@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Proctor — Exam Monitoring</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0f1117; color: #e1e4e8; }
+  .header { background: #161b22; padding: 12px 24px; display: flex; align-items: center; gap: 16px; border-bottom: 1px solid #30363d; }
+  .header h1 { font-size: 18px; font-weight: 600; }
+  .status-badge { padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: 600; }
+  .status-active { background: #238636; color: #fff; }
+  .status-warning { background: #d29922; color: #000; }
+  .status-danger { background: #da3633; color: #fff; }
+
+  .container { display: grid; grid-template-columns: 1fr 320px; gap: 16px; padding: 16px; height: calc(100vh - 56px); }
+
+  .main-panel { display: flex; flex-direction: column; gap: 16px; }
+
+  .video-container { position: relative; background: #000; border-radius: 8px; overflow: hidden; flex: 1; min-height: 300px; }
+  .video-container video { width: 100%; height: 100%; object-fit: cover; }
+  .video-overlay { position: absolute; top: 12px; right: 12px; display: flex; flex-direction: column; gap: 8px; }
+  .overlay-badge { background: rgba(0,0,0,0.7); padding: 6px 12px; border-radius: 6px; font-size: 13px; backdrop-filter: blur(4px); }
+
+  .score-bar { display: flex; gap: 12px; }
+  .score-card { flex: 1; background: #161b22; border-radius: 8px; padding: 16px; border: 1px solid #30363d; }
+  .score-card .label { font-size: 11px; text-transform: uppercase; color: #8b949e; margin-bottom: 4px; }
+  .score-card .value { font-size: 28px; font-weight: 700; }
+  .score-low { color: #3fb950; }
+  .score-mid { color: #d29922; }
+  .score-high { color: #da3633; }
+
+  .side-panel { display: flex; flex-direction: column; gap: 16px; }
+
+  .panel-card { background: #161b22; border-radius: 8px; border: 1px solid #30363d; overflow: hidden; }
+  .panel-card h3 { padding: 12px 16px; font-size: 13px; text-transform: uppercase; color: #8b949e; border-bottom: 1px solid #30363d; }
+
+  .flags-list { max-height: 200px; overflow-y: auto; padding: 8px; }
+  .flag-item { padding: 6px 10px; margin: 4px 0; border-radius: 4px; font-size: 12px; display: flex; justify-content: space-between; }
+  .flag-HIGH { background: rgba(218,54,51,0.15); border-left: 3px solid #da3633; }
+  .flag-MEDIUM { background: rgba(210,153,34,0.15); border-left: 3px solid #d29922; }
+  .flag-LOW { background: rgba(63,185,80,0.15); border-left: 3px solid #3fb950; }
+  .flag-CRITICAL { background: rgba(218,54,51,0.3); border-left: 3px solid #ff6b6b; }
+
+  .modules-grid { padding: 12px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .module-item { padding: 8px; border-radius: 4px; background: #0d1117; text-align: center; }
+  .module-item .name { font-size: 10px; color: #8b949e; }
+  .module-item .score { font-size: 18px; font-weight: 700; margin-top: 2px; }
+
+  .controls { display: flex; gap: 8px; padding: 12px; }
+  .btn { padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 600; }
+  .btn-start { background: #238636; color: #fff; }
+  .btn-stop { background: #da3633; color: #fff; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .timeline { padding: 8px; max-height: 250px; overflow-y: auto; }
+  .timeline-item { font-size: 11px; padding: 4px 8px; color: #8b949e; border-left: 2px solid #30363d; margin-left: 8px; margin-bottom: 4px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>AI Proctor</h1>
+  <span id="statusBadge" class="status-badge status-active">INITIALIZING</span>
+  <span style="margin-left:auto; font-size:12px; color:#8b949e;" id="fps">0 FPS</span>
+</div>
+
+<div class="container">
+  <div class="main-panel">
+    <div class="video-container">
+      <video id="webcam" autoplay muted playsinline></video>
+      <div class="video-overlay">
+        <div class="overlay-badge" id="faceStatus">Face: --</div>
+        <div class="overlay-badge" id="gazeStatus">Gaze: --</div>
+        <div class="overlay-badge" id="poseStatus">Pose: OK</div>
+      </div>
+    </div>
+    <div class="score-bar">
+      <div class="score-card">
+        <div class="label">Cheating Score</div>
+        <div class="value" id="mainScore">0</div>
+      </div>
+      <div class="score-card">
+        <div class="label">Flags</div>
+        <div class="value" id="flagCount">0</div>
+      </div>
+      <div class="score-card">
+        <div class="label">Processing</div>
+        <div class="value" id="procTime" style="font-size:20px">-- ms</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="side-panel">
+    <div class="panel-card">
+      <h3>Controls</h3>
+      <div class="controls">
+        <button class="btn btn-start" id="btnStart" onclick="startSession()">Start</button>
+        <button class="btn btn-stop" id="btnStop" onclick="stopSession()" disabled>Stop</button>
+      </div>
+    </div>
+
+    <div class="panel-card">
+      <h3>Module Scores</h3>
+      <div class="modules-grid">
+        <div class="module-item"><div class="name">Face</div><div class="score" id="mFace">0</div></div>
+        <div class="module-item"><div class="name">Object</div><div class="score" id="mObject">0</div></div>
+        <div class="module-item"><div class="name">Audio</div><div class="score" id="mAudio">0</div></div>
+        <div class="module-item"><div class="name">Pose</div><div class="score" id="mPose">0</div></div>
+        <div class="module-item"><div class="name">Behavior</div><div class="score" id="mBehavior">0</div></div>
+      </div>
+    </div>
+
+    <div class="panel-card">
+      <h3>Live Flags</h3>
+      <div class="flags-list" id="flagsList"></div>
+    </div>
+
+    <div class="panel-card">
+      <h3>Event Timeline</h3>
+      <div class="timeline" id="timeline"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = window.location.origin;
+let sessionId = null;
+let videoWs = null;
+let audioWs = null;
+let behavioralWs = null;
+let webcamStream = null;
+let captureInterval = null;
+let frameCount = 0;
+let lastFpsTime = Date.now();
+
+// ---------- Webcam ----------
+
+async function initWebcam() {
+  try {
+    webcamStream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480, frameRate: 15 }, audio: true });
+    document.getElementById('webcam').srcObject = webcamStream;
+    addTimeline('Webcam initialized');
+  } catch (e) {
+    addTimeline('Webcam error: ' + e.message);
+  }
+}
+
+// ---------- Session ----------
+
+async function startSession() {
+  document.getElementById('btnStart').disabled = true;
+
+  const res = await fetch(API + '/api/v1/proctor/sessions/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ candidate_id: 'test-candidate', test_id: 'test-exam' })
+  });
+  const data = await res.json();
+  sessionId = data.session_id;
+
+  document.getElementById('statusBadge').textContent = 'ACTIVE';
+  document.getElementById('statusBadge').className = 'status-badge status-active';
+  document.getElementById('btnStop').disabled = false;
+
+  connectVideoWs(data.ws_video_url);
+  connectAudioWs(data.ws_audio_url);
+  connectBehavioralWs(data.ws_behavioral_url);
+  startBehavioralCollection();
+
+  addTimeline('Session started: ' + sessionId);
+}
+
+async function stopSession() {
+  if (!sessionId) return;
+  clearInterval(captureInterval);
+
+  if (videoWs) videoWs.close();
+  if (audioWs) audioWs.close();
+  if (behavioralWs) behavioralWs.close();
+
+  const res = await fetch(API + '/api/v1/proctor/sessions/' + sessionId + '/stop', { method: 'POST' });
+  const data = await res.json();
+
+  document.getElementById('statusBadge').textContent = 'COMPLETED';
+  document.getElementById('statusBadge').className = 'status-badge status-warning';
+  document.getElementById('btnStart').disabled = false;
+  document.getElementById('btnStop').disabled = true;
+
+  addTimeline('Session stopped. Avg score: ' + data.avg_cheating_score);
+  sessionId = null;
+}
+
+// ---------- Video WebSocket ----------
+
+function connectVideoWs(path) {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  videoWs = new WebSocket(proto + '://' + location.host + path);
+
+  videoWs.onopen = () => {
+    addTimeline('Video stream connected');
+    startFrameCapture();
+  };
+
+  videoWs.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.event === 'face_registered') {
+      addTimeline('Face registered successfully');
+      document.getElementById('faceStatus').textContent = 'Face: Registered';
+      return;
+    }
+    if (msg.event === 'analysis') {
+      updateUI(msg);
+    }
+  };
+
+  videoWs.onclose = () => addTimeline('Video stream disconnected');
+}
+
+function startFrameCapture() {
+  const video = document.getElementById('webcam');
+  const canvas = document.createElement('canvas');
+  canvas.width = 640;
+  canvas.height = 480;
+  const ctx = canvas.getContext('2d');
+
+  captureInterval = setInterval(() => {
+    if (!videoWs || videoWs.readyState !== 1) return;
+    ctx.drawImage(video, 0, 0, 640, 480);
+    canvas.toBlob(blob => {
+      if (!blob) return;
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const b64 = reader.result.split(',')[1];
+        videoWs.send(b64);
+        frameCount++;
+        const now = Date.now();
+        if (now - lastFpsTime >= 1000) {
+          document.getElementById('fps').textContent = frameCount + ' FPS';
+          frameCount = 0;
+          lastFpsTime = now;
+        }
+      };
+      reader.readAsDataURL(blob);
+    }, 'image/jpeg', 0.7);
+  }, 1000 / 15);  // 15 FPS
+}
+
+// ---------- Audio WebSocket ----------
+
+function connectAudioWs(path) {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  audioWs = new WebSocket(proto + '://' + location.host + path);
+  audioWs.binaryType = 'arraybuffer';
+
+  audioWs.onopen = () => {
+    addTimeline('Audio stream connected');
+    startAudioCapture();
+  };
+}
+
+function startAudioCapture() {
+  if (!webcamStream) return;
+  const audioCtx = new AudioContext({ sampleRate: 16000 });
+  const source = audioCtx.createMediaStreamSource(webcamStream);
+  const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+
+  source.connect(processor);
+  processor.connect(audioCtx.destination);
+
+  processor.onaudioprocess = (e) => {
+    if (!audioWs || audioWs.readyState !== 1) return;
+    const float32 = e.inputBuffer.getChannelData(0);
+    const int16 = new Int16Array(float32.length);
+    for (let i = 0; i < float32.length; i++) {
+      int16[i] = Math.max(-32768, Math.min(32767, Math.floor(float32[i] * 32768)));
+    }
+    audioWs.send(int16.buffer);
+  };
+}
+
+// ---------- Behavioral WebSocket ----------
+
+function connectBehavioralWs(path) {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  behavioralWs = new WebSocket(proto + '://' + location.host + path);
+  behavioralWs.onopen = () => addTimeline('Behavioral stream connected');
+}
+
+const behavioralData = { keystrokes: [], mouse_positions: [], copy_paste: [], tab_switches: [] };
+
+function startBehavioralCollection() {
+  document.addEventListener('keydown', (e) => {
+    behavioralData.keystrokes.push(Date.now());
+  });
+
+  let lastMouse = 0;
+  document.addEventListener('mousemove', (e) => {
+    const now = Date.now();
+    if (now - lastMouse < 100) return;
+    lastMouse = now;
+    behavioralData.mouse_positions.push({ x: e.clientX, y: e.clientY, t: now });
+  });
+
+  document.addEventListener('copy', () => behavioralData.copy_paste.push(Date.now()));
+  document.addEventListener('paste', () => behavioralData.copy_paste.push(Date.now()));
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      behavioralData.tab_switches.push(Date.now());
+      addTimeline('Tab switch detected!');
+    }
+  });
+
+  // Send every 5 seconds
+  setInterval(() => {
+    if (!behavioralWs || behavioralWs.readyState !== 1) return;
+    behavioralWs.send(JSON.stringify(behavioralData));
+    // Clear after send
+    behavioralData.keystrokes = [];
+    behavioralData.mouse_positions = [];
+    behavioralData.copy_paste = [];
+    behavioralData.tab_switches = [];
+  }, 5000);
+}
+
+// ---------- UI Update ----------
+
+function updateUI(msg) {
+  const score = msg.cheating_score || 0;
+  const el = document.getElementById('mainScore');
+  el.textContent = Math.round(score);
+  el.className = 'value ' + (score < 30 ? 'score-low' : score < 60 ? 'score-mid' : 'score-high');
+
+  document.getElementById('procTime').textContent = (msg.processing_ms || 0) + ' ms';
+  document.getElementById('flagCount').textContent = (msg.flags || []).length;
+
+  // Module scores
+  const ms = msg.module_scores || {};
+  updateModuleScore('mFace', ms.face);
+  updateModuleScore('mObject', ms.object);
+  updateModuleScore('mAudio', ms.audio);
+  updateModuleScore('mPose', ms.pose);
+  updateModuleScore('mBehavior', ms.behavioral);
+
+  // Status badge
+  const badge = document.getElementById('statusBadge');
+  if (score >= 60) { badge.textContent = 'HIGH RISK'; badge.className = 'status-badge status-danger'; }
+  else if (score >= 30) { badge.textContent = 'WARNING'; badge.className = 'status-badge status-warning'; }
+  else { badge.textContent = 'ACTIVE'; badge.className = 'status-badge status-active'; }
+
+  // Flags
+  const flags = msg.flags || [];
+  if (flags.length > 0) {
+    const list = document.getElementById('flagsList');
+    flags.forEach(f => {
+      const severity = f.includes('CRITICAL') ? 'CRITICAL' : f.includes('HIGH') ? 'HIGH' : f.includes('IDENTITY') || f.includes('LEFT') ? 'HIGH' : 'MEDIUM';
+      const item = document.createElement('div');
+      item.className = 'flag-item flag-' + severity;
+      item.innerHTML = '<span>' + f + '</span><span style="color:#8b949e">' + new Date().toLocaleTimeString() + '</span>';
+      list.prepend(item);
+      if (list.children.length > 50) list.removeChild(list.lastChild);
+    });
+  }
+}
+
+function updateModuleScore(id, val) {
+  if (val === undefined) return;
+  const el = document.getElementById(id);
+  const v = Math.round(val);
+  el.textContent = v;
+  el.style.color = v < 30 ? '#3fb950' : v < 60 ? '#d29922' : '#da3633';
+}
+
+function addTimeline(text) {
+  const tl = document.getElementById('timeline');
+  const item = document.createElement('div');
+  item.className = 'timeline-item';
+  item.textContent = new Date().toLocaleTimeString() + ' — ' + text;
+  tl.prepend(item);
+  if (tl.children.length > 100) tl.removeChild(tl.lastChild);
+}
+
+// ---------- Init ----------
+initWebcam();
+</script>
+</body>
+</html>

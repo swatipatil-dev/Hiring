@@ -1,0 +1,154 @@
+import { createContext, useContext, useState, useCallback } from 'react'
+import api from '../api/client'
+
+const AuthContext = createContext(null)
+
+function parseJWT(token) {
+  try {
+    return JSON.parse(atob(token.split('.')[1]))
+  } catch {
+    return {}
+  }
+}
+
+function setFavicon(url) {
+  if (!url) return
+  let link = document.querySelector("link[rel~='icon']")
+  if (!link) {
+    link = document.createElement('link')
+    link.rel = 'icon'
+    document.head.appendChild(link)
+  }
+  link.href = url
+}
+
+function applyFont(fontFamily) {
+  if (!fontFamily) return
+  const id = 'company-font-link'
+  if (!document.getElementById(id)) {
+    const link = document.createElement('link')
+    link.id = id
+    link.rel = 'stylesheet'
+    document.head.appendChild(link)
+  }
+  const encoded = encodeURIComponent(fontFamily)
+  document.getElementById(id).href = `https://fonts.googleapis.com/css2?family=${encoded}:wght@400;500;600;700;800&display=swap`
+  document.documentElement.style.setProperty('--font-body', `'${fontFamily}', system-ui, sans-serif`)
+}
+
+function applyCompanyBranding(token) {
+  const payload = parseJWT(token)
+  // The platform org (Innomax) keeps the default teal theme — only real client
+  // companies override the accent with their brand color.
+  const isInnomax = payload.company_slug === 'innomax'
+  if (payload.company_color && !isInnomax) {
+    document.documentElement.style.setProperty('--accent-primary', payload.company_color)
+    document.documentElement.style.setProperty('--accent-secondary', payload.company_secondary_color || payload.company_color)
+    document.documentElement.style.setProperty('--accent-tertiary', payload.company_accent_color || payload.company_color)
+  }
+  if (payload.company_favicon && !isInnomax) setFavicon(payload.company_favicon)
+  if (payload.company_font && !isInnomax) applyFont(payload.company_font)
+  return {
+    company_id: payload.company_id || null,
+    company_logo: payload.company_logo || null,
+    company_favicon: payload.company_favicon || null,
+    company_color: payload.company_color || null,
+    company_secondary_color: payload.company_secondary_color || null,
+    company_accent_color: payload.company_accent_color || null,
+    company_font: payload.company_font || null,
+    company_name: payload.company_name || null,
+    company_slug: payload.company_slug || null,
+  }
+}
+
+export function AuthProvider({ children }) {
+  const [user, setUser] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('hireflow_user')) } catch { return null }
+  })
+  const [token, setToken] = useState(() => {
+    const t = localStorage.getItem('hireflow_token')
+    if (t) applyCompanyBranding(t)
+    return t
+  })
+
+  const login = useCallback(async (email, password, opts = {}) => {
+    const body = { email, password }
+    if (opts.apiKey) body.api_key = opts.apiKey
+    if (opts.platformLogin) body.platform_login = true
+    const res = await api.post('/auth/login', body)
+    const { access_token, user: u } = res.data
+    const branding = applyCompanyBranding(access_token)
+    const enrichedUser = { ...u, ...branding }
+    localStorage.setItem('hireflow_token', access_token)
+    localStorage.setItem('hireflow_user', JSON.stringify(enrichedUser))
+    setToken(access_token)
+    setUser(enrichedUser)
+    return enrichedUser
+  }, [])
+
+  // Used by CompanyLogin to update React state after a raw fetch login
+  const loginDirect = useCallback((access_token, u) => {
+    const branding = applyCompanyBranding(access_token)
+    const enrichedUser = { ...u, ...branding }
+    localStorage.setItem('hireflow_token', access_token)
+    localStorage.setItem('hireflow_user', JSON.stringify(enrichedUser))
+    setToken(access_token)
+    setUser(enrichedUser)
+    return enrichedUser
+  }, [])
+
+  const register = useCallback(async (data) => {
+    return (await api.post('/auth/register', data)).data
+  }, [])
+
+  const verifyOtp = useCallback(async (email, otp) => {
+    const res = await api.post('/auth/verify-otp', { email, otp })
+    const { access_token, user: u } = res.data
+    const branding = applyCompanyBranding(access_token)
+    const enrichedUser = { ...u, ...branding }
+    localStorage.setItem('hireflow_token', access_token)
+    localStorage.setItem('hireflow_user', JSON.stringify(enrichedUser))
+    setToken(access_token)
+    setUser(enrichedUser)
+    return enrichedUser
+  }, [])
+
+  const resendOtp = useCallback(async (email) => {
+    return (await api.post('/auth/resend-otp', { email })).data
+  }, [])
+
+  const refreshToken = useCallback(async () => {
+    try {
+      const res = await api.post('/auth/refresh')
+      const { access_token, user: u } = res.data
+      const branding = applyCompanyBranding(access_token)
+      const enrichedUser = { ...u, ...branding }
+      localStorage.setItem('hireflow_token', access_token)
+      localStorage.setItem('hireflow_user', JSON.stringify(enrichedUser))
+      setToken(access_token)
+      setUser(enrichedUser)
+      return enrichedUser
+    } catch {
+      return null
+    }
+  }, [])
+
+  const logout = useCallback(() => {
+    localStorage.removeItem('hireflow_token')
+    localStorage.removeItem('hireflow_user')
+    setToken(null)
+    setUser(null)
+  }, [])
+
+  return (
+    <AuthContext.Provider value={{ user, token, login, loginDirect, register, verifyOtp, resendOtp, logout, refreshToken, isAuthenticated: !!token }}>
+      {children}
+    </AuthContext.Provider>
+  )
+}
+
+export const useAuth = () => {
+  const ctx = useContext(AuthContext)
+  if (!ctx) throw new Error('useAuth must be inside AuthProvider')
+  return ctx
+}

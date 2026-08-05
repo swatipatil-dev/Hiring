@@ -1,0 +1,1315 @@
+/* ═══════════════════════════════════════════════════════════
+   Resume Matcher — scoped page styles.
+
+   Every selector is prefixed .rm- and lives under .rm-page, so nothing
+   here can reach the rest of the HireFlow UI. Faces and base colors come
+   from the global tokens in index.css; only the score bands are local.
+   ═══════════════════════════════════════════════════════════ */
+
+.rm-page {
+  max-width: 1180px;
+
+  /* Score bands — same thresholds the ATS sheet uses, moved onto the
+     app's warm status palette so they sit in the ivory workspace. */
+  --rm-strong: #2d8a6e;
+  --rm-good:   #3b6fa0;
+  --rm-fair:   #c17f3e;
+  --rm-weak:   #c44536;
+
+  --rm-rule: var(--border-subtle);
+  --rm-mono: var(--font-mono);
+}
+
+.rm-page :focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+/* ─── Masthead ─────────────────────────────────────────── */
+
+.rm-masthead {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 24px 32px;
+  flex-wrap: wrap;
+  padding-bottom: 16px;
+  border-bottom: 2px solid var(--text-primary);
+}
+
+.rm-masthead__title {
+  font-family: var(--font-display);
+  font-size: 1.9rem;
+  font-weight: 700;
+  letter-spacing: -0.025em;
+  line-height: 1.1;
+  margin-bottom: 6px;
+}
+
+.rm-masthead__sub {
+  font-size: 0.88rem;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  max-width: 54ch;
+}
+
+.rm-masthead__actions,
+.rm-intake__actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.rm-intake__actions { justify-content: center; }
+
+/* The mono tally line that runs under the masthead rule. */
+.rm-ledgerline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 20px;
+  flex-wrap: wrap;
+  padding: 11px 0 0;
+  font-family: var(--rm-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.rm-ledgerline b {
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+/* ─── Intake ───────────────────────────────────────────── */
+
+.rm-intake {
+  border: 1.5px dashed var(--border-medium);
+  border-radius: 16px;
+  padding: 46px 24px;
+  text-align: center;
+  background: var(--surface-card);
+}
+
+.rm-intake__title {
+  font-family: var(--font-display);
+  font-size: 1.2rem;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  margin-bottom: 6px;
+}
+
+.rm-intake__hint {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  margin-bottom: 18px;
+}
+
+/* Full-page drop target — dragging anywhere on the page is a valid drop. */
+.rm-dropveil {
+  position: fixed;
+  inset: 0;
+  z-index: 900;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  background: rgba(250, 249, 247, 0.84);
+  backdrop-filter: blur(5px);
+  pointer-events: none;
+}
+
+.rm-dropveil__frame {
+  border: 2px dashed var(--accent-primary);
+  border-radius: 22px;
+  background: var(--surface-card);
+  box-shadow: var(--shadow-xl);
+  padding: 46px 60px;
+  text-align: center;
+  color: var(--accent-primary);
+}
+
+.rm-dropveil__frame strong {
+  display: block;
+  font-family: var(--font-display);
+  font-size: 1.35rem;
+  font-weight: 600;
+  margin-top: 12px;
+  letter-spacing: -0.02em;
+}
+
+.rm-dropveil__frame span {
+  font-family: var(--rm-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+/* ─── Queued files ─────────────────────────────────────── */
+
+.rm-queue {
+  border: 1px solid var(--rm-rule);
+  border-radius: 14px;
+  background: var(--surface-card);
+  padding: 14px 16px;
+  box-shadow: var(--shadow-sm);
+}
+
+.rm-queue__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.rm-queue__count {
+  font-family: var(--rm-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.rm-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.rm-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 260px;
+  padding: 3px 4px 3px 9px;
+  border: 1px solid var(--rm-rule);
+  border-radius: 6px;
+  background: var(--bg-tertiary);
+  font-family: var(--rm-mono);
+  font-size: 0.71rem;
+  color: var(--text-secondary);
+}
+
+.rm-chip__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rm-chip button {
+  display: flex;
+  padding: 2px;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  cursor: pointer;
+  color: var(--text-tertiary);
+  transition: color 0.18s, background 0.18s;
+}
+
+.rm-chip button:hover:not(:disabled) {
+  color: var(--rm-weak);
+  background: #fef2f0;
+}
+
+/* ─── Alerts ───────────────────────────────────────────── */
+
+.rm-alert {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 11px 14px;
+  border: 1px solid;
+  border-radius: 10px;
+  font-size: 0.85rem;
+  line-height: 1.45;
+}
+
+.rm-alert svg { flex-shrink: 0; margin-top: 2px; }
+
+.rm-alert--ok   { background: #eef6f3; border-color: #c8e6dc; color: #1a6b5a; }
+.rm-alert--warn { background: #fef7ec; border-color: #fde4b1; color: #92610a; }
+.rm-alert--err  { background: #fef2f0; border-color: #f5c6c0; color: var(--rm-weak); }
+
+/* ─── Filters ──────────────────────────────────────────── */
+
+.rm-filters {
+  border: 1px solid var(--rm-rule);
+  border-radius: 14px;
+  background: var(--surface-card);
+  padding: 12px 14px;
+  box-shadow: var(--shadow-sm);
+}
+
+.rm-filters__row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.rm-search {
+  position: relative;
+  flex: 1 1 260px;
+  min-width: 190px;
+}
+
+.rm-search svg {
+  position: absolute;
+  left: 11px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-tertiary);
+  pointer-events: none;
+}
+
+.rm-search .input { padding-left: 34px; }
+
+.rm-filters__more {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--rm-rule);
+}
+
+.rm-filters__label {
+  font-family: var(--rm-mono);
+  font-size: 0.66rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+/* ─── Record ───────────────────────────────────────────── */
+
+.rm-records {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.rm-record {
+  display: grid;
+  grid-template-columns: 78px minmax(0, 1fr) 148px;
+  overflow: hidden;
+  border: 1px solid var(--rm-rule);
+  border-radius: 14px;
+  background: var(--surface-card);
+  box-shadow: var(--shadow-sm);
+  transition: border-color 0.25s, box-shadow 0.35s var(--ease-out-expo);
+  animation: rm-rise 0.5s var(--ease-out-expo) both;
+}
+
+.rm-record:hover {
+  border-color: var(--border-medium);
+  box-shadow: var(--shadow-md);
+}
+
+/* The spine: score numeral over a bottom-up segmented gauge. */
+.rm-spine {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 9px;
+  padding: 16px 0 18px;
+  background: var(--bg-tertiary);
+  border-right: 1px solid var(--rm-rule);
+}
+
+.rm-spine__score {
+  font-family: var(--rm-mono);
+  font-size: 1.55rem;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: -0.05em;
+}
+
+.rm-spine__of {
+  margin-top: -7px;
+  font-family: var(--rm-mono);
+  font-size: 0.58rem;
+  letter-spacing: 0.12em;
+  color: var(--text-tertiary);
+}
+
+.rm-spine__gauge {
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 3px;
+  width: 13px;
+  flex: 1;
+  min-height: 74px;
+}
+
+.rm-spine__seg {
+  flex: 1;
+  border-radius: 2px;
+  background: var(--border-subtle);
+}
+
+.rm-spine__seg--on {
+  background: currentColor;
+  transform-origin: bottom;
+  animation: rm-fill 0.42s var(--ease-out-quart) both;
+}
+
+.rm-spine--empty {
+  justify-content: center;
+  color: var(--text-tertiary);
+}
+
+.rm-record__body {
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+  min-width: 0;
+  padding: 16px 20px 18px;
+}
+
+.rm-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.rm-name {
+  font-size: 1.02rem;
+  font-weight: 600;
+  letter-spacing: -0.012em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.rm-pill {
+  font-family: var(--rm-mono);
+  font-size: 0.6rem;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+  padding: 3px 8px;
+  border: 1px solid var(--rm-rule);
+  border-radius: 4px;
+  background: var(--bg-tertiary);
+  color: var(--text-tertiary);
+  white-space: nowrap;
+}
+
+/* Provenance: where this record came from. Kept quiet — the spine is the loud part. */
+.rm-pill--portal {
+  border-color: #d6ddf0;
+  background: #eef1f8;
+  color: var(--rm-good);
+}
+
+/* Hired. The one pill that earns full colour. */
+.rm-pill--moved {
+  border-color: #c8e6dc;
+  background: #eef6f3;
+  color: #1a6b5a;
+}
+
+/* Live in a pipeline right now. */
+.rm-pill--live {
+  border-color: #d6ddf0;
+  background: #eef1f8;
+  color: var(--rm-good);
+}
+
+/* Rejected or declined — free to approach again. Deliberately NOT the error red:
+   a past rejection is an opportunity on this screen, not a fault. */
+.rm-pill--available {
+  border-color: #f0dfc4;
+  background: #fbf5ec;
+  color: var(--rm-fair);
+}
+
+/* ─── Outcome rail ─────────────────────────────────────── */
+
+.rm-outcomes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px dashed var(--rm-rule);
+}
+
+.rm-outcome {
+  padding: 5px 11px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: none;
+  cursor: pointer;
+  font-family: var(--rm-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  transition: background 0.18s, color 0.18s, border-color 0.18s;
+}
+
+.rm-outcome:hover { color: var(--text-primary); background: var(--bg-hover); }
+
+.rm-outcome--on {
+  background: var(--accent-primary);
+  border-color: var(--accent-primary);
+  color: var(--text-inverse);
+}
+
+.rm-outcome--on:hover { background: var(--accent-secondary); color: var(--text-inverse); }
+
+/* ─── Application history ──────────────────────────────── */
+
+.rm-hist__rows {
+  margin-top: 9px;
+  display: flex;
+  flex-direction: column;
+}
+
+.rm-hist__row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 0;
+  font-size: 0.84rem;
+  border-bottom: 1px dashed var(--rm-rule);
+}
+
+.rm-hist__row:last-child { border-bottom: none; }
+
+.rm-hist__job {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rm-hist__when {
+  font-family: var(--rm-mono);
+  font-size: 0.68rem;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+}
+
+/* Stage chips reuse the pill type spec; only the colour family changes. */
+.rm-stage {
+  font-family: var(--rm-mono);
+  font-size: 0.6rem;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border: 1px solid var(--rm-rule);
+  border-radius: 4px;
+  background: var(--bg-tertiary);
+  color: var(--text-tertiary);
+  white-space: nowrap;
+}
+
+.rm-stage--hired { border-color: #c8e6dc; background: #eef6f3; color: #1a6b5a; }
+.rm-stage--offer { border-color: #d6ddf0; background: #eef1f8; color: var(--rm-good); }
+.rm-stage--live  { border-color: #d6ddf0; background: #eef1f8; color: var(--rm-good); }
+/* Closed stages stay grey. Red is reserved for genuine read errors. */
+.rm-stage--closed { border-color: var(--rm-rule); background: var(--bg-tertiary); color: var(--text-tertiary); }
+
+/* ─── Pagination ───────────────────────────────────────── */
+
+.rm-pagefoot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 20px;
+  padding-top: 14px;
+  border-top: 1px solid var(--rm-rule);
+}
+
+/* Rhymes with the ledger line at the top of the page. */
+.rm-pagefoot__pos {
+  font-family: var(--rm-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.rm-pagefoot__pos b { color: var(--text-secondary); font-weight: 600; }
+
+/* Record fields, separated by mono middots. */
+.rm-facts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  font-family: var(--rm-mono);
+  font-size: 0.71rem;
+  color: var(--text-tertiary);
+  margin-top: -6px;
+}
+
+.rm-facts > span {
+  max-width: 30ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rm-facts > span:not(:last-child)::after {
+  content: '·';
+  margin: 0 9px;
+  color: var(--border-medium);
+}
+
+/* The verdict — the one thing this page exists to say. */
+.rm-verdict {
+  border-left: 3px solid var(--accent-primary);
+  padding-left: 14px;
+}
+
+.rm-verdict__eyebrow {
+  font-family: var(--rm-mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--accent-primary);
+}
+
+.rm-verdict__job {
+  font-family: var(--font-display);
+  font-size: 1.35rem;
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: -0.022em;
+  margin-top: 2px;
+}
+
+.rm-verdict__meta {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+
+/* ─── Factor breakdown — the spine vocabulary, laid flat ── */
+
+.rm-factors {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin-top: 11px;
+}
+
+.rm-factor {
+  display: grid;
+  grid-template-columns: 84px minmax(0, 1fr) 28px;
+  align-items: center;
+  gap: 12px;
+}
+
+.rm-factor__label {
+  font-family: var(--rm-mono);
+  font-size: 0.65rem;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.rm-factor__track {
+  display: flex;
+  gap: 3px;
+  height: 8px;
+}
+
+.rm-factor__seg {
+  flex: 1;
+  border-radius: 1px;
+  background: var(--border-subtle);
+}
+
+.rm-factor__seg--on { background: currentColor; }
+
+.rm-factor__val {
+  font-family: var(--rm-mono);
+  font-size: 0.74rem;
+  font-weight: 600;
+  text-align: right;
+  color: inherit;
+}
+
+/* ─── Skills ───────────────────────────────────────────── */
+
+.rm-skillset {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.rm-skillset__label {
+  font-family: var(--rm-mono);
+  font-size: 0.63rem;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  width: 52px;
+  flex-shrink: 0;
+}
+
+.rm-skill {
+  font-family: var(--rm-mono);
+  font-size: 0.69rem;
+  padding: 2px 7px;
+  border: 1px solid;
+  border-radius: 4px;
+}
+
+.rm-skill--have { background: #eef6f3; border-color: #c8e6dc; color: #1a6b5a; }
+.rm-skill--gap  { background: var(--bg-tertiary); border-color: var(--rm-rule); color: var(--text-tertiary); }
+
+.rm-skill__more {
+  font-family: var(--rm-mono);
+  font-size: 0.69rem;
+  color: var(--text-tertiary);
+}
+
+/* ─── Disclosure toggles ───────────────────────────────── */
+
+.rm-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: pointer;
+  font-family: var(--rm-mono);
+  font-size: 0.66rem;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  transition: color 0.2s;
+}
+
+.rm-toggle:hover { color: var(--accent-primary); }
+
+.rm-alts {
+  border-top: 1px solid var(--rm-rule);
+  padding-top: 12px;
+}
+
+.rm-alt {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 0;
+  font-size: 0.84rem;
+  border-bottom: 1px dashed var(--rm-rule);
+}
+
+.rm-alt:last-child { border-bottom: none; }
+
+.rm-alt__title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rm-alt__dept {
+  font-family: var(--rm-mono);
+  font-size: 0.68rem;
+  color: var(--text-tertiary);
+  margin-left: 8px;
+}
+
+.rm-alt__score {
+  font-family: var(--rm-mono);
+  font-size: 0.85rem;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+/* ─── Action rail ──────────────────────────────────────── */
+
+.rm-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 5px;
+  padding: 16px 14px 16px 13px;
+  border-left: 1px solid var(--rm-rule);
+}
+
+.rm-act {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: none;
+  cursor: pointer;
+  font-family: var(--font-body);
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+  text-align: left;
+  transition: background 0.18s, color 0.18s;
+}
+
+.rm-act svg { flex-shrink: 0; }
+
+.rm-act:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.rm-act--primary {
+  justify-content: center;
+  background: var(--accent-primary);
+  color: var(--text-inverse);
+  font-weight: 600;
+  margin-bottom: 3px;
+}
+
+.rm-act--primary:hover:not(:disabled) {
+  background: var(--accent-secondary);
+  color: var(--text-inverse);
+}
+
+.rm-act--danger:hover:not(:disabled) {
+  background: #fef2f0;
+  color: var(--rm-weak);
+}
+
+.rm-act:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* ─── Empty & loading ──────────────────────────────────── */
+
+.rm-empty {
+  border: 1px solid var(--rm-rule);
+  border-radius: 14px;
+  background: var(--surface-card);
+  padding: 52px 28px;
+  text-align: center;
+}
+
+.rm-empty__title {
+  font-family: var(--font-display);
+  font-size: 1.15rem;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  margin-bottom: 6px;
+}
+
+.rm-empty__body {
+  font-size: 0.86rem;
+  color: var(--text-secondary);
+  max-width: 44ch;
+  margin: 0 auto 16px;
+  line-height: 1.5;
+}
+
+.rm-skeleton {
+  height: 132px;
+  border: 1px solid var(--rm-rule);
+  border-radius: 14px;
+  background: linear-gradient(100deg, var(--surface-card) 30%, var(--bg-tertiary) 50%, var(--surface-card) 70%);
+  background-size: 220% 100%;
+  animation: rm-shimmer 1.4s ease-in-out infinite;
+}
+
+/* ═══ Talent Pool dashboard ═══════════════════════════════
+   Tabs, stat tiles, bars and the sourcing-CRM controls. Same scoped-prefix rule as
+   everything above: nothing here escapes .rm-page.
+   ═══════════════════════════════════════════════════════ */
+
+.rm-page .tp-tabs {
+  display: flex;
+  gap: 2px;
+  flex-wrap: wrap;
+  margin-top: 18px;
+  border-bottom: 1px solid var(--rm-rule);
+}
+
+.rm-page .tp-tab {
+  position: relative;
+  padding: 9px 16px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  font-family: var(--font-body);
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-tertiary);
+  transition: color 0.18s;
+}
+
+.rm-page .tp-tab:hover { color: var(--text-primary); }
+
+.rm-page .tp-tab--on { color: var(--accent-primary); }
+
+.rm-page .tp-tab--on::after {
+  content: '';
+  position: absolute;
+  left: 10px; right: 10px; bottom: -1px;
+  height: 2px;
+  background: var(--accent-primary);
+  border-radius: 2px 2px 0 0;
+}
+
+.rm-page .tp-tab__count {
+  margin-left: 7px;
+  font-family: var(--rm-mono);
+  font-size: 0.68rem;
+  color: var(--text-tertiary);
+}
+
+.rm-page .tp-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  margin-top: 22px;
+}
+
+.rm-page .tp-loading {
+  margin-top: 24px;
+  font-family: var(--rm-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+/* ─── Stat tiles ───────────────────────────────────────── */
+
+.rm-page .tp-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 12px;
+}
+
+.rm-page .tp-tile {
+  border: 1px solid var(--rm-rule);
+  border-radius: 12px;
+  background: var(--surface-card);
+  padding: 15px 17px;
+  box-shadow: var(--shadow-sm);
+}
+
+.rm-page .tp-tile__label {
+  font-family: var(--rm-mono);
+  font-size: 0.65rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+/* The number is the point of a tile, so it gets the display face and real size. */
+.rm-page .tp-tile__value {
+  font-family: var(--font-display);
+  font-size: 1.9rem;
+  font-weight: 700;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  margin-top: 5px;
+}
+
+.rm-page .tp-tile__hint {
+  font-size: 0.76rem;
+  color: var(--text-secondary);
+  margin-top: 3px;
+}
+
+/* ─── Cards & bars ─────────────────────────────────────── */
+
+.rm-page .tp-card {
+  border: 1px solid var(--rm-rule);
+  border-radius: 14px;
+  background: var(--surface-card);
+  padding: 18px 20px 20px;
+  box-shadow: var(--shadow-sm);
+}
+
+.rm-page .tp-card__title {
+  font-family: var(--font-display);
+  font-size: 1.1rem;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+}
+
+.rm-page .tp-card__sub {
+  font-size: 0.83rem;
+  color: var(--text-secondary);
+  margin-top: 4px;
+  max-width: 62ch;
+  line-height: 1.5;
+}
+
+.rm-page .tp-card__actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 16px;
+}
+
+.rm-page .tp-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.rm-page .tp-bar {
+  display: grid;
+  grid-template-columns: minmax(90px, 190px) minmax(0, 1fr) 44px;
+  align-items: center;
+  gap: 12px;
+}
+
+.rm-page .tp-bar__label {
+  font-size: 0.83rem;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rm-page .tp-bar__track {
+  height: 10px;
+  border-radius: 5px;
+  background: var(--bg-tertiary);
+  margin: 0;
+  overflow: hidden;
+}
+
+/* Rounded on the data end only, anchored to the baseline. */
+.rm-page .tp-bar__fill {
+  display: block;
+  height: 100%;
+  border-radius: 2px 5px 5px 2px;
+  transition: width 0.5s var(--ease-out-quart);
+}
+
+/* The value is direct-labelled on every bar, so nothing relies on colour alone. */
+.rm-page .tp-bar__value {
+  margin: 0;
+  font-family: var(--rm-mono);
+  font-size: 0.85rem;
+  font-weight: 600;
+  text-align: right;
+}
+
+.rm-page .tp-empty,
+.rm-page .tp-note {
+  font-size: 0.8rem;
+  color: var(--text-tertiary);
+  margin-top: 12px;
+  line-height: 1.5;
+}
+
+/* Live progress during a long scoring run. Mono, because it is a changing count. */
+.rm-page .tp-progress {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--rm-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  color: var(--accent-primary);
+}
+
+.rm-page .tp-defs { margin-top: 14px; }
+.rm-page .tp-defs dt {
+  font-family: var(--rm-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--accent-primary);
+  margin-top: 12px;
+}
+.rm-page .tp-defs dd {
+  margin: 3px 0 0;
+  font-size: 0.84rem;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+/* ─── Stage pill & control ─────────────────────────────── */
+
+/* Same ordinal ramp as the pipeline chart, so a stage looks identical wherever it
+   appears. Text stays in ink — the swatch carries the identity. */
+.rm-page .tp-stagepill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--rm-mono);
+  font-size: 0.6rem;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+  padding: 3px 8px;
+  border: 1px solid var(--rm-rule);
+  border-radius: 4px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.rm-page .tp-stagepill::before {
+  content: '';
+  width: 7px; height: 7px;
+  border-radius: 2px;
+  background: currentColor;
+}
+
+.rm-page .tp-stagepill--new      { color: #2b6cb0; border-color: #d6ddf0; background: #eef1f8; }
+.rm-page .tp-stagepill--ongoing  { color: #0e4fa0; border-color: #c9d6ec; background: #e7eef8; }
+.rm-page .tp-stagepill--archived { color: #0a3b7d; border-color: #c2cfe6; background: #e2eaf5; }
+
+.rm-page .tp-stagesel {
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--border-medium);
+  border-radius: 8px;
+  background: var(--surface-card);
+  cursor: pointer;
+  font-family: var(--font-body);
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 3px;
+}
+
+.rm-page .tp-stagesel:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* ─── Notes & files on a card ──────────────────────────── */
+
+.rm-page .tp-notes {
+  border-left: 2px solid var(--rm-rule);
+  padding-left: 12px;
+}
+
+.rm-page .tp-notes p {
+  margin: 3px 0 0;
+  font-size: 0.83rem;
+  color: var(--text-secondary);
+  line-height: 1.5;
+  /* Preview only — the full text lives in the edit dialog. */
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.rm-page .tp-notes__head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.rm-page .tp-notes--empty { color: var(--text-tertiary); font-style: italic; }
+
+/* ─── File list ────────────────────────────────────────── */
+
+.rm-page .tp-filelist ul {
+  list-style: none;
+  margin: 7px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.rm-page .tp-filerow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px dashed var(--rm-rule);
+}
+
+.rm-page .tp-filerow:last-child { border-bottom: none; }
+
+.rm-page .tp-file__name {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border: none;
+  background: none;
+  padding: 0;
+  cursor: pointer;
+  font-family: var(--rm-mono);
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  text-align: left;
+}
+
+.rm-page .tp-file__name:hover { color: var(--accent-primary); text-decoration: underline; }
+
+.rm-page .tp-file__meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--rm-mono);
+  font-size: 0.65rem;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+}
+
+/* Amber, not red: an image is a legitimate attachment that simply cannot be scored. */
+.rm-page .tp-file__tag {
+  font-size: 0.58rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--rm-fair);
+  border: 1px solid #f0dfc4;
+  background: #fbf5ec;
+  border-radius: 3px;
+  padding: 1px 5px;
+}
+
+.rm-page .tp-file__acts { display: inline-flex; gap: 2px; }
+
+.rm-page .tp-file__act {
+  display: flex;
+  padding: 4px;
+  border: none;
+  border-radius: 5px;
+  background: none;
+  cursor: pointer;
+  color: var(--text-tertiary);
+  transition: color 0.15s, background 0.15s;
+}
+
+.rm-page .tp-file__act:hover:not(:disabled) {
+  color: var(--accent-primary);
+  background: var(--bg-hover);
+}
+
+.rm-page .tp-file__act--danger:hover:not(:disabled) {
+  color: var(--rm-weak);
+  background: #fef2f0;
+}
+
+.rm-page .tp-file__act:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* ─── Inline editors ───────────────────────────────────── */
+
+.rm-page .tp-inline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.rm-page .tp-inline--editing {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.rm-page .tp-inline__value {
+  font-family: var(--rm-mono);
+  font-size: 0.71rem;
+  color: var(--text-tertiary);
+}
+
+/* Quiet until wanted — an edit affordance on every field would shout over the data. */
+.rm-page .tp-inline__edit {
+  border: none;
+  background: none;
+  padding: 0;
+  cursor: pointer;
+  font-family: var(--rm-mono);
+  font-size: 0.63rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  transition: color 0.18s;
+}
+
+.rm-page .tp-inline__edit:hover { color: var(--accent-primary); }
+
+.rm-page .tp-inline__actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+.rm-page .tp-inline__hint {
+  font-family: var(--rm-mono);
+  font-size: 0.62rem;
+  color: var(--text-tertiary);
+}
+
+@media (max-width: 560px) {
+  .rm-page .tp-filerow { grid-template-columns: minmax(0, 1fr) auto; }
+  .rm-page .tp-file__meta { grid-column: 1 / -1; }
+}
+
+@media (max-width: 560px) {
+  .rm-page .tp-bar { grid-template-columns: minmax(78px, 1fr) minmax(0, 1.4fr) 34px; gap: 8px; }
+  .rm-page .tp-tile__value { font-size: 1.6rem; }
+  .rm-page .tp-tab { padding: 9px 11px; font-size: 0.8rem; }
+}
+
+/* ─── Motion ───────────────────────────────────────────── */
+
+@keyframes rm-rise {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: none; }
+}
+
+@keyframes rm-fill {
+  from { transform: scaleY(0); }
+  to   { transform: scaleY(1); }
+}
+
+@keyframes rm-shimmer {
+  from { background-position: 180% 0; }
+  to   { background-position: -20% 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rm-record,
+  .rm-spine__seg--on,
+  .rm-skeleton {
+    animation: none !important;
+  }
+  .rm-record { opacity: 1; transform: none; }
+}
+
+/* ─── Responsive ───────────────────────────────────────── */
+
+@media (max-width: 900px) {
+  .rm-record { grid-template-columns: 68px minmax(0, 1fr); }
+  .rm-actions {
+    grid-column: 1 / -1;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    border-left: none;
+    border-top: 1px solid var(--rm-rule);
+    padding: 12px 20px;
+  }
+  .rm-act--primary { margin-bottom: 0; }
+  .rm-act--danger { margin-left: auto; }
+}
+
+@media (max-width: 560px) {
+  .rm-masthead__title { font-size: 1.5rem; }
+  .rm-verdict__job { font-size: 1.15rem; }
+  .rm-factor { grid-template-columns: 72px minmax(0, 1fr) 26px; gap: 9px; }
+  .rm-record__body { padding: 14px 16px 16px; }
+  .rm-intake { padding: 34px 18px; }
+  .rm-dropveil__frame { padding: 32px 26px; }
+}

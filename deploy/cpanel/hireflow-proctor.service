@@ -1,0 +1,62 @@
+# HireFlow proctoring — the SAME app, serving only the proctoring routes.
+#
+# Why this is a separate service, and why it must stay at ONE worker:
+#
+# proctoring/routes.py keeps active sessions in a process-local dict whose values
+# are live MediaPipe graph handles. Those cannot be serialised, so the state
+# cannot move to Redis or be shared between workers. A session started by
+# POST /sessions/start lives in exactly one process, and its WebSocket arrives as
+# a NEW connection that gunicorn hands to an arbitrary worker — with N workers it
+# lands on the right one 1/N of the time and closes 4004 otherwise.
+#
+# So: one worker, on its own port, with Apache routing the proctoring paths here.
+# The API keeps its 3 workers because it has no such constraint.
+#
+# Capacity is set by PROCTOR_INFERENCE_SLOTS, not by worker count — models are
+# pooled and borrowed per frame (proctoring/model_registry.py), so one process
+# handles many candidates concurrently.
+
+[Unit]
+Description=HireFlow Proctoring (single worker — session state is process-local)
+After=network.target mysqld.service hireflow-api.service
+
+[Service]
+Type=exec
+User=hireflow
+Group=hireflow
+WorkingDirectory=/opt/hireflow/backend
+EnvironmentFile=/opt/hireflow/backend/.env
+
+Environment=ROLE=web
+Environment=PORT=8001
+Environment=BIND_HOST=127.0.0.1
+# MUST be 1. See the header above — this is a correctness constraint, not tuning.
+Environment=WEB_CONCURRENCY=1
+Environment=PROCTOR_PREWARM=1
+# Frames in flight at once. Resident model memory is roughly this x ~115 MB and
+# does NOT grow with candidate count. Default is (cpu_count - 2).
+Environment=PROCTOR_INFERENCE_SLOTS=6
+# Refuse new sessions past this instead of degrading everyone mid-test.
+Environment=PROCTOR_MAX_SESSIONS=9
+Environment=HF_HOME=/opt/hireflow/hf-cache
+Environment=OMP_NUM_THREADS=1
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/opt/hireflow/venv/bin:/usr/local/bin:/usr/bin:/bin
+
+ExecStart=/bin/sh /opt/hireflow/backend/entrypoint.sh
+
+Restart=always
+RestartSec=5
+# Cold start imports mediapipe/ultralytics/torch (~102s measured) before the
+# first model set is built. Do not lower this without measuring.
+TimeoutStartSec=600
+TimeoutStopSec=60
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/hireflow
+
+[Install]
+WantedBy=multi-user.target

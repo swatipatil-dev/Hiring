@@ -1,0 +1,38 @@
+# HireFlow outbound-email worker.
+#
+# Without this, src/mailq/queue.py falls back to sending inline on the request
+# thread — every OTP and notification then blocks an HTTP response, and the
+# hourly per-mailbox rate limit is not enforced.
+#
+# --with-scheduler (set by entrypoint.sh for this role) is required so deferred
+# sends — retries and rate-limit deferrals — actually fire.
+
+[Unit]
+Description=HireFlow email RQ worker (with scheduler)
+After=network.target redis.service mysqld.service
+Requires=redis.service
+
+[Service]
+Type=exec
+User=hireflow
+Group=hireflow
+WorkingDirectory=/opt/hireflow/backend
+EnvironmentFile=/opt/hireflow/backend/.env
+
+Environment=ROLE=email-worker
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/opt/hireflow/venv/bin:/usr/local/bin:/usr/bin:/bin
+
+ExecStart=/bin/sh /opt/hireflow/backend/entrypoint.sh
+
+Restart=always
+RestartSec=10
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/hireflow
+
+[Install]
+WantedBy=multi-user.target

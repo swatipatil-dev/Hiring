@@ -1,0 +1,373 @@
+========================================================
+  CANDIDATE PROFILE - FEATURE UPDATE INSTRUCTIONS
+  For use with Claude Code
+========================================================
+
+CONTEXT
+-------
+This is a hiring platform with multiple user roles: Admin, HR, Interviewer,
+and Candidate. The candidate can register, log in, apply for jobs, track
+application status, and take tests.
+
+The candidate profile currently only has these fields:
+  - First Name
+  - Last Name
+  - Gender
+  - Date of Birth
+  - Phone Number
+
+The goal of this update is to build out a complete, production-ready
+candidate profile with all the sections described below.
+
+
+========================================================
+SECTION 1 — PERSONAL INFORMATION (extend existing)
+========================================================
+
+Fields to ADD to the existing personal info section:
+
+  - profile_photo         (image upload, JPG/PNG, max 2MB)
+  - email                 (string, unique, read-only if used for login)
+  - alternate_phone       (string, optional)
+  - nationality           (string / dropdown, optional)
+  - marital_status        (enum: Single | Married | Prefer not to say, optional)
+  - languages             (array of strings, multi-select or tag input)
+
+Already existing (keep as-is):
+  - first_name
+  - last_name
+  - gender
+  - date_of_birth
+  - phone_number
+
+
+========================================================
+SECTION 2 — LOCATION & ADDRESS (new section)
+========================================================
+
+  - current_city          (string)
+  - state                 (string)
+  - country               (string / dropdown)
+  - pincode               (string)
+  - willing_to_relocate   (boolean, Yes / No toggle)
+  - preferred_locations   (array of strings, multi-select cities)
+
+
+========================================================
+SECTION 3 — PROFESSIONAL SUMMARY (new section)
+========================================================
+
+  - headline              (string, max 120 chars — e.g. "Full Stack Developer at Infosys")
+  - about                 (text, max 2000 chars — professional bio / summary)
+  - total_experience_years  (number, e.g. 4.5)
+  - current_employment_status (enum: Employed | Unemployed | Student | Freelancing)
+  - notice_period         (enum: Immediately | 15 days | 1 month | 2 months | 3 months | More than 3 months)
+  - open_to_work          (boolean toggle — shows "Open to Work" badge on profile)
+
+
+========================================================
+SECTION 4 — WORK EXPERIENCE (new repeatable section)
+========================================================
+
+This is a LIST. A candidate can add multiple work experience entries.
+
+Each entry contains:
+  - job_title             (string, required)
+  - company_name          (string, required)
+  - industry              (string / dropdown)
+  - employment_type       (enum: Full-time | Part-time | Contract | Internship | Freelance)
+  - location              (string — city name)
+  - start_date            (date: month + year)
+  - end_date              (date: month + year — disabled if currently_working is true)
+  - currently_working     (boolean — "I currently work here" checkbox)
+  - description           (text, max 1000 chars — roles and responsibilities)
+  - key_achievements      (text, max 500 chars — optional bullet highlights)
+
+UI Notes:
+  - Show entries in reverse chronological order (latest first)
+  - Show a running total of years of experience calculated from dates
+  - Allow reordering, editing, and deleting entries
+
+
+========================================================
+SECTION 5 — EDUCATION (new repeatable section)
+========================================================
+
+This is a LIST. A candidate can add multiple education entries.
+
+Each entry contains:
+  - degree                (string / dropdown — e.g. B.Tech, MBA, 12th, Diploma)
+  - field_of_study        (string — e.g. Computer Science, Finance)
+  - institution_name      (string, required)
+  - university_or_board   (string — parent university or exam board)
+  - start_year            (year)
+  - end_year              (year — or "Expected YYYY" if pursuing)
+  - currently_pursuing    (boolean)
+  - grade                 (string — GPA, percentage, CGPA, or division)
+  - description           (text, optional — activities, achievements)
+
+UI Notes:
+  - Show latest education first
+  - Allow editing and deleting entries
+
+
+========================================================
+SECTION 6 — SKILLS (new section)
+========================================================
+
+This is a LIST of skill tags. Each skill entry contains:
+  - skill_name            (string — searchable from a preset list, plus free-form)
+  - proficiency_level     (enum: Beginner | Intermediate | Advanced | Expert)
+  - years_of_experience   (number, optional — e.g. 2.5)
+
+Skill categories (for grouping display):
+  - Technical Skills      (programming languages, frameworks, databases, etc.)
+  - Soft Skills           (communication, leadership, etc.)
+  - Tools & Software      (Figma, JIRA, VS Code, etc.)
+  - Domain Knowledge      (Finance, Healthcare, E-commerce, etc.)
+
+UI Notes:
+  - Tag-based input with autocomplete/search
+  - Show skill chips grouped by category on profile view
+  - Min: 1 skill | Max: 30 skills recommended
+
+
+========================================================
+SECTION 7 — CERTIFICATIONS & LICENSES (new repeatable section)
+========================================================
+
+Each entry contains:
+  - certificate_name      (string, required)
+  - issuing_organization  (string — e.g. Google, Coursera, AWS)
+  - issue_date            (date: month + year)
+  - expiry_date           (date: month + year, optional)
+  - does_not_expire       (boolean)
+  - credential_id         (string, optional)
+  - credential_url        (URL, optional — link to verify)
+  - certificate_file      (file upload, PDF/image, optional)
+
+
+========================================================
+SECTION 8 — PROJECTS (new repeatable section)
+========================================================
+
+Each entry contains:
+  - project_title         (string, required)
+  - project_type          (enum: Personal | Academic | Professional | Open-source)
+  - description           (text, max 1000 chars)
+  - technologies_used     (array of strings — tag input)
+  - role                  (string — your role in the project)
+  - start_date            (date, optional)
+  - end_date              (date, optional)
+  - ongoing               (boolean)
+  - project_url           (URL, optional — live link)
+  - repository_url        (URL, optional — GitHub / GitLab)
+
+
+========================================================
+SECTION 9 — JOB PREFERENCES (new section)
+========================================================
+
+  - preferred_job_roles   (array of strings — e.g. "Backend Developer", "Data Analyst")
+  - preferred_industries  (array of strings — multi-select)
+  - preferred_job_type    (enum: Full-time | Part-time | Contract | Internship | Freelance)
+  - work_mode_preference  (enum: On-site | Remote | Hybrid | Any)
+  - expected_salary_min   (number)
+  - expected_salary_max   (number)
+  - salary_currency       (string — default based on country, e.g. INR / USD)
+  - salary_type           (enum: Monthly | Annual)
+  - preferred_locations   (array of strings — cities or countries)
+
+UI Notes:
+  - Show salary as a range slider or two number inputs
+  - This data should be visible to HR/Admin for filtering candidates
+
+
+========================================================
+SECTION 10 — DOCUMENTS & LINKS (new section)
+========================================================
+
+Uploads:
+  - resume_cv             (file upload, PDF only, max 5MB, required)
+  - cover_letter          (file upload, PDF/DOC, optional)
+  - portfolio_file        (file upload, PDF/ZIP/image, optional)
+
+Social & Web Links:
+  - linkedin_url          (URL)
+  - github_url            (URL)
+  - portfolio_url         (URL — personal website)
+  - twitter_url           (URL, optional)
+  - behance_url           (URL, optional — for designers)
+  - dribbble_url          (URL, optional — for designers)
+  - other_url             (URL, optional — custom label)
+
+
+========================================================
+SECTION 11 — ADDITIONAL SECTIONS (new optional sections)
+========================================================
+
+--- Achievements & Awards ---
+Each entry:
+  - award_title           (string)
+  - issuing_organization  (string)
+  - year                  (year)
+  - description           (text, optional)
+
+--- Publications ---
+Each entry:
+  - title                 (string)
+  - publisher             (string)
+  - publication_date      (date)
+  - url                   (URL, optional)
+  - description           (text, optional)
+
+--- Volunteer Experience ---
+Each entry:
+  - organization          (string)
+  - role                  (string)
+  - start_date            (date)
+  - end_date              (date, optional)
+  - currently_volunteering (boolean)
+  - description           (text, optional)
+
+--- References ---
+Each entry:
+  - referee_name          (string)
+  - designation           (string)
+  - company               (string)
+  - email                 (string)
+  - phone                 (string, optional)
+  - relationship          (string — e.g. "Former Manager")
+
+
+========================================================
+PROFILE COMPLETION SCORE (new feature)
+========================================================
+
+Calculate and display a profile completion percentage.
+
+Scoring weights (suggested):
+
+  Personal Info (basic fields filled)     — 10%
+  Profile photo uploaded                  — 5%
+  Professional summary / headline         — 10%
+  At least 1 work experience entry        — 20%
+  At least 1 education entry              — 15%
+  At least 3 skills added                 — 15%
+  Resume / CV uploaded                    — 15%
+  Job preferences filled                  — 10%
+
+Total = 100%
+
+UI Notes:
+  - Show a progress bar at the top of the profile page
+  - Show a checklist of what's missing to reach 100%
+  - Consider showing a "Profile Strength" label:
+      0–40%   = Beginner
+      41–70%  = Intermediate
+      71–90%  = Strong
+      91–100% = All Star
+
+
+========================================================
+DATABASE / MODEL NOTES
+========================================================
+
+Suggested table structure (adapt to your existing ORM/DB):
+
+  candidates                — main profile record (1-to-1 with user)
+  candidate_work_experience — 1-to-many with candidates
+  candidate_education       — 1-to-many with candidates
+  candidate_skills          — 1-to-many with candidates
+  candidate_certifications  — 1-to-many with candidates
+  candidate_projects        — 1-to-many with candidates
+  candidate_achievements    — 1-to-many with candidates
+  candidate_publications    — 1-to-many with candidates
+  candidate_volunteer       — 1-to-many with candidates
+  candidate_references      — 1-to-many with candidates
+  candidate_documents       — 1-to-many with candidates (for file uploads)
+  candidate_preferences     — 1-to-1 with candidates (job preferences)
+  candidate_links           — 1-to-1 with candidates (social links)
+
+
+========================================================
+API ENDPOINTS TO CREATE (REST convention)
+========================================================
+
+GET    /api/candidate/profile                  — fetch full profile
+PUT    /api/candidate/profile                  — update personal info + summary
+
+POST   /api/candidate/work-experience          — add entry
+PUT    /api/candidate/work-experience/:id      — edit entry
+DELETE /api/candidate/work-experience/:id      — delete entry
+
+POST   /api/candidate/education                — add entry
+PUT    /api/candidate/education/:id            — edit entry
+DELETE /api/candidate/education/:id            — delete entry
+
+POST   /api/candidate/skills                   — add skill
+DELETE /api/candidate/skills/:id               — remove skill
+
+POST   /api/candidate/certifications           — add entry
+PUT    /api/candidate/certifications/:id       — edit entry
+DELETE /api/candidate/certifications/:id       — delete entry
+
+POST   /api/candidate/projects                 — add entry
+PUT    /api/candidate/projects/:id             — edit entry
+DELETE /api/candidate/projects/:id             — delete entry
+
+PUT    /api/candidate/preferences              — update job preferences
+PUT    /api/candidate/links                    — update social links
+
+POST   /api/candidate/documents/resume         — upload resume
+POST   /api/candidate/documents/cover-letter   — upload cover letter
+
+GET    /api/candidate/profile/completion       — get completion score + checklist
+
+
+========================================================
+UI / UX NOTES FOR FRONTEND
+========================================================
+
+- Use a LEFT SIDEBAR or TOP TABS for section navigation
+  (Personal | Experience | Education | Skills | Preferences | Documents)
+
+- Each section should have an EDIT button that opens an inline form
+  or a modal — avoid full page reloads
+
+- Repeatable sections (Experience, Education, etc.) should show:
+    - A summary card for each entry (collapsed view)
+    - An expand / edit / delete control on each card
+
+- Use AUTO-SAVE or a clear SAVE button per section — not one global save
+
+- On mobile, stack sections vertically with accordion-style collapse
+
+- Show VALIDATION inline (e.g. "End date must be after Start date")
+
+- Resume upload should show:
+    - File name + size after upload
+    - A "Preview" link (open PDF in new tab)
+    - A "Replace" button
+
+- Skills input should have:
+    - Autocomplete from a predefined skills list
+    - Option to add custom skill if not in list
+    - Chips/tags that can be individually deleted
+
+
+========================================================
+PERMISSIONS / VISIBILITY RULES
+========================================================
+
+  - Candidate can view and edit their OWN profile only
+  - HR and Admin can VIEW candidate profiles (read-only)
+  - HR and Admin can see Job Preferences and Documents sections
+  - Interviewer can see profile summary, skills, experience, education
+  - References section should be visible only to HR/Admin, not Interviewers
+  - Salary expectations visible only to HR/Admin
+
+
+========================================================
+END OF INSTRUCTIONS
+========================================================

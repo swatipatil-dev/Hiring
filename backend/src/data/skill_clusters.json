@@ -1,0 +1,48 @@
+{
+  "vector_database": ["FAISS", "Pinecone", "Weaviate", "ChromaDB", "Qdrant", "Milvus", "Vector Database"],
+  "cloud_platform": ["AWS", "Azure", "GCP"],
+  "llm_framework": ["LangChain", "LangGraph", "LlamaIndex", "Haystack", "Semantic Kernel"],
+  "llm_model": ["OpenAI", "Anthropic", "GPT-4", "GPT-3.5", "Claude", "Gemini", "Ollama", "LLMs"],
+  "container_orchestration": ["Docker", "Kubernetes", "Helm", "Podman"],
+  "ci_cd": ["Jenkins", "GitHub Actions", "GitLab CI", "CircleCI", "Travis CI", "ArgoCD", "Azure DevOps"],
+  "relational_database": ["SQL", "PostgreSQL", "MySQL", "SQLite", "SQL Server", "MariaDB", "Oracle"],
+  "nosql_database": ["MongoDB", "Cassandra", "DynamoDB", "Redis", "CouchDB", "Neo4j", "Firestore"],
+  "ml_framework": ["TensorFlow", "PyTorch", "Keras", "JAX", "scikit-learn"],
+  "data_processing": ["Apache Spark", "Hadoop", "Apache Kafka", "Apache Airflow", "dbt", "Pandas", "Dask"],
+  "frontend_framework": ["React", "Angular", "Vue.js", "Svelte", "Next.js", "Nuxt.js"],
+  "backend_framework": ["Django", "Flask", "FastAPI", "Spring", "Express.js", "Ruby on Rails", "Laravel", "NestJS"],
+  "mobile": ["iOS", "Android", "React Native", "Flutter", "Swift", "Kotlin"],
+  "testing": ["pytest", "Jest", "Cypress", "Selenium", "Mocha", "JUnit"],
+  "monitoring": ["Prometheus", "Grafana", "Datadog", "Sentry", "Elasticsearch"],
+  "version_control": ["Git", "GitHub", "GitLab", "Bitbucket"],
+  "message_queue": ["Apache Kafka", "RabbitMQ", "Celery", "Redis Queue"],
+  "data_warehouse": ["Snowflake", "BigQuery", "Amazon Redshift", "dbt"],
+  "embedding_model": ["Sentence Transformers", "Hugging Face", "OpenAI", "Embeddings", "FAISS"],
+
+  "web_fundamentals": ["HTML", "CSS", "JavaScript", "React", "Angular", "Vue.js", "Next.js", "Nuxt.js", "Svelte"],
+
+  "digital_marketing": ["SEO", "Google Ads", "Facebook Ads", "Content Marketing", "Email Marketing", "Social Media Marketing", "PPC", "Affiliate Marketing"],
+  "marketing_analytics": ["Google Analytics", "HubSpot", "Marketo", "Mailchimp", "Hootsuite", "A/B Testing"],
+  "content_creation": ["Copywriting", "Content Marketing", "Blogging", "Copyediting", "Social Media Marketing"],
+
+  "hr_core": ["Recruitment", "Talent Acquisition", "Employee Relations", "Performance Management", "Onboarding"],
+  "hr_systems": ["HRIS", "SAP HR", "Workday", "Payroll Management"],
+  "hr_compliance": ["Labor Law", "Compensation and Benefits", "Organizational Development"],
+
+  "sales_core": ["B2B Sales", "Account Management", "Negotiation", "Cold Calling", "Business Development"],
+  "sales_tools": ["CRM", "Salesforce", "Pipeline Management", "Revenue Forecasting"],
+
+  "finance_core": ["Financial Planning", "Budgeting", "Forecasting", "Financial Analysis", "Financial Reporting"],
+  "finance_compliance": ["GAAP", "IFRS", "Audit", "Tax Preparation"],
+  "finance_tools": ["QuickBooks", "SAP Finance", "Tally ERP", "Excel"],
+  "accounting": ["Bookkeeping", "Accounts Payable", "Accounts Receivable", "Financial Reporting", "GAAP"],
+
+  "design_tools": ["Adobe Photoshop", "Adobe Illustrator", "Figma", "InDesign", "Canva", "Sketch", "After Effects"],
+  "design_skills": ["Branding", "Typography", "UI/UX Design", "Motion Graphics", "Wireframing", "Prototyping"],
+
+  "project_management": ["Agile", "Scrum", "Kanban", "PMP", "PRINCE2", "Stakeholder Management", "Risk Management", "MS Project"],
+  "leadership": ["Team Leadership", "Stakeholder Management", "Change Management", "Strategic Planning", "Resource Management"],
+
+  "office_tools": ["Microsoft Office", "Excel", "PowerPoint", "Word", "MS Project"],
+  "operations": ["Operations Management", "Supply Chain", "Logistics", "Inventory Management", "Process Improvement", "Lean", "Six Sigma", "Quality Assurance"]
+}

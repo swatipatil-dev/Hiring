@@ -1,0 +1,57 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Node
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# Environment
+.env
+*.env.local
+
+# GCP service-account keys — NEVER commit
+gcp-key.json
+*-key.json
+*service-account*.json
+*-sa.json
+cloud-sql-proxy.exe
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Resumes (user data)
+resumes/
+
+# Evidence frames (proctoring)
+evidence_frames/
+
+# Temp
+*.tmp
+*.bak
+venv/
+
+# Uploads (user data — candidate photos/resumes; never commit, PII)
+uploads/
+backend/uploads/photos/
+backend/upload/photos/
+
+# Logos (tenant/company assets — not tracked in git)
+logos/
+# Local DB backups (created before backfills/migrations)
+backend/backups/

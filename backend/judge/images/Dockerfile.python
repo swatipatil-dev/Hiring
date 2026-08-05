@@ -1,0 +1,11 @@
+# Hardened Python runtime image for the judge sandbox.
+# Build:  docker build -t hireflow-judge-python:latest -f judge/images/Dockerfile.python .
+FROM python:3.11-slim
+
+# GNU time → peak-memory reporting (enabled via JUDGE_GNU_TIME=1).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends time \
+    && rm -rf /var/lib/apt/lists/*
+
+# `nobody` (uid 65534) already exists in the base image; the sandbox runs as it.
+WORKDIR /work

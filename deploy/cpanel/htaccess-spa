@@ -1,0 +1,38 @@
+# SPA history fallback for the React build.
+#
+# Install as .htaccess in the subdomain document root:
+#   cp deploy/cpanel/htaccess-spa /home/innomaxskills/public_html/hire/.htaccess
+#
+# The API prefixes are handled by ProxyPass at the vhost level, which is
+# evaluated before .htaccess, so those requests never reach these rules — this
+# only ever sees SPA routes and static assets.
+
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteBase /
+
+  # Real files and directories are served as-is (index.html, /assets/*, favicon…).
+  RewriteCond %{REQUEST_FILENAME} -f [OR]
+  RewriteCond %{REQUEST_FILENAME} -d
+  RewriteRule ^ - [L]
+
+  # Everything else is a client-side route: hand back the SPA shell.
+  RewriteRule ^ index.html [L]
+</IfModule>
+
+# Vite emits content-hashed asset filenames, so they can be cached hard.
+# index.html must NOT be, or a deploy leaves clients on stale asset references.
+<IfModule mod_headers.c>
+  <FilesMatch "\.(js|css|woff2?|png|jpe?g|svg|webp|ico)$">
+    Header set Cache-Control "public, max-age=31536000, immutable"
+  </FilesMatch>
+  <FilesMatch "index\.html$">
+    Header set Cache-Control "no-cache, no-store, must-revalidate"
+  </FilesMatch>
+</IfModule>
+
+<IfModule mod_deflate.c>
+  AddOutputFilterByType DEFLATE text/html text/css text/plain \
+                                application/javascript application/json \
+                                image/svg+xml
+</IfModule>

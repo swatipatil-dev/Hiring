@@ -1,0 +1,10 @@
+# Shell scripts and Docker files run inside Linux containers — they MUST use LF
+# line endings even when checked out on Windows (CRLF breaks the shebang/parsing).
+*.sh            text eol=lf
+entrypoint.sh   text eol=lf
+Dockerfile      text eol=lf
+Dockerfile.*    text eol=lf
+*.Dockerfile    text eol=lf
+.dockerignore   text eol=lf
+*.template      text eol=lf
+nginx.conf*     text eol=lf

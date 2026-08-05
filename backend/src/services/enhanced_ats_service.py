@@ -1,0 +1,2157 @@
+"""
+🔍 ENHANCED ATS SERVICE MODULE
+Advanced resume processing with OCR support, enhanced parsing, and detailed candidate analysis
+"""
+
+import os
+import re
+import json
+import logging
+import pathlib
+import unicodedata
+import hashlib
+import functools
+from typing import List, Dict, Any, Optional, Tuple
+from pathlib import Path
+from datetime import datetime
+import pdfplumber
+import numpy as np
+from pydantic import BaseModel
+
+from src.services.institution_tiers import best_tier
+from src.services.pincode_region import is_rural
+from src.services.jd_overlap import jd_copy_overlap
+
+# Resume<->JD verbatim-copy handling. Default is flag-only (no score change);
+# set > 0 to subtract points from flagged candidates.
+JD_COPY_PENALTY = 0.0
+
+# ==================== MODULE-LEVEL AI/NLP SETUP ====================
+
+# --- Data paths ---
+_DATA_DIR = pathlib.Path(__file__).parent.parent / "data"
+
+# Run scripts/enrich_skill_data.py to expand skill coverage before deploying
+
+# --- C4.1: Skill alias map (loaded once at import) ---
+ALIAS_MAP: Dict[str, str] = json.loads((_DATA_DIR / "skill_aliases.json").read_text(encoding="utf-8"))
+
+def normalize_skill(token: str) -> str:
+    """Return canonical skill name for a token, or the token itself if unknown."""
+    return ALIAS_MAP.get(token.lower().strip(), token.strip())
+
+# --- C4.3: Canonical skills set (canonical names + all alias keys for variant matching) ---
+CANONICAL_SKILLS_SET: set = (
+    set(s.lower() for s in json.loads((_DATA_DIR / "canonical_skills.json").read_text(encoding="utf-8")))
+    | set(ALIAS_MAP.keys())  # includes "lang chain", "llm", "lang graph", etc.
+)
+
+# --- Skill clustering — partial credit when a related tech is found ---
+SKILL_CLUSTERS: Dict[str, List[str]] = json.loads((_DATA_DIR / "skill_clusters.json").read_text(encoding="utf-8"))
+# Reverse map: lowercase canonical name → cluster name
+SKILL_TO_CLUSTER: Dict[str, str] = {
+    member.lower(): cluster_name
+    for cluster_name, members in SKILL_CLUSTERS.items()
+    for member in members
+}
+CLUSTER_PARTIAL_CREDIT = 0.6  # 60% of full credit for a same-category skill
+
+# --- C4.2: Sentence Transformer (eager load — reused across requests) ---
+# Catch ANY failure, not just ImportError: loading the model can hit the network
+# (HuggingFace download) and fail with HfHubHTTPError/OSError — e.g. a 429 rate-limit
+# on a fresh container. That must degrade to the TF-IDF fallback, NEVER crash app
+# import (which would take the whole API down). The model is baked into the Docker
+# image at build time, so this normally loads instantly from the local cache.
+try:
+    from sentence_transformers import SentenceTransformer, util as st_util
+    _SEMANTIC_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
+except Exception as _st_err:  # noqa: BLE001 — intentional broad fallback
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
+    _SEMANTIC_MODEL = None
+    st_util = None
+    logging.warning(
+        "Semantic model unavailable (%s). Falling back to TF-IDF for semantic scoring.",
+        _st_err,
+    )
+
+# FIXED: No embedding cache — LRU cache for JD embeddings
+_EMBEDDING_CACHE: Dict[str, Any] = {}
+_EMBEDDING_CACHE_MAXSIZE = 128
+
+
+def _get_text_embedding(text: str) -> Any:
+    """
+    Get embedding for a text string with SHA-256 based LRU caching.
+
+    Caches up to _EMBEDDING_CACHE_MAXSIZE embeddings keyed on the SHA-256
+    hash of the input text. Cache hits avoid the 200-800ms encode() call.
+
+    Args:
+        text: Input text to embed.
+
+    Returns:
+        Embedding tensor/array from SentenceTransformer, or None if unavailable.
+    """
+    if not SENTENCE_TRANSFORMERS_AVAILABLE or _SEMANTIC_MODEL is None:
+        return None
+    text_hash = hashlib.sha256(text.encode()).hexdigest()
+    if text_hash in _EMBEDDING_CACHE:
+        logger.debug("JD embedding cache hit: %s", text_hash[:8])
+        return _EMBEDDING_CACHE[text_hash]
+    embedding = _SEMANTIC_MODEL.encode(text, convert_to_tensor=True)
+    # Evict oldest if at capacity (simple FIFO eviction)
+    if len(_EMBEDDING_CACHE) >= _EMBEDDING_CACHE_MAXSIZE:
+        oldest_key = next(iter(_EMBEDDING_CACHE))
+        del _EMBEDDING_CACHE[oldest_key]
+    _EMBEDDING_CACHE[text_hash] = embedding
+    return embedding
+
+
+# --- Cache skill cluster embeddings at module load time (they never change) ---
+_CLUSTER_EMBEDDINGS: Dict[str, Any] = {}
+if SENTENCE_TRANSFORMERS_AVAILABLE and _SEMANTIC_MODEL is not None:
+    try:
+        for cluster_name, members in SKILL_CLUSTERS.items():
+            cluster_text = ", ".join(members)
+            _CLUSTER_EMBEDDINGS[cluster_name] = _SEMANTIC_MODEL.encode(
+                cluster_text, convert_to_tensor=True
+            )
+        logging.info("Cached %d skill cluster embeddings at module load.", len(_CLUSTER_EMBEDDINGS))
+    except Exception as e:
+        logging.warning("Failed to cache skill cluster embeddings: %s", e)
+
+# --- C4.3: spaCy NER (lazy load — transformer model is large) ---
+_NLP = None
+
+def _get_nlp():
+    """Lazy-load spaCy en_core_web_trf on first use (production-grade NER accuracy)."""
+    global _NLP
+    if _NLP is None:
+        try:
+            import spacy
+            _NLP = spacy.load("en_core_web_trf")
+        except Exception as e:
+            logging.warning(f"spaCy en_core_web_trf not available: {e}. NER features disabled.")
+    return _NLP
+
+# --- C4.4: Fuzzy matching ---
+try:
+    from rapidfuzz import fuzz as _fuzz
+    RAPIDFUZZ_AVAILABLE = True
+except ImportError:
+    RAPIDFUZZ_AVAILABLE = False
+    logging.warning("rapidfuzz not installed. Falling back to exact keyword matching.")
+
+FUZZY_THRESHOLD = 75  # rapidfuzz scores are 0-100
+
+# --- C4.3: Degree scoring ---
+DEGREE_SCORES = {
+    # Doctoral
+    "phd": 100, "ph.d": 100, "ph.d.": 100, "doctorate": 100, "doctoral": 100,
+    "d.phil": 100, "doctor of philosophy": 100,
+    # Masters
+    "master": 80, "masters": 80, "m.s": 80, "m.s.": 80, "m.sc": 80, "m.sc.": 80,
+    "mba": 80, "m.b.a": 80, "m.tech": 80, "m.tech.": 80, "m.e": 80, "m.e.": 80,
+    "mca": 80, "m.c.a": 80, "msc": 80, "m.eng": 80, "master of science": 80,
+    "master of technology": 80, "master of engineering": 80,
+    # Bachelors
+    "bachelor": 60, "bachelors": 60, "b.s": 60, "b.s.": 60, "b.sc": 60, "b.sc.": 60,
+    "b.tech": 60, "b.tech.": 60, "btech": 60, "b tech": 60,
+    "b.e": 60, "b.e.": 60, "be": 60, "b.eng": 60, "b.eng.": 60,
+    "bca": 60, "b.c.a": 60, "bsc": 60, "b.com": 60,
+    "bachelor of science": 60, "bachelor of technology": 60,
+    "bachelor of engineering": 60, "bachelor of arts": 55,
+    "honours": 60, "hons": 60,
+    # Associate
+    "associate": 40, "a.a": 40, "a.s": 40, "a.a.s": 40,
+    # Below degree
+    "diploma": 30, "advanced diploma": 35, "higher national diploma": 35,
+    "certificate": 20, "certification": 20,
+}
+
+# Domain validation sets for strict category anti-misclassification
+SPOKEN_LANGUAGES_SET: set = {
+    'english', 'spanish', 'french', 'german', 'chinese', 'japanese',
+    'korean', 'russian', 'arabic', 'portuguese', 'italian', 'hindi',
+    'tamil', 'telugu', 'bengali', 'marathi', 'gujarati', 'punjabi', 'kannada', 'malayalam'
+}
+
+SOFT_SKILLS_SET: set = {
+    'communication', 'teamwork', 'leadership', 'problem solving', 'critical thinking',
+    'time management', 'adaptability', 'decision making', 'negotiation', 'emotional intelligence',
+    'creativity', 'interpersonal skills', 'conflict resolution', 'active listening',
+    'work ethic', 'attention to detail', 'analytical thinking', 'collaboration', 'organization', 'multitasking'
+}
+
+DEGREE_TITLES_SET: set = {
+    'b.tech', 'btech', 'b.e', 'be', 'b.sc', 'bsc', 'bachelor', 'bachelors',
+    'm.tech', 'mtech', 'm.e', 'me', 'm.sc', 'msc', 'master', 'masters',
+    'phd', 'ph.d', 'doctorate', 'diploma', 'bca', 'mca', 'b.com', 'm.com'
+}
+
+# --- C4.6: Section detection ---
+SECTION_HEADERS: Dict[str, List[str]] = {
+    "skills": [
+        "skills", "technical skills", "core skills", "key skills", "competencies", "tech stack", "technical stack",
+        "technologies", "tools", "expertise", "proficiencies", "competencies", "skill set",
+        "programming languages", "my technical skills", "technical expertise", "languages & frameworks",
+        "it skills", "domain skills", "areas of expertise", "core competencies", "technical proficiencies",
+        "skills & abilities", "technical toolkit", "platforms & tools", "programming",
+    ],
+    "experience": [
+        "experience", "work experience", "employment", "professional experience", "work history", "career",
+        "professional background", "relevant experience", "employment history",
+        "job history", "work background", "professional journey", "career history",
+        "career summary", "work summary", "work profile", "professional work experience",
+        "industry experience", "experience summary",
+    ],
+    "education": [
+        "education", "academic", "qualifications", "degrees", "studies",
+        "educational background", "academic background", "academic qualifications",
+        "academic history", "schooling", "education & training", "scholastic background",
+        "academic details", "academic record", "education summary",
+    ],
+    "projects": [
+        "projects", "personal projects", "open source", "portfolio", "side projects",
+        "key projects", "notable projects", "project experience",
+        "selected projects", "academic projects", "professional projects", "major projects",
+        "technical projects", "software projects",
+    ],
+    "certifications": [
+        "certifications", "certificates", "licenses", "accreditations",
+        "professional certifications", "credentials", "awards & certifications",
+        "certifications & licenses", "courses & certifications",
+        "training & certifications", "licenses & certifications", "professional courses",
+        "certifications / licenses", "certificates & licenses", "online certifications",
+        "professional credentials",
+    ],
+    "summary": [
+        "summary", "profile", "objective", "about me", "professional summary",
+        "career objective", "professional profile", "executive summary",
+        "personal statement", "overview", "profile summary", "summary of qualifications",
+        "career overview", "personal summary",
+    ],
+    "hobbies": [
+        "hobbies", "interests", "activities", "extracurricular",
+        "personal interests", "outside interests", "volunteer work", "hobbies & interests",
+    ],
+    "job_preferences": [
+        "job preferences", "career preferences", "preferred location", "target role",
+        "expected salary", "availability", "preferences", "career goals",
+    ],
+}
+
+SECTION_SKILL_WEIGHTS: Dict[str, float] = {
+    "skills": 1.5,
+    "experience": 1.2,
+    "projects": 1.1,
+    "certifications": 1.0,
+    "education": 0.8,
+    "summary": 0.7,
+    "hobbies": 0.3,
+    "other": 0.5,
+}
+
+# Enhanced imports for OCR and DOC processing
+try:
+    import pytesseract
+    from PIL import Image
+    import io
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+    logging.warning("OCR not available. Install pytesseract and Pillow for enhanced scanning.")
+
+try:
+    import docx
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
+    logging.warning("DOCX processing not available. Install python-docx for document support.")
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ==================== ENHANCED PYDANTIC MODELS ====================
+
+class EnhancedResumeParseResult(BaseModel):
+    """Enhanced resume parsing result with OCR support"""
+    text: str
+    skills: List[str]
+    experience_years: float
+    contact_info: Dict[str, str]
+    education: List[Dict[str, Any]]
+    work_experience: List[Dict[str, Any]]
+    certifications: List[str]
+    languages: List[str]
+    projects: List[Dict[str, Any]]
+    confidence_score: float
+    file_type: str
+    processing_method: str
+
+class EnhancedATSScoreResult(BaseModel):
+    """Enhanced ATS scoring result with detailed breakdown"""
+    ats_score: float
+    skills_match_score: float
+    semantic_score: float
+    experience_score: float
+    keyword_score: float
+    education_score: float
+    certification_score: float
+    project_score: float
+    matched_skills: List[str]
+    missing_skills: List[str]
+    cluster_matched_skills: List[Dict[str, str]] = []
+    extracted_skills: List[str]
+    extracted_experience: float
+    education_level: str
+    certifications: List[str]
+    confidence_score: float
+    scoring_breakdown: Dict[str, Any]
+    recommendations: List[str]
+    strengths: List[str]
+    weaknesses: List[str]
+    rating: str = ""
+    hiring_recommendation: str = ""
+
+# ==================== MODULE-LEVEL HELPER FUNCTIONS ====================
+
+def compute_semantic_score(text_a: str, text_b: str) -> float:
+    """
+    C4.2 — Compute semantic similarity using Sentence Transformers (all-MiniLM-L6-v2).
+    Falls back to TF-IDF cosine similarity if sentence-transformers is unavailable.
+    Uses cached embeddings via _get_text_embedding() for performance.
+    Returns score in 0-100 range.
+    """
+    if not text_a or not text_b:
+        return 0.0
+    if SENTENCE_TRANSFORMERS_AVAILABLE:
+        try:
+            # FIXED: No embedding cache — use cached embeddings
+            emb_a = _get_text_embedding(text_a)
+            emb_b = _get_text_embedding(text_b)
+            if emb_a is not None and emb_b is not None:
+                sim = float(st_util.cos_sim(emb_a, emb_b))
+                return round(max(0.0, sim) * 100, 2)
+        except Exception as e:
+            logger.warning(f"Sentence transformer scoring failed: {e}. Using TF-IDF fallback.")
+    # TF-IDF fallback
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.metrics.pairwise import cosine_similarity
+        vect = TfidfVectorizer(stop_words="english", max_features=500)
+        tfidf = vect.fit_transform([text_a, text_b])
+        sim = cosine_similarity(tfidf[0:1], tfidf[1:2])[0][0]
+        return round(float(sim) * 100, 2)
+    except Exception:
+        return 50.0
+
+
+def compute_weighted_semantic_score(sections: Dict[str, str], jd_text: str) -> float:
+    """
+    C4.2 — Section-aware semantic score. Weights each section's similarity by importance.
+    """
+    if not sections or not jd_text:
+        return 0.0
+    total_weight = 0.0
+    weighted_sum = 0.0
+    section_semantic_weights = {
+        "experience": 1.5, "skills": 1.3, "projects": 1.1,
+        "summary": 0.9, "education": 0.7, "certifications": 0.8,
+        "hobbies": 0.2, "other": 0.5,
+    }
+    for section_name, section_text in sections.items():
+        if not section_text.strip():
+            continue
+        weight = section_semantic_weights.get(section_name, 0.5)
+        score = compute_semantic_score(section_text, jd_text)
+        weighted_sum += score * weight
+        total_weight += weight
+    if total_weight == 0:
+        return 0.0
+    return round(weighted_sum / total_weight, 2)
+
+
+
+def extract_skills_from_tokens(text: str) -> List[str]:
+    """
+    C4.3 — Extract skills using spaCy tokens/noun-chunks matched against canonical skills set.
+    Falls back to empty list if spaCy unavailable.
+    """
+    nlp = _get_nlp()
+    if nlp is None or not text:
+        return []
+    found = set()
+    try:
+        doc = nlp(text[:10000])
+        for token in doc:
+            t = token.text.lower().strip()
+            # Skip single-char tokens — they cause false positives (e.g. "r" in "architecture")
+            if len(t) >= 2 and t in CANONICAL_SKILLS_SET:
+                found.add(normalize_skill(t))
+        for chunk in doc.noun_chunks:
+            c = chunk.text.lower().strip()
+            if len(c) >= 2 and c in CANONICAL_SKILLS_SET:
+                found.add(normalize_skill(c))
+    except Exception as e:
+        logger.warning(f"spaCy skill extraction failed: {e}")
+    return list(found)
+
+
+_HEADER_CLEAN_RE = re.compile(r'^[#*\-•·▪\d\.\s\[\]\(\)]+|[\s\:\-\|]+$')
+
+
+def _is_section_header(line: str) -> Optional[str]:
+    """
+    Determine if a line is a section header line.
+    Requires line length <= 55 characters and word count <= 8 to prevent prose/sentences from matching.
+    Returns matched section_name or None.
+    """
+    stripped = line.strip()
+    if not stripped or len(stripped) > 55:
+        return None
+
+    clean_line = _HEADER_CLEAN_RE.sub('', stripped).strip().lower()
+    if not clean_line or len(clean_line.split()) > 8:
+        return None
+
+    for section_name, headers in SECTION_HEADERS.items():
+        for h in headers:
+            if clean_line == h:
+                return section_name
+            if clean_line.startswith(h + ":") or clean_line.startswith(h + " -") or clean_line.startswith(h + " |"):
+                return section_name
+    return None
+
+
+def detect_sections(text: str) -> Dict[str, str]:
+    """
+    Split resume text into named sections by scanning for section header lines.
+    Returns dict mapping section_name -> section_text.
+    """
+    lines = text.split("\n")
+    sections: Dict[str, str] = {}
+    current_section = "other"
+    buffer: List[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            buffer.append("")
+            continue
+
+        matched_section = _is_section_header(line)
+        if matched_section:
+            if buffer:
+                sections[current_section] = sections.get(current_section, "") + "\n".join(buffer) + "\n"
+            current_section = matched_section
+            buffer = []
+        else:
+            buffer.append(stripped)
+
+    if buffer:
+        sections[current_section] = sections.get(current_section, "") + "\n".join(buffer)
+
+    return sections
+
+
+# Typography ligature map — common PDF rendering artifacts
+_LIGATURES: Dict[str, str] = {
+    "\ufb00": "ff", "\ufb01": "fi", "\ufb02": "fl",
+    "\ufb03": "ffi", "\ufb04": "ffl", "\ufb05": "st", "\ufb06": "st",
+}
+_LIGATURE_RE = re.compile("|".join(re.escape(k) for k in _LIGATURES))
+
+# Bullet/list-marker characters to normalize to a hyphen
+_BULLET_RE = re.compile(r"^[\u2022\u25aa\u25a6\u25e6\u2023\u2192\u2713\u2714\u2605\u2606\u00b7]+\s*", re.MULTILINE)
+
+# Hyphenated line-break: "Py-\nthon" → "Python"
+_HYPHEN_BREAK_RE = re.compile(r"(\w)-\n(\w)")
+
+
+def clean_resume_text(text: str) -> str:
+    """
+    Normalise raw PDF/DOCX text before NLP processing.
+    Fixes: Unicode normalisation, PDF ligatures, hyphenated line-breaks,
+    bullet-point markers, and excessive whitespace.
+    """
+    if not text:
+        return text
+    # 1. Unicode NFKC — decomposes compatibility characters (half-width, fullwidth, etc.)
+    text = unicodedata.normalize("NFKC", text)
+    # 2. Replace typographic ligatures (ﬁ → fi, ﬂ → fl, etc.)
+    text = _LIGATURE_RE.sub(lambda m: _LIGATURES[m.group(0)], text)
+    # 3. Repair hyphenated line breaks ("Py-\nthon" → "Python")
+    text = _HYPHEN_BREAK_RE.sub(r"\1\2", text)
+    # 4. Normalise bullet markers to a simple hyphen
+    text = _BULLET_RE.sub("- ", text)
+    # 5. Collapse multiple blank lines to one
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    # 6. Strip leading/trailing whitespace per line
+    text = "\n".join(line.rstrip() for line in text.splitlines())
+    return text.strip()
+
+
+# FIXED: No input sanitization (prompt injection risk)
+_PROMPT_INJECTION_LINE_RE = re.compile(
+    r'^\s*(?:ignore|disregard|system:|assistant:|\[INST\]|<s>|</s>|<<SYS>>|<\|)',
+    re.IGNORECASE,
+)
+_BRACKET_INSTRUCTION_RE = re.compile(
+    r'[\[{<]\s*(?:instruction|system|prompt|ignore|override|hack)[^}\]>]*[\]}>]',
+    re.IGNORECASE,
+)
+_CONTROL_CHAR_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]')
+
+_SANITIZE_MAX_CHARS = 8000
+
+
+def sanitize_resume_text(text: str) -> str:
+    """
+    Sanitize resume text to mitigate prompt injection risks.
+
+    Applies the following cleaning steps:
+    1. Strips all control characters except newline (\\n) and tab (\\t).
+    2. Removes lines that begin with known prompt-injection prefixes
+       (Ignore, Disregard, System:, Assistant:, [INST], <s>, </s>, etc.).
+    3. Removes bracket-wrapped instruction patterns like [instruction],
+       {system override}, etc.
+    4. Truncates to 8000 characters maximum.
+
+    Never raises an exception — silently cleans and continues.
+
+    Args:
+        text: Raw resume text.
+
+    Returns:
+        Sanitized text safe for LLM consumption.
+    """
+    if not text:
+        return text
+    try:
+        # 1. Strip control characters (keep \n=0x0a and \t=0x09)
+        text = _CONTROL_CHAR_RE.sub('', text)
+
+        # 2. Remove prompt-injection lines
+        lines = text.split('\n')
+        clean_lines = [
+            line for line in lines
+            if not _PROMPT_INJECTION_LINE_RE.match(line)
+        ]
+        text = '\n'.join(clean_lines)
+
+        # 3. Remove bracket-wrapped instructions
+        text = _BRACKET_INSTRUCTION_RE.sub('', text)
+
+        # 4. Truncate
+        if len(text) > _SANITIZE_MAX_CHARS:
+            text = text[:_SANITIZE_MAX_CHARS]
+
+    except Exception:
+        # Never raise — return whatever we have
+        pass
+
+    return text
+
+
+# FIXED: No resume length normalization
+def normalize_resume_text(text: str, max_tokens: int = 1200) -> str:
+    """
+    Normalize resume length to prevent long resumes from inflating scores.
+
+    Splits the resume into sections (Skills, Experience, Summary, Other)
+    and allocates a token budget per section. Each section is independently
+    truncated to its budget before rejoining.
+
+    Uses simple whitespace tokenization (split on whitespace) — no heavy
+    tokenizer dependency.
+
+    Args:
+        text: Raw resume text (already cleaned).
+        max_tokens: Total token budget across all sections. Default 1200.
+
+    Returns:
+        Truncated resume text respecting per-section budgets.
+    """
+    if not text:
+        return text
+
+    # Quick check: if already under budget, return as-is
+    tokens = text.split()
+    if len(tokens) <= max_tokens:
+        return text
+
+    sections = detect_sections(text)
+
+    # Per-section token budgets (must sum to <= max_tokens)
+    budget = {
+        "skills": 400,
+        "experience": 400,
+        "summary": 200,
+        "education": 100,
+        "certifications": 50,
+        "projects": 50,
+        "other": 0,  # computed as remainder
+        "hobbies": 0,
+    }
+    allocated = sum(v for k, v in budget.items() if k != "other")
+    budget["other"] = max(0, max_tokens - allocated)
+
+    truncated_parts: List[str] = []
+    for section_name, section_text in sections.items():
+        section_budget = budget.get(section_name, budget["other"])
+        if section_budget <= 0:
+            continue
+        section_tokens = section_text.split()
+        if len(section_tokens) > section_budget:
+            section_text = " ".join(section_tokens[:section_budget])
+        truncated_parts.append(section_text)
+
+    result = "\n\n".join(truncated_parts)
+    return result if result.strip() else text
+
+
+def _find_cluster_match(required_skill: str, resume_skills_set: set) -> Optional[str]:
+    """
+    Return the first resume skill that shares ANY cluster with required_skill,
+    or None if no cluster relationship exists.
+    Example: required="pinecone", resume has "faiss" → returns "faiss" (both vector_database)
+
+    A skill can belong to multiple clusters (e.g. FAISS is in both vector_database
+    and embedding_model), so we iterate every cluster containing required_skill
+    rather than relying on SKILL_TO_CLUSTER's single-cluster reverse map.
+    """
+    req_lower = required_skill.lower()
+    for members in SKILL_CLUSTERS.values():
+        members_lower = {m.lower() for m in members}
+        if req_lower not in members_lower:
+            continue
+        for member_lower in members_lower:
+            if member_lower != req_lower and member_lower in resume_skills_set:
+                return member_lower
+    return None
+
+
+def compute_weighted_skills_score(sections: Dict[str, str], required_skills: List[str]) -> float:
+    """
+    C4.6 — Calculate skills match score weighted by which section each skill appears in.
+    Exact matches get full section weight; cluster matches (related tech) get 60% credit.
+    """
+    if not required_skills:
+        return 100.0
+    required_normalized = [normalize_skill(s).lower() for s in required_skills]
+    skill_scores: Dict[str, float] = {}  # skill -> best weighted hit
+
+    for section_name, section_text in sections.items():
+        weight = SECTION_SKILL_WEIGHTS.get(section_name, 0.5)
+        text_lower = section_text.lower()
+        for skill in required_normalized:
+            # Exact match
+            if skill in text_lower:
+                if skill not in skill_scores or skill_scores[skill] < weight:
+                    skill_scores[skill] = weight
+            # Cluster match — check if any related skill appears in this section
+            elif skill not in skill_scores:
+                cluster = SKILL_TO_CLUSTER.get(skill)
+                if cluster:
+                    for member in SKILL_CLUSTERS.get(cluster, []):
+                        if member.lower() != skill and member.lower() in text_lower:
+                            skill_scores[skill] = weight * CLUSTER_PARTIAL_CREDIT
+                            break
+
+    if not skill_scores:
+        return 0.0
+
+    # Weighted score: sum(weight_of_best_match) / sum(max_weight) × 100
+    max_weight = SECTION_SKILL_WEIGHTS["skills"]  # 1.5
+    total = sum(skill_scores.values())
+    perfect = len(required_normalized) * max_weight
+    return round(min(100.0, (total / perfect) * 100), 2)
+
+
+# ==================== ENHANCED ATS SCORING SERVICE ====================
+
+class EnhancedATSScoringService:
+    """Enhanced ATS scoring service with OCR and advanced parsing"""
+
+    def __init__(self):
+        # Enhanced tech skills list (used as fallback when spaCy unavailable)
+        self.tech_skills = [
+            # Programming Languages
+            'python', 'java', 'javascript', 'typescript', 'c++', 'c#', 'go', 'rust',
+            'ruby', 'php', 'swift', 'kotlin', 'scala', 'perl', 'r', 'matlab',
+            'objective-c', 'dart', 'lua', 'bash', 'powershell', 'sql',
+
+            # Web Technologies
+            'react', 'angular', 'vue', 'svelte', 'nextjs', 'nuxtjs', 'django',
+            'flask', 'fastapi', 'spring', 'express', 'laravel', 'rails',
+            'nodejs', 'webpack', 'vite', 'babel', 'rollup',
+
+            # Databases
+            'postgresql', 'mysql', 'mongodb', 'redis', 'elasticsearch',
+            'cassandra', 'dynamodb', 'sqlite', 'oracle', 'sql server',
+            'mariadb', 'neo4j', 'influxdb', 'timescaledb',
+
+            # Cloud & DevOps
+            'aws', 'azure', 'gcp', 'docker', 'kubernetes', 'terraform',
+            'ansible', 'jenkins', 'circleci', 'travis ci',
+            'github actions', 'argocd', 'helm', 'prometheus', 'grafana',
+
+            # Tools & Technologies
+            'git', 'github', 'gitlab', 'bitbucket', 'jira', 'confluence',
+            'linux', 'ubuntu', 'centos', 'windows server', 'nginx', 'apache',
+            'vscode', 'intellij', 'pycharm', 'eclipse', 'vim', 'emacs',
+
+            # Data Science & AI
+            'machine learning', 'deep learning', 'tensorflow', 'pytorch',
+            'keras', 'scikit-learn', 'pandas', 'numpy', 'matplotlib',
+            'seaborn', 'jupyter', 'nltk', 'spacy', 'opencv', 'hadoop',
+            'spark', 'kafka', 'airflow', 'mlflow', 'dvc',
+
+            # Generative AI & LLM Stack
+            'langchain', 'lang chain', 'langgraph', 'lang graph',
+            'llm', 'llms', 'large language models', 'generative ai', 'genai',
+            'rag', 'retrieval augmented generation', 'prompt engineering',
+            'fine-tuning', 'fine tuning', 'embeddings', 'vector embeddings',
+            'multi-agent', 'multi agent', 'agentic',
+            'ollama', 'openai', 'anthropic', 'hugging face', 'huggingface',
+            'gpt', 'gpt-4', 'claude', 'gemini',
+            'sentence transformers', 'sentence-transformers',
+            'faiss', 'chromadb', 'chroma db', 'pinecone', 'weaviate',
+            'qdrant', 'milvus', 'vector database', 'vector db',
+            'ocr', 'speech-to-text', 'text-to-speech',
+            'lora', 'rlhf', 'peft',
+
+            # Mobile Development
+            'ios', 'android', 'react native', 'flutter',
+            'xamarin', 'cordova', 'ionic', 'unity',
+            'unreal engine', 'godot',
+
+            # Other Technologies
+            'rest api', 'graphql', 'microservices', 'serverless',
+            'blockchain', 'iot',
+            'tableau', 'power bi', 'looker', 'superset',
+            'html', 'css', 'html5', 'css3',
+
+            # Digital Marketing
+            'seo', 'google ads', 'facebook ads', 'content marketing',
+            'email marketing', 'social media marketing', 'hubspot',
+            'google analytics', 'copywriting', 'lead generation',
+            'a/b testing', 'ppc', 'mailchimp', 'marketo', 'hootsuite',
+            'affiliate marketing',
+
+            # HR
+            'recruitment', 'talent acquisition', 'performance management',
+            'hris', 'labor law', 'employee relations', 'onboarding',
+            'payroll management', 'organizational development',
+            'succession planning', 'compensation and benefits',
+            'sap hr', 'workday',
+
+            # Sales
+            'b2b sales', 'crm', 'salesforce', 'negotiation',
+            'account management', 'revenue forecasting',
+            'pipeline management', 'cold calling',
+            'sales strategy', 'business development',
+
+            # Finance & Accounting
+            'financial planning', 'budgeting', 'forecasting',
+            'financial reporting', 'financial analysis', 'gaap', 'ifrs',
+            'bookkeeping', 'accounts payable', 'accounts receivable',
+            'tax preparation', 'audit', 'treasury management',
+            'quickbooks', 'tally erp', 'sap finance', 'excel',
+            'valuation',
+
+            # Design
+            'adobe photoshop', 'adobe illustrator', 'figma', 'indesign',
+            'branding', 'typography', 'ui/ux design', 'motion graphics',
+            'after effects', 'canva', 'sketch', 'wireframing', 'prototyping',
+
+            # Project Management & Leadership
+            'stakeholder management', 'risk management', 'resource management',
+            'project planning', 'ms project', 'prince2', 'change management',
+            'team leadership', 'strategic planning', 'budget management',
+
+            # Operations
+            'operations management', 'supply chain', 'logistics',
+            'inventory management', 'quality assurance', 'process improvement',
+            'lean', 'six sigma',
+
+            # Office Tools
+            'microsoft office', 'ms office', 'powerpoint', 'word',
+        ]
+
+        # Enhanced ATS scoring weights (total must sum to 1.0).
+        # Recruiter-defined rubric: education-weighted hiring model.
+        self.weights = {
+            'education': 0.35,     # degree match + college tier + CGPA
+            'skills_match': 0.25,  # required + preferred skills
+            'experience': 0.15,    # relevant exp + internships + github/OSS/hackathons
+            'certification': 0.10,
+            'semantic': 0.05,
+            'project': 0.05,
+            'keyword': 0.05,
+        }
+
+        # Education level mapping
+        self.education_levels = {
+            'high school': 1,
+            'associate': 2,
+            'bachelor': 3,
+            'master': 4,
+            'phd': 5,
+            'postdoc': 6
+        }
+
+    def extract_skills(self, text: str) -> List[str]:
+        """
+        C4.1 + C4.3 — Extract and normalize skills.
+        Uses spaCy token matching against canonical skills when available,
+        falls back to word-boundary regex match against self.tech_skills.
+        All extracted skills are passed through normalize_skill().
+        """
+        found: set = set()
+
+        # spaCy-based canonical skill extraction
+        spacy_skills = extract_skills_from_tokens(text)
+        for s in spacy_skills:
+            found.add(normalize_skill(s))
+
+        # Fallback / supplemental: whole-word match against self.tech_skills
+        # Uses \b word boundaries so "go" doesn't match inside "government",
+        # "ar" doesn't match inside "rag"/"language", etc.
+        text_lower = text.lower()
+        for skill in self.tech_skills:
+            pattern = r'\b' + re.escape(skill) + r'\b'
+            if re.search(pattern, text_lower):
+                found.add(normalize_skill(skill))
+
+        # Filter out soft skills, spoken languages, and single-character noise
+        filtered_skills = []
+        for s in found:
+            s_clean = s.strip()
+            if len(s_clean) <= 1:
+                continue
+            s_low = s_clean.lower()
+            if s_low in SOFT_SKILLS_SET or s_low in SPOKEN_LANGUAGES_SET:
+                continue
+            filtered_skills.append(s_clean)
+        return filtered_skills
+
+    def calculate_work_experience_years_from_entries(self, entries: List[Dict[str, Any]]) -> float:
+        """
+        Calculate total experience years from structured work experience entries.
+        Rule: Internships with duration <= 8 months are EXCLUDED from total experience years calculation.
+        """
+        total_months = 0
+        for entry in entries:
+            emp_type = (entry.get('employment_type') or '').lower()
+            title = (entry.get('job_title') or entry.get('title') or '').lower()
+            is_internship = 'intern' in emp_type or 'intern' in title or 'trainee' in title
+
+            duration_m = entry.get('duration_months')
+            if duration_m is None and entry.get('start_date'):
+                try:
+                    s_yr = int(str(entry['start_date'])[:4])
+                    if entry.get('end_date'):
+                        e_yr = int(str(entry['end_date'])[:4])
+                    else:
+                        e_yr = datetime.now().year
+                    duration_m = max(0, (e_yr - s_yr)) * 12
+                except Exception:
+                    duration_m = 0
+
+            if duration_m is None:
+                duration_m = 0
+
+            # Internship Rule: Internships <= 8 months are excluded from total work experience calculation
+            if is_internship and duration_m <= 8:
+                continue
+
+            total_months += duration_m
+        return round(total_months / 12.0, 1)
+
+    # FIXED: extract_experience_years double-counting & internship exclusion
+    def extract_experience_years(self, text: str) -> float:
+        """
+        Multi-pattern experience extraction with deduplication and internship filtering.
+        Rule: Internships of 0 to 8 months are excluded from total work experience calculation.
+        """
+        text_norm = text.replace("–", "-").replace("—", "-")
+
+        # --- Explicit year mentions ---
+        year_patterns = [
+            r'(\d+)\+?\s*years?\s*(?:of\s+)?experience',
+            r'experience\s*(?:of\s+)?(\d+)\+?\s*years?',
+            r'(\d+)\+?\s*years?\s*(?:of\s+)?(?:work|professional|industry)',
+        ]
+        year_hits: set = set()
+        for pattern in year_patterns:
+            for m in re.finditer(pattern, text_norm, re.IGNORECASE):
+                # Ensure the mention isn't specifically about an internship <= 8 months
+                snippet = text_norm[max(0, m.start() - 60):min(len(text_norm), m.end() + 60)].lower()
+                if 'intern' in snippet and int(m.group(1)) == 0:
+                    continue
+                year_hits.add(int(m.group(1)))
+        explicit_years = max(year_hits) if year_hits else 0.0
+
+        # --- Month mentions (added to explicit) ---
+        month_pattern = r'(\d+)\+?\s*months?\s*(?:of\s+)?(?:experience|work|internship)'
+        month_total = 0.0
+        for m in re.finditer(month_pattern, text_norm, re.IGNORECASE):
+            months = int(m.group(1))
+            snippet = text_norm[max(0, m.start() - 60):min(len(text_norm), m.end() + 60)].lower()
+            # If internship <= 8 months, exclude from total work experience
+            if 'intern' in snippet and months <= 8:
+                continue
+            month_total += months
+        explicit_years += month_total / 12.0
+
+        # --- Date range extraction ---
+        current_year = datetime.now().year
+        date_range_pattern = r'(\d{4})\s*[-–—]\s*(\d{4}|present|current|now|till date|to date)'
+        date_range_years = 0.0
+        for m in re.finditer(date_range_pattern, text_norm, re.IGNORECASE):
+            start_str, end_str = m.group(1), m.group(2).strip().lower()
+            snippet = text_norm[max(0, m.start() - 80):min(len(text_norm), m.end() + 80)].lower()
+            is_intern = 'intern' in snippet or 'trainee' in snippet
+            try:
+                start = int(start_str)
+                end = current_year if end_str not in {str(y) for y in range(1990, current_year + 1)} and not end_str.isdigit() else int(end_str) if end_str.isdigit() else current_year
+                duration = end - start
+                # Exclude short internships (<= 8 months / same year or 1 yr intern)
+                if is_intern and duration <= 0:
+                    continue
+                if 0 < duration <= 50:
+                    date_range_years += duration
+            except ValueError:
+                logger.warning(f"Could not parse experience date range: {m.group(0)}")
+
+        # Dedup: take whichever source gives the higher total, never sum them
+        return round(max(explicit_years, date_range_years), 1)
+
+    def extract_contact_info(self, text: str) -> dict:
+        """Extract contact information from text"""
+        contact = {}
+        email_match = re.search(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', text)
+        if email_match:
+            contact['email'] = email_match.group()
+        phone_match = re.search(r'[\+]?[(]?[0-9]{1,4}[)]?[-\s\.]?[(]?[0-9]{1,4}[)]?[-\s\.]?[0-9]{4,6}', text)
+        if phone_match:
+            contact['phone'] = phone_match.group()
+        return contact
+
+    def _extract_page_layout_aware(self, page) -> str:
+        """
+        Extract text from a pdfplumber page using column layout awareness.
+        Detects 2-column / 3-column / sidebar layouts and reads left column top-to-bottom
+        followed by right column top-to-bottom.
+        """
+        try:
+            words = page.extract_words(keep_blank_chars=False, use_text_flow=True)
+            if not words:
+                return page.extract_text() or ""
+
+            page_width = float(page.width or 612)
+            mid_point = page_width * 0.38
+
+            left_words = [w for w in words if w['x1'] <= mid_point + 15]
+            right_words = [w for w in words if w['x0'] >= mid_point - 15]
+            spanning_words = [w for w in words if w['x0'] < mid_point - 15 and w['x1'] > mid_point + 15]
+
+            # If a clear 2-column / sidebar split exists
+            if len(left_words) >= 5 and len(right_words) >= 5 and len(spanning_words) <= len(words) * 0.12:
+                def render_column(col_words):
+                    sorted_w = sorted(col_words, key=lambda w: (round(w['top'] / 3.5) * 3.5, w['x0']))
+                    lines, cur_line, cur_top = [], [], None
+                    for w in sorted_w:
+                        t = round(w['top'] / 3.5) * 3.5
+                        if cur_top is None or abs(t - cur_top) <= 3.5:
+                            cur_line.append(w['text'])
+                            cur_top = t
+                        else:
+                            lines.append(" ".join(cur_line))
+                            cur_line = [w['text']]
+                            cur_top = t
+                    if cur_line:
+                        lines.append(" ".join(cur_line))
+                    return "\n".join(lines)
+
+                return render_column(left_words) + "\n\n" + render_column(right_words)
+        except Exception as e:
+            logger.debug(f"Layout extraction fallback: {e}")
+
+        return page.extract_text() or ""
+
+    def extract_text_from_pdf_enhanced(self, file_path: str) -> Tuple[str, float]:
+        """Enhanced PDF text extraction with OCR and column layout awareness"""
+        text = ""
+        confidence = 0.0
+
+        try:
+            with pdfplumber.open(file_path) as pdf:
+                for page_num, page in enumerate(pdf.pages):
+                    page_text = self._extract_page_layout_aware(page)
+                    if page_text:
+                        text += page_text + "\n"
+                        confidence += 0.9
+                    else:
+                        if OCR_AVAILABLE:
+                            try:
+                                image = page.to_image()
+                                ocr_text = pytesseract.image_to_string(image)
+                                if ocr_text.strip():
+                                    text += ocr_text + "\n"
+                                    confidence += 0.7
+                            except Exception as e:
+                                logger.warning(f"OCR failed for page {page_num}: {e}")
+                                confidence += 0.5
+
+            return clean_resume_text(text), min(confidence, 1.0)
+
+        except Exception as e:
+            logger.error(f"Enhanced PDF extraction failed: {e}")
+            return "", 0.0
+
+    def extract_text_from_docx(self, file_path: str) -> Tuple[str, float]:
+        """Enhanced DOCX text extraction"""
+        if not DOCX_AVAILABLE:
+            return "", 0.0
+
+        try:
+            import docx
+            doc = docx.Document(file_path)
+
+            text = ""
+            confidence = 0.0
+
+            for paragraph in doc.paragraphs:
+                if paragraph.text.strip():
+                    text += paragraph.text + "\n"
+                    confidence += 0.1
+
+            for table in doc.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        if cell.text.strip():
+                            text += cell.text + " "
+                            confidence += 0.05
+
+            return clean_resume_text(text), min(confidence, 1.0)
+
+        except Exception as e:
+            logger.error(f"DOCX extraction failed: {e}")
+            return "", 0.0
+
+    def extract_education_info(self, text: str) -> List[Dict[str, Any]]:
+        """
+        C4.3 — Extract education using DEGREE_SCORES dict instead of pure regex.
+        Returns list of dicts with degree, score, confidence.
+        """
+        education = []
+        text_lower = text.lower()
+
+        for degree_key, score in DEGREE_SCORES.items():
+            if degree_key in text_lower:
+                education.append({
+                    'degree': degree_key,
+                    'score': score,
+                    'confidence': 0.85
+                })
+
+        # Also run original pattern matching for institution names
+        institution_pattern = r'(?:University|College|Institute|Institution)\s+of\s+([A-Za-z\s]+)'
+        for match in re.findall(institution_pattern, text, re.IGNORECASE):
+            education.append({
+                'degree': match.strip(),
+                'score': 0,
+                'confidence': 0.7
+            })
+
+        return education
+
+    # FIXED: extract_work_experience weak regex
+    def extract_work_experience(self, text: str) -> List[Dict[str, Any]]:
+        """
+        Extract work experience entries from resume text.
+
+        Uses a three-tier extraction strategy:
+        1. Section-header detection: finds the Experience/Work History section and
+           parses entries with date ranges and company/title patterns.
+        2. spaCy NER (if en_core_web_sm available): extracts ORG + DATE entity
+           pairs as work entries.
+        3. Regex fallback: the original pattern-based extraction.
+
+        Returns a list of dicts. Each dict always contains at minimum:
+            {"company": str, "title": str, "duration_months": int,
+             "extracted_text": str, "confidence": float}
+        Legacy keys ("years", "text") are preserved for backward compatibility.
+        """
+        experience: List[Dict[str, Any]] = []
+
+        # --- Tier 1: Section-header detection ---
+        experience_section = self._extract_experience_section(text)
+        if experience_section:
+            tier1 = self._parse_experience_section(experience_section)
+            if tier1:
+                experience.extend(tier1)
+
+        # --- Tier 2: spaCy NER (ORG + DATE pairs) ---
+        if not experience:
+            tier2 = self._extract_experience_via_ner(text)
+            if tier2:
+                experience.extend(tier2)
+
+        # --- Tier 3: Regex fallback ---
+        if not experience:
+            experience_patterns = [
+                r'(\d+)\s*(?:\+|\+?\s*years?)\s*(?:of\s*)?(?:experience|work)',
+                r'(\d{4})\s*[-–]\s*(\d{4}|\s*present)\s*(?:at|@)\s+([A-Za-z\s&]+)',
+                r'(?:Senior|Junior|Lead|Principal|Staff|Mid-level|Entry-level)\s+(?:Software Engineer|Developer|Manager|Analyst|Consultant)',
+            ]
+            for pattern in experience_patterns:
+                matches = re.findall(pattern, text, re.IGNORECASE)
+                for match in matches:
+                    if isinstance(match, tuple):
+                        experience.append({
+                            'years': int(match[0]),
+                            'company': match[1] if len(match) > 1 else '',
+                            'title': '',
+                            'duration_months': int(match[0]) * 12 if match[0].isdigit() else 0,
+                            'extracted_text': ' '.join(match),
+                            'confidence': 0.5
+                        })
+                    else:
+                        experience.append({
+                            'text': match,
+                            'company': '',
+                            'title': match,
+                            'duration_months': 0,
+                            'extracted_text': match,
+                            'confidence': 0.4
+                        })
+
+        return experience
+
+    def _extract_experience_section(self, text: str) -> str:
+        """
+        Locate the work-experience section by scanning for header lines.
+
+        Looks for lines containing keywords like Experience, Work History,
+        Employment, Career, Professional Background (case-insensitive).
+        Returns the text from that header to the next detected section header,
+        or empty string if no experience section found.
+        """
+        lines = text.split("\n")
+        exp_keywords = {
+            "experience", "work history", "employment", "career",
+            "professional background", "work experience",
+            "employment history", "relevant experience",
+        }
+        start_idx = None
+        end_idx = len(lines)
+
+        for i, line in enumerate(lines):
+            stripped = line.strip().lower()
+            if not stripped:
+                continue
+            if start_idx is None:
+                # Look for experience header
+                if any(stripped.startswith(kw) or stripped == kw for kw in exp_keywords):
+                    start_idx = i + 1
+            else:
+                # Look for next section header (any known section)
+                for headers in SECTION_HEADERS.values():
+                    if any(stripped.startswith(h) or stripped == h for h in headers):
+                        # Make sure it's not another experience-related header
+                        if not any(stripped.startswith(kw) or stripped == kw for kw in exp_keywords):
+                            end_idx = i
+                            break
+                if end_idx != len(lines):
+                    break
+
+        if start_idx is None:
+            return ""
+        return "\n".join(lines[start_idx:end_idx])
+
+    def _parse_experience_section(self, section_text: str) -> List[Dict[str, Any]]:
+        """
+        Parse structured work entries from an experience section.
+
+        Looks for date-range lines (e.g. "2019 - 2023") paired with nearby
+        company/title text.
+        """
+        entries: List[Dict[str, Any]] = []
+        current_year = datetime.now().year
+        date_pattern = re.compile(
+            r'(\d{4})\s*[-–—]\s*(\d{4}|present|current|now|till date|to date)',
+            re.IGNORECASE,
+        )
+        lines = section_text.split("\n")
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            m = date_pattern.search(line)
+            if m:
+                start_year = int(m.group(1))
+                end_str = m.group(2).strip().lower()
+                end_year = int(end_str) if end_str.isdigit() else current_year
+                duration_months = max(0, (end_year - start_year)) * 12
+
+                # Try to grab company/title from the same line or adjacent lines
+                context_lines = []
+                if i > 0:
+                    context_lines.append(lines[i - 1].strip())
+                context_lines.append(line)
+                if i + 1 < len(lines):
+                    context_lines.append(lines[i + 1].strip())
+                context = " | ".join(l for l in context_lines if l)
+
+                # Simple heuristic: the longest non-date line is likely company/title
+                non_date_parts = [l for l in context_lines if l and not date_pattern.search(l)]
+                company = non_date_parts[0] if non_date_parts else ""
+                title = non_date_parts[1] if len(non_date_parts) > 1 else ""
+
+                entries.append({
+                    "company": company,
+                    "title": title,
+                    "duration_months": duration_months,
+                    "extracted_text": context,
+                    "confidence": 0.75,
+                })
+            i += 1
+        return entries
+
+    def _extract_experience_via_ner(self, text: str) -> List[Dict[str, Any]]:
+        """
+        Use spaCy NER to extract ORG + DATE entity pairs as work entries.
+
+        Gracefully returns empty list if spaCy or en_core_web_sm is unavailable.
+        """
+        try:
+            import spacy
+            try:
+                nlp = spacy.load("en_core_web_sm")
+            except OSError:
+                return []
+        except ImportError:
+            return []
+
+        entries: List[Dict[str, Any]] = []
+        doc = nlp(text[:10000])
+        orgs = [ent for ent in doc.ents if ent.label_ == "ORG"]
+        dates = [ent for ent in doc.ents if ent.label_ == "DATE"]
+
+        # Pair each ORG with the nearest DATE within 200 chars
+        used_dates: set = set()
+        for org in orgs:
+            best_date = None
+            best_dist = 200
+            for j, date in enumerate(dates):
+                if j in used_dates:
+                    continue
+                dist = abs(org.start_char - date.start_char)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_date = (j, date)
+            duration_months = 0
+            date_text = ""
+            if best_date:
+                used_dates.add(best_date[0])
+                date_text = best_date[1].text
+                # Try to parse year range from date text
+                yr_match = re.search(r'(\d{4})\s*[-–—]\s*(\d{4}|present|current|now)', date_text, re.IGNORECASE)
+                if yr_match:
+                    s = int(yr_match.group(1))
+                    e_str = yr_match.group(2).lower()
+                    e = int(e_str) if e_str.isdigit() else datetime.now().year
+                    duration_months = max(0, (e - s)) * 12
+
+            entries.append({
+                "company": org.text,
+                "title": "",
+                "duration_months": duration_months,
+                "extracted_text": f"{org.text} ({date_text})" if date_text else org.text,
+                "confidence": 0.65,
+            })
+
+        return entries
+
+    def extract_certifications(self, text: str) -> List[str]:
+        """Extract certifications from resume text with category validation."""
+        certifications = []
+
+        cert_patterns = [
+            r'(?:AWS|Amazon Web Services)\s+(?:Certified|Solutions Architect|Developer|Practitioner)',
+            r'(?:Google Cloud|GCP)\s+(?:Professional|Associate|Cloud\s+\w+)',
+            r'(?:Microsoft|Azure)\s+(?:Certified|Solutions Expert|Administrator|Developer)',
+            r'(?:Oracle|PMP|Scrum|Agile)\s+(?:Certified|Professional|Master)',
+            r'(?:CCNA|CCNP|CISSP|CISA|CEH|CKA|CKAD|CKS|ITIL)\b',
+            r'(?:Certified\s+)?(?:Information\s+Systems\s+Security\s+Professional|CISSP|Scrum\s+Master)',
+            r'(?:Certified\s+)[A-Za-z0-9\s\-]+',
+        ]
+
+        for pattern in cert_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for match in matches:
+                m_str = ' '.join(match).strip() if isinstance(match, tuple) else match.strip()
+                if m_str:
+                    certifications.append(m_str)
+
+        # Extract line items from detected Certifications section if present
+        sections = detect_sections(text)
+        cert_section_text = sections.get("certifications", "")
+        if cert_section_text:
+            for raw_line in cert_section_text.split("\n"):
+                line = re.sub(r'^[#*\-•·▪\d\.\s\[\]\(\)]+', '', raw_line).strip(" .,-–—|()")
+                if 4 <= len(line) <= 120 and re.search(r'[A-Za-z]{3,}', line):
+                    certifications.append(line)
+
+        # Filter out false positives (bare technical skills, soft skills, spoken languages, degree titles)
+        filtered = []
+        seen = set()
+        for cert in certifications:
+            c_clean = cert.strip()
+            c_low = c_clean.lower()
+            if not c_clean or len(c_clean) < 3 or c_low in seen:
+                continue
+            if c_low in SPOKEN_LANGUAGES_SET or c_low in SOFT_SKILLS_SET or c_low in DEGREE_TITLES_SET:
+                continue
+            # Drop single word bare tech skills (e.g. "python", "sql", "react") unless recognized cert acronym
+            if len(c_clean.split()) == 1 and c_low not in {'ccna', 'ccnp', 'cissp', 'cisa', 'ceh', 'ckad', 'cka', 'cks', 'pmp', 'itil'}:
+                continue
+            seen.add(c_low)
+            filtered.append(c_clean)
+
+        return filtered
+
+    def extract_projects(self, text: str) -> List[Dict[str, Any]]:
+        """Extract project information from resume text"""
+        projects = []
+
+        project_patterns = [
+            r'(?:Project|Projects?)\s*[:\-]\s*([A-Za-z0-9\s]+)',
+            r'(?:Developed|Built|Created|Designed|Implemented)\s+([A-Za-z0-9\s]+)',
+            r'(?:GitHub|GitLab|Bitbucket)\s+(?:repository|repo)\s*([A-Za-z0-9\-_]+)',
+        ]
+
+        for pattern in project_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for match in matches:
+                projects.append({
+                    'name': match if isinstance(match, str) else ' '.join(match),
+                    'extracted_text': match if isinstance(match, str) else ' '.join(match),
+                    'confidence': 0.6
+                })
+
+        return projects
+
+    def extract_languages(self, text: str) -> List[str]:
+        """Extract languages from resume text"""
+        languages = []
+
+        language_list = [
+            'english', 'spanish', 'french', 'german', 'chinese', 'japanese',
+            'korean', 'russian', 'arabic', 'portuguese', 'italian',
+            'hindi', 'tamil', 'telugu', 'bengali', 'marathi', 'gujarati'
+        ]
+
+        text_lower = text.lower()
+        for lang in language_list:
+            if lang in text_lower:
+                languages.append(lang.capitalize())
+
+        return list(set(languages))
+
+    def calculate_skills_match(self, resume_skills: List[str], required_skills: List[str]) -> float:
+        """
+        C4.1 — Normalize both sides before matching.
+        Exact/substring match = 1.0 credit. Same-cluster skill = 0.6 credit.
+        """
+        if not required_skills:
+            return 100.0
+        resume_normalized = set(normalize_skill(s).lower() for s in resume_skills)
+        required_normalized = [normalize_skill(s).lower() for s in required_skills]
+        total = 0.0
+        for skill in required_normalized:
+            if any(skill in rs or rs in skill for rs in resume_normalized):
+                total += 1.0  # exact / substring match
+            elif _find_cluster_match(skill, resume_normalized):
+                total += CLUSTER_PARTIAL_CREDIT  # related tech in same cluster
+        return round(min(100.0, (total / len(required_normalized)) * 100), 2)
+
+    def calculate_semantic_similarity(self, resume_text: str, job_description: str) -> float:
+        """C4.2 — Delegates to module-level compute_semantic_score()."""
+        return compute_semantic_score(resume_text, job_description)
+
+    def calculate_experience_match(self, resume_years: float, required_years: float) -> float:
+        """Calculate experience match score (0-100)"""
+        if required_years == 0:
+            return 100.0
+        ratio = resume_years / required_years
+        if ratio >= 1.5:
+            return 100.0
+        elif ratio >= 1.0:
+            return 90.0
+        elif ratio >= 0.75:
+            return 75.0
+        elif ratio >= 0.5:
+            return 60.0
+        else:
+            return round(max(0.0, ratio * 100), 2)
+
+    def calculate_keyword_match(self, resume_text: str, job_description: str) -> float:
+        """
+        C4.4 — Fuzzy keyword matching using rapidfuzz.partial_ratio.
+        Falls back to exact overlap if rapidfuzz unavailable.
+        """
+        job_words = list(set(re.findall(r'\b[a-zA-Z]{3,}\b', job_description.lower())))
+        resume_words = set(re.findall(r'\b[a-zA-Z]{3,}\b', resume_text.lower()))
+        if not job_words:
+            return 50.0
+
+        if RAPIDFUZZ_AVAILABLE:
+            hits = sum(
+                1 for jw in job_words
+                if any(_fuzz.token_set_ratio(jw, rw) >= FUZZY_THRESHOLD for rw in resume_words)
+            )
+        else:
+            hits = sum(1 for jw in job_words if jw in resume_words)
+
+        overlap = hits / len(job_words)
+        return round(min(100.0, overlap * 150), 2)
+
+    def calculate_education_score(self, education: List[Dict[str, Any]], required_level: str = "bachelor") -> float:
+        """
+        C4.3 — Score based on DEGREE_SCORES dict extracted from education list.
+        """
+        if not education:
+            return 0.0
+
+        max_score = max((edu.get('score', 0) for edu in education), default=0)
+        required_score = DEGREE_SCORES.get(required_level.lower(), 60)
+
+        if max_score >= required_score:
+            return 100.0
+        return round((max_score / required_score) * 100, 2)
+
+    def calculate_certification_score(self, certifications: List[str]) -> float:
+        """Calculate certification score — counts certs and gives bonus for recognized ones."""
+        if not certifications:
+            return 0.0
+
+        base_score = min(len(certifications) * 20, 80)
+        relevant_keywords = [
+            # Cloud
+            'aws', 'azure', 'google cloud', 'gcp', 'alibaba cloud',
+            # DevOps / infra
+            'kubernetes', 'docker', 'terraform', 'hashicorp', 'red hat', 'rhce', 'rhcsa',
+            'linux foundation', 'ckad', 'cka', 'cks', 'argocd',
+            # Security
+            'cissp', 'cisa', 'cism', 'comptia', 'security+', 'network+', 'ceh', 'ccna', 'ccnp',
+            'oscp', 'pentest',
+            # Data / ML
+            'databricks', 'snowflake', 'tensorflow', 'pytorch', 'deeplearning.ai',
+            'machine learning', 'data science', 'aws ml',
+            # Project management
+            'pmp', 'prince2', 'safe', 'scrum', 'agile', 'csm', 'psm',
+            # General
+            'oracle', 'java', 'python', 'microsoft', 'cisco',
+        ]
+        relevant_count = sum(1 for cert in certifications
+                             if any(keyword in cert.lower() for keyword in relevant_keywords))
+        bonus = min(relevant_count * 10, 20)
+        return min(100.0, base_score + bonus)
+
+    def calculate_project_score(self, projects: List[Dict[str, Any]], jd_text: str = "") -> float:
+        """
+        C4.7 — Semantic project relevance score.
+        Each project's extracted_text is compared to the JD using sentence transformers.
+        Falls back to count-based score if no JD text provided.
+        """
+        if not projects:
+            return 0.0
+
+        if jd_text:
+            project_texts = [p.get('extracted_text', p.get('name', '')) for p in projects]
+            project_texts = [t for t in project_texts if t.strip()]
+            if project_texts:
+                scores = [compute_semantic_score(pt, jd_text) for pt in project_texts]
+                avg = sum(scores) / len(scores)
+                count_bonus = min(len(project_texts) * 5, 20)
+                return round(min(100.0, avg + count_bonus), 2)
+
+        # Count-based fallback (no JD text)
+        base_score = min(len(projects) * 15, 60)
+        tech_keywords = ['developed', 'built', 'implemented', 'designed', 'created']
+        tech_count = sum(1 for proj in projects
+                        if any(keyword in proj.get('extracted_text', '').lower()
+                              for keyword in tech_keywords))
+        bonus = min(tech_count * 10, 40)
+        return base_score + bonus
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Recruiter rubric — nested sub-scores
+    #   Education   = Degree match (40) + College tier (30) + CGPA (30)
+    #   Experience  = Relevant exp (50) + Internships (25) + GitHub/OSS/Hack (25)
+    #   Skills      = Required (70) + Preferred (30)
+    # ──────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _degree_score_from_text(*texts: str) -> int:
+        """Highest DEGREE_SCORES value found across the given strings (0 if none)."""
+        best = 0
+        for t in texts:
+            if not t:
+                continue
+            low = t.lower()
+            for kw, sc in DEGREE_SCORES.items():
+                if kw in low and sc > best:
+                    best = sc
+        return best
+
+    @staticmethod
+    def _parse_cgpa(*values) -> Optional[float]:
+        """Parse a CGPA / GPA / percentage from any of the given strings.
+        Returns a normalized 0.0-1.0 fraction, or None if not found."""
+        for v in values:
+            if v is None:
+                continue
+            s = str(v).strip()
+            if not s:
+                continue
+            # Percentage e.g. "85%"
+            m = re.search(r'(\d{2,3}(?:\.\d+)?)\s*%', s)
+            if m:
+                pct = float(m.group(1))
+                if 0 < pct <= 100:
+                    return min(1.0, pct / 100.0)
+            # Explicit scale e.g. "8.5/10", "3.8/4", "10/10"
+            m = re.search(r'(\d{1,2}(?:\.\d+)?)\s*/\s*(10|5|4)\b', s)
+            if m:
+                num, den = float(m.group(1)), float(m.group(2))
+                if den > 0 and num <= den:
+                    return min(1.0, num / den)
+            # cgpa/gpa/grade keyword followed by a number
+            m = re.search(r'(?:cgpa|gpa|grade)\D{0,8}(\d{1,2}(?:\.\d+)?)', s, re.I)
+            if m:
+                val = float(m.group(1))
+                if val <= 4:
+                    return min(1.0, val / 4.0)
+                if val <= 10:
+                    return min(1.0, val / 10.0)
+                if val <= 100:
+                    return min(1.0, val / 100.0)
+            # Bare number in a short field (structured grade like "8.7")
+            if len(s) <= 6:
+                m = re.fullmatch(r'(\d{1,2}(?:\.\d+)?)', s)
+                if m:
+                    val = float(m.group(1))
+                    if val <= 4:
+                        return min(1.0, val / 4.0)
+                    if val <= 10:
+                        return min(1.0, val / 10.0)
+        return None
+
+    def score_education_v2(self, educations, institution_names, parsed_education,
+                           resume_text, required_education):
+        """Education sub-score (0-100) = degree(40) + college tier(30) + CGPA(30)."""
+        # Degree match (0-40)
+        if educations:
+            cand_degree = max(
+                (self._degree_score_from_text(e.get('education_level', ''), e.get('degree', ''))
+                 for e in educations), default=0)
+        else:
+            cand_degree = max((e.get('score', 0) for e in (parsed_education or [])), default=0)
+        if not cand_degree:
+            cand_degree = self._degree_score_from_text(resume_text or '')
+        req_degree = DEGREE_SCORES.get((required_education or 'bachelor').lower(), 60)
+        if cand_degree <= 0:
+            degree_sub = 0.0
+        elif cand_degree >= req_degree:
+            degree_sub = 40.0
+        else:
+            degree_sub = round(40.0 * cand_degree / req_degree, 1)
+
+        # College tier (0-30)
+        names = [e.get('institution_name', '') for e in educations] if educations else (institution_names or [])
+        tier = best_tier([n for n in names if n])
+        tier_sub = 30.0 if tier == 'tier_1' else 20.0 if tier == 'tier_2' else 0.0
+
+        # CGPA (0-30)
+        cgpa_frac = None
+        if educations:
+            for e in educations:
+                cgpa_frac = self._parse_cgpa(e.get('cgpa'), e.get('grade'))
+                if cgpa_frac is not None:
+                    break
+        if cgpa_frac is None:
+            cgpa_frac = self._parse_cgpa(resume_text or '')
+        cgpa_sub = round(30.0 * cgpa_frac, 1) if cgpa_frac is not None else 0.0
+
+        score = round(min(100.0, degree_sub + tier_sub + cgpa_sub), 2)
+        detail = {
+            'degree_match': degree_sub, 'degree_max': 40,
+            'college_tier': tier_sub, 'college_tier_max': 30, 'tier': tier,
+            'cgpa': cgpa_sub, 'cgpa_max': 30, 'cgpa_found': cgpa_frac is not None,
+        }
+        return score, detail
+
+    def score_experience_v2(self, years, required_years, work_experiences, links_text, resume_text):
+        """Experience sub-score (0-100) = relevant(50) + internships(25) + github/OSS/hack(25)."""
+        # Relevant experience (0-50)
+        if not required_years or required_years <= 0:
+            rel = 50.0
+        else:
+            ratio = (years or 0) / required_years
+            if ratio >= 1.0:
+                rel = 50.0
+            elif ratio >= 0.75:
+                rel = 40.0
+            elif ratio >= 0.5:
+                rel = 30.0
+            else:
+                rel = round(max(0.0, ratio) * 50.0, 1)
+
+        # Internships (0-25)
+        intern_count = 0
+        if work_experiences:
+            intern_count = sum(
+                1 for w in work_experiences
+                if 'intern' in (w.get('employment_type', '') or '').lower()
+                or 'intern' in (w.get('job_title', '') or '').lower())
+        if intern_count == 0 and resume_text and 'intern' in resume_text.lower():
+            intern_count = 1
+        intern_sub = float(min(intern_count * 15, 25))
+
+        # GitHub / Open-source / Hackathons (0-25)
+        blob = ' '.join(filter(None, [links_text or '', resume_text or ''])).lower()
+        gh = 15.0 if 'github' in blob else 0.0
+        oss = 5.0 if ('open source' in blob or 'open-source' in blob) else 0.0
+        hack = 5.0 if 'hackathon' in blob else 0.0
+        oss_sub = min(25.0, gh + oss + hack)
+
+        score = round(min(100.0, rel + intern_sub + oss_sub), 2)
+        detail = {
+            'relevant_experience': rel, 'relevant_max': 50,
+            'internships': intern_sub, 'internships_max': 25, 'internship_count': intern_count,
+            'github_oss_hackathons': oss_sub, 'github_oss_max': 25,
+            'has_github': gh > 0, 'has_oss': oss > 0, 'has_hackathon': hack > 0,
+        }
+        return score, detail
+
+    def score_skills_v2(self, resume_skills, required_skills, preferred_skills):
+        """Skills sub-score (0-100) = required(70) + preferred(30).
+        When the JD lists no preferred skills, required carries the full 100."""
+        req_pct = (self.calculate_skills_match(resume_skills, required_skills) / 100.0
+                   if required_skills else 1.0)
+        if preferred_skills:
+            pref_pct = self.calculate_skills_match(resume_skills, preferred_skills) / 100.0
+            req_sub = round(70.0 * req_pct, 1)
+            pref_sub = round(30.0 * pref_pct, 1)
+            score = round(req_sub + pref_sub, 2)
+        else:
+            req_sub = round(70.0 * req_pct, 1)
+            pref_sub = None
+            score = round(100.0 * req_pct, 2)
+        detail = {
+            'required_skills': req_sub, 'required_max': 70,
+            'preferred_skills': pref_sub, 'preferred_max': 30,
+            'has_preferred': bool(preferred_skills),
+        }
+        return score, detail
+
+    def extract_preferred_skills(self, jd_text: str) -> List[str]:
+        """Skills mentioned under a preferred / nice-to-have / desirable section of the JD."""
+        if not jd_text:
+            return []
+        low = jd_text.lower()
+        markers = ['preferred', 'nice to have', 'nice-to-have', 'good to have',
+                   'desirable', 'plus', 'bonus', 'advantage', 'added advantage']
+        hits = [low.find(m) for m in markers if low.find(m) >= 0]
+        if not hits:
+            return []
+        segment = jd_text[min(hits):min(hits) + 600]
+        # Don't double-count: caller diffs preferred against required separately.
+        return self.extract_skills(segment)
+
+    @staticmethod
+    def _rating_and_recommendation(score: float):
+        """Map a final 0-100 score to a recruiter rating + hiring recommendation."""
+        if score >= 85:
+            return "Excellent", "Strong hire — fast-track to interview"
+        if score >= 70:
+            return "Very Good", "Recommended — shortlist for interview"
+        if score >= 55:
+            return "Good", "Consider — review manually before deciding"
+        if score >= 40:
+            return "Average", "Weak match — only if the pipeline is thin"
+        return "Poor", "Not recommended for this role"
+
+    def _strengths_weaknesses_v2(self, edu, exp, skl, matched_skills, missing_skills,
+                                 certification_score):
+        """Recruiter-friendly strengths / weaknesses derived from the sub-scores."""
+        strengths, weaknesses = [], []
+
+        if edu['tier'] == 'tier_1':
+            strengths.append("Graduated from a Tier-1 institute")
+        elif edu['tier'] == 'tier_2':
+            strengths.append("Graduated from a Tier-2 institute")
+        if edu['degree_match'] >= 40:
+            strengths.append("Meets or exceeds the required degree level")
+        elif edu['degree_match'] < 20:
+            weaknesses.append("Degree level is below the role requirement")
+        if edu['cgpa_found'] and edu['cgpa'] >= 24:
+            strengths.append("Strong academic record (high CGPA)")
+        elif not edu['cgpa_found']:
+            weaknesses.append("No CGPA/GPA found on the resume")
+
+        if matched_skills:
+            strengths.append(f"Matches {len(matched_skills)} required skill(s)")
+        if missing_skills:
+            weaknesses.append(f"Missing {len(missing_skills)} required skill(s): "
+                              f"{', '.join(missing_skills[:5])}")
+        if not skl['has_preferred']:
+            pass
+        elif skl['preferred_skills'] is not None and skl['preferred_skills'] >= 24:
+            strengths.append("Covers most preferred/nice-to-have skills")
+
+        if exp['relevant_experience'] >= 50:
+            strengths.append("Has the required years of relevant experience")
+        elif exp['relevant_experience'] < 30:
+            weaknesses.append("Less relevant experience than required")
+        if exp['internship_count'] > 0:
+            strengths.append(f"Completed {exp['internship_count']} internship(s)")
+        if exp['has_github']:
+            strengths.append("Active GitHub / open-source presence")
+        if exp['has_hackathon']:
+            strengths.append("Hackathon participation")
+
+        if certification_score >= 60:
+            strengths.append("Holds relevant professional certifications")
+        elif certification_score == 0:
+            weaknesses.append("No certifications found")
+
+        return strengths, weaknesses
+
+    def enhanced_parse_resume(self, file_path: str) -> EnhancedResumeParseResult:
+        """Enhanced resume parsing with OCR and detailed extraction"""
+        file_extension = Path(file_path).suffix.lower()
+
+        if file_extension == '.pdf':
+            text, confidence = self.extract_text_from_pdf_enhanced(file_path)
+            processing_method = "pdf_enhanced"
+        elif file_extension in ['.docx', '.doc']:
+            text, confidence = self.extract_text_from_docx(file_path)
+            processing_method = "docx_enhanced"
+        else:
+            raise ValueError(f"Unsupported file format: {file_extension}")
+
+        if not text:
+            raise ValueError("No text extracted from resume")
+
+        skills = self.extract_skills(text)
+        experience_years = self.extract_experience_years(text)
+        contact_info = self.extract_contact_info(text)
+        education = self.extract_education_info(text)
+        work_experience = self.extract_work_experience(text)
+        certifications = self.extract_certifications(text)
+        projects = self.extract_projects(text)
+        languages = self.extract_languages(text)
+
+        return EnhancedResumeParseResult(
+            text=text,
+            skills=skills,
+            experience_years=experience_years,
+            contact_info=contact_info,
+            education=education,
+            work_experience=work_experience,
+            certifications=certifications,
+            languages=languages,
+            projects=projects,
+            confidence_score=confidence,
+            file_type=file_extension,
+            processing_method=processing_method
+        )
+
+    def enhanced_score_candidate(
+        self,
+        resume_text: str,
+        job_description: str,
+        required_skills: List[str],
+        required_experience: int,
+        required_education: str = "bachelor",
+        custom_weights: Optional[Dict[str, float]] = None,
+        institution_names: Optional[List[str]] = None,
+        permanent_pincode: Optional[str] = None,
+        educations: Optional[List[Dict[str, Any]]] = None,
+        work_experiences: Optional[List[Dict[str, Any]]] = None,
+        links_text: Optional[str] = None,
+        preferred_skills: Optional[List[str]] = None
+    ) -> EnhancedATSScoreResult:
+        """
+        Recruiter-rubric ATS scoring.
+
+        Weighted factors (sum to 1.0): education 35%, skills 25%, experience 15%,
+        certification 10%, semantic 5%, project 5%, keyword 5%. Education, skills,
+        and experience are themselves composed of sub-scores (see score_*_v2).
+
+        Structured inputs (``educations``, ``work_experiences``, ``links_text``,
+        ``preferred_skills``) make the sub-scores reliable; when absent the scorer
+        falls back to extracting them from ``resume_text`` / ``job_description``.
+
+        A rural permanent-address affirmative bonus (+3, capped at 100) is added
+        from ``permanent_pincode``. College tier is part of the education score.
+        """
+        weights = custom_weights if custom_weights else self.weights
+
+        # FIXED: No input sanitization — sanitize before any processing
+        resume_text = sanitize_resume_text(resume_text)
+
+        # Clean raw text before any processing (ligatures, line-break repair, bullets)
+        resume_text = clean_resume_text(resume_text)
+
+        # FIXED: No resume length normalization — apply token-budget truncation
+        resume_text = normalize_resume_text(resume_text)
+
+        # C4.6 — Detect sections for section-aware scoring
+        sections = detect_sections(resume_text)
+
+        # Parse resume
+        resume_result = self.enhanced_parse_resume_from_text(resume_text)
+
+        # ── Secondary factors (semantic / keyword / certification / project) ──
+        if len(sections) > 1:
+            semantic_score = compute_weighted_semantic_score(sections, job_description)
+        else:
+            semantic_score = self.calculate_semantic_similarity(resume_text, job_description)
+        keyword_score = self.calculate_keyword_match(resume_text, job_description)
+        certification_score = self.calculate_certification_score(resume_result.certifications)
+        project_score = self.calculate_project_score(resume_result.projects, jd_text=job_description)
+
+        # ── Skills = Required (70) + Preferred (30) ──
+        if preferred_skills is None:
+            preferred_skills = self.extract_preferred_skills(job_description)
+        skills_score, skills_detail = self.score_skills_v2(
+            resume_result.skills, required_skills, preferred_skills)
+
+        # ── Education = Degree match (40) + College tier (30) + CGPA (30) ──
+        education_score, education_detail = self.score_education_v2(
+            educations, institution_names, resume_result.education, resume_text, required_education)
+
+        # ── Experience = Relevant (50) + Internships (25) + GitHub/OSS/Hack (25) ──
+        experience_score, experience_detail = self.score_experience_v2(
+            resume_result.experience_years, required_experience, work_experiences,
+            links_text, resume_text)
+
+        # Composite ATS score (recruiter rubric).
+        ats_score = (
+            education_score * weights['education'] +
+            skills_score * weights['skills_match'] +
+            experience_score * weights['experience'] +
+            certification_score * weights['certification'] +
+            semantic_score * weights['semantic'] +
+            project_score * weights['project'] +
+            keyword_score * weights['keyword']
+        )
+
+        # College tier is now part of the education score (no separate tier bonus).
+        # Rural permanent address remains a small affirmative bonus, capped at 100.
+        college_tier = education_detail.get('tier')
+        rural = bool(permanent_pincode) and is_rural(permanent_pincode)
+        rural_bonus = 3.0 if rural else 0.0
+        total_bonus = rural_bonus
+
+        ats_score = min(100.0, ats_score + total_bonus)
+
+        # Resume<->JD verbatim-overlap (copy / plagiarism) detection. This is
+        # distinct from the semantic factor: it flags large blocks of identical
+        # text (a pasted JD), which would otherwise game skills/semantic/keyword.
+        plagiarism = jd_copy_overlap(resume_text, job_description)
+        if JD_COPY_PENALTY > 0 and plagiarism["flagged"]:
+            ats_score = max(0.0, ats_score - JD_COPY_PENALTY)
+
+        # C4.1 — Normalize required skills before diff
+        required_normalized = [normalize_skill(s).lower() for s in required_skills]
+        resume_normalized = [normalize_skill(s).lower() for s in resume_result.skills]
+
+        matched_skills = list(set(resume_normalized) & set(required_normalized))
+        raw_missing = list(set(required_normalized) - set(resume_normalized))
+
+        # Skill clustering — split raw missing into cluster-matched and truly missing
+        resume_normalized_set = set(resume_normalized)
+        cluster_matched_skills: List[Dict[str, str]] = []
+        missing_skills: List[str] = []
+        for skill in raw_missing:
+            cluster_hit = _find_cluster_match(skill, resume_normalized_set)
+            if cluster_hit:
+                cluster_matched_skills.append({
+                    "required": skill,
+                    "found": cluster_hit,
+                    "cluster": SKILL_TO_CLUSTER.get(skill.lower(), ""),
+                })
+            else:
+                missing_skills.append(skill)
+
+        rating, hiring_recommendation = self._rating_and_recommendation(ats_score)
+
+        recommendations = self._generate_recommendations(
+            skills_score, experience_score, education_score,
+            missing_skills, resume_result.certifications
+        )
+
+        strengths, weaknesses = self._strengths_weaknesses_v2(
+            education_detail, experience_detail, skills_detail,
+            matched_skills, missing_skills, certification_score
+        )
+
+        education_level = self._determine_education_level(resume_result.education)
+
+        # Preferred skills the candidate is missing (for the dashboard).
+        missing_preferred = []
+        if preferred_skills:
+            res_norm = set(resume_normalized)
+            for s in preferred_skills:
+                if normalize_skill(s).lower() not in res_norm:
+                    missing_preferred.append(s)
+
+        scoring_breakdown = {
+            'weights_used': weights,
+            'individual_scores': {
+                'education': education_score,
+                'skills_match': skills_score,
+                'experience': experience_score,
+                'certification': certification_score,
+                'semantic': semantic_score,
+                'project': project_score,
+                'keyword': keyword_score,
+            },
+            'weighted_contributions': {
+                'education': round(education_score * weights['education'], 2),
+                'skills_match': round(skills_score * weights['skills_match'], 2),
+                'experience': round(experience_score * weights['experience'], 2),
+                'certification': round(certification_score * weights['certification'], 2),
+                'semantic': round(semantic_score * weights['semantic'], 2),
+                'project': round(project_score * weights['project'], 2),
+                'keyword': round(keyword_score * weights['keyword'], 2),
+            },
+            'sub_scores': {
+                'education': education_detail,
+                'experience': experience_detail,
+                'skills': skills_detail,
+            },
+            'rating': rating,
+            'hiring_recommendation': hiring_recommendation,
+            'strengths': strengths,
+            'weaknesses': weaknesses,
+            'preferred_skills': preferred_skills or [],
+            'missing_preferred_skills': missing_preferred,
+            'parsing_confidence': resume_result.confidence_score,
+            'processing_method': resume_result.processing_method,
+            'sections_detected': list(sections.keys()),
+            'cluster_matched_count': len(cluster_matched_skills),
+            'bonus': {
+                'college_tier': college_tier,
+                'rural': rural,
+                'rural_bonus': rural_bonus,
+                'total_bonus': total_bonus,
+            },
+            'plagiarism': plagiarism,
+        }
+
+        return EnhancedATSScoreResult(
+            ats_score=round(ats_score, 2),
+            skills_match_score=round(skills_score, 2),
+            semantic_score=round(semantic_score, 2),
+            experience_score=round(experience_score, 2),
+            keyword_score=round(keyword_score, 2),
+            education_score=round(education_score, 2),
+            certification_score=round(certification_score, 2),
+            project_score=round(project_score, 2),
+            matched_skills=matched_skills,
+            missing_skills=missing_skills,
+            cluster_matched_skills=cluster_matched_skills,
+            extracted_skills=resume_result.skills,
+            extracted_experience=resume_result.experience_years,
+            education_level=education_level,
+            certifications=resume_result.certifications,
+            confidence_score=resume_result.confidence_score,
+            scoring_breakdown=scoring_breakdown,
+            recommendations=recommendations,
+            strengths=strengths,
+            weaknesses=weaknesses,
+            rating=rating,
+            hiring_recommendation=hiring_recommendation,
+        )
+
+    def enhanced_parse_resume_from_text(self, text: str) -> EnhancedResumeParseResult:
+        """Parse resume from already extracted text"""
+        skills = self.extract_skills(text)
+        experience_years = self.extract_experience_years(text)
+        contact_info = self.extract_contact_info(text)
+        education = self.extract_education_info(text)
+        work_experience = self.extract_work_experience(text)
+        certifications = self.extract_certifications(text)
+        projects = self.extract_projects(text)
+        languages = self.extract_languages(text)
+
+        return EnhancedResumeParseResult(
+            text=text,
+            skills=skills,
+            experience_years=experience_years,
+            contact_info=contact_info,
+            education=education,
+            work_experience=work_experience,
+            certifications=certifications,
+            languages=languages,
+            projects=projects,
+            confidence_score=0.8,
+            file_type="text",
+            processing_method="text_input"
+        )
+
+    def _generate_recommendations(
+        self, skills_score: float, experience_score: float, education_score: float,
+        missing_skills: List[str], certifications: List[str]
+    ) -> List[str]:
+        """Generate personalized recommendations"""
+        recommendations = []
+
+        if skills_score < 70:
+            recommendations.append(f"Consider learning missing skills: {', '.join(missing_skills[:3])}")
+
+        if experience_score < 70:
+            recommendations.append("Gain more relevant work experience through internships or projects")
+
+        if education_score < 70:
+            recommendations.append("Consider pursuing additional certifications or advanced degrees")
+
+        if not certifications:
+            recommendations.append("Obtain industry-recognized certifications to strengthen your profile")
+
+        return recommendations
+
+    def _generate_strengths_weaknesses(
+        self, matched_skills: List[str], missing_skills: List[str],
+        experience_years: float, required_experience: int,
+        education: List[Dict], certifications: List[str]
+    ) -> Tuple[List[str], List[str]]:
+        """Generate strengths and weaknesses analysis"""
+        strengths = []
+        weaknesses = []
+
+        if matched_skills:
+            strengths.append(f"Strong in {len(matched_skills)} key technologies")
+
+        if experience_years >= required_experience:
+            strengths.append("Sufficient experience for the role")
+
+        if education:
+            strengths.append("Relevant educational background")
+
+        if certifications:
+            strengths.append(f"Holds {len(certifications)} professional certifications")
+
+        if missing_skills:
+            weaknesses.append(f"Missing {len(missing_skills)} required skills")
+
+        if experience_years < required_experience:
+            weaknesses.append("Insufficient experience for the role")
+
+        if not certifications:
+            weaknesses.append("No professional certifications found")
+
+        return strengths, weaknesses
+
+    def _determine_education_level(self, education: List[Dict[str, Any]]) -> str:
+        """Determine highest education level"""
+        if not education:
+            return "Not specified"
+
+        max_score = 0
+        result_level = "Not specified"
+
+        for edu in education:
+            degree = edu.get('degree', '').lower()
+            score = edu.get('score', 0)
+            if score > max_score:
+                max_score = score
+                result_level = degree.title()
+            # Also check via education_levels for backward compat
+            for level_name, level_value in self.education_levels.items():
+                if level_name in degree and DEGREE_SCORES.get(level_name, 0) > max_score:
+                    max_score = DEGREE_SCORES.get(level_name, 0)
+                    result_level = level_name.title()
+
+        return result_level
+
+    def get_score_interpretation(self, ats_score: float) -> Dict[str, Any]:
+        """Get detailed score interpretation"""
+        if ats_score >= 90:
+            return {
+                'level': 'Excellent',
+                'recommendation': 'Strongly Recommend - Immediate Interview',
+                'color': '#10B981',
+                'priority': 'High',
+                'description': 'Outstanding match - Top candidate for this position'
+            }
+        elif ats_score >= 80:
+            return {
+                'level': 'Very Good',
+                'recommendation': 'Recommend - Schedule Interview Soon',
+                'color': '#3B82F6',
+                'priority': 'High',
+                'description': 'Strong candidate - Should advance to next round'
+            }
+        elif ats_score >= 70:
+            return {
+                'level': 'Good',
+                'recommendation': 'Consider - Worth Interviewing',
+                'color': '#F59E0B',
+                'priority': 'Medium',
+                'description': 'Qualified candidate - May have some gaps'
+            }
+        elif ats_score >= 60:
+            return {
+                'level': 'Fair',
+                'recommendation': 'Borderline - Review Carefully',
+                'color': '#F97316',
+                'priority': 'Low',
+                'description': 'Potential candidate - Significant gaps exist'
+            }
+        else:
+            return {
+                'level': 'Poor',
+                'recommendation': 'Do Not Recommend - Reject',
+                'color': '#EF4444',
+                'priority': 'Very Low',
+                'description': 'Does not meet position requirements'
+            }
+
+# ==================== GLOBAL ENHANCED ATS SERVICE INSTANCE ====================
+
+enhanced_ats_service = EnhancedATSScoringService()
+
+# ==================== CONVENIENCE FUNCTIONS ====================
+
+def enhanced_parse_resume_file(file_path: str) -> EnhancedResumeParseResult:
+    """Parse resume file using enhanced ATS service"""
+    return enhanced_ats_service.enhanced_parse_resume(file_path)
+
+def enhanced_score_candidate_ats(
+    resume_text: str,
+    job_description: str,
+    required_skills: List[str],
+    required_experience: int,
+    required_education: str = "bachelor"
+) -> EnhancedATSScoreResult:
+    """Score candidate using enhanced ATS service"""
+    return enhanced_ats_service.enhanced_score_candidate(
+        resume_text, job_description, required_skills,
+        required_experience, required_education
+    )
+
+def get_enhanced_ats_interpretation(ats_score: float) -> Dict[str, Any]:
+    """Get enhanced score interpretation"""
+    return enhanced_ats_service.get_score_interpretation(ats_score)

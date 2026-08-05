@@ -1,0 +1,56 @@
+# HireFlow API — the main FastAPI app.
+#
+# Install:
+#   cp deploy/cpanel/*.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now hireflow-api
+#
+# Serves everything EXCEPT proctoring. Proctoring runs as its own single-worker
+# service (hireflow-proctor) because proctoring session state is process-local;
+# see the note in proctoring/routes.py. That split is also why PROCTOR_PREWARM=0
+# here — these workers never handle a proctoring request, so they should not pay
+# for loading MediaPipe/YOLO.
+
+[Unit]
+Description=HireFlow API (FastAPI/gunicorn)
+After=network.target mysqld.service redis.service
+Wants=redis.service
+
+[Service]
+Type=exec
+User=hireflow
+Group=hireflow
+WorkingDirectory=/opt/hireflow/backend
+EnvironmentFile=/opt/hireflow/backend/.env
+
+Environment=ROLE=web
+Environment=PORT=8000
+Environment=BIND_HOST=127.0.0.1
+# 3 workers: enough that a blocking DB or Gemini call never serialises the API,
+# while leaving CPU for the proctor service, MySQL and the judge containers.
+Environment=WEB_CONCURRENCY=3
+# These workers do no inference — skip the ~102s of proctoring imports entirely.
+Environment=PROCTOR_PREWARM=0
+# Parallelism comes from the app, not from OpenMP nesting a pool per call.
+Environment=OMP_NUM_THREADS=1
+Environment=PYTHONUNBUFFERED=1
+# entrypoint.sh invokes `gunicorn` / `rq` by name, so the venv must be on PATH.
+Environment=PATH=/opt/hireflow/venv/bin:/usr/local/bin:/usr/bin:/bin
+
+ExecStart=/bin/sh /opt/hireflow/backend/entrypoint.sh
+
+Restart=always
+RestartSec=5
+# Generous: model loading and long Gemini generations both happen at boot/first use.
+TimeoutStartSec=300
+TimeoutStopSec=30
+
+# Hardening. ReadWritePaths must include the upload tree (HIREFLOW_DATA_DIR) and
+# the HuggingFace cache, or ProtectSystem makes them read-only at runtime.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/hireflow
+
+[Install]
+WantedBy=multi-user.target

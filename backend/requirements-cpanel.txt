@@ -1,0 +1,131 @@
+# =====================================================
+# HIREFLOW — cPanel / self-hosted Linux dependency set
+# =====================================================
+# Install with:
+#   pip install -r requirements-cpanel.txt
+#
+# Differences from requirements.txt and why they exist:
+#
+# 1. CPU-only torch. Plain `pip install torch==2.1.1` pulls the CUDA build and
+#    ~2 GB of nvidia-* wheels that are dead weight on a CPU-only server. The
+#    extra index below serves the CPU wheels instead (same approach as the
+#    Cloud Run Dockerfile).
+# 2. Dropped packages with zero import sites in the codebase — verified, not
+#    assumed. psycopg2-binary additionally FAILS to build without pg_config,
+#    so leaving it in breaks the install outright on a box with no Postgres.
+# 3. Added dnspython, which routes/superadmin_routes.py imports for DNS-TXT
+#    custom-domain verification but which requirements.txt never declared.
+# 4. Dropped google-cloud-storage: only used by the STORAGE_BACKEND=gcs branch
+#    in src/services/storage.py. Self-hosted uses STORAGE_BACKEND=local.
+#    Re-add it if you ever point storage back at a bucket.
+# 5. Dropped deepface. requirements.txt lists it under "Proctoring AI
+#    dependencies", but it has ZERO import sites — face recognition is done
+#    entirely with OpenCV DNN (SFace + YuNet ONNX models shipped in
+#    proctoring/models/), see core/face_analyzer.py:30-31. deepface pulls
+#    TensorFlow transitively (~1.5 GB installed) for nothing. Nothing in the
+#    codebase imports tensorflow or keras either — verified.
+#
+# Kept deliberately: torch / sentence-transformers (semantic ATS scoring),
+# mediapipe / opencv-python / ultralytics (AI proctoring), google-genai (all
+# LLM features), redis + rq (background email + judge queues). Dropping any of
+# those disables a feature — see the fallbacks noted inline below.
+#
+# System packages these need (not installable via pip):
+#   mesa-libGL, mesa-libEGL, glib2   → opencv / mediapipe
+#   libsndfile, ffmpeg               → audio proctoring
+#   tesseract                        → pytesseract OCR for scanned resumes
+#   docker CLI + daemon              → coding judge (JUDGE_BACKEND=docker)
+
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# ── Web framework & server ───────────────────────────────────────────────────
+fastapi==0.115.14
+uvicorn==0.24.0
+uvicorn[standard]==0.24.0
+gunicorn==21.2.0
+python-multipart==0.0.6
+websockets==13.1
+slowapi==0.1.9
+httpx==0.28.1
+requests==2.31.0
+
+# ── Data model & validation ──────────────────────────────────────────────────
+pydantic==2.9.2
+pydantic[email]==2.9.2
+pydantic-settings==2.1.0
+sqlalchemy==2.0.23
+alembic==1.12.1
+pymysql==1.1.0
+python-dateutil==2.8.2
+validators==0.22.0
+
+# ── Auth & security ──────────────────────────────────────────────────────────
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+
+# ── Config, logging, CLI ─────────────────────────────────────────────────────
+python-dotenv==1.0.0
+environs==10.0.0
+structlog==23.2.0
+click==8.1.7
+typer==0.9.0
+rich==13.7.0
+jinja2==3.1.2
+aiocache==0.12.2
+
+# ── Email ────────────────────────────────────────────────────────────────────
+aiosmtplib==3.0.1
+
+# ── LLM (Gemini Developer API — src/services/gemini_service.py) ──────────────
+# REQUIRED. gemini_service.py swallows the ImportError and degrades to
+# `genai = None`, so omitting this does not fail loudly at startup — it kills
+# question generation, JD generation, cover letters, the LLM ATS layer and SQL
+# test-case seeding at first use instead. Same package as requirements.txt:78.
+google-genai>=1.0,<2
+
+# ── DNS (custom tenant domain verification — routes/superadmin_routes.py) ────
+dnspython>=2.4,<3
+
+# ── Background queues (email + coding judge) ─────────────────────────────────
+redis==5.0.8
+rq==1.16.2
+
+# ── Document parsing ─────────────────────────────────────────────────────────
+pdfplumber==0.9.0
+python-docx==0.8.11
+Pillow==10.1.0
+pytesseract==0.3.10          # requires the `tesseract` binary on PATH
+
+# ── ATS scoring ──────────────────────────────────────────────────────────────
+# Without sentence-transformers, enhanced_ats_service.py falls back to sklearn
+# TF-IDF automatically (~50 MB instead of ~2.5 GB) at some cost to scoring
+# quality. Drop the torch/transformers/sentence-transformers trio if you ever
+# need to run on a small box.
+numpy==1.24.3
+scipy==1.11.4
+scikit-learn==1.3.2
+torch==2.1.1
+transformers==4.35.2
+sentence-transformers>=2.5.0,<3.0.0
+rapidfuzz>=3.0.0
+spacy==3.7.2
+# NOTE: enhanced_ats_service.py loads the spaCy model "en_core_web_trf", which
+# is not a PyPI package and is not pinned here or in requirements.txt. NER-based
+# skill extraction silently no-ops unless you install it separately:
+#   python -m spacy download en_core_web_trf     (~450 MB)
+# This is pre-existing behaviour, not a migration regression.
+
+# ── AI proctoring ────────────────────────────────────────────────────────────
+opencv-python>=4.8.0
+mediapipe>=0.10.0
+ultralytics>=8.0.0
+webrtcvad>=2.0.10
+soundfile>=0.12.0
+# Face recognition uses OpenCV DNN (SFace/YuNet) from proctoring/models/, not
+# deepface — see header note 5. Do not re-add deepface without a call site.
+# resemblyzer>=0.1.1   # see requirements.txt — pulls librosa/numba/llvmlite
+
+# ── Tests (optional on a production box) ─────────────────────────────────────
+pytest==7.4.3
+pytest-asyncio==0.21.1

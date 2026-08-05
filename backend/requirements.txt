@@ -1,0 +1,78 @@
+Pillow==10.1.0
+aiocache==0.12.2
+aiosmtplib==3.0.1
+alembic==1.12.1
+black==23.11.0
+boto3==1.34.0
+click==8.1.7
+dramatiq==1.15.0
+environs==10.0.0
+fastapi-users==12.1.2
+fastapi==0.115.14
+flake8==6.1.0
+gensim==4.3.2
+gunicorn==21.2.0
+httpx==0.28.1
+jinja2==3.1.2
+mediapipe>=0.10.0
+minio==7.2.0
+nltk==3.8.1
+numpy==1.24.3
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+pdfplumber==0.9.0
+psycopg2-binary==2.9.9
+pydantic-settings==2.1.0
+pydantic==2.9.2
+pydantic[email]==2.9.2
+pymysql==1.1.0
+pytesseract==0.3.10
+pytest-asyncio==0.21.1
+pytest==7.4.3
+python-dateutil==2.8.2
+python-docx==0.8.11
+python-dotenv==1.0.0
+python-jose[cryptography]==3.3.0
+python-multipart==0.0.6
+redis==5.0.8
+requests==2.31.0
+rich==13.7.0
+rq==1.16.2
+scikit-learn==1.3.2
+scipy==1.11.4
+slowapi==0.1.9
+spacy==3.7.2
+sqlalchemy==2.0.23
+structlog==23.2.0
+torch==2.1.1
+transformers==4.35.2
+typer==0.9.0
+uvicorn==0.24.0
+uvicorn[standard]==0.24.0
+validators==0.22.0
+watchdog==3.0.0
+websockets==13.1
+
+# ATS scoring upgrade dependencies (pinned to torch==2.1.1 compatible versions)
+sentence-transformers>=2.5.0,<3.0.0
+rapidfuzz>=3.0.0
+
+# Proctoring AI dependencies
+opencv-python>=4.8.0
+ultralytics>=8.0.0
+deepface>=0.0.79
+webrtcvad>=2.0.10
+soundfile>=0.12.0
+# Speaker diarization uses neural voice embeddings when this is present, and falls back
+# to an MFCC+F0 comparison (numpy/scipy only) when it is not — see core/diarizer.py, and
+# check "audio_engine" in the session-status response to see which one is live.
+# Left commented deliberately: it pulls librosa -> numba/llvmlite, which is a real risk to
+# the Cloud Run image build. Uncomment and verify `docker build` before relying on it.
+# resemblyzer>=0.1.1
+
+# Cloud Storage (used when STORAGE_BACKEND=gcs)
+google-cloud-storage>=2.14,<3
+
+# Vertex AI (LLM: question generation, JD, cover letters, qualitative ATS)
+# Auth via Application Default Credentials; brings google-auth transitively.
+google-genai>=1.0,<2

@@ -1,0 +1,51 @@
+# HireFlow coding-judge worker — runs candidate code in Docker sandboxes.
+#
+# Runs as its own user (hfjudge), NOT as hireflow, and that is deliberate.
+#
+# SECURITY: membership in the `docker` group is root-equivalent — a member can
+# bind-mount the host filesystem into a container. This box hosts other cPanel
+# accounts, so that privilege is confined to a dedicated user running exactly one
+# process, rather than granted to the account that serves web traffic.
+#
+# If that is not an acceptable trade-off, run Judge0 on a separate machine and
+# set JUDGE_BACKEND=judge0 with JUDGE0_URL pointing at it; the client for that
+# path is still in the tree (src/judge/judge0_client.py).
+#
+# Prerequisites:
+#   useradd -r -s /sbin/nologin -G docker hfjudge
+#   mkdir -p /srv/judge_work && chown hfjudge:hfjudge /srv/judge_work
+#   bash backend/scripts/build_judge_images.sh   # builds hireflow-judge-{python,cpp,node,java}
+
+[Unit]
+Description=HireFlow coding-judge RQ worker
+After=network.target redis.service docker.service
+Requires=docker.service
+Wants=redis.service
+
+[Service]
+Type=exec
+User=hfjudge
+Group=hfjudge
+SupplementaryGroups=docker
+WorkingDirectory=/opt/hireflow/backend
+EnvironmentFile=/opt/hireflow/backend/.env
+
+Environment=ROLE=worker
+Environment=JUDGE_BACKEND=docker
+Environment=JUDGE_WORK_ROOT=/srv/judge_work
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/opt/hireflow/venv/bin:/usr/local/bin:/usr/bin:/bin
+
+ExecStart=/bin/sh /opt/hireflow/backend/entrypoint.sh
+
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=false
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/hireflow /srv/judge_work
+
+[Install]
+WantedBy=multi-user.target
