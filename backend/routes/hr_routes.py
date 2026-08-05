@@ -4,6 +4,7 @@ Handles job creation, ATS screening, interview scheduling, and offer management
 """
 
 from fastapi import APIRouter, HTTPException, status, Depends, Query, UploadFile, File
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func, desc, and_, or_
 from typing import List, Optional, Dict, Any
@@ -22,6 +23,7 @@ from src.services.resume_pool_import import (
 from src.services.talent_pool import derive_outcome, outcome_filter
 from pydantic import BaseModel, EmailStr, Field
 from datetime import datetime, timedelta
+import hashlib
 import logging
 import uuid
 import json

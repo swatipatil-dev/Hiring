@@ -164,7 +164,26 @@ def _register_and_login(client: TestClient, email: str, password: str,
 
 @pytest.fixture()
 def admin_headers(client, db):
-    return _register_and_login(client, "admin_test@test.com", "Pass@1234", "admin", "Admin", "User", db=db)
+    headers = _register_and_login(client, "admin_test@test.com", "Pass@1234", "admin", "Admin", "User", db=db)
+
+    # Non-candidate roles are seeded straight into the DB (see _register_and_login),
+    # which leaves company_id NULL. Every admin endpoint scopes queries by
+    # current_user.company_id, and SQLAlchemy renders `column == None` as
+    # `IS NULL` — so a company-less admin matches NO users and every lookup 404s.
+    #
+    # Candidates registered through the public endpoint resolve to the platform
+    # company, and routes/auth_routes.py states the intent directly: "HireFlow
+    # candidates share the same company as the superadmin/admin". Putting the
+    # admin there is what makes this fixture reflect production.
+    from src.models.models import User
+    from src.tenancy.platform_company import ensure_platform_company
+
+    company = ensure_platform_company(db)
+    admin = db.query(User).filter(User.email == "admin_test@test.com").first()
+    if admin:
+        admin.company_id = company.id
+        db.flush()
+    return headers
 
 
 @pytest.fixture()
