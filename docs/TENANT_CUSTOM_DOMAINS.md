@@ -2,7 +2,7 @@
 
 White-label HireFlow so each tenant company can serve its careers page, candidate
 portal, logins, and dashboards from **its own domain** — e.g. `careers.acmecorp.com`
-— instead of `hire.innomaxskills.com/jobs?key=<api_key>`.
+— instead of `career.innomaxskills.com/jobs?key=<api_key>`.
 
 > **Status legend used throughout this doc**
 > - ✅ **Built** — already in the codebase.
@@ -35,7 +35,7 @@ Two things make this cheap to build here:
 | Term | Meaning |
 |---|---|
 | **Tenant / Company** | A customer org. Root record: `companies` table (`Company` model). Everything else hangs off `company_id`. |
-| **Platform host** | Our own domain(s): `hire.innomaxskills.com` (prod), `localhost` (dev). The platform landing page and superadmin live here. |
+| **Platform host** | Our own domain(s): `career.innomaxskills.com` (prod), `localhost` (dev). The platform landing page and superadmin live here. |
 | **Slug** | URL-safe company key (`Company.slug`, unique). Basis for an optional `slug.<base-domain>` subdomain model (not the chosen model, but supported by the resolver). |
 | **API key** | `Company.api_key` (`sk_live_…`). Used by the legacy `?key=` iframe/embed flow. |
 | **Custom domain** | A tenant's own hostname (`careers.acmecorp.com`) stored in `Company.custom_domain` once verified. This is the model we ship. |
@@ -202,7 +202,7 @@ verification; the ALB makes each tenant a clean two-CNAME onboarding with an aut
 One-time setup (full `gcloud` sequence lives in the plan file
 `.claude/plans/as-the-project-system-silly-cosmos.md`, appendix):
 static global IP → Serverless NEG → backend service + URL map → Certificate Manager map →
-HTTPS proxy + forwarding rule → HTTP→HTTPS redirect. Migrate `hire.innomaxskills.com` onto the
+HTTPS proxy + forwarding rule → HTTP→HTTPS redirect. Migrate `career.innomaxskills.com` onto the
 LB and publish a stable `ingress.hireflow.io A <LB IP>` — that hostname is the CNAME target
 handed to tenants (so the LB IP can change without tenants re-doing DNS).
 

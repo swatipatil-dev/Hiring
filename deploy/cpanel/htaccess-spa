@@ -1,7 +1,7 @@
 # SPA history fallback for the React build.
 #
 # Install as .htaccess in the subdomain document root:
-#   cp deploy/cpanel/htaccess-spa /home/innomaxskills/public_html/hire/.htaccess
+#   cp deploy/cpanel/htaccess-spa /home/innomaxskills/public_html/career/.htaccess
 #
 # The API prefixes are handled by ProxyPass at the vhost level, which is
 # evaluated before .htaccess, so those requests never reach these rules — this

@@ -2,7 +2,7 @@
 
 Step-by-step, including where to click and where to paste. Follow top to bottom.
 
-**Target:** `hire.innomaxskills.com`
+**Target:** `career.innomaxskills.com`
 **Server:** `66.116.207.71` — AlmaLinux 9, 8 vCPU, 32 GB RAM
 **cPanel account:** `innomaxskills`
 
@@ -41,9 +41,9 @@ moving on — later steps assume the earlier ones worked.
 ## How the finished system fits together
 
 ```
-Browser → https://hire.innomaxskills.com
+Browser → https://career.innomaxskills.com
              │
-             ├─ /                    → /home/innomaxskills/public_html/hire/   (React files)
+             ├─ /                    → /home/innomaxskills/public_html/career/   (React files)
              ├─ /api/  /interviews/  → 127.0.0.1:8000   hireflow-api      (3 workers)
              └─ /proctor/ + sockets  → 127.0.0.1:8001   hireflow-proctor  (1 worker)
 
@@ -68,10 +68,10 @@ is not, so nothing comes as a surprise.
 
 | Thing | Why it is contained |
 |---|---|
-| Subdomain `hire.innomaxskills.com` | Belongs to this account only |
+| Subdomain `career.innomaxskills.com` | Belongs to this account only |
 | Database `innomaxskills_hireflow` | cPanel prefixes and permissions scope it per account |
-| Apache config | Installed at `.../userdata/{std,ssl}/2_4/innomaxskills/hire.innomaxskills.com/` — that path is read **only** for this account's vhost |
-| Website files | `/home/innomaxskills/public_html/hire/` |
+| Apache config | Installed at `.../userdata/{std,ssl}/2_4/innomaxskills/career.innomaxskills.com/` — that path is read **only** for this account's vhost |
+| Website files | `/home/innomaxskills/public_html/career/` |
 | Application code | `/opt/hireflow` — outside every account's home directory |
 | Service users | `hireflow`, `hfjudge` — new users owning nothing pre-existing |
 
@@ -407,32 +407,32 @@ mkdir -p /srv/judge_work && chown hfjudge:hfjudge /srv/judge_work
 
 1. `[cPanel]` (still in the `innomaxskills` account) Search box → `Domains`
 2. Click **Domains** → **Create A New Domain**
-3. **Domain:** `hire.innomaxskills.com`
+3. **Domain:** `career.innomaxskills.com`
 4. **Untick** "Share document root"
-5. **Document Root:** `/home/innomaxskills/public_html/hire`
+5. **Document Root:** `/home/innomaxskills/public_html/career`
 6. **Submit**
 
 <details>
 <summary>Older cPanel versions</summary>
 
 Search for **Subdomains** instead. Subdomain `hire`, Domain `innomaxskills.com`,
-Document Root `public_html/hire`, then **Create**.
+Document Root `public_html/career`, then **Create**.
 </details>
 
-**Check:** `[root]` `ls -d /home/innomaxskills/public_html/hire` exists.
+**Check:** `[root]` `ls -d /home/innomaxskills/public_html/career` exists.
 
 ### 5.2 Issue the SSL certificate
 
 1. `[cPanel]` Search box → `SSL`
 2. Click **SSL/TLS Status**
-3. Tick `hire.innomaxskills.com`
+3. Tick `career.innomaxskills.com`
 4. Click **Run AutoSSL**
 5. Wait for a green padlock next to the domain (can take a few minutes)
 
 **Check:**
 
 ```bash
-curl -sI https://hire.innomaxskills.com | head -1
+curl -sI https://career.innomaxskills.com | head -1
 ```
 
 You should get an HTTP response line with **no certificate error**. A 403 or 404
@@ -695,10 +695,10 @@ journalctl -u hireflow-api -n 50 --no-pager
 `[root]`
 
 ```bash
-mkdir -p /etc/apache2/conf.d/userdata/{std,ssl}/2_4/innomaxskills/hire.innomaxskills.com
+mkdir -p /etc/apache2/conf.d/userdata/{std,ssl}/2_4/innomaxskills/career.innomaxskills.com
 for m in std ssl; do
   cp /opt/hireflow/deploy/cpanel/hireflow.conf \
-     /etc/apache2/conf.d/userdata/$m/2_4/innomaxskills/hire.innomaxskills.com/
+     /etc/apache2/conf.d/userdata/$m/2_4/innomaxskills/career.innomaxskills.com/
 done
 /scripts/ensure_vhost_includes --user=innomaxskills
 /scripts/restartsrv_httpd
@@ -722,7 +722,7 @@ setsebool -P httpd_can_network_connect 1
 **Check:**
 
 ```bash
-curl -s https://hire.innomaxskills.com/health
+curl -s https://career.innomaxskills.com/health
 ```
 
 Returns the same healthy JSON as Step 11.
@@ -737,9 +737,9 @@ Returns the same healthy JSON as Step 11.
 cd /opt/hireflow/frontend
 npm ci
 npm run build
-rsync -a --delete dist/ /home/innomaxskills/public_html/hire/
-cp /opt/hireflow/deploy/cpanel/htaccess-spa /home/innomaxskills/public_html/hire/.htaccess
-chown -R innomaxskills:innomaxskills /home/innomaxskills/public_html/hire
+rsync -a --delete dist/ /home/innomaxskills/public_html/career/
+cp /opt/hireflow/deploy/cpanel/htaccess-spa /home/innomaxskills/public_html/career/.htaccess
+chown -R innomaxskills:innomaxskills /home/innomaxskills/public_html/career
 ```
 
 If `npm` is missing:
@@ -748,10 +748,10 @@ If `npm` is missing:
 dnf install -y nodejs npm
 ```
 
-**Check:** `ls /home/innomaxskills/public_html/hire` shows `index.html` and an
+**Check:** `ls /home/innomaxskills/public_html/career` shows `index.html` and an
 `assets` folder.
 
-Open **https://hire.innomaxskills.com** — the login page should appear.
+Open **https://career.innomaxskills.com** — the login page should appear.
 
 ---
 
@@ -761,7 +761,7 @@ Work through these in order.
 
 | # | Test | How | Expected |
 |---|---|---|---|
-| 1 | Website loads | Open `https://hire.innomaxskills.com` | Login page, no errors in browser console (`F12`) |
+| 1 | Website loads | Open `https://career.innomaxskills.com` | Login page, no errors in browser console (`F12`) |
 | 2 | Sign-up + email | Register a test account | OTP email arrives; you can log in |
 | 3 | Migrated files | Open a candidate with an old CV | The PDF opens |
 | 4 | CV scoring | Upload a CV against a job | A score appears |
@@ -787,7 +787,7 @@ docker ps
 For test 8, with real sessions running:
 
 ```bash
-curl -s https://hire.innomaxskills.com/api/v1/proctor/warmup
+curl -s https://career.innomaxskills.com/api/v1/proctor/warmup
 free -g
 ```
 
@@ -895,7 +895,7 @@ systemctl restart hireflow-api hireflow-proctor hireflow-judge-worker hireflow-e
 
 # Rebuild the website after a code update
 cd /opt/hireflow/frontend && npm ci && npm run build
-rsync -a --delete dist/ /home/innomaxskills/public_html/hire/
-cp /opt/hireflow/deploy/cpanel/htaccess-spa /home/innomaxskills/public_html/hire/.htaccess
-chown -R innomaxskills:innomaxskills /home/innomaxskills/public_html/hire
+rsync -a --delete dist/ /home/innomaxskills/public_html/career/
+cp /opt/hireflow/deploy/cpanel/htaccess-spa /home/innomaxskills/public_html/career/.htaccess
+chown -R innomaxskills:innomaxskills /home/innomaxskills/public_html/career
 ```
