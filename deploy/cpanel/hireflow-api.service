@@ -44,6 +44,20 @@ RestartSec=5
 TimeoutStartSec=300
 TimeoutStopSec=30
 
+# ── Resource limits: this server also hosts other cPanel accounts ────────────
+# MemoryMax is a HARD ceiling. Without it, a leak or spike here lets the kernel
+# OOM-killer choose a victim anywhere on the box — quite possibly MySQL or
+# another account's PHP workers. With it, systemd kills only this service.
+#
+# CPUWeight, not CPUQuota, is deliberate. CPUQuota throttles even on an idle
+# machine, wasting capacity we paid for. CPUWeight only applies under
+# contention: below the default of 100, so Apache, MySQL and the other accounts
+# win when the box is busy, while this service still uses everything spare.
+MemoryMax=8G
+MemoryHigh=7G
+CPUWeight=50
+IOWeight=50
+
 # Hardening. ReadWritePaths must include the upload tree (HIREFLOW_DATA_DIR) and
 # the HuggingFace cache, or ProtectSystem makes them read-only at runtime.
 NoNewPrivileges=true

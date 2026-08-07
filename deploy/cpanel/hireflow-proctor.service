@@ -52,6 +52,19 @@ RestartSec=5
 TimeoutStartSec=600
 TimeoutStopSec=60
 
+# ── Resource limits: this server also hosts other cPanel accounts ────────────
+# This is the heaviest service on the box — video inference for every candidate
+# — so it gets the largest ceiling and the LOWEST cpu priority. Under load it
+# yields to Apache, MySQL and the other accounts first.
+#
+# Sizing: measured ~604 MB for models plus 50 live sessions, on top of roughly
+# 1 GB of resident torch/mediapipe imports. 10G leaves generous headroom; raise
+# it only alongside PROCTOR_INFERENCE_SLOTS, since each slot costs ~115 MB.
+MemoryMax=10G
+MemoryHigh=9G
+CPUWeight=40
+IOWeight=40
+
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full

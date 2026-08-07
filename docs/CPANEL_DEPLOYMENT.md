@@ -19,7 +19,7 @@ moving on — later steps assume the earlier ones worked.
 - [Step 0 — Get logged in](#step-0--get-logged-in)
 - [Step 1 — Collect these before you start](#step-1--collect-these-before-you-start)
 - [Step 2 — Install server software](#step-2--install-server-software)
-- [Step 3 — MySQL 8.0 and the database](#step-3--mysql-80-and-the-database)
+- [Step 3 — The database](#step-3--the-database)
 - [Step 4 — Create users and folders](#step-4--create-users-and-folders)
 - [Step 5 — Create the subdomain and SSL](#step-5--create-the-subdomain-and-ssl)
 - [Step 6 — Install the application](#step-6--install-the-application)
@@ -56,6 +56,65 @@ memory of one process. If it ran with several workers, a candidate's video
 connection could land on a different worker than the one holding their session,
 and it would disconnect. So proctoring runs alone with exactly **one** worker.
 Do not change that — capacity comes from `PROCTOR_INFERENCE_SLOTS` instead.
+
+---
+
+## What this deployment touches on a shared server
+
+This box hosts five cPanel accounts. Here is exactly what is isolated and what
+is not, so nothing comes as a surprise.
+
+### Isolated to `innomaxskills` — cannot affect the others
+
+| Thing | Why it is contained |
+|---|---|
+| Subdomain `hire.innomaxskills.com` | Belongs to this account only |
+| Database `innomaxskills_hireflow` | cPanel prefixes and permissions scope it per account |
+| Apache config | Installed at `.../userdata/{std,ssl}/2_4/innomaxskills/hire.innomaxskills.com/` — that path is read **only** for this account's vhost |
+| Website files | `/home/innomaxskills/public_html/hire/` |
+| Application code | `/opt/hireflow` — outside every account's home directory |
+| Service users | `hireflow`, `hfjudge` — new users owning nothing pre-existing |
+
+### Server-wide — affects all five accounts
+
+Marked **`[SERVER-WIDE]`** in the steps below.
+
+| Action | What actually changes | Risk |
+|---|---|---|
+| Add Apache modules (2.1) | Adds `mod_proxy_wstunnel`; Apache restarts once | Low — purely additive; ~2 s blip for all sites |
+| Install Python 3.11 (2.2) | New package alongside the system Python | Very low — nothing replaced |
+| EPEL + graphics libraries (2.3) | Adds a repository and shared libraries | Low — additive, but EPEL is a third-party repo |
+| Install Redis (2.4) | New service on `127.0.0.1:6379` | Low — verify the port is free first |
+| Install Docker (2.5) | New daemon plus iptables rules | Moderate — can interact with CSF/firewalld |
+| CPU, RAM and disk | Shared with every account | Managed — see below |
+
+**Nothing in this guide removes, downgrades or reconfigures software the other
+accounts already use.** The one step that would have — upgrading the database
+engine — has been removed; see Step 3.1.
+
+### How the other accounts are protected from resource starvation
+
+The four service files in `deploy/cpanel/` set systemd limits:
+
+| Service | Memory ceiling | CPU priority |
+|---|---|---|
+| `hireflow-proctor` | 10 GB | 40 |
+| `hireflow-api` | 8 GB | 50 |
+| `hireflow-judge-worker` | 2 GB | 30 |
+| `hireflow-email-worker` | 1 GB | 30 |
+
+Two deliberate choices:
+
+- **`MemoryMax` is a hard ceiling.** If HireFlow leaks or spikes, systemd kills
+  *our* service. Without it the kernel's OOM killer picks its own victim, which
+  could be MySQL or another account's PHP workers.
+- **`CPUWeight`, not `CPUQuota`.** A quota throttles even when the machine is
+  idle, wasting capacity. Weight applies only under contention: the default is
+  100, so at 40–50 our services yield to Apache, MySQL and the other accounts
+  when the box is busy, while still using everything spare when it is not.
+
+Worst case, all four services together are capped at 21 GB of 32 GB, leaving
+11 GB for MySQL, Apache, cPanel and the other four accounts.
 
 ---
 
@@ -110,6 +169,45 @@ cat /etc/redhat-release && nproc && free -g | head -2
 
 **Check:** AlmaLinux 9.x, `8` CPUs, roughly 31 GB total memory.
 
+### 0.4 Pre-flight checks — run these before changing anything
+
+**This server is shared.** It hosts five cPanel accounts — `crminnomaxsol`,
+`innomaxskills`, `innomax2`, `innomaxstartup`, `tropicaeco` — all on the same IP,
+the same Apache, the same database engine and the same CPU and RAM. Most of this
+guide only touches `innomaxskills`, but a few steps are server-wide (they are
+marked **`[SERVER-WIDE]`**). Run these checks first so you know what you are
+starting from.
+
+`[root]` — paste the whole block:
+
+```bash
+echo "--- OS / CloudLinux ---";  cat /etc/redhat-release
+                                 test -f /etc/cloudlinux-release && echo "CloudLinux: YES" || echo "CloudLinux: no"
+echo "--- CPU / RAM / disk ---"; nproc; free -g | head -2; df -h / | tail -1
+echo "--- database engine ---";  mysql --version
+echo "--- databases in use ---"; mysql -e "SHOW DATABASES;" 2>/dev/null | wc -l
+echo "--- ports we need ---";    ss -lntp | grep -E ':(8000|8001|6379)\b' || echo "8000, 8001, 6379 all free"
+echo "--- firewall ---";         systemctl is-active csf firewalld docker 2>/dev/null
+echo "--- apache modules ---";   httpd -M 2>/dev/null | grep -cE 'proxy_wstunnel'
+echo "--- epel present? ---";    dnf repolist 2>/dev/null | grep -ci epel
+```
+
+Read the output against this table:
+
+| Output | Meaning |
+|---|---|
+| `CloudLinux: no` | Expected. No per-account memory caps to work around. |
+| RAM `total` ~31, `free` low | Normal — Linux caches aggressively. Check the `available` column, which is what matters. |
+| `mysql --version` shows **MariaDB** | **Fine — do not upgrade.** See Step 3.1. |
+| Ports listed as busy | Something already uses 8000/8001/6379. Stop and change the ports before continuing. |
+| `csf` or `firewalld` active | Note it — Docker adds firewall rules in Step 2.5. |
+| `docker` already active | Docker is installed; you can skip Step 2.5. |
+| apache modules count `1` | `mod_proxy_wstunnel` is already there; Step 2.1 is a no-op. |
+
+**Take a backup before the server-wide steps.** `[WHM]` search box → `Backup
+Configuration`, and confirm backups are enabled and recent. If anything goes
+wrong at Apache or Docker level, that is your way back.
+
 ### A note on editing files with `nano`
 
 Several steps ask you to edit a file. We use `nano`, which is already installed:
@@ -156,7 +254,7 @@ are for migration only — skip them for a fresh install.
 
 ## Step 2 — Install server software
 
-### 2.1 Apache WebSocket module
+### 2.1 Apache WebSocket module  `[SERVER-WIDE]`
 
 `[root]`
 
@@ -173,7 +271,7 @@ httpd -M 2>/dev/null | grep -E 'proxy_wstunnel|proxy_http'
 Both must be listed. `mod_proxy_wstunnel` is **not** installed by default, and
 without it the live proctoring video will never connect.
 
-### 2.2 Python 3.11
+### 2.2 Python 3.11  `[SERVER-WIDE]`
 
 `[root]`
 
@@ -186,7 +284,7 @@ dnf install -y python3.11 python3.11-devel
 > Do **not** use cPanel's "Setup Python App" for this. That system cannot handle
 > the live video connections proctoring needs.
 
-### 2.3 Graphics and OCR libraries
+### 2.3 Graphics and OCR libraries  `[SERVER-WIDE]`
 
 `[root]`
 
@@ -200,7 +298,7 @@ dnf install -y mesa-libGL mesa-libEGL glib2 libsndfile tesseract gcc gcc-c++ mak
 These are required by the AI vision libraries. Skip them and proctoring fails
 later with `libGL.so.1: cannot open shared object file`.
 
-### 2.4 Redis
+### 2.4 Redis  `[SERVER-WIDE]`
 
 `[root]`
 
@@ -212,7 +310,7 @@ systemctl enable --now redis
 
 **Check:** `redis-cli ping` replies `PONG`.
 
-### 2.5 Docker
+### 2.5 Docker  `[SERVER-WIDE]`
 
 `[root]`
 
@@ -228,18 +326,31 @@ Docker runs candidate code safely isolated. No reboot is needed.
 
 ---
 
-## Step 3 — MySQL 8.0 and the database
+## Step 3 — The database
 
-### 3.1 Switch to MySQL 8.0
+### 3.1 Do NOT change the database engine
 
-Do this **before** creating any database.
+**Use whatever is already installed.** cPanel cannot run without MySQL or
+MariaDB, so it is already there and the other four accounts already have live
+databases on it.
 
-1. `[WHM]` Search box → type `MySQL`
-2. Click **MySQL/MariaDB Upgrade**
-3. Select **MySQL 8.0**
-4. Follow the prompts and let it finish
+> ### Why this guide no longer tells you to upgrade to MySQL 8.0
+>
+> An earlier draft did, to match the old Google Cloud setup exactly. That is the
+> wrong call on a shared server:
+>
+> - The engine is **server-wide** — all five accounts share one instance.
+> - cPanel's MariaDB → MySQL upgrade is **irreversible**; there is no downgrade.
+> - It could break the other four sites if any depend on MariaDB behaviour.
+>
+> And HireFlow does not need it. The application stores JSON as whole documents
+> that Python serialises, never querying into them with SQL JSON functions, and
+> uses no MySQL-8-only syntax. It runs correctly on MariaDB 10.5+.
+>
+> **Skip the upgrade. There is nothing to install in this step.**
 
-**Check:** `[root]` `mysql --version` shows `8.0` and **not** `MariaDB`.
+**Check:** `[root]` `mysql --version` prints *something* — MariaDB or MySQL, either
+is fine. Note which, in case you need it for support later.
 
 ### 3.2 Create the database and user
 

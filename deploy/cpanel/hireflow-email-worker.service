@@ -28,6 +28,12 @@ ExecStart=/bin/sh /opt/hireflow/backend/entrypoint.sh
 Restart=always
 RestartSec=10
 
+# ── Resource limits: this server also hosts other cPanel accounts ────────────
+# Tiny workload — it formats messages and hands them to an SMTP relay.
+MemoryMax=1G
+CPUWeight=30
+IOWeight=30
+
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full

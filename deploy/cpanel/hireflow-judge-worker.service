@@ -41,6 +41,19 @@ ExecStart=/bin/sh /opt/hireflow/backend/entrypoint.sh
 Restart=always
 RestartSec=5
 
+# ── Resource limits: this server also hosts other cPanel accounts ────────────
+# Lowest priority on the box — a candidate's submission must never slow down
+# another account's website.
+#
+# IMPORTANT: these limits bound THIS worker process only. The sandboxes it
+# launches are separate Docker containers with their own cgroups, capped by
+# --memory / --cpus / --pids-limit in src/judge/sandbox.py. Both layers matter:
+# this one stops the queue runner leaking, that one stops submitted code from
+# consuming the machine.
+MemoryMax=2G
+CPUWeight=30
+IOWeight=30
+
 NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=full
