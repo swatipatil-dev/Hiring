@@ -101,7 +101,9 @@ Uploaded files resolve against `HIREFLOW_DATA_DIR` (default: the `backend/` dire
 
 Additional docs in `docs/`: API documentation, microservice architecture guide, MySQL setup, quickstart guide, and workflow docs.
 
-**Deployment**: `docs/CPANEL_DEPLOYMENT.md` is the runbook, with the service units and Apache config in `deploy/cpanel/`. Two constraints worth knowing before changing anything there:
+**Deployment**: `docs/CPANEL_DEPLOYMENT.md` is the step-by-step runbook and `docs/DEPLOYMENT_NOTES.md` is the reference for *why* — non-obvious constraints, silent failure modes, and which config file wins. Read the latter before changing deployment behaviour. Service units and Apache config live in `deploy/cpanel/`.
+
+Two constraints worth knowing before changing anything there:
 
 - **Proctoring must run as a single worker.** `proctoring/routes.py` keeps sessions in a process-local dict of live MediaPipe handles, so a session's WebSocket must reach the process that created it. It runs as its own service for this reason.
 - **Proctoring models are shared, not per-session.** `proctoring/model_registry.py` holds a bounded pool of model sets borrowed per call; analyzers hold only session state. Memory scales with CPU, not candidate count. Anything added to an analyzer's `__init__` should be state, not a model.

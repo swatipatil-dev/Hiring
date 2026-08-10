@@ -9,6 +9,11 @@ Step-by-step, including where to click and where to paste. Follow top to bottom.
 Each step lists a **Check:** line. If it doesn't match, stop and fix it before
 moving on — later steps assume the earlier ones worked.
 
+> **Changing the deployment rather than performing it?** Read
+> [DEPLOYMENT_NOTES.md](DEPLOYMENT_NOTES.md) first. It records the constraints
+> that are easy to break unknowingly, the failures that produce no error message,
+> and why several things are shaped the way they are.
+
 > **Notation.** `[root]` = paste into the root terminal (Step 0.2).
 > `[cPanel]` / `[WHM]` = do it in the browser.
 
