@@ -89,7 +89,12 @@ def check_proctoring_models():
 
 
 def warm_model_pool():
-    """Build one ModelSet so a bad install fails here, not at session start."""
+    """Build one ModelSet so a bad install fails here, not at session start.
+
+    Each engine is reported on its own line. Summarising them as a dict inside an
+    "ok" result hides a disabled one: proctoring still starts without YOLO or
+    pose, it just silently stops detecting whole categories of cheating.
+    """
     print("\nProctoring model pool (builds one set to prove it loads)")
     try:
         t0 = time.perf_counter()
@@ -97,16 +102,33 @@ def warm_model_pool():
         built = model_registry.warm(1)
         caps = model_registry.capabilities()
         model_registry.shutdown()
-        usable = caps.get("landmarker") or caps.get("sface")
-        _report("ModelSet build", bool(built) and usable,
-                f"{time.perf_counter() - t0:.1f}s, engines={caps}"
-                if usable else f"no face engine loaded: {caps}")
     except ImportError as e:
         _report("ModelSet build", False,
                 f"proctoring extras not installed ({e}) — proctoring disabled",
                 required=False)
+        return
     except Exception as e:
         _report("ModelSet build", False, f"{type(e).__name__}: {e}")
+        return
+
+    _report("ModelSet build", bool(built), f"{time.perf_counter() - t0:.1f}s")
+
+    # At least one face engine is mandatory — without it the pipeline reports
+    # clean frames forever and a test only looks proctored.
+    face_ok = caps.get("landmarker") or caps.get("sface")
+    _report("face engine (landmarker or sface)", face_ok,
+            "" if face_ok else "NEITHER loaded — proctoring cannot verify identity")
+
+    for engine, what_is_lost in (
+        ("landmarker", "head pose and gaze fall back to the reduced Haar path"),
+        ("sface",      "identity matching falls back to histogram comparison"),
+        ("pose",       "no posture or phone-gesture detection"),
+        ("yolo",       "NO OBJECT DETECTION — phones, books and second people "
+                       "go unflagged"),
+    ):
+        on = bool(caps.get(engine))
+        _report(f"  engine: {engine}", on, "" if on else what_is_lost,
+                required=False)
 
 
 def check_spacy():

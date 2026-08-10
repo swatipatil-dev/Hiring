@@ -45,6 +45,11 @@ from .runtime import configure_native_threads, inference_slots
 
 logger = logging.getLogger(__name__)
 
+# The backend/ directory. YOLO weights are configured as a bare filename
+# ("yolov8n.pt") and live here, so they must be resolved against this rather than
+# the process working directory — see _load_yolo.
+_BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 _MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
 _FACE_LANDMARKER_MODEL = os.path.join(_MODEL_DIR, "face_landmarker.task")
 _POSE_LANDMARKER_MODEL = os.path.join(_MODEL_DIR, "pose_landmarker.task")
@@ -191,7 +196,25 @@ class ModelSet:
             cfg = object_cfg or ObjectConfig()
             has_cuda = torch.cuda.is_available()
             self.device = "cuda" if has_cuda else "cpu"
-            self.yolo = YOLO(cfg.model_gpu if has_cuda else cfg.model_cpu)
+
+            # The config names the weights as a bare filename. Ultralytics
+            # resolves such a name against the CWD and, failing to find it,
+            # tries to DOWNLOAD it there — which raises EACCES under systemd,
+            # cron, or any shell started outside backend/, silently disabling
+            # object detection. Resolve against backend/ where the file lives.
+            weights = cfg.model_gpu if has_cuda else cfg.model_cpu
+            if not os.path.isabs(weights):
+                local = os.path.join(_BACKEND_DIR, weights)
+                if os.path.exists(local):
+                    weights = local
+                else:
+                    logger.warning(
+                        "YOLO weights %r not found in %s — ultralytics will try to "
+                        "download them, which needs a writable working directory",
+                        weights, _BACKEND_DIR,
+                    )
+
+            self.yolo = YOLO(weights)
             if has_cuda:
                 self.yolo.to("cuda")
 
