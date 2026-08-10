@@ -552,7 +552,30 @@ Edit each line (see the nano keys in Step 0). Use `Ctrl+W` to jump to a setting.
 | `DATABASE_URL=` | `mysql+pymysql://innomaxskills_hf:YOURPASSWORD@localhost:3306/innomaxskills_hireflow` |
 | `GEMINI_API_KEY=` | your key from Step 1 |
 | `SMTP_HOST=` `SMTP_PORT=` `SMTP_USER=` `SMTP_PASS=` `FROM_EMAIL=` | your email provider details |
+| `SUPERADMIN_EMAIL=` `SUPERADMIN_PASSWORD=` | **required on a fresh install** — see below |
+| `PLATFORM_ADMIN_EMAIL=` `PLATFORM_ADMIN_PASSWORD=` | **required on a fresh install** — see below |
 | `EMAIL_ENCRYPTION_KEY=` | migration only — **read the box below, it may not exist under that name** |
+
+> ### Without the admin accounts you cannot log in at all
+>
+> Self-registration is candidate-only — HR, interviewer and admin accounts are
+> normally created by an existing admin. On an empty database that leaves no way
+> in. `src/bootstrap.py` seeds the first two accounts from these variables at
+> startup; both are no-ops if the user already exists.
+>
+> Generate passwords with:
+>
+> ```bash
+> /opt/hireflow/venv/bin/python -c "import secrets; print(secrets.token_urlsafe(18))"
+> ```
+>
+> Use addresses you can receive mail at — password resets go there. After the
+> accounts exist you may blank the passwords, but leave the email values: the
+> seeding is skipped entirely when they are empty.
+>
+> Skip this and you get a deployment that passes every health check and that you
+> cannot administer. Migrating existing data instead? Your old admin accounts
+> come across with the dump, so these are optional in that case.
 
 > ### `EMAIL_ENCRYPTION_KEY` — the trap when migrating
 >
