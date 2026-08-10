@@ -476,18 +476,47 @@ sudo -u hireflow /opt/hireflow/venv/bin/pip install -U pip wheel
 sudo -u hireflow /opt/hireflow/venv/bin/pip install -r /opt/hireflow/backend/requirements-cpanel.txt
 ```
 
-**Check:**
+**Check:** confirm the CPU build of PyTorch was installed, not the graphics-card one:
 
 ```bash
-/opt/hireflow/venv/bin/pip list | grep -c nvidia
+/opt/hireflow/venv/bin/python -c "import torch; print(torch.__version__, '| CUDA build:', torch.version.cuda)"
+du -sh /opt/hireflow/venv
 ```
 
-Must print `0`.
+**Expected:** `2.1.1+cpu | CUDA build: None`, and a venv of roughly **2–3 GB**.
+
+| Result | Meaning |
+|---|---|
+| ends `+cpu`, `CUDA build: None` | Correct. Continue. |
+| a CUDA version number, venv 6–8 GB | The graphics-card build got in — see below. Not fatal; it still runs on CPU. |
+
+> Do not use `pip list \| grep nvidia` to judge this. `ultralytics` pulls in
+> `nvidia-ml-py`, a ~50 KB pure-Python package for querying GPU stats that
+> contains no CUDA libraries at all — so its presence is normal and means
+> nothing. `torch.version.cuda` is the real answer.
 
 > Use `requirements-cpanel.txt`, **never** `requirements.txt`. The plain file
 > downloads a graphics-card version of PyTorch — about 2 GB of files this server
 > cannot use — and includes a database driver that fails to build here and aborts
 > the whole install.
+
+<details>
+<summary>If the CUDA build was installed anyway</summary>
+
+`requirements-cpanel.txt` uses `--extra-index-url` for the CPU wheels. *Extra*
+means additional, not exclusive — pip may still choose PyPI's CUDA build, since
+`torch==2.1.1` exists on both. Everything works either way; the cost is a few GB
+of disk and a little memory. To reclaim it:
+
+```bash
+sudo -u hireflow /opt/hireflow/venv/bin/pip uninstall -y torch
+sudo -u hireflow /opt/hireflow/venv/bin/pip install torch==2.1.1 \
+  --index-url https://download.pytorch.org/whl/cpu
+```
+
+`--index-url` replaces the index rather than adding to it, so the CPU wheel is
+the only candidate.
+</details>
 
 ---
 
