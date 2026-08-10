@@ -58,7 +58,11 @@ def _json_list(value) -> list:
 # Lines that begin like a sentence/description rather than a project title.
 _PROJECT_DESC_STARTERS = re.compile(
     r'^(developed|built|created|designed|implemented|worked|using|used|responsible|'
-    r'led|managed|the|a|an|this|it|we|i|my)\b',
+    r'led|managed|the|a|an|this|it|we|i|my|preprocessed|trained|achieved|deployed|'
+    r'applied|verified|delivered|evaluated|fine-tuned|optimized|integrated|engineered|'
+    r'extracted|automated|analyzed|constructed|configured|formulated|maintained|'
+    r'conducted|calculated|performed|generated|utilizing|utilizes|leverages|leveraging|'
+    r'spearheaded|orchestrated|established|accelerated|pioneered|transformed)\b',
     re.IGNORECASE,
 )
 _LEADING_BULLET = re.compile(r'^[\s•\-\*·▪‣◦>\.]+')
@@ -78,15 +82,14 @@ _DEGREE_KW = re.compile(
 _INSTITUTION_KW = re.compile(r'\b(university|college|institute|school|academy)\b', re.IGNORECASE)
 
 
-def _work_experience_from_section(section_text: str) -> List[Dict[str, Any]]:
-    """Extract (company, title) pairs from the detected Experience section only.
+_URL_PATTERN = re.compile(r'(?:https?://|www\.|[\w\-]+\.(?:com|org|io|net|edu|gov|co|in|dev|app|me|ai))', re.IGNORECASE)
+_EMAIL_PATTERN = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b')
+_PHONE_PATTERN = re.compile(r'(?:\+?\d{1,3}[\s\.\-]*)?\(?\d{2,5}\)?[\s\.\-]*\d{3,5}[\s\.\-]*\d{3,5}')
+_LOCATION_PATTERN = re.compile(r'\b([A-Z][a-zA-Z\s]{2,25}),\s*([A-Z][a-zA-Z\s]{2,20}|[A-Z]{2})\b')
 
-    Handles the common two-line entry layout
-    ``<Company> <date-range>`` / ``<Title> <location>``: the company sits on
-    the line carrying the date range, the title is the next non-bullet line.
-    Avoids the whole-document ATS scan that mistakes the "EXPERIENCE" heading
-    for a company. Returns [] when nothing usable is found.
-    """
+
+def _work_experience_from_section(section_text: str) -> List[Dict[str, Any]]:
+    """Extract (company, title) pairs from the detected Experience section only."""
     if not section_text or not section_text.strip():
         return []
     lines = [ln.strip() for ln in section_text.split("\n") if ln.strip()]
@@ -112,142 +115,305 @@ def _work_experience_from_section(section_text: str) -> List[Dict[str, Any]]:
 
 
 def _education_from_section(section_text: str) -> List[Dict[str, Any]]:
-    """Extract (degree, institution) pairs from the detected Education section.
-
-    Degree = line matching a degree keyword with the trailing date range
-    stripped; institution = text up to and including the institution keyword
-    (drops the location that usually follows it). Pairs them positionally.
-    """
+    """Extract (degree, institution) pairs dynamically across any education layout."""
     if not section_text or not section_text.strip():
         return []
     lines = [ln.strip() for ln in section_text.split("\n") if ln.strip()]
-    degrees: List[str] = []
-    institutions: List[str] = []
-    for line in lines:
-        if _DEGREE_KW.search(line):
-            m = _DATE_TOKEN.search(line)
-            deg = (line[: m.start()] if m else line).strip(" .,-–—|")
-            if deg:
-                degrees.append(deg)
-        elif _INSTITUTION_KW.search(line):
-            im = _INSTITUTION_KW.search(line)
-            end = im.end()
-            # Keep a trailing "of <Name>" so "University of Madrid" survives
-            # intact; otherwise cut after the keyword to drop the location that
-            # usually follows (e.g. "Stanford University  California").
-            of_match = re.match(
-                r'\s+of\s+[A-Za-z][\w&.\'-]*(?:\s+[A-Za-z][\w&.\'-]*){0,3}',
-                line[end:],
-            )
-            if of_match:
-                end += of_match.end()
-            inst = line[:end].strip(" .,-–—|")
-            if inst:
-                institutions.append(inst)
     out: List[Dict[str, Any]] = []
-    rows = max(len(degrees), len(institutions))
-    for k in range(rows):
-        deg = degrees[k] if k < len(degrees) else ""
-        inst = institutions[k] if k < len(institutions) else ""
-        if deg or inst:
-            out.append({"degree": deg, "institution": inst, "confidence": 0.6})
+
+    for line in lines:
+        if _LEADING_BULLET.match(line):
+            line = _LEADING_BULLET.sub("", line).strip()
+        if not line:
+            continue
+
+        m_deg = _DEGREE_KW.search(line)
+        if m_deg:
+            m_date = _DATE_TOKEN.search(line)
+            clean_line = line[: m_date.start()] if m_date else line
+            clean_line = clean_line.strip(" .,-–—|")
+
+            degree_part = clean_line
+            inst_part = ""
+
+            parts = re.split(r',\s*|\s+from\s+|\s+at\s+|(?<=\w)\s+–\s+|(?<=\w)\s+-\s+', clean_line)
+            if len(parts) >= 2:
+                inst_tokens = [p.strip() for p in parts if _INSTITUTION_KW.search(p)]
+                deg_tokens = [p.strip() for p in parts if not _INSTITUTION_KW.search(p)]
+                if inst_tokens:
+                    inst_part = ", ".join(inst_tokens)
+                    degree_part = " - ".join(deg_tokens) if deg_tokens else degree_part
+
+            out.append({
+                "degree": degree_part,
+                "institution": inst_part,
+                "confidence": 0.8 if inst_part else 0.6
+            })
+        elif _INSTITUTION_KW.search(line):
+            inst = line.strip(" .,-–—|")
+            if out and not out[-1]["institution"]:
+                out[-1]["institution"] = inst
+            else:
+                out.append({"degree": "", "institution": inst, "confidence": 0.6})
+
     return out[:10]
 
 
 def _certifications_from_section(section_text: str) -> List[str]:
-    """Extract full certification names from the detected Certifications section.
-
-    The ATS regex only recognises a fixed vendor list and truncates names
-    ("AWS Certified Solutions Architect" → "AWS Certified"); reading the section
-    line-by-line preserves the full name and captures custom/org certs the
-    regex misses. Bullets and trailing dates are stripped. Returns [] when
-    there's no Certifications section, so the caller can fall back to the regex.
-    """
-    from src.services.enhanced_ats_service import SPOKEN_LANGUAGES_SET, SOFT_SKILLS_SET, DEGREE_TITLES_SET
+    """Extract certification names dynamically for any resume, excluding noise and contact lines."""
     if not section_text or not section_text.strip():
         return []
+    from src.services.enhanced_ats_service import SPOKEN_LANGUAGES_SET, SOFT_SKILLS_SET, DEGREE_TITLES_SET, _is_section_header
     out: List[str] = []
     seen = set()
+
     for raw in section_text.split("\n"):
-        line = _LEADING_BULLET.sub("", raw).strip(" .,-–—|()")
-        # Strip a trailing date / year ("... – Associate (2022)").
+        line = _LEADING_BULLET.sub("", raw).strip(" .,-–—|")
+        if not line or len(line) < 3 or len(line) > 100:
+            continue
+
+        if _URL_PATTERN.search(line) or _EMAIL_PATTERN.search(line) or _PHONE_PATTERN.search(line):
+            continue
+
+        if line.count(",") >= 2 or line.count(";") >= 2:
+            continue
+
+        low = line.lower()
+        if low in seen or low in SPOKEN_LANGUAGES_SET or low in SOFT_SKILLS_SET or low in DEGREE_TITLES_SET:
+            continue
+
+        if _is_section_header(line):
+            continue
+
+        if not re.search(r'[A-Za-z]{3,}', line):
+            continue
+
         m = _DATE_TOKEN.search(line)
         if m and m.start() > 0:
-            line = line[: m.start()].strip(" .,-–—|()")
-        # Need at least a few letters; drop date-only lines and over-long prose.
-        if not (3 <= len(line) <= 120) or not re.search(r'[A-Za-z]{3,}', line):
-            continue
+            line = line[: m.start()].strip(" .,-–—|")
+
         key = line.lower()
-        if key in seen or key in SPOKEN_LANGUAGES_SET or key in SOFT_SKILLS_SET or key in DEGREE_TITLES_SET:
-            continue
-        seen.add(key)
-        out.append(line)
+        if key not in seen:
+            seen.add(key)
+            out.append(line)
+
     return out[:20]
 
 
 def _projects_from_section(section_text: str) -> List[Dict[str, Any]]:
-    """Extract project *titles* from the resume's Projects section only.
+    """Extract structured projects strictly from the Projects section.
 
-    Far more precise than scanning the whole document: we look only inside the
-    detected "Projects" section and keep short, title-like lines, dropping
-    bullet descriptions and full sentences. Returns [] when there's no clear
-    Projects section — better to surface nothing than to surface noise.
+    Extracts required fields matching the Edit Project modal:
+    - title / name (Clean title only, preventing description text from becoming title)
+    - project_type (e.g. "Personal", "Academic", "Professional")
+    - role (e.g. "Lead Developer", "Contributor")
+    - technologies_used (e.g. "React, Node.js, Python, SQL")
+    - description (Clean bullet points or narrative summary)
+    - start_date / end_date (e.g. "2023-01")
+    - ongoing (Boolean)
+    - project_url (Live URL)
+    - repository_url (GitHub/Repository URL)
     """
     if not section_text or not section_text.strip():
         return []
-    lines = [ln.strip() for ln in section_text.split("\n")]
-    out: List[Dict[str, Any]] = []
-    seen = set()
 
-    def _clean_title(line: str) -> str:
-        t = _LEADING_BULLET.sub("", line).strip()
-        # Keep the part before a separator (dates, tech list, link, summary).
-        return re.split(r'\s[\|–—\-:(]\s|\s{2,}', t)[0].strip(" .,-–—|")
+    lines = [ln.strip() for ln in section_text.split("\n") if ln.strip()]
+    if not lines:
+        return []
 
-    def _add(title: str) -> None:
-        if len(title) < 3:
-            return
-        key = title.lower()
-        if key in seen:
-            return
-        seen.add(key)
-        out.append({"name": title})
+    projects: List[Dict[str, Any]] = []
+    current_proj: Optional[Dict[str, Any]] = None
+    seen_titles: set = set()
 
-    # Primary (high precision): a project title is the non-bullet line directly
-    # above a "Tech:"/"Technologies:" line — the common
-    # "<Project Name>\nTech: ...\n- bullets" resume layout. This avoids the
-    # wrapped-bullet fragments that a naive line scan mistakes for titles.
-    has_tech = False
-    prev = ""
-    for line in lines:
+    def _save_current():
+        nonlocal current_proj
+        if current_proj and current_proj.get("name"):
+            t_key = current_proj["name"].lower()
+            if t_key not in seen_titles:
+                seen_titles.add(t_key)
+                if isinstance(current_proj.get("description"), list):
+                    current_proj["description"] = " ".join(current_proj["description"]).strip() or None
+                projects.append(current_proj)
+        current_proj = None
+
+    from src.services.enhanced_ats_service import _is_section_header
+
+    for raw in lines:
+        line = _LEADING_BULLET.sub("", raw).strip(" .,-–—|")
         if not line:
             continue
-        if _TECH_LINE.match(line):
-            has_tech = True
-            if prev and not _LEADING_BULLET.match(prev):
-                _add(_clean_title(prev))
-        prev = line
-    if has_tech:
-        return out[:15]
 
-    # Fallback (no Tech markers): keep short, title-like lines. Require an
-    # uppercase/alphanumeric start so wrapped mid-sentence bullet fragments
-    # (which begin lowercase) are dropped, and skip bullet lines outright.
-    for raw in lines:
-        if not raw or _LEADING_BULLET.match(raw):
+        matched_hdr = _is_section_header(raw.strip())
+        if matched_hdr == "projects":
             continue
-        if len(raw) > 80 or _PROJECT_DESC_STARTERS.match(raw):
-            continue
-        first = raw[:1]
-        if not first.isalnum() or (first.isalpha() and not first.isupper()):
-            continue
-        words = raw.split()
-        if not (1 <= len(words) <= 10):
-            continue
-        _add(_clean_title(raw))
-        if len(out) >= 15:
+        if matched_hdr and matched_hdr != "projects":
+            _save_current()
             break
-    return out
+
+        is_bullet = bool(_LEADING_BULLET.match(raw)) or bool(re.match(r'^\s*[•\*·▪‣◦►■\u2022\u25cf\u25aa\u25b6]', raw))
+        is_action_desc = bool(_PROJECT_DESC_STARTERS.match(line))
+        is_tech = bool(_TECH_LINE.match(raw)) or bool(re.match(r'^(tech|technologies|tools|stack)\b', line, re.I))
+        is_role = bool(re.match(r'^(role|position|as\s+a)\b', line, re.I))
+        is_link = bool(_URL_PATTERN.search(line))
+        is_date = bool(_DATE_TOKEN.search(line)) and len(line) <= 25
+
+        is_title_candidate = (
+            not is_bullet
+            and not is_action_desc
+            and not is_tech
+            and not is_role
+            and not is_link
+            and not is_date
+            and 3 <= len(line) <= 80
+            and 1 <= len(line.split()) <= 10
+            and (line[0].isupper() or line[0].isdigit())
+        )
+
+        if is_title_candidate:
+            _save_current()
+
+            tech_in_title = ""
+            m_bracket = re.search(r'\[(.*?)\]|\((.*?)\)', line)
+            if m_bracket:
+                tech_in_title = m_bracket.group(1) or m_bracket.group(2) or ""
+
+            clean_title = re.sub(r'\s*\[.*?\]|\s*\(.*?\)', '', line)
+            clean_title = re.split(r'\s[\|–—\-:(]\s|\s{2,}', clean_title)[0].strip(" .,-–—|")
+
+            current_proj = {
+                "name": clean_title,
+                "title": clean_title,
+                "project_type": "Personal",
+                "role": None,
+                "technologies_used": tech_in_title if tech_in_title else None,
+                "description": [],
+                "start_date": None,
+                "end_date": None,
+                "ongoing": False,
+                "project_url": None,
+                "repository_url": None,
+            }
+            continue
+
+        if current_proj is None:
+            continue
+
+        if is_tech:
+            parts = re.split(r'[:\-]\s*', line, 1)
+            tech_str = parts[1].strip() if len(parts) > 1 else line
+            current_proj["technologies_used"] = tech_str
+        elif is_role:
+            parts = re.split(r'[:\-]\s*', line, 1)
+            current_proj["role"] = parts[1].strip() if len(parts) > 1 else line
+        elif "github.com" in line.lower():
+            m_gh = re.search(r'https?://(?:www\.)?github\.com/[\w\-]+/[\w\-]+', line, re.I)
+            if m_gh:
+                current_proj["repository_url"] = m_gh.group(0)
+        elif _URL_PATTERN.search(line):
+            m_url = re.search(r'https?://[\w\.\-]+\.[a-z]{2,}(?:/[\w\-]*)*', line, re.I)
+            if m_url and "github.com" not in m_url.group(0):
+                current_proj["project_url"] = m_url.group(0)
+        elif _DATE_TOKEN.search(line):
+            m_d = re.search(r'(\d{4}|\w{3}\s*\d{4})\s*[-–—]\s*(\d{4}|\w{3}\s*\d{4}|present|current|ongoing)', line, re.I)
+            if m_d:
+                current_proj["start_date"] = m_d.group(1)
+                end_str = m_d.group(2).lower()
+                if any(kw in end_str for kw in ["present", "current", "ongoing"]):
+                    current_proj["ongoing"] = True
+                else:
+                    current_proj["end_date"] = end_str
+        else:
+            if len(line) >= 10:
+                current_proj["description"].append(line)
+
+    _save_current()
+    return projects[:15]
+
+
+def _job_preferences_from_section(section_text: str) -> Dict[str, Any]:
+    if not section_text or not section_text.strip():
+        return {}
+    prefs = {}
+    lines = [ln.strip() for ln in section_text.split("\n") if ln.strip()]
+    for line in lines:
+        line_low = line.lower()
+        if "role" in line_low or "target" in line_low or "title" in line_low:
+            parts = line.split(":", 1)
+            if len(parts) > 1 and parts[1].strip():
+                prefs["preferred_role"] = parts[1].strip()
+        elif "location" in line_low or "preferred location" in line_low:
+            parts = line.split(":", 1)
+            if len(parts) > 1 and parts[1].strip():
+                prefs["preferred_location"] = parts[1].strip()
+        elif "salary" in line_low or "expected" in line_low:
+            parts = line.split(":", 1)
+            if len(parts) > 1 and parts[1].strip():
+                prefs["expected_salary"] = parts[1].strip()
+        elif "mode" in line_low or "remote" in line_low or "hybrid" in line_low or "onsite" in line_low:
+            parts = line.split(":", 1)
+            if len(parts) > 1 and parts[1].strip():
+                prefs["work_mode"] = parts[1].strip()
+    return prefs
+
+
+def _location_from_section(section_text: str, full_text: str) -> Dict[str, Any]:
+    """Extract location info dynamically for any city/state/country."""
+    text = section_text if section_text and section_text.strip() else full_text[:1000]
+    if not text:
+        return {}
+    m = _LOCATION_PATTERN.search(text)
+    if m:
+        return {
+            "city": m.group(1).strip(),
+            "state_or_country": m.group(2).strip(),
+        }
+    return {}
+
+
+def _extract_link(text: str, pattern: str) -> Optional[str]:
+    m = re.search(pattern, text, re.IGNORECASE)
+    return m.group(0) if m else None
+
+
+def _skills_from_section(section_text: str, fallback_skills: List[str]) -> List[str]:
+    """Extract skills dynamically for any resume, cleaning brackets and filtering sentences."""
+    from src.services.enhanced_ats_service import SPOKEN_LANGUAGES_SET, SOFT_SKILLS_SET, DEGREE_TITLES_SET
+    out: List[str] = []
+    seen: set = set()
+
+    def _add_skill(s: str) -> None:
+        clean_s = re.sub(r'^[^\w]+|[^\w]+$', '', s).strip()
+        clean_s = re.sub(r'^[A-Za-z\s]+\(\s*', '', clean_s).strip()
+        clean_s = clean_s.rstrip(')')
+
+        if not clean_s or len(clean_s) <= 1:
+            return
+        low_s = clean_s.lower()
+        if (
+            low_s in seen
+            or low_s in DEGREE_TITLES_SET
+            or low_s in SOFT_SKILLS_SET
+            or low_s in SPOKEN_LANGUAGES_SET
+            or _URL_PATTERN.search(low_s)
+            or _EMAIL_PATTERN.search(low_s)
+        ):
+            return
+        seen.add(low_s)
+        out.append(clean_s)
+
+    if section_text and section_text.strip():
+        raw_items = re.split(r'[\n,;•·▪|:]\s*', section_text)
+        for item in raw_items:
+            item_str = item.strip()
+            if not item_str or len(item_str) > 40 or _PROJECT_DESC_STARTERS.match(item_str):
+                continue
+            _add_skill(item_str)
+        if out:
+            return out[:30]
+
+    for s in fallback_skills:
+        _add_skill(s)
+    return out[:30]
 
 
 def _serialize_profile(user: User, profile: CandidateProfileExt) -> dict:
@@ -1243,7 +1409,7 @@ async def get_completion(
 
 @router.post("/import/parse")
 async def parse_resume_for_import(
-    resume: UploadFile = File(...),
+    resume: Optional[UploadFile] = File(None),
     current_user: User = Depends(AuthMiddleware.get_current_candidate),
     db: Session = Depends(get_db),
 ):
@@ -1252,16 +1418,29 @@ async def parse_resume_for_import(
     Writes NOTHING to the profile — the candidate reviews/edits the result and
     only then calls /import/apply. Reuses the same extraction the ATS uses.
     """
-    suffix = Path(resume.filename or "").suffix.lower()
-    if suffix not in (".pdf", ".docx", ".doc"):
-        raise HTTPException(status_code=400, detail="Please upload a PDF or Word (.docx/.doc) resume")
+    if resume and resume.filename:
+        suffix = Path(resume.filename or "").suffix.lower()
+        if suffix not in (".pdf", ".docx", ".doc"):
+            raise HTTPException(status_code=400, detail="Please upload a PDF or Word (.docx/.doc) resume")
+        contents = await resume.read()
+    else:
+        profile = _get_or_create_profile(current_user.id, db)
+        if not profile.resume_path:
+            raise HTTPException(status_code=400, detail="No resume uploaded yet. Please upload a resume first.")
+        from src.services.storage import storage
+        try:
+            contents = storage.read_bytes(profile.resume_path)
+        except Exception:
+            raise HTTPException(status_code=404, detail="Uploaded resume file not found in storage.")
+        suffix = Path(profile.resume_path).suffix.lower()
+        if suffix not in (".pdf", ".docx", ".doc"):
+            suffix = ".pdf"
 
     import tempfile
     from src.services.enhanced_ats_service import EnhancedATSScoringService, detect_sections
 
     tmp_path = None
     try:
-        contents = await resume.read()
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(contents)
             tmp_path = tmp.name
@@ -1275,38 +1454,56 @@ async def parse_resume_for_import(
         # whole-document scan the ATS extractor uses; fall back to the ATS
         # values only when the section yields nothing.
         sections = detect_sections(parsed.text)
-        section_projects = _projects_from_section(sections.get("projects", ""))
 
+        # 1. Personal Info
+        contact = parsed.contact_info or {}
+        from src.services.resume_profile_parser import parse_resume_profile
+        profile_identity = parse_resume_profile(parsed.text)
+        full_name = profile_identity.get("full_name")
+        first_name = current_user.first_name if current_user and current_user.first_name else (full_name.split()[0] if full_name else None)
+        last_name = current_user.last_name if current_user and current_user.last_name else (" ".join(full_name.split()[1:]) if full_name and len(full_name.split()) > 1 else None)
+
+        personal_info = {
+            "full_name": full_name,
+            "first_name": first_name,
+            "last_name": last_name,
+            "email": contact.get("email") or getattr(current_user, "email", None),
+            "phone": contact.get("phone") or getattr(current_user, "phone", None),
+        }
+
+        # 2. Documents & Links
+        documents_links = {
+            "linkedin_url": _extract_link(parsed.text, r'https?://(?:www\.)?linkedin\.com/in/[\w\-]+'),
+            "github_url": _extract_link(parsed.text, r'https?://(?:www\.)?github\.com/[\w\-]+'),
+            "portfolio_url": _extract_link(parsed.text, r'https?://(?:www\.)?(?!linkedin|github)[\w\.\-]+\.[a-z]{2,}(?:/[\w\-]*)*'),
+        }
+
+        # 3. Location
+        location = _location_from_section(sections.get("location", ""), parsed.text)
+
+        # 4. Work Experience & Summary
+        summary = (sections.get("summary", "") or "").strip()
         section_work = _work_experience_from_section(sections.get("experience", ""))
         if section_work:
             work_experience = [
                 {
                     "title": w["title"],
                     "company": w["company"],
-                    "duration_months": None,
+                    "duration_months": w.get("duration_months"),
                     "confidence": w["confidence"],
                 }
                 for w in section_work
             ]
-        else:
-            # No Experience section detected (e.g. an unrecognised heading like
-            # "Professional Journey"): the ATS whole-document scan leaks skills
-            # and institutions in as "companies", so filter those out rather
-            # than surface garbage entries for review.
+        elif sections.get("experience", ""):
             skill_set = {s.lower() for s in (parsed.skills or []) if s}
             work_experience = []
             for w in (parsed.work_experience or []):
                 title = (w.get("title") or "").strip()
                 company = (w.get("company") or "").strip()
-                # Require a real job title: the ATS scan's false positives
-                # (the candidate's name, heading words, stray section text) all
-                # arrive with an empty title, so this drops them.
                 if not title:
                     continue
                 probe = company or title
-                if probe.lower() in skill_set:
-                    continue
-                if _INSTITUTION_KW.search(probe) or _DEGREE_KW.search(probe):
+                if probe.lower() in skill_set or _INSTITUTION_KW.search(probe) or _DEGREE_KW.search(probe):
                     continue
                 work_experience.append({
                     "title": title,
@@ -1314,7 +1511,20 @@ async def parse_resume_for_import(
                     "duration_months": w.get("duration_months"),
                     "confidence": round(float(w.get("confidence", 0.5)), 2),
                 })
+        else:
+            work_experience = []
 
+        from src.services.enhanced_ats_service import enhanced_ats_service
+        total_exp = enhanced_ats_service.calculate_work_experience_years_from_entries(work_experience)
+        if total_exp == 0.0 and parsed.experience_years and len(work_experience) > 0:
+            total_exp = parsed.experience_years
+
+        work_experience_summary = {
+            "summary": summary if summary else None,
+            "total_experience_years": total_exp,
+        }
+
+        # 5. Education
         section_edu = _education_from_section(sections.get("education", ""))
         if section_edu:
             education = [
@@ -1325,7 +1535,7 @@ async def parse_resume_for_import(
                 }
                 for e in section_edu
             ]
-        else:
+        elif sections.get("education", ""):
             education = [
                 {
                     "degree": (e.get("degree") or "").strip(),
@@ -1335,22 +1545,36 @@ async def parse_resume_for_import(
                 for e in (parsed.education or [])
                 if e.get("degree")
             ]
+        else:
+            education = []
 
-        # Calculate total experience excluding internships <= 8 months
-        from src.services.enhanced_ats_service import enhanced_ats_service
-        total_exp = enhanced_ats_service.calculate_work_experience_years_from_entries(work_experience)
-        if total_exp == 0.0 and parsed.experience_years:
-            total_exp = parsed.experience_years
+        # 6. Skills
+        skills = _skills_from_section(sections.get("skills", ""), parsed.skills or [])
+
+        # 7. Certifications (STRICT: only from certifications section, NO fallback if section missing)
+        certifications = _certifications_from_section(sections.get("certifications", ""))
+
+        # 8. Projects
+        projects = _projects_from_section(sections.get("projects", ""))
+
+        # 9. Job Preferences
+        job_preferences = _job_preferences_from_section(sections.get("job_preferences", ""))
 
         return {
-            "skills": [s for s in parsed.skills if s],
-            "total_experience_years": total_exp,
-            "contact": parsed.contact_info or {},
-            "work_experience": work_experience,
+            "personal_info": personal_info,
+            "documents_links": documents_links,
+            "location": location,
+            "work_experience_summary": work_experience_summary,
             "education": education,
-            "certifications": (_certifications_from_section(sections.get("certifications", ""))
-                               or [c for c in (parsed.certifications or []) if c]),
-            "projects": section_projects,
+            "skills": skills,
+            "certifications": certifications,
+            "projects": projects,
+            "job_preferences": job_preferences,
+
+            # Backward-compatibility fields for ResumeImportReview component
+            "total_experience_years": total_exp,
+            "contact": personal_info,
+            "work_experience": work_experience,
             "languages": [l for l in (parsed.languages or []) if l],
             "confidence_score": round(float(parsed.confidence_score), 2),
         }
@@ -1445,7 +1669,7 @@ async def apply_resume_import(
         existing_certs.add(nm.lower())
         counts["certifications_added"] += 1
 
-    # Projects
+    # Projects — populate all fields matching the CandidateProject model & Edit Project modal
     for p in data.projects:
         title = (p.get("name") or p.get("title") or "").strip()
         if not title:
@@ -1454,6 +1678,14 @@ async def apply_resume_import(
             profile_id=profile.id,
             project_title=title[:255],
             description=(p.get("description") or None),
+            technologies_used=(p.get("technologies_used") or p.get("technologies") or p.get("tech_stack") or None),
+            role=(p.get("role") or None),
+            project_type=(p.get("project_type") or "Personal")[:50],
+            start_date=(p.get("start_date") or None),
+            end_date=(p.get("end_date") or None),
+            ongoing=bool(p.get("ongoing") or p.get("is_ongoing") or False),
+            project_url=(p.get("project_url") or p.get("live_url") or None),
+            repository_url=(p.get("repository_url") or p.get("github_url") or None),
         ))
         counts["projects_added"] += 1
 

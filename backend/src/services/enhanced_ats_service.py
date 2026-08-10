@@ -235,6 +235,8 @@ SECTION_HEADERS: Dict[str, List[str]] = {
     "hobbies": [
         "hobbies", "interests", "activities", "extracurricular",
         "personal interests", "outside interests", "volunteer work", "hobbies & interests",
+        "extracurricular activities", "extra curricular activities", "extra-curricular activities",
+        "achievements", "awards", "declaration", "publications", "honors & awards",
     ],
     "job_preferences": [
         "job preferences", "career preferences", "preferred location", "target role",

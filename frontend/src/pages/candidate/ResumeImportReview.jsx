@@ -35,7 +35,19 @@ export default function ResumeImportReview({ data, onClose, onApplied }) {
   // Projects are the least reliable extraction, so they default to OFF —
   // the candidate opts in deliberately after checking each title.
   const [projects, setProjects] = useState(
-    () => (data.projects || []).map(p => ({ value: p.name || '', include: false }))
+    () => (data.projects || []).map(p => ({
+      value: p.title || p.name || '',
+      description: p.description || '',
+      technologies_used: p.technologies_used || p.tech_stack || '',
+      role: p.role || '',
+      project_type: p.project_type || 'Personal',
+      start_date: p.start_date || null,
+      end_date: p.end_date || null,
+      ongoing: p.ongoing || false,
+      project_url: p.project_url || null,
+      repository_url: p.repository_url || null,
+      include: false
+    }))
   )
   const expYears = data.total_experience_years
   const [includeExp, setIncludeExp] = useState(!!expYears)
@@ -64,7 +76,19 @@ export default function ResumeImportReview({ data, onClose, onApplied }) {
       education: education.filter(e => e.include && (e.degree.trim() || e.institution.trim()))
         .map(e => ({ degree: e.degree.trim(), institution: e.institution.trim() })),
       certifications: certs.filter(c => c.include && c.value.trim()).map(c => c.value.trim()),
-      projects: projects.filter(p => p.include && p.value.trim()).map(p => ({ name: p.value.trim() })),
+      projects: projects.filter(p => p.include && p.value.trim()).map(p => ({
+        name: p.value.trim(),
+        title: p.value.trim(),
+        description: p.description || null,
+        technologies_used: p.technologies_used || null,
+        role: p.role || null,
+        project_type: p.project_type || 'Personal',
+        start_date: p.start_date || null,
+        end_date: p.end_date || null,
+        ongoing: p.ongoing || false,
+        project_url: p.project_url || null,
+        repository_url: p.repository_url || null,
+      })),
       total_experience_years: includeExp ? expYears : null,
     }
     try {
