@@ -552,7 +552,49 @@ Edit each line (see the nano keys in Step 0). Use `Ctrl+W` to jump to a setting.
 | `DATABASE_URL=` | `mysql+pymysql://innomaxskills_hf:YOURPASSWORD@localhost:3306/innomaxskills_hireflow` |
 | `GEMINI_API_KEY=` | your key from Step 1 |
 | `SMTP_HOST=` `SMTP_PORT=` `SMTP_USER=` `SMTP_PASS=` `FROM_EMAIL=` | your email provider details |
-| `EMAIL_ENCRYPTION_KEY=` | carried over — migration only |
+| `EMAIL_ENCRYPTION_KEY=` | migration only — **read the box below, it may not exist under that name** |
+
+> ### `EMAIL_ENCRYPTION_KEY` — the trap when migrating
+>
+> This decrypts the per-mailbox SMTP passwords inside the rows you import. Get it
+> wrong and nothing errors: `decrypt()` returns an empty string
+> (`src/security.py:42`), so mail just stops working with no message anywhere.
+>
+> **It may never have existed under that name.** `src/security.py` resolves the
+> key in this order:
+>
+> 1. `EMAIL_ENCRYPTION_KEY`, used as-is
+> 2. **`SECRET_KEY`**, hashed SHA-256 → base64
+> 3. the literal `hireflow-dev-key-change-me`
+>
+> So if the old deployment only ever set `SECRET_KEY`, that is what your data is
+> encrypted against — and the fresh key you generated in 7.1 produces a different
+> result. **Leaving this blank is exactly how the data becomes unreadable.**
+>
+> Retrieve both values from the old service:
+>
+> ```bash
+> gcloud run services describe hire-flow-api --region us-central1 \
+>   --format="yaml(spec.template.spec.containers[0].env)"
+> ```
+>
+> Or in the browser: Cloud Run → `hire-flow-api` → the **YAML** tab (read-only —
+> do not use "Edit & Deploy"). If a value reads `valueFrom: secretKeyRef`, open
+> Secret Manager → the secret → the version → **View secret value**.
+>
+> | What the old service had | What to set here |
+> |---|---|
+> | `EMAIL_ENCRYPTION_KEY` with a value | that value, verbatim |
+> | only `SECRET_KEY` | derive it, below |
+> | neither | derive it from `hireflow-dev-key-change-me` |
+>
+> ```bash
+> python3 -c "import hashlib,base64; \
+>   print(base64.urlsafe_b64encode(hashlib.sha256(b'OLD_SECRET_KEY').digest()).decode())"
+> ```
+>
+> Setting the derived value explicitly is the better outcome either way: it lets
+> this server keep a brand-new `SECRET_KEY` while still reading the old passwords.
 
 Leave everything else as-is. Confirm these two are present and unchanged:
 
