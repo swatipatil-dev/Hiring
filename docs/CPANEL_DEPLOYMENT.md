@@ -669,20 +669,62 @@ Four entries: `python`, `cpp`, `node`, `java`.
 
 ### 10.1 Create the tables
 
+> **Do not run `alembic upgrade head` on an empty database — it cannot work.**
+> The first revision (`2a077fcbf6c4`) has no parent but its first statement is
+> `CREATE INDEX ... ON interviews`: it *alters* tables it expects to exist. There
+> is no `create_table` for the base schema anywhere in the chain, because Alembic
+> was adopted after the schema already existed. It only records changes made
+> *since* then. On an empty database it fails immediately with
+> `Table '...interviews' doesn't exist`.
+>
+> The schema comes from the ORM instead. The models already reflect every one of
+> those migrations, so `create_all()` lands in exactly the same place — it just
+> gets there in one step.
+
+**Build the schema from the models:**
+
 `[root]`
 
 ```bash
 cd /opt/hireflow/backend
-sudo -u hireflow /opt/hireflow/venv/bin/alembic upgrade head
+
+sudo -u hireflow /opt/hireflow/venv/bin/python -c "
+import sys; sys.path.insert(0, '.')
+import main
+from src.config.database_config_mysql import init_db, db_manager
+ok = init_db()
+info = db_manager.get_database_info()
+print('created:', ok, '| db:', info.get('database'), '| tables:', info.get('table_count'))
+"
 ```
 
-**Check:**
+**Expected:** `created: True | db: innomaxskills_hireflow | tables: 44` (approximately).
+
+`import main` is required, not decorative. `create_all()` only creates tables for
+models that have been imported, and the judge and question tables live in
+separate modules. Importing the app pulls them all in; importing only
+`src.models.models` silently skips them.
+
+**Then record that the schema is current**, so future upgrades start from the
+right point instead of replaying history:
 
 ```bash
+sudo -u hireflow /opt/hireflow/venv/bin/alembic stamp head
 sudo -u hireflow /opt/hireflow/venv/bin/alembic current
 ```
 
-Shows `x4n5o6p7q8r9 (head)`.
+**Expected:** `x4n5o6p7q8r9 (head)`
+
+> `stamp` only writes a version marker — it creates no tables. Both commands are
+> needed, in either order.
+>
+> **Migrating data later is the opposite case.** A dump from a working
+> deployment already contains the tables *and* its own `alembic_version` row, so
+> after importing it you run `alembic upgrade head` normally — that applies any
+> revisions newer than the dump. Never `create_all` over an imported dump.
+
+Do not use `setup_db.py`. It hardcodes `root`/`recruitment_db` credentials and
+**drops tables**.
 
 ### 10.2 Import existing data — *migration only*
 
