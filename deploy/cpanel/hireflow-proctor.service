@@ -33,12 +33,19 @@ Environment=BIND_HOST=127.0.0.1
 # MUST be 1. See the header above — this is a correctness constraint, not tuning.
 Environment=WEB_CONCURRENCY=1
 Environment=PROCTOR_PREWARM=1
-# Frames in flight at once. Resident model memory is roughly this x ~115 MB and
-# does NOT grow with candidate count. Default is (cpu_count - 2).
-Environment=PROCTOR_INFERENCE_SLOTS=6
-# Refuse new sessions past this instead of degrading everyone mid-test.
-Environment=PROCTOR_MAX_SESSIONS=9
 Environment=HF_HOME=/opt/hireflow/hf-cache
+
+# NOTE: PROCTOR_INFERENCE_SLOTS and PROCTOR_MAX_SESSIONS are deliberately NOT set
+# here. They are the two knobs an operator tunes against real load, and they are
+# documented in backend/.env.
+#
+# systemd applies Environment= AFTER EnvironmentFile=, so anything set here would
+# silently override .env — the operator would edit .env, restart, and see no
+# change. Values that are correctness constraints (WEB_CONCURRENCY, PORT, ROLE)
+# stay pinned above precisely because they must NOT be overridable; tuning values
+# live in .env so there is exactly one place to change them.
+#
+# Unset, the app defaults to (cpu_count - 2) slots and slots * 1.5 sessions.
 Environment=OMP_NUM_THREADS=1
 Environment=PYTHONUNBUFFERED=1
 Environment=PATH=/opt/hireflow/venv/bin:/usr/local/bin:/usr/bin:/bin

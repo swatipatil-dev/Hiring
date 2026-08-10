@@ -865,16 +865,33 @@ systemctl restart hireflow-api hireflow-proctor
 
 ## Tuning after real load
 
-Edit `/opt/hireflow/backend/.env`, then
-`systemctl restart hireflow-proctor`.
+**Where a setting lives decides how you change it.** systemd applies
+`Environment=` *after* `EnvironmentFile=`, so anything pinned in a `.service`
+file overrides `.env` — edit the wrong place and a restart appears to do nothing.
 
-| Setting | Default | Change when |
-|---|---|---|
-| `PROCTOR_INFERENCE_SLOTS` | 6 | `waits` keeps climbing. Each slot uses ~115 MB and does **not** grow with candidate numbers |
-| `PROCTOR_MAX_SESSIONS` | 9 | Candidates see "at capacity" while `peak_in_use` stays below `capacity` |
-| `WEB_CONCURRENCY` (api) | 3 | The site feels slow under load and memory allows |
-| `WEB_CONCURRENCY` (proctor) | **1** | **Never change this** |
-| `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | 5 / 5 | `QueuePool limit` errors appear in the logs |
+| Setting | Default | Edit in | Change when |
+|---|---|---|---|
+| `PROCTOR_INFERENCE_SLOTS` | 6 | **`.env`** | `waits` keeps climbing. Each slot uses ~115 MB and does **not** grow with candidate numbers |
+| `PROCTOR_MAX_SESSIONS` | 9 | **`.env`** | Candidates see "at capacity" while `peak_in_use` stays below `capacity` |
+| `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | 5 / 5 | **`.env`** | `QueuePool limit` errors appear in the logs |
+| `WEB_CONCURRENCY` (api) | 3 | `hireflow-api.service` | The site feels slow under load and memory allows |
+| `WEB_CONCURRENCY` (proctor) | **1** | — | **Never change this** — correctness constraint |
+| `MemoryMax` / `CPUWeight` | see units | the `.service` files | Another account is being starved, or ours is being killed |
+
+After editing **`.env`**:
+
+```bash
+systemctl restart hireflow-proctor
+```
+
+After editing a **`.service`** file:
+
+```bash
+systemctl daemon-reload && systemctl restart hireflow-proctor
+```
+
+Forgetting `daemon-reload` is the usual reason a `.service` edit seems to have
+no effect.
 
 Expected capacity is roughly **8–10 simultaneous proctored candidates**. That is
 an estimate based on processing cost, not a measurement on this hardware — test 8
