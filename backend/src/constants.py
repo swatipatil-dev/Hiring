@@ -20,7 +20,7 @@ BCRYPT_ROUNDS = 12
 # Vertex AI Configuration (reference defaults only — the live values are read
 # from env in src/services/gemini_service.py; nothing imports these).
 VERTEX_LOCATION = "us-central1"
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-flash-latest"
 GEMINI_TIMEOUT = 300
 
 # File Paths

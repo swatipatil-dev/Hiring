@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT", "")
 VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "us-central1")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
 GEMINI_TIMEOUT = 300  # seconds (5 min for batch generation)
 MAX_RETRIES = 3
 # Vertex quota (429 / RESOURCE_EXHAUSTED) needs a much longer pause than a transient
@@ -61,6 +61,25 @@ def is_rate_limit_error(exc: Exception) -> bool:
     s = f"{type(exc).__name__} {exc}".lower()
     return ("429" in s or "resource_exhausted" in s or "rate limit" in s
             or "ratelimit" in s or "quota" in s or "too many requests" in s)
+
+
+def _is_invalid_argument(exc: Exception) -> bool:
+    """True if the API rejected the request shape (400 INVALID_ARGUMENT)."""
+    s = f"{type(exc).__name__} {exc}".lower()
+    return "invalid_argument" in s or "invalid argument" in s
+
+
+# Whether the configured model accepts thinking_config. Assume yes, and flip to
+# False the first time a model rejects it.
+#
+# Why this is discovered rather than configured: thinking_budget=0 is load-bearing
+# on Gemini 2.5, where thinking tokens are spent OUT OF max_output_tokens and a
+# long thinking phase truncates JSON mid-string (see _generate_content). But
+# Gemini 3.x models will not let thinking be disabled and reject the parameter
+# with a bare "400 Request contains an invalid argument", naming nothing. Pinning
+# the behaviour to a model list would break again at the next model change, so the
+# client probes once and adapts.
+_thinking_config_supported = True
 
 def credentials_configured() -> bool:
     """True if either auth mode has been configured. Used by health checks so they
@@ -159,20 +178,43 @@ def _generate_content(prompt: str, *, temperature: float = 0.7, top_p: float = 0
     "thinking" tokens. On gemini-2.5-flash those tokens are spent out of
     max_output_tokens, so a small budget can be fully consumed by thinking and
     truncate the visible answer mid-string — disable it for short JSON tasks."""
-    cfg_kwargs = dict(
-        temperature=temperature,
-        top_p=top_p,
-        max_output_tokens=max_output_tokens,
-        # Honor the per-call timeout (e.g. sql_testgen uses 180s); value in ms.
-        http_options=types.HttpOptions(timeout=timeout * 1000),
-    )
-    if thinking_budget is not None:
-        cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=thinking_budget)
-    resp = _get_client().models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(**cfg_kwargs),
-    )
+    global _thinking_config_supported
+
+    def _config(with_thinking: bool):
+        cfg_kwargs = dict(
+            temperature=temperature,
+            top_p=top_p,
+            max_output_tokens=max_output_tokens,
+            # Honor the per-call timeout (e.g. sql_testgen uses 180s); value in ms.
+            http_options=types.HttpOptions(timeout=timeout * 1000),
+        )
+        if with_thinking:
+            cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=thinking_budget)
+        return types.GenerateContentConfig(**cfg_kwargs)
+
+    want_thinking = thinking_budget is not None and _thinking_config_supported
+    try:
+        resp = _get_client().models.generate_content(
+            model=GEMINI_MODEL, contents=prompt, config=_config(want_thinking),
+        )
+    except Exception as exc:
+        # Gemini 3.x rejects thinking_config outright, with a 400 that names no
+        # field. Retry once without it; only remember the model's limitation if
+        # dropping the parameter is what actually fixed the call, so an unrelated
+        # 400 (bad prompt, oversized request) does not disable it wrongly.
+        if not (want_thinking and _is_invalid_argument(exc)):
+            raise
+        logger.warning(
+            "Model %s rejected thinking_config (400) — retrying without it. "
+            "Note this model spends thinking tokens outside max_output_tokens, so "
+            "long JSON answers are no longer at risk of truncation from it.",
+            GEMINI_MODEL,
+        )
+        resp = _get_client().models.generate_content(
+            model=GEMINI_MODEL, contents=prompt, config=_config(False),
+        )
+        _thinking_config_supported = False
+        logger.info("thinking_config disabled for the rest of this process")
 
     if not resp.candidates:
         # Surface safety blocks / empty completions explicitly.
