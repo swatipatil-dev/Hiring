@@ -2,12 +2,13 @@ import React, { useCallback, useEffect, useRef, useState } from 'react'
 import {
   FileSearch, Upload, X, ChevronDown, ChevronRight, ChevronLeft, CheckCircle2,
   AlertCircle, Download, RefreshCw, Trash2, UserPlus, Search, SlidersHorizontal, Users,
-  Pencil, PhoneCall, Paperclip, Save,
+  Pencil, PhoneCall, Paperclip, Save, Check, GraduationCap,
 } from 'lucide-react'
 import api from '../../api/client'
 import MoveToATSModal from './MoveToATSModal'
 import CandidateForm from './CandidateForm'
 import { OverviewPanel, AnalyticsPanel, SettingsPanel } from './TalentPoolPanels'
+import { COLLEGE_GROUPS, ALL_COLLEGES, collegeKey } from '../../data/colleges'
 import './ResumeMatcher.css'
 
 const ACCEPT = '.pdf,.doc,.docx'
@@ -568,6 +569,190 @@ async function onDownload(result) {
   } catch {
     alert('Could not download this resume.')
   }
+}
+
+/**
+ * Searchable, grouped, multi-select college filter.
+ *
+ * Campus hiring is a set operation — "everyone from the Coimbatore region", "all the
+ * IIITs" — so this picks many colleges at once and the server ORs them. A typed
+ * college that isn't on the list still works: it falls through as a free-text term,
+ * which is exactly what the plain text box this replaced used to do.
+ *
+ * `value` stays a comma-joined string rather than an array so the filter behaves like
+ * every other one on this screen — loadPool's param loop, hasFilters and clearFilters
+ * all keep working untouched.
+ */
+function CollegePicker({ value, onChange }) {
+  const [open, setOpen] = useState(false)
+  const [query, setQuery] = useState('')
+  const boxRef = useRef(null)
+  const searchRef = useRef(null)
+
+  const terms = (value || '').split(',').map(t => t.trim()).filter(Boolean)
+  const termSet = new Set(terms)
+
+  // A college is picked when every spelling it carries is in the filter. Leftover
+  // terms are the free-text ones and render as their own chips.
+  const picked = ALL_COLLEGES.filter(c => c.terms.every(t => termSet.has(t)))
+  const claimed = new Set(picked.flatMap(c => c.terms))
+  const freeTerms = terms.filter(t => !claimed.has(t))
+
+  const commit = (next) => onChange([...new Set(next)].join(','))
+  const isPicked = (c) => c.terms.every(t => termSet.has(t))
+
+  const add = (list) => commit([...terms, ...list.flatMap(c => c.terms)])
+
+  const remove = (list) => {
+    const dropping = new Set(list.map(collegeKey))
+    // A term is only really gone once no still-picked college needs it — the same
+    // college sits in two groups, so its terms can be claimed twice.
+    const keep = new Set(picked.filter(c => !dropping.has(collegeKey(c))).flatMap(c => c.terms))
+    const doomed = new Set(list.flatMap(c => c.terms))
+    commit(terms.filter(t => !doomed.has(t) || keep.has(t)))
+  }
+
+  const toggle = (c) => (isPicked(c) ? remove([c]) : add([c]))
+  const addFreeText = (raw) => {
+    // Commas would split into two broken terms — the value is comma-joined.
+    const t = raw.replace(/,/g, ' ').trim()
+    if (!t) return
+    commit([...terms, t])
+    setQuery('')
+  }
+
+  // Close on outside click and on Escape, the same way the compose dropdown on the
+  // HR dashboard does. Without this the panel sits over the record list forever.
+  useEffect(() => {
+    if (!open) return
+    const onDown = (e) => { if (boxRef.current && !boxRef.current.contains(e.target)) setOpen(false) }
+    const onKey = (e) => { if (e.key === 'Escape') { setOpen(false); setQuery('') } }
+    document.addEventListener('mousedown', onDown)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onDown)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [open])
+
+  useEffect(() => { if (open) searchRef.current?.focus() }, [open])
+
+  const q = query.trim().toLowerCase()
+  const groups = COLLEGE_GROUPS
+    .map(g => ({
+      ...g,
+      // "coimbatore" means the region, not just the one college with the city in its
+      // name — a group whose label matches keeps all of its members.
+      visible: !q || g.label.toLowerCase().includes(q)
+        ? g.colleges
+        : g.colleges.filter(c =>
+            c.name.toLowerCase().includes(q) || c.terms.some(t => t.includes(q))),
+    }))
+    .filter(g => g.visible.length > 0)
+
+  const nothingFound = q !== '' && groups.length === 0
+
+  return (
+    <div className="rm-college" ref={boxRef}>
+      {/* A div, not a button: the chips carry their own remove controls and nesting
+          interactive elements inside a button is invalid and breaks click handling. */}
+      <div className="rm-college__trigger" role="combobox" tabIndex={0}
+           aria-expanded={open} aria-haspopup="listbox" aria-label="Filter by college"
+           onClick={() => setOpen(o => !o)}
+           onKeyDown={e => {
+             if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setOpen(o => !o) }
+           }}>
+        {picked.length === 0 && freeTerms.length === 0 ? (
+          <span className="rm-college__placeholder">
+            <GraduationCap size={14} /> College
+          </span>
+        ) : (
+          <span className="rm-college__chips">
+            {picked.map(c => (
+              <Chip key={collegeKey(c)} label={c.name} onRemove={() => remove([c])} />
+            ))}
+            {freeTerms.map(t => (
+              <Chip key={t} label={t} free
+                    onRemove={() => commit(terms.filter(x => x !== t))} />
+            ))}
+          </span>
+        )}
+        <ChevronDown size={14} className="rm-college__caret" />
+      </div>
+
+      {open && (
+        <div className="rm-college__panel" role="listbox" aria-multiselectable="true">
+          <div className="rm-college__search">
+            <Search size={14} />
+            <input value={query} autoComplete="off" placeholder="Search colleges"
+                   onChange={e => setQuery(e.target.value)}
+                   onKeyDown={e => { if (e.key === 'Enter' && nothingFound) addFreeText(query) }}
+                   ref={searchRef} />
+          </div>
+
+          <div className="rm-college__list">
+            {groups.map(g => {
+              const allOn = g.visible.every(isPicked)
+              return (
+                <div key={g.id} className="rm-college__group">
+                  <div className="rm-college__head">
+                    <span>{g.label}</span>
+                    <span className="rm-college__count">
+                      {g.colleges.filter(isPicked).length}/{g.colleges.length}
+                    </span>
+                    <button type="button" className="rm-college__bulk"
+                            onClick={() => (allOn ? remove(g.visible) : add(g.visible))}>
+                      {allOn ? 'Remove all' : 'Add all'}
+                    </button>
+                  </div>
+                  {g.visible.map(c => {
+                    const on = isPicked(c)
+                    return (
+                      <button type="button" key={collegeKey(c)} role="option" aria-selected={on}
+                              className={`rm-college__opt${on ? ' rm-college__opt--on' : ''}`}
+                              onClick={() => toggle(c)}>
+                        <span className="rm-college__box">{on && <Check size={11} />}</span>
+                        {c.name}
+                      </button>
+                    )
+                  })}
+                </div>
+              )
+            })}
+
+            {nothingFound && (
+              <button type="button" className="rm-college__opt rm-college__opt--free"
+                      onClick={() => addFreeText(query)}>
+                <span className="rm-college__box" />
+                Use “{query.trim()}”
+              </button>
+            )}
+          </div>
+
+          {terms.length > 0 && (
+            <div className="rm-college__foot">
+              <span>{terms.length} term{terms.length === 1 ? '' : 's'} applied</span>
+              <button type="button" className="rm-college__bulk" onClick={() => onChange('')}>
+                Clear all
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function Chip({ label, onRemove, free }) {
+  return (
+    <span className={`rm-college__chip${free ? ' rm-college__chip--free' : ''}`}>
+      {label}
+      <span role="button" tabIndex={-1} aria-label={`Remove ${label}`}
+            onClick={e => { e.stopPropagation(); onRemove() }}>
+        <X size={11} />
+      </span>
+    </span>
+  )
 }
 
 const EMPTY_FILTERS = {
@@ -1263,8 +1448,8 @@ export default function ResumeMatcher() {
 
           {showMoreFilters && (
             <div className="rm-filters__more">
-              <input className="input" style={{ flex: '0 1 170px' }} placeholder="College"
-                     value={filters.college} onChange={e => setFilter('college', e.target.value)} />
+              <CollegePicker value={filters.college}
+                             onChange={v => setFilter('college', v)} />
               <input className="input" style={{ flex: '0 1 140px' }} placeholder="Year of passing" type="number"
                      value={filters.year_of_passing} onChange={e => setFilter('year_of_passing', e.target.value)} />
               <input className="input" style={{ flex: '0 1 150px' }} placeholder="Job role"

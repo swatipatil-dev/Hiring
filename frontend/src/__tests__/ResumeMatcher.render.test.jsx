@@ -218,6 +218,48 @@ describe('Talent Pool candidates tab', () => {
     expect(await screen.findByText('Bare Person')).toBeInTheDocument()
   })
 
+  it('picks a whole region of colleges in one click', async () => {
+    // The point of the filter: campus hiring is a set operation, so a region goes in
+    // as one query the server ORs — not seven searches typed one at a time.
+    const user = (await import('@testing-library/user-event')).default
+    render(<ResumeMatcher />)
+    await goToCandidates()
+    await screen.findByText('Anjali Rao')
+
+    await user.click(screen.getByText('More filters'))
+    await user.click(screen.getByLabelText('Filter by college'))
+    await user.type(screen.getByPlaceholderText('Search colleges'), 'Coimbatore')
+
+    // The group label matches, so the whole region is offered — not only the one
+    // college with the city in its name.
+    expect(screen.getByText('PSG College of Technology')).toBeInTheDocument()
+    await user.click(screen.getByText('Add all'))
+
+    await waitFor(() => {
+      const last = api.get.mock.calls.filter(c => !String(c[0]).includes('metrics')).pop()
+      expect(last[1].params.college).toContain('psg college')
+      expect(last[1].params.college).toContain('kpr institute')
+      expect(last[1].params.college.split(',')).toHaveLength(7)
+    })
+  })
+
+  it('keeps a college that is not on the list', async () => {
+    const user = (await import('@testing-library/user-event')).default
+    render(<ResumeMatcher />)
+    await goToCandidates()
+    await screen.findByText('Anjali Rao')
+
+    await user.click(screen.getByText('More filters'))
+    await user.click(screen.getByLabelText('Filter by college'))
+    await user.type(screen.getByPlaceholderText('Search colleges'), 'Parul University')
+    await user.click(screen.getByText(/Use “Parul University”/))
+
+    await waitFor(() => {
+      const last = api.get.mock.calls.filter(c => !String(c[0]).includes('metrics')).pop()
+      expect(last[1].params.college).toBe('Parul University')
+    })
+  })
+
   it('paginates when there are more people than one page', async () => {
     const many = Array.from({ length: 25 }, (_, i) => ({ ...RECORD, id: `r${i}` }))
     api.get.mockImplementation((url) => Promise.resolve(

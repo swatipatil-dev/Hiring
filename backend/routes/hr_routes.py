@@ -572,6 +572,7 @@ async def get_my_jobs(
 RESUME_MATCH_MAX_FILES = 20          # cap the batch so scoring stays responsive
 RESUME_MATCH_ALTERNATES = 3          # runner-up jobs shown per resume
 RESUME_POOL_DIR = "resumes/pool"     # storage prefix for pooled resumes
+MAX_COLLEGE_TERMS = 200              # ceiling on the college filter's OR arm count
 
 
 class JobMatch(BaseModel):
@@ -1210,7 +1211,8 @@ def _get_pool_entry(db: Session, entry_id: str, current_user: User) -> ResumePoo
 @router.get("/resume-pool", response_model=ResumePoolListResponse)
 async def list_resume_pool(
     search: Optional[str] = Query(None, description="Match name, email, college, role or skills"),
-    college: Optional[str] = Query(None),
+    college: Optional[str] = Query(
+        None, description="College name, or a comma-separated list — matches ANY of them"),
     year_of_passing: Optional[int] = Query(None),
     job_role: Optional[str] = Query(None),
     min_score: Optional[float] = Query(None, ge=0, le=100),
@@ -1244,7 +1246,15 @@ async def list_resume_pool(
             ResumePoolEntry.extracted_skills.ilike(term),
         ))
     if college:
-        query = query.filter(ResumePoolEntry.college.ilike(f"%{college.strip()}%"))
+        # Campus hiring is a set operation — HR picks a whole region or every IIIT at
+        # once — so this is a comma-separated OR, not a single name. One value behaves
+        # exactly as it did before. The cap bounds a pathological query string; the
+        # largest curated group the UI can send is 30 colleges (~60 spellings).
+        terms = [t.strip() for t in college.split(",") if t.strip()][:MAX_COLLEGE_TERMS]
+        if terms:
+            query = query.filter(or_(*[
+                ResumePoolEntry.college.ilike(f"%{t}%") for t in terms
+            ]))
     if year_of_passing:
         query = query.filter(ResumePoolEntry.year_of_passing == year_of_passing)
     if job_role:

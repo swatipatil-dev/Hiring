@@ -939,6 +939,62 @@ def test_metrics_report_the_unscored_backlog(client, db, hr_headers, hr_company)
     assert m["unscoreable"] == 1
 
 
+# ── College filter ───────────────────────────────────────────────────────────
+
+def _colleges(client, hr_headers, value):
+    return client.get("/api/v1/hr/resume-pool", params={"college": value},
+                      headers=hr_headers).json()
+
+
+def _campus(db, company):
+    _pool_row(db, company, email="psg@x.com", college="PSG College of Technology")
+    _pool_row(db, company, email="iiit@x.com", college="IIIT Pune")
+    _pool_row(db, company, email="other@x.com", college="Parul University")
+
+
+def test_college_filter_still_takes_a_single_name(client, db, hr_headers, hr_company):
+    """The old single-value behaviour is what every existing caller sends."""
+    _campus(db, hr_company)
+
+    body = _colleges(client, hr_headers, "psg college")
+    assert body["total"] == 1
+    assert body["results"][0]["college"] == "PSG College of Technology"
+
+
+def test_college_filter_matches_any_of_several(client, db, hr_headers, hr_company):
+    """Campus hiring is a set operation — a region or the whole IIIT network arrives
+    as one comma-separated list and must come back as the union, not the intersection."""
+    _campus(db, hr_company)
+
+    body = _colleges(client, hr_headers, "psg college,iiit pune")
+    assert body["total"] == 2
+    assert {r["college"] for r in body["results"]} == {
+        "PSG College of Technology", "IIIT Pune"}
+
+
+def test_college_filter_ignores_blank_terms(client, db, hr_headers, hr_company):
+    """A chip removed mid-list leaves stray separators in the query string; they must
+    not become an empty '%%' term that matches everyone."""
+    _campus(db, hr_company)
+
+    assert _colleges(client, hr_headers, " psg college , ,iiit pune, ")["total"] == 2
+    # All-empty degrades to no filter rather than matching nothing.
+    assert _colleges(client, hr_headers, " , ")["total"] == 3
+
+
+def test_college_filter_counts_before_paging(client, db, hr_headers, hr_company):
+    """`total` drives the pager, so it has to reflect the filter, not the page."""
+    for i in range(4):
+        _pool_row(db, hr_company, email=f"c{i}@x.com", college="IIIT Nagpur")
+    _pool_row(db, hr_company, email="z@x.com", college="Parul University")
+
+    body = client.get("/api/v1/hr/resume-pool",
+                      params={"college": "iiit nagpur,iiit pune", "limit": 2},
+                      headers=hr_headers).json()
+    assert body["total"] == 4
+    assert len(body["results"]) == 2
+
+
 def test_history_survives_a_job_with_no_company(client, db, hr_headers, hr_company):
     """Proves the read path uses two queries rather than a join.
 
