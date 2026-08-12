@@ -55,3 +55,12 @@ websockets==13.1
 # Vertex AI SDK — needed so `import src.services.gemini_service` succeeds in CI.
 # Tests mock the network, so no GCP credentials are required.
 google-genai>=1.0,<2
+
+# Queue libraries — needed so test_queue_redis_serialization.py can inspect a real
+# connection pool. get_redis()/get_redis_raw() swallow the ImportError and return
+# None, so without these the tests do not fail loudly on a missing dependency —
+# they fail on AttributeError against None.
+# No Redis server is required: Redis.from_url() does not connect eagerly, and
+# redis_available() simply fails its ping and falls back to the inline path.
+redis==5.0.8
+rq==1.16.2
