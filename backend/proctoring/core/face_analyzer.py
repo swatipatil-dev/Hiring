@@ -234,6 +234,19 @@ class FaceAnalyzer:
     def _use_sface(self) -> bool:
         return bool(self._models and self._models.use_sface)
 
+    def _has_registration(self) -> bool:
+        """True if an identity baseline was enrolled for this session.
+
+        Set on `result.has_reference` at the TOP of both analysis paths, before
+        any early return. It used to be assigned only in the matching block, which
+        every no-face frame returns before reaching — so a session with a perfectly
+        good reference photo reported has_reference=False whenever the candidate
+        looked away. The frontend keys its live self-enrollment on that field
+        (OnlineTest.jsx), so it could retry enrollment mid-test.
+        """
+        return (self._registered_face_gray is not None
+                or self._registered_sface_embedding is not None)
+
     # ══════════════════════════════════════════════════
     #  FACE REGISTRATION (untouched per user request)
     # ══════════════════════════════════════════════════
@@ -356,6 +369,7 @@ class FaceAnalyzer:
         t0 = time.perf_counter()
         self._frame_count += 1
         result = FaceAnalysisResult()
+        result.has_reference = self._has_registration()
         h, w = frame.shape[:2]
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -550,8 +564,9 @@ class FaceAnalyzer:
         # ══════════════════════════════════════════
         #  FACE MATCHING (untouched per user request)
         # ══════════════════════════════════════════
-        has_registration = self._registered_face_gray is not None or self._registered_sface_embedding is not None
-        result.has_reference = has_registration
+        # Already set at the top of this method; recomputed here only because
+        # the matching logic below branches on it.
+        has_registration = self._has_registration()
         if has_registration and self._frame_count % max(self.cfg.skip_frames, 1) == 0:
             result.identity_match, result.similarity_score = self._match_face(frame, fx_px, fy_px, fw_px, fh_px)
             if not result.identity_match:
@@ -705,6 +720,7 @@ class FaceAnalyzer:
         t0 = time.perf_counter()
         self._frame_count += 1
         result = FaceAnalysisResult()
+        result.has_reference = self._has_registration()
         h, w = frame.shape[:2]
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.equalizeHist(gray)
@@ -816,8 +832,9 @@ class FaceAnalyzer:
         if result.gaze_deviation_score > self.cfg.gaze_deviation_threshold:
             result.flags.append("SUSPICIOUS_GAZE")
 
-        has_registration = self._registered_face_gray is not None or self._registered_sface_embedding is not None
-        result.has_reference = has_registration
+        # Already set at the top of this method; recomputed here only because
+        # the matching logic below branches on it.
+        has_registration = self._has_registration()
         if has_registration and self._frame_count % max(self.cfg.skip_frames, 1) == 0:
             result.identity_match, result.similarity_score = self._match_face(frame, fx, fy, fw, fh)
             if not result.identity_match:

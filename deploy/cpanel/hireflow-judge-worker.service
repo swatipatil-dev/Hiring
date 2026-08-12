@@ -33,6 +33,13 @@ EnvironmentFile=/opt/hireflow/backend/.env
 Environment=ROLE=worker
 Environment=JUDGE_BACKEND=docker
 Environment=JUDGE_WORK_ROOT=/srv/judge_work
+
+# Concurrent judge jobs. The API does NOT execute sandboxes itself — it enqueues
+# here and blocks on the result inside the HTTP request — so this value is the
+# ceiling on simultaneous "Run Code" presses before candidates start queueing.
+# Each job runs its own resource-capped container, so keep this at or below the
+# CPU count and remember the containers' memory is NOT covered by MemoryMax below.
+Environment=JUDGE_WORKERS=3
 Environment=PYTHONUNBUFFERED=1
 Environment=PATH=/opt/hireflow/venv/bin:/usr/local/bin:/usr/bin:/bin
 

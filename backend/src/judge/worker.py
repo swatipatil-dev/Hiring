@@ -7,8 +7,19 @@ It loads the submission + problem + test cases, runs the sandboxed judge, persis
 per-case results, updates the submission, and publishes status to the pub/sub
 channel the WebSocket streams from.
 
-Run a worker (inside the Linux judge-worker container) with:
-    rq worker judge --url redis://redis:6379/0
+The three ``*_job`` wrappers below exist for a different reason: **only this
+process is allowed to touch Docker.** The API service runs as a user with no
+Docker access and no write access to ``JUDGE_WORK_ROOT``, deliberately — Docker
+group membership is root-equivalent and the API is internet-facing. So the API
+enqueues and waits (``queue.run_in_worker``) rather than executing sandboxes
+itself.
+
+They are deliberately thin: no DB, no persistence, just "run this and hand back
+the dataclass". Every argument and return value is a plain dataclass so RQ can
+pickle them without custom serialisation.
+
+Run a worker with (see backend/entrypoint.sh, ROLE=worker):
+    rq worker-pool -n 3 judge --url redis://127.0.0.1:6379/5
 """
 from __future__ import annotations
 
@@ -158,3 +169,64 @@ def judge_submission_job(submission_id: str) -> dict:
         return {"error": "exception", "detail": str(exc)}
     finally:
         db.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Sandbox-only jobs (no database, no persistence)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# These run the sandbox on behalf of the API process, which cannot do it itself
+# (see the module docstring). They intentionally do NOT swallow exceptions: the
+# dispatcher re-raises them in the caller so existing try/except blocks in
+# routes/judge_routes.py and interview_grading.py keep behaving as they did when
+# execution was inline.
+
+
+def run_once_job(language_key: str, source_code: str, stdin: str = "",
+                 time_limit_ms: int = 5000, memory_limit_mb: int = 256):
+    """Scratch 'Run Code' — compile and run once, no test-case comparison."""
+    from .runner import run_once
+    logger.info("run_once_job: lang=%s bytes=%d", language_key, len(source_code or ""))
+    return run_once(language_key, source_code, stdin,
+                    time_limit_ms=time_limit_ms, memory_limit_mb=memory_limit_mb)
+
+
+def judge_code_job(language_key: str, source_code: str, test_cases,
+                   time_limit_ms: int = 5000, memory_limit_mb: int = 256):
+    """Graded run against test cases. `test_cases` is a list of TestCaseInput."""
+    from .runner import judge_submission
+    logger.info("judge_code_job: lang=%s cases=%d", language_key, len(test_cases or []))
+    return judge_submission(language_key, source_code, test_cases,
+                            time_limit_ms=time_limit_ms,
+                            memory_limit_mb=memory_limit_mb)
+
+
+def judge_sql_job(source_code: str, test_cases, reference_sql=None, image=None,
+                  time_limit_ms: int = 5000, memory_limit_mb: int = 256):
+    """SQL grading. Separate entry point because SQL is graded by sql_harness.py
+    INSIDE the sandbox, comparing result sets rather than stdout strings."""
+    from .sql_sandbox import judge_sql_sandboxed
+    logger.info("judge_sql_job: cases=%d ref=%s", len(test_cases or []),
+                bool(reference_sql))
+    return judge_sql_sandboxed(source_code, test_cases, reference_sql=reference_sql,
+                               image=image, time_limit_ms=time_limit_ms,
+                               memory_limit_mb=memory_limit_mb)
+
+
+def hidden_testgen_job(question_text: str, sample_answer: str, category=None,
+                       existing=None, min_hidden: int = 3, max_total: int = 6):
+    """Validate and top up a question's test cases.
+
+    The WHOLE function runs here rather than each of its sandbox calls being
+    dispatched individually — it executes the reference solution once per case,
+    so per-call dispatch would mean N Redis round-trips instead of one. Its
+    arguments and return value are plain str/list/dict, so it pickles cleanly.
+
+    Inside this process Docker IS available, so hidden_testgen's own
+    backend_available() gate passes and needs no change.
+    """
+    from .hidden_testgen import ensure_hidden_testcases
+    logger.info("hidden_testgen_job: existing=%d min_hidden=%d",
+                len(existing or []), min_hidden)
+    return ensure_hidden_testcases(question_text, sample_answer, category, existing,
+                                   min_hidden=min_hidden, max_total=max_total)

@@ -127,6 +127,26 @@ def backend_available() -> bool:
     return docker_available()
 
 
+def execution_available() -> bool:
+    """True when code can be executed *somewhere* — here or in the judge worker.
+
+    ``backend_available()`` answers a narrower question: "can THIS process run a
+    sandbox right now". In the API process that is False by design, because it has
+    no Docker access (see src/judge/worker.py). Callers that merely need to know
+    whether execution is possible at all must use this instead, or they silently
+    skip work the worker would happily have done — which is how AI-generated test
+    cases ended up unvalidated on the cPanel deployment.
+    """
+    if active_backend() == "judge0":
+        return True
+    from .queue import sync_forced, redis_available
+    if sync_forced():
+        # Inline mode: this process must be able to run Docker itself.
+        from .sandbox import docker_available
+        return docker_available()
+    return redis_available()
+
+
 def judge_submission(
     language_key: str,
     source_code: str,

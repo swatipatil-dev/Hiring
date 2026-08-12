@@ -8,8 +8,16 @@ set -e
 ROLE="${ROLE:-web}"
 
 if [ "$ROLE" = "worker" ]; then
-    echo "Starting coding-judge RQ worker..."
-    exec rq worker "${JUDGE_QUEUE:-judge}" \
+    # A worker POOL, not a single worker. The API no longer executes sandboxes
+    # itself — it enqueues here and waits for the result inside the HTTP request
+    # (see src/judge/queue.py run_in_worker). With one worker, two candidates
+    # pressing "Run Code" would serialise, so concurrency has to live here.
+    #
+    # Each concurrent job still runs its own container with its own
+    # --memory/--cpus/--pids-limit caps from src/judge/sandbox.py, so raising
+    # JUDGE_WORKERS raises real resource use. Keep it at or below the CPU count.
+    echo "Starting coding-judge RQ worker pool (${JUDGE_WORKERS:-3} workers)..."
+    exec rq worker-pool -n "${JUDGE_WORKERS:-3}" "${JUDGE_QUEUE:-judge}" \
         --url "${JUDGE_REDIS_URL:-${REDIS_URL:-redis://localhost:6379/0}}"
 fi
 

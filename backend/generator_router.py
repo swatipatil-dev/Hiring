@@ -82,10 +82,13 @@ def _revalidate_coding_testcases(q, language=None):
         return
     run_lang = (language or "python").lower()
     try:
-        from src.judge.runner import backend_available, judge_submission, TestCaseInput
-        # Works under either backend: Docker must be up locally, Judge0 is remote
-        # (validated per call). Skip only when neither can execute code.
-        if not backend_available():
+        from src.judge.runner import execution_available, TestCaseInput
+        from src.judge.queue import run_in_worker
+        # execution_available(), NOT backend_available(): this is the API process,
+        # which has no Docker by design, so backend_available() is always False
+        # here and this whole block silently skipped — leaving LLM-generated test
+        # cases unvalidated. What matters is whether the judge WORKER can run.
+        if not execution_available():
             return
 
         # Validate any LLM-provided cases against the reference solution — in the
@@ -99,8 +102,8 @@ def _revalidate_coding_testcases(q, language=None):
                               is_sample=bool(c.get("is_sample")), ordinal=i)
                 for i, c in enumerate(cases)
             ]
-            result = judge_submission(run_lang, q.sample_answer, tcs,
-                                      time_limit_ms=4000, memory_limit_mb=256)
+            result = run_in_worker("src.judge.worker.judge_code_job",
+                                   run_lang, q.sample_answer, tcs, 4000, 256)
             kept = [cases[int(cr.test_case_id)] for cr in result.cases if cr.verdict == "AC"]
             if kept:
                 q.test_cases = kept   # else keep originals for manual review
@@ -111,10 +114,12 @@ def _revalidate_coding_testcases(q, language=None):
         if run_lang == "python":
             current = q.test_cases if isinstance(q.test_cases, list) else cases
             if _hidden(current) < MIN_HIDDEN:
-                from src.judge.hidden_testgen import ensure_hidden_testcases
-                topped = ensure_hidden_testcases(
+                # Dispatched as ONE job: this runs the reference solution once per
+                # case, so per-call dispatch would be N Redis round-trips.
+                topped = run_in_worker(
+                    "src.judge.worker.hidden_testgen_job",
                     q.question_text, q.sample_answer, getattr(q, "category", None),
-                    current, min_hidden=MIN_HIDDEN)
+                    current, MIN_HIDDEN)
                 if topped:
                     q.test_cases = topped
     except Exception as e:

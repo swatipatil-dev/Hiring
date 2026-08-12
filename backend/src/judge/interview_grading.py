@@ -11,7 +11,9 @@ import logging
 from typing import Optional
 
 from . import verdict as V
-from .runner import judge_submission, TestCaseInput
+# TestCaseInput only — the runner's execution functions are no longer called from
+# this process; they run in the judge worker via queue.run_in_worker.
+from .runner import TestCaseInput
 
 logger = logging.getLogger("judge.interview_grading")
 
@@ -66,20 +68,32 @@ def grade_interview_question(question, language: str, source_code: str,
         for i, c in enumerate(cases_raw) if isinstance(c, dict)
     ]
 
+    # Both branches execute in the judge worker, never in this process: the API
+    # runs as a user with no Docker access by design (see src/judge/worker.py).
+    # run_in_worker blocks until the result is back, so grading stays synchronous.
+    from .queue import run_in_worker, SandboxUnavailable
     try:
         if lang == "sql":
             # SQL is graded INSIDE the sandbox (sql_harness.py) against the reference
             # query (sample_answer), comparing result sets order-independently rather
             # than string-matching expected_output.
-            from .sql_sandbox import judge_sql_sandboxed
             from .languages import get_language as _get_lang
-            result = judge_sql_sandboxed(
-                source_code, tcs, reference_sql=getattr(question, "sample_answer", None),
-                image=_get_lang("sql").image,
-                time_limit_ms=_CASE_TIME_MS, memory_limit_mb=_CASE_MEM_MB)
+            result = run_in_worker(
+                "src.judge.worker.judge_sql_job",
+                source_code, tcs,
+                getattr(question, "sample_answer", None),
+                _get_lang("sql").image,
+                _CASE_TIME_MS, _CASE_MEM_MB)
         else:
-            result = judge_submission(lang, source_code, tcs,
-                                      time_limit_ms=_CASE_TIME_MS, memory_limit_mb=_CASE_MEM_MB)
+            result = run_in_worker(
+                "src.judge.worker.judge_code_job",
+                lang, source_code, tcs, _CASE_TIME_MS, _CASE_MEM_MB)
+    except SandboxUnavailable as e:
+        # Nothing executed. Take the existing unavailable path so the candidate is
+        # not scored 0 for an infrastructure problem — candidate_routes defers
+        # these for regrade rather than banking a zero.
+        logger.warning("judge sandbox unavailable: %s", e)
+        return _empty(points, JUDGE_UNAVAILABLE_MESSAGE, unavailable=True)
     except Exception as e:
         logger.exception("grade_interview_question failed")
         return _empty(points, f"Judge error: {e}")

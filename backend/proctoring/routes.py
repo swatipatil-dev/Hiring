@@ -248,10 +248,19 @@ def _save_evidence(frame, evidence_path: str):
     try:
         from src.services.storage import storage
         ok, buf = cv2.imencode(".jpg", frame)
-        if ok:
-            storage.save_bytes(buf.tobytes(), evidence_path)
+        if not ok:
+            # The violation row is written with this evidence_path regardless of
+            # whether the upload succeeded, so a silent failure here leaves HR
+            # looking at a broken image with nothing explaining it.
+            logger.error(
+                "Evidence NOT saved (cv2.imencode returned False) for %s — the "
+                "violation row will reference a file that does not exist",
+                evidence_path,
+            )
+            return
+        storage.save_bytes(buf.tobytes(), evidence_path)
     except Exception as ev_err:
-        logger.error("Failed to save face evidence: %s", ev_err)
+        logger.error("Failed to save face evidence %s: %s", evidence_path, ev_err)
 
 
 def _update_session_scores(db_session_id: str, result):
@@ -1137,6 +1146,19 @@ async def ws_video(ws: WebSocket, session_id: str):
     await ws.accept()
     entry = _sessions.get(session_id)
     if not entry:
+        # Logged deliberately: a 4004 is the signature of a ROUTING problem, not a
+        # client error. _sessions is process-local, so this means the socket reached
+        # a different process than the one that ran /sessions/start — more than one
+        # proctor worker, or a proxy sending WS and HTTP to different upstreams.
+        # This used to close silently, leaving the client on "Checking..." with no
+        # server-side evidence whatsoever.
+        logger.warning(
+            "Proctor WS 4004 on %s: session=%s not in THIS process (pid=%s, %d live "
+            "session(s)). Proctoring must run as ONE worker — check WEB_CONCURRENCY "
+            "in hireflow-proctor.service and the proxy's WebSocket route.",
+            getattr(getattr(ws, "url", None), "path", "?"),
+            session_id, os.getpid(), len(_sessions),
+        )
         await ws.close(code=4004, reason="Session not found")
         return
 
@@ -1153,6 +1175,7 @@ async def ws_video(ws: WebSocket, session_id: str):
     # Tracks what we last told the client about enrollment, so a live enrollment that
     # completes *after* this socket opened is pushed instead of waiting for a reload.
     announced_registered = entry.get("face_registered")
+    decode_failures = 0       # counted so the log line below can be rate-limited
 
     logger.info("Video WS connected: session=%s (face_pre_registered=%s)",
                 session_id, announced_registered)
@@ -1166,6 +1189,19 @@ async def ws_video(ws: WebSocket, session_id: str):
                 nparr = np.frombuffer(img_bytes, np.uint8)
                 frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                 if frame is None:
+                    # Log it — rate-limited. A run of silent decode failures used to
+                    # leave NO trace anywhere: frame_count never increments, the
+                    # client stays on "Checking..." because `skipped` does not count
+                    # as an analysis, and the session ends looking clean. That is
+                    # indistinguishable from "no frames were ever sent" unless this
+                    # line exists.
+                    decode_failures += 1
+                    if decode_failures == 1 or decode_failures % 50 == 0:
+                        logger.warning(
+                            "Video WS decode failed: session=%s count=%d payload=%dB "
+                            "b64_len=%d (a binary frame or a truncated data URL?)",
+                            session_id, decode_failures, len(img_bytes), len(data),
+                        )
                     # Ack anyway: the client paces on replies, so silently dropping a bad
                     # frame would stall its pump until the watchdog fires.
                     await ws.send_json({"event": "skipped", "reason": "decode_failed"})
@@ -1330,7 +1366,16 @@ async def ws_video(ws: WebSocket, session_id: str):
                 await ws.send_json({"event": "error", "message": str(e)})
 
     except WebSocketDisconnect:
-        logger.info("Video WS disconnected: session=%s (frames=%d)", session_id, entry.get("frame_count", 0))
+        logger.info("Video WS disconnected: session=%s (frames=%d, decode_failures=%d)",
+                    session_id, entry.get("frame_count", 0), decode_failures)
+    except Exception as e:
+        # receive_text() raises here — OUTSIDE the per-frame try — if the client
+        # sends a binary frame. It is not a WebSocketDisconnect, so without this
+        # branch the socket simply died: no disconnect log, no error log, and a
+        # session that looks like it was never used.
+        logger.error("Video WS aborted: session=%s (frames=%d, decode_failures=%d) "
+                     "%s: %s", session_id, entry.get("frame_count", 0),
+                     decode_failures, type(e).__name__, e)
     finally:
         # Let the audit-trail writes finish. A violation raised in the last second of a
         # test is exactly the one worth keeping, and these tasks hold no reference that
@@ -1352,6 +1397,19 @@ async def ws_audio(ws: WebSocket, session_id: str):
     await ws.accept()
     entry = _sessions.get(session_id)
     if not entry:
+        # Logged deliberately: a 4004 is the signature of a ROUTING problem, not a
+        # client error. _sessions is process-local, so this means the socket reached
+        # a different process than the one that ran /sessions/start — more than one
+        # proctor worker, or a proxy sending WS and HTTP to different upstreams.
+        # This used to close silently, leaving the client on "Checking..." with no
+        # server-side evidence whatsoever.
+        logger.warning(
+            "Proctor WS 4004 on %s: session=%s not in THIS process (pid=%s, %d live "
+            "session(s)). Proctoring must run as ONE worker — check WEB_CONCURRENCY "
+            "in hireflow-proctor.service and the proxy's WebSocket route.",
+            getattr(getattr(ws, "url", None), "path", "?"),
+            session_id, os.getpid(), len(_sessions),
+        )
         await ws.close(code=4004, reason="Session not found")
         return
 
@@ -1375,6 +1433,19 @@ async def ws_behavioral(ws: WebSocket, session_id: str):
     await ws.accept()
     entry = _sessions.get(session_id)
     if not entry:
+        # Logged deliberately: a 4004 is the signature of a ROUTING problem, not a
+        # client error. _sessions is process-local, so this means the socket reached
+        # a different process than the one that ran /sessions/start — more than one
+        # proctor worker, or a proxy sending WS and HTTP to different upstreams.
+        # This used to close silently, leaving the client on "Checking..." with no
+        # server-side evidence whatsoever.
+        logger.warning(
+            "Proctor WS 4004 on %s: session=%s not in THIS process (pid=%s, %d live "
+            "session(s)). Proctoring must run as ONE worker — check WEB_CONCURRENCY "
+            "in hireflow-proctor.service and the proxy's WebSocket route.",
+            getattr(getattr(ws, "url", None), "path", "?"),
+            session_id, os.getpid(), len(_sessions),
+        )
         await ws.close(code=4004, reason="Session not found")
         return
 

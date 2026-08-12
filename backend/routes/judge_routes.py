@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from datetime import datetime
 from typing import List, Optional
@@ -32,6 +33,8 @@ from src.models.models import (
 from src.tenancy import set_current_company
 from src.judge import languages as judge_languages
 from src.judge.queue import enqueue_submission
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/judge", tags=["Coding Judge"])
 
@@ -222,8 +225,28 @@ async def run_code(
             except Exception:
                 pass
 
-    from src.judge.runner import run_once
-    r = run_once(lang, body.source_code, stdin)
+    # Executed in the judge worker, not here: the API process has no Docker
+    # access by design (see src/judge/worker.py). run_in_worker blocks until the
+    # result is back, so this stays a normal synchronous response.
+    from src.judge.queue import run_in_worker, SandboxUnavailable
+    try:
+        r = await asyncio.to_thread(
+            run_in_worker, "src.judge.worker.run_once_job",
+            lang, body.source_code, stdin,
+        )
+    except SandboxUnavailable as e:
+        # Nothing ran. Report it as the judge's own "unavailable" status rather
+        # than a 500, so the editor shows a retryable message.
+        logger.warning("Run Code unavailable: %s", e)
+        return {
+            "status": "unavailable", "stdout": "", "stderr": "",
+            "exit_code": -1, "time_ms": 0, "timed_out": False,
+            "compile_error": None,
+            "error_message": "The code execution service is temporarily "
+                             "unavailable. Please try again in a moment.",
+            "seeded_from_sample": seeded_from_sample,
+        }
+
     return {
         "status": r.status, "stdout": r.stdout, "stderr": r.stderr,
         "exit_code": r.exit_code, "time_ms": r.time_ms, "timed_out": r.timed_out,
