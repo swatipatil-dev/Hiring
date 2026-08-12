@@ -23,13 +23,17 @@ per-submission work directory.
 """
 from __future__ import annotations
 
+import logging
 import os
+import re
 import shutil
 import subprocess
 import time
 import uuid
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 class SandboxUnavailable(RuntimeError):
@@ -55,6 +59,56 @@ _OUTPUT_CAP = int(os.getenv("JUDGE_OUTPUT_CAP_BYTES", str(256 * 1024)))  # 256 K
 _docker_ok: Optional[bool] = None
 _docker_checked_at: float = 0.0
 _DOCKER_TTL = float(os.getenv("JUDGE_DOCKER_TTL_S", "10"))
+
+# ── Docker CLI diagnostics vs. the candidate's stderr ────────────────────────
+# `docker run` streams the container's stderr to its OWN stderr, so the two are
+# interleaved in one pipe and cannot be separated at the stream level. Anything
+# the CLI says about the host therefore lands in the candidate's error box, where
+# it reads as a fault in their code.
+#
+# A live example: the judge worker's unit has ProtectHome=true, which makes
+# /home/hfjudge unreadable, so every single run printed
+#
+#     WARNING: Error loading config file: open /home/hfjudge/.docker/config.json:
+#     permission denied
+#
+# to candidates sitting an exam. The root cause is fixed (DOCKER_CONFIG in
+# hireflow-judge-worker.service), but the class of problem is not: image pulls,
+# platform mismatches and kernel warnings all arrive the same way.
+#
+# These patterns are deliberately specific rather than a blanket `^WARNING:` —
+# a candidate's program may legitimately print that. Matched lines are LOGGED,
+# never silently dropped: they are how an operator learns the host is unhealthy,
+# which is exactly what we would have missed here.
+_DOCKER_NOISE = re.compile(
+    r"^(?:"
+    r"WARNING: Error loading config file:"
+    r"|WARNING: No swap limit support"
+    r"|WARNING: Your kernel does not support"
+    r"|WARNING: Published ports are discarded"
+    r"|WARNING: The requested image's platform"
+    r"|WARNING: daemon is not using the default seccomp"
+    r"|Unable to find image "
+    r"|\S+: Pulling from "
+    r"|docker: Error response from daemon: .*(?:no space left|too many open files)"
+    r")"
+)
+
+
+def _split_docker_noise(stderr: str) -> Tuple[str, List[str]]:
+    """Split the Docker CLI's own diagnostics out of the program's stderr.
+
+    Returns (program_stderr, cli_lines). Order and blank lines within the
+    program's own output are preserved.
+    """
+    if "WARNING" not in stderr and "Pulling from" not in stderr \
+            and "Unable to find image" not in stderr and "docker: Error" not in stderr:
+        return stderr, []          # the overwhelmingly common case — no scanning
+
+    kept, noise = [], []
+    for line in stderr.splitlines(keepends=True):
+        (noise if _DOCKER_NOISE.match(line) else kept).append(line)
+    return "".join(kept), [n.rstrip("\r\n") for n in noise]
 
 
 def _probe_docker() -> bool:
@@ -180,6 +234,16 @@ def run_in_sandbox(
         _force_kill(name)
 
     wall_ms = int((time.monotonic() - start) * 1000)
+
+    # Strip the CLI's own chatter before anything reads this as program output.
+    # Done BEFORE the OOM heuristic on purpose: that heuristic greps stderr for
+    # "Killed", so a host-level message could otherwise fabricate an MLE verdict.
+    stderr, cli_noise = _split_docker_noise(stderr)
+    if cli_noise:
+        logger.warning(
+            "docker CLI diagnostics suppressed from candidate output (image=%s): %s",
+            image, " | ".join(cli_noise[:5]),
+        )
 
     # OOM heuristic: exit 137 (128+SIGKILL) without a host timeout almost always
     # means the cgroup memory cap killed it; corroborate with common signatures.

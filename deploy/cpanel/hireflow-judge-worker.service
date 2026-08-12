@@ -43,6 +43,20 @@ Environment=JUDGE_WORKERS=3
 Environment=PYTHONUNBUFFERED=1
 Environment=PATH=/opt/hireflow/venv/bin:/usr/local/bin:/usr/bin:/bin
 
+# ProtectHome=true below makes /home unreadable, so the docker CLI cannot open its
+# default config at $HOME/.docker/config.json and printed
+#   WARNING: Error loading config file: open /home/hfjudge/.docker/config.json:
+#   permission denied
+# on its stderr — the same stream the container's stderr arrives on, so every
+# candidate saw it in their program's error output.
+#
+# Point both at a directory this service can actually reach. The directory does not
+# need to exist: the CLI is silent on ENOENT, and only warns when a path exists but
+# cannot be read. HOME is set too because ProtectHome leaves it dangling for
+# anything else that looks there.
+Environment=HOME=/srv/judge_work
+Environment=DOCKER_CONFIG=/srv/judge_work/.docker
+
 ExecStart=/bin/sh /opt/hireflow/backend/entrypoint.sh
 
 Restart=always

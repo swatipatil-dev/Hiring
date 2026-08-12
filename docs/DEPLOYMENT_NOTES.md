@@ -67,6 +67,36 @@ instructive: ultralytics treats an unfound weights *name* as something to
 **download into the CWD**, so the failure was a permissions error rather than a
 "file not found".
 
+### The judge worker's home directory is unreachable
+
+`hireflow-judge-worker.service` sets `ProtectHome=true`, so `/home/hfjudge` does
+not exist as far as that process is concerned. The `docker` CLI looks for
+`$HOME/.docker/config.json`, gets `permission denied` rather than "not found", and
+warns — on its own stderr.
+
+That matters more than it sounds, because **`docker run` streams the container's
+stderr onto its own**. The two are one pipe and cannot be separated at the stream
+level, so a host-level warning is delivered to the candidate as their program's
+error output. Candidates sitting an exam saw:
+
+```
+WARNING: Error loading config file: open /home/hfjudge/.docker/config.json: permission denied
+```
+
+Fixed on both sides, and both are needed:
+
+- `Environment=HOME=/srv/judge_work` and `DOCKER_CONFIG=/srv/judge_work/.docker`
+  in the unit. The directory need not exist — the CLI is silent on `ENOENT` and
+  only complains about a path it can see but not read.
+- `_split_docker_noise()` in `src/judge/sandbox.py` separates CLI diagnostics from
+  program stderr and **logs** them. Image pulls, platform mismatches and daemon
+  errors all arrive by the same route, so removing one cause does not close the
+  hole. It runs *before* the OOM heuristic, which greps stderr for `Killed` — a
+  host message could otherwise fabricate an MLE verdict.
+
+The patterns are specific rather than a blanket `^WARNING:`, because a candidate's
+program may legitimately print that.
+
 ### RQ must never be given a decoding Redis client
 
 Both queue modules keep **two** clients, and the distinction is load-bearing:
@@ -123,6 +153,7 @@ These all leave the deployment looking healthy. Check them explicitly.
 | `google-genai` missing | Health checks pass | Every AI feature fails at first use, three retries deep |
 | `PORT` / `WEB_CONCURRENCY` set in `.env` | Site loads, `/health` green, one service `active` | `.env` overrode the unit; proctoring took the API's port and the API crash-looped ([§4](#4-configuration-which-file-wins)) |
 | A service losing a port race | `systemctl status` cycles `activating`, nothing else | `Restart=always` hides it; the survivor serves the traffic |
+| Docker CLI warnings | Candidates see them as *their* program's stderr | `docker run` merges container stderr into its own ([above](#the-judge-workers-home-directory-is-unreachable)) |
 | `create_all` without `import main` | Plausible table count | Judge and question tables silently absent |
 | Wrong schema name | `/health` reports 0 tables | App works; only the reporting queries were hardcoded |
 | `en_core_web_trf` missing | ATS scores fine | NER skill extraction returns `[]` |
