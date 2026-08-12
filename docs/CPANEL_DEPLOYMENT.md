@@ -901,7 +901,7 @@ face badge sits on "Checking…" forever, zero frames are analysed, and every re
 comes back clean:
 
 ```bash
-curl -sS -o /dev/null -w '%{http_code}\n' \
+curl -sS --http1.1 -o /dev/null -w '%{http_code}\n' \
   -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
   -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
   'https://career.innomaxskills.com/api/v1/proctor/ws/video/probe'
@@ -911,12 +911,38 @@ curl -sS -o /dev/null -w '%{http_code}\n' \
 (`proctoring/routes.py:1146`), so a made-up session id still completes the
 handshake and is then closed with code 4004 — which is the correct outcome here.
 
-Anything else — `200`, `400`, `404`, `502` — means the upgrade was forwarded as
-ordinary HTTP by `mod_proxy_http`. The cause is almost always directive
-precedence: **Apache evaluates `ProxyPass` before mod_rewrite's `[P]` flag**, so a
-`RewriteRule … [P]` for a path that a later `ProxyPass` also matches never runs.
-`hireflow.conf` therefore declares the WebSocket paths as `ProxyPass … ws://`
-entries *above* the general `ProxyPass`. Confirm yours did get installed:
+> **`--http1.1` is required, and is not paranoia.** This server runs `mod_http2`,
+> so curl negotiates HTTP/2 over TLS by default — and `Connection: Upgrade` is not
+> a legal HTTP/2 header. Apache drops it, `mod_proxy_wstunnel` never sees an
+> upgrade request, and the probe reports a **`404`** from a perfectly healthy
+> deployment. (404 rather than 400 because Starlette matches routes by scope: an
+> ordinary HTTP GET does not match a WebSocket-only route.) Real candidates are
+> unaffected — browsers use HTTP/1.1 for `wss://` unless the server advertises
+> RFC 8441, which Apache does not by default.
+
+Any other status — `200`, `400`, `404` *with* `--http1.1`, `502` — means the
+upgrade was forwarded as ordinary HTTP by `mod_proxy_http`. Two causes, in order
+of likelihood:
+
+1. **Nothing is listening on 8001.** A `503` says this outright. Go back to the
+   port-ownership check in Step 11 — this is the more common fault, and no amount
+   of Apache work fixes it.
+2. **Directive precedence.** **Apache evaluates `ProxyPass` before mod_rewrite's
+   `[P]` flag**, so a `RewriteRule … [P]` for a path that a later `ProxyPass` also
+   matches never runs. `hireflow.conf` therefore declares the WebSocket paths as
+   `ProxyPass … ws://` entries *above* the general `ProxyPass`.
+
+To tell those apart, probe the app directly, bypassing Apache entirely:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+  -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+  http://127.0.0.1:8001/api/v1/proctor/ws/video/probe
+```
+
+`101` here but not through the domain isolates the fault to Apache. Anything else
+here means the service, not the proxy. Then confirm the rules got installed:
 
 ```bash
 grep -c '^ProxyPass.*ws://127.0.0.1' \
