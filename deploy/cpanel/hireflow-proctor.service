@@ -27,23 +27,28 @@ Group=hireflow
 WorkingDirectory=/opt/hireflow/backend
 EnvironmentFile=/opt/hireflow/backend/.env
 
-Environment=ROLE=web
-Environment=PORT=8001
+# ROLE=proctor, not web. That role hardcodes one worker and port 8001 in
+# entrypoint.sh instead of reading WEB_CONCURRENCY and PORT.
+#
+# It has to work that way. systemd applies EnvironmentFile= AFTER Environment=,
+# so a value in the shared .env OVERRIDES what is pinned here — the opposite of
+# what the ordering in this file suggests. PORT=8000 in .env duly beat an
+# Environment=PORT=8001 pinned right here: proctoring bound 8000, won the startup
+# race, hireflow-api crash-looped on "Connection in use", and the site kept
+# serving from this process while proctoring itself was unreachable. Every
+# candidate's face check sat on "Checking…" and every report came back clean.
+#
+# Pinning a correctness constraint in a unit file does not make it safe. Putting
+# it in the code path does.
+Environment=ROLE=proctor
 Environment=BIND_HOST=127.0.0.1
-# MUST be 1. See the header above — this is a correctness constraint, not tuning.
-Environment=WEB_CONCURRENCY=1
 Environment=PROCTOR_PREWARM=1
 Environment=HF_HOME=/opt/hireflow/hf-cache
 
-# NOTE: PROCTOR_INFERENCE_SLOTS and PROCTOR_MAX_SESSIONS are deliberately NOT set
-# here. They are the two knobs an operator tunes against real load, and they are
-# documented in backend/.env.
-#
-# systemd applies Environment= AFTER EnvironmentFile=, so anything set here would
-# silently override .env — the operator would edit .env, restart, and see no
-# change. Values that are correctness constraints (WEB_CONCURRENCY, PORT, ROLE)
-# stay pinned above precisely because they must NOT be overridable; tuning values
-# live in .env so there is exactly one place to change them.
+# PROCTOR_INFERENCE_SLOTS and PROCTOR_MAX_SESSIONS are deliberately NOT set here.
+# They are the two knobs an operator tunes against real load, so they belong in
+# .env — which, per the note above, is also the layer that wins. Anything pinned
+# here would be un-tunable.
 #
 # Unset, the app defaults to (cpu_count - 2) slots and slots * 1.5 sessions.
 Environment=OMP_NUM_THREADS=1

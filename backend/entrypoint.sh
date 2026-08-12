@@ -1,10 +1,17 @@
 #!/usr/bin/env sh
 # Container entrypoint. ROLE selects what this instance runs:
-#   web    (default) → FastAPI app via gunicorn/uvicorn, binds $PORT (Cloud Run)
+#   web    (default) → FastAPI app via gunicorn/uvicorn, binds $PORT
+#   proctor          → the same app, one worker, fixed port — see below
 #   worker           → coding-judge RQ worker (run on a host that HAS Docker)
 #   email-worker     → outbound-email RQ worker (rate-limited; needs the scheduler)
 set -e
 
+# Every role branch below ends in `exit 1` after its `exec`. That line is
+# unreachable while exec does its job of replacing this process — it is there for
+# the case where it doesn't (gunicorn or rq missing from PATH, say). Without it,
+# execution would fall through to the web role at the bottom and quietly start a
+# SECOND API on port 8000, colliding with the real one. That collision has already
+# cost us a silent proctoring outage once; see hireflow-proctor.service.
 ROLE="${ROLE:-web}"
 
 if [ "$ROLE" = "worker" ]; then
@@ -19,6 +26,42 @@ if [ "$ROLE" = "worker" ]; then
     echo "Starting coding-judge RQ worker pool (${JUDGE_WORKERS:-3} workers)..."
     exec rq worker-pool -n "${JUDGE_WORKERS:-3}" "${JUDGE_QUEUE:-judge}" \
         --url "${JUDGE_REDIS_URL:-${REDIS_URL:-redis://localhost:6379/0}}"
+    exit 1   # see the note above: a role branch must never fall through
+fi
+
+if [ "$ROLE" = "proctor" ]; then
+    # Proctoring, and ONLY proctoring. Two values are hardcoded here on purpose,
+    # because both are correctness constraints rather than tuning:
+    #
+    # -w 1  proctoring/routes.py keeps sessions in a process-local dict of live
+    #       MediaPipe handles, which cannot be serialised or shared. A session's
+    #       WebSocket must reach the process that created it; with N workers it
+    #       does so 1/N of the time and closes 4004 otherwise.
+    #
+    # 8001  a distinct port from the API's 8000, matched by the ws:// and http://
+    #       ProxyPass entries in deploy/cpanel/hireflow.conf. Change one, change
+    #       the other.
+    #
+    # Neither reads WEB_CONCURRENCY or PORT, and that is the point. Both services
+    # share one .env, and systemd applies EnvironmentFile= AFTER Environment=, so
+    # a PORT=8000 in .env silently beat the Environment=PORT=8001 pinned in
+    # hireflow-proctor.service: proctoring bound 8000, won the race, the API
+    # crash-looped on "Connection in use", and the site kept serving from the
+    # proctor process while proctoring itself was unreachable. Capacity is tuned
+    # with PROCTOR_INFERENCE_SLOTS, which is safe to set anywhere.
+    if [ -n "${WEB_CONCURRENCY:-}" ] && [ "${WEB_CONCURRENCY}" != "1" ]; then
+        echo "note: ignoring WEB_CONCURRENCY=${WEB_CONCURRENCY} — proctoring requires" \
+             "exactly one worker. Tune PROCTOR_INFERENCE_SLOTS instead." >&2
+    fi
+    echo "Starting HireFlow proctoring on ${BIND_HOST:-127.0.0.1}:8001 with 1 worker..."
+    exec gunicorn main:app \
+        -k uvicorn.workers.UvicornWorker \
+        -w 1 \
+        -b "${BIND_HOST:-127.0.0.1}:8001" \
+        --timeout 0 \
+        --access-logfile - \
+        --error-logfile -
+    exit 1   # see the note above: a role branch must never fall through
 fi
 
 if [ "$ROLE" = "email-worker" ]; then
@@ -26,16 +69,15 @@ if [ "$ROLE" = "email-worker" ]; then
     # --with-scheduler is required so deferred (rate-limited/retry) sends fire.
     exec rq worker "${EMAIL_QUEUE:-email}" --with-scheduler \
         --url "${EMAIL_REDIS_URL:-${JUDGE_REDIS_URL:-${REDIS_URL:-redis://localhost:6379/0}}}"
+    exit 1   # see the note above: a role branch must never fall through
 fi
 
-# Web role. Worker count = WEB_CONCURRENCY (default 2 — never 1 for the API: with
-# blocking DB/Gemini calls a single worker serializes every request, which is what
-# caused the QueuePool-exhaustion outage).
+# Web role — the API. Worker count = WEB_CONCURRENCY (default 2 — never 1 here:
+# with blocking DB/Gemini calls a single worker serializes every request, which is
+# what caused the QueuePool-exhaustion outage).
 #
-# EXCEPTION: the proctoring service MUST run WEB_CONCURRENCY=1. Its session state
-# is a process-local dict of live MediaPipe handles, so a session's WebSocket has
-# to reach the same process that created it. See proctoring/routes.py and
-# deploy/cpanel/hireflow-proctor.service.
+# Proctoring does NOT use this role; it has its own above, precisely so that its
+# one-worker requirement is not a variable anything can override.
 #
 # BIND_HOST defaults to 127.0.0.1 so the app is reachable only through the Apache
 # reverse proxy. Set BIND_HOST=0.0.0.0 only where the port itself is protected.

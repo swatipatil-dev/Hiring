@@ -22,7 +22,10 @@ arrives as a *separate connection*, which gunicorn hands to an arbitrary worker.
 With N workers it reaches the right one 1/N of the time and closes **4004**
 otherwise.
 
-- `WEB_CONCURRENCY=1` is pinned in `hireflow-proctor.service` for this reason.
+- The worker count is **hardcoded** as `-w 1` in `entrypoint.sh` under
+  `ROLE=proctor`, and that role ignores `WEB_CONCURRENCY` entirely. It was once
+  pinned in the unit file instead; [§4](#4-configuration-which-file-wins) is the
+  story of why that wasn't enough.
 - Capacity comes from `PROCTOR_INFERENCE_SLOTS`, never from worker count.
 - This is why proctoring is a separate service from the API at all.
 
@@ -118,7 +121,8 @@ These all leave the deployment looking healthy. Check them explicitly.
 | Admin bootstrap vars unset | Everything green, candidates can register | No account exists that can administer anything |
 | YOLO weights unresolvable | Proctoring runs normally | No object detection — phones, books, second people unflagged |
 | `google-genai` missing | Health checks pass | Every AI feature fails at first use, three retries deep |
-| `PROCTOR_*` set in `.env` but pinned in the unit | Edit, restart, no change, no error | systemd `Environment=` overrides `EnvironmentFile=` |
+| `PORT` / `WEB_CONCURRENCY` set in `.env` | Site loads, `/health` green, one service `active` | `.env` overrode the unit; proctoring took the API's port and the API crash-looped ([§4](#4-configuration-which-file-wins)) |
+| A service losing a port race | `systemctl status` cycles `activating`, nothing else | `Restart=always` hides it; the survivor serves the traffic |
 | `create_all` without `import main` | Plausible table count | Judge and question tables silently absent |
 | Wrong schema name | `/health` reports 0 tables | App works; only the reporting queries were hardcoded |
 | `en_core_web_trf` missing | ATS scores fine | NER skill extraction returns `[]` |
@@ -157,20 +161,51 @@ Do not use `setup_db.py` — it hardcodes `root`/`recruitment_db` credentials an
 
 ## 4. Configuration: which file wins
 
-systemd applies `Environment=` **after** `EnvironmentFile=`, so anything pinned
-in a `.service` file overrides `.env`. Edit the wrong place and a restart appears
-to do nothing.
+**`.env` wins.** systemd applies `EnvironmentFile=` **after** `Environment=`, and
+it does so regardless of the order those directives appear in the unit — a
+`Environment=PORT=8001` written twenty lines *below* the `EnvironmentFile=` line
+still loses. This is the opposite of what reading a unit file top-to-bottom
+suggests, and an earlier version of this document had it backwards.
 
-| Pinned in the unit (correctness) | Read from `.env` (tuning) |
-|---|---|
-| `ROLE`, `PORT`, `BIND_HOST` | `PROCTOR_INFERENCE_SLOTS` |
-| `WEB_CONCURRENCY` | `PROCTOR_MAX_SESSIONS` |
-| `PROCTOR_PREWARM`, `HF_HOME` | `DB_POOL_SIZE`, `DB_MAX_OVERFLOW` |
-| `OMP_NUM_THREADS`, `PATH` | everything else |
+Never trust the unit file to tell you what took effect. Ask the process:
 
-The split is deliberate: values that must **not** be overridable live in the
-unit. `WEB_CONCURRENCY=1` for proctoring is a correctness constraint, not a
-preference.
+```bash
+tr '\0' '\n' < /proc/$(systemctl show hireflow-proctor -p MainPID --value)/environ \
+  | grep -E '^(PORT|WEB_CONCURRENCY|ROLE)='
+```
+
+### Pinning a constraint in a unit does not make it safe
+
+Four services share one `.env`. `PORT=8000` and `WEB_CONCURRENCY=2` were in it,
+left over from Cloud Run where there was a single service. They overrode the
+`PORT=8001` and `WEB_CONCURRENCY=1` pinned in `hireflow-proctor.service`, so:
+
+1. `hireflow-proctor` bound **8000** with **2** workers.
+2. It won the startup race. `hireflow-api` crash-looped on `Connection in use`,
+   restarting every 5s under `Restart=always`.
+3. The site kept working — the proctor service is the same app, so it served the
+   API's traffic quite happily.
+4. Nothing listened on 8001. Apache returned 503 for the proctoring WebSocket,
+   every candidate's face badge sat on "Checking…", zero frames were analysed, and
+   every proctoring report came back **clean**.
+
+Note how little of that looks like a fault: one `systemctl is-active` says
+`active`, the site loads, `/health` is green. The tell was `journalctl -u
+hireflow-proctor` showing the *same PIDs* that `ss -ltnp` showed on port 8000.
+
+The fix was not a better comment. Proctoring now runs `ROLE=proctor`, and
+`entrypoint.sh` hardcodes `-w 1` and port 8001 for that role — no variable to
+override. **A correctness constraint belongs in the code path, not in a config
+layer that something else can win.**
+
+| Genuinely un-overridable (in `entrypoint.sh`) | Unit-provided, `.env` can override | Tuning, set in `.env` |
+|---|---|---|
+| proctor worker count (`-w 1`) | `ROLE`, `BIND_HOST` | `PROCTOR_INFERENCE_SLOTS` |
+| proctor port (8001) | `PORT` (API only) | `PROCTOR_MAX_SESSIONS` |
+| judge queue name default | `WEB_CONCURRENCY` (API only) | `DB_POOL_SIZE`, `DB_MAX_OVERFLOW` |
+| | `PROCTOR_PREWARM`, `HF_HOME`, `PATH` | everything else |
+
+Do not reintroduce `PORT` or `WEB_CONCURRENCY` into `.env`.
 
 After editing `.env`: `systemctl restart <svc>`.
 After editing a `.service`: `systemctl daemon-reload && systemctl restart <svc>`.

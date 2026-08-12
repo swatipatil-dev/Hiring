@@ -803,7 +803,8 @@ start — this is normal and only happens once.
 systemctl is-active hireflow-api hireflow-proctor hireflow-judge-worker hireflow-email-worker
 ```
 
-Four lines of `active`. Then:
+Four lines of `active`. `activating` on a repeat check means a restart loop —
+`Restart=always` makes that look almost identical to starting up. Then:
 
 ```bash
 curl -s localhost:8000/health
@@ -816,18 +817,43 @@ greater than 0**.
 > `table_count: 0` means the app is connected to the wrong database. Re-check
 > `DATABASE_URL` in Step 7.
 
+**Then check that the two ports belong to the two different services.** Do not
+skip this. The API and the proctor run the same application, so if the proctor
+binds 8000 the site works perfectly while proctoring is silently absent:
+
+```bash
+ss -ltnp | grep -E ':800[01]'
+for s in hireflow-api hireflow-proctor; do
+  printf '%s: ' "$s"
+  tr '\0' '\n' < /proc/$(systemctl show $s -p MainPID --value)/environ \
+    | grep -E '^(ROLE|PORT|WEB_CONCURRENCY)=' | tr '\n' ' '; echo
+done
+```
+
+Expected: **8000 and 8001 both listening**, `hireflow-api` with `ROLE=web
+PORT=8000`, and `hireflow-proctor` with `ROLE=proctor`. Three specific wrong
+answers:
+
+| What you see | What happened |
+|---|---|
+| Only 8000 listening | One service took the other's port; the loser is crash-looping on `Connection in use` |
+| `hireflow-proctor` reporting `ROLE=web` | Stale unit file — re-copy from `deploy/cpanel/` and `daemon-reload` |
+| `PORT` or `WEB_CONCURRENCY` present in the proctor's environment | They are set in `.env`, where they override the units. Remove them — see [Deployment notes §4](DEPLOYMENT_NOTES.md#4-configuration-which-file-wins) |
+
 If a service is not active:
 
 ```bash
 journalctl -u hireflow-api -n 50 --no-pager
 ```
 
-> ### Never increase `WEB_CONCURRENCY` in `hireflow-proctor.service`
+> ### Proctoring capacity is not a worker count
 >
-> It must stay at **1**. Each live proctoring session is held in one process's
-> memory, so with more workers a candidate's video connection reaches the wrong
-> process and drops with error 4004. To handle more candidates, raise
-> `PROCTOR_INFERENCE_SLOTS` instead (see [Tuning](#tuning-after-real-load)).
+> Proctoring runs exactly **one** worker, hardcoded in `entrypoint.sh` under
+> `ROLE=proctor`. Each live session is held in that one process's memory, so with
+> more workers a candidate's video connection reaches the wrong process and drops
+> with error 4004. `WEB_CONCURRENCY` is ignored for this service by design. To
+> handle more candidates, raise `PROCTOR_INFERENCE_SLOTS` instead (see
+> [Tuning](#tuning-after-real-load)).
 
 ---
 
@@ -978,8 +1004,11 @@ Record `capacity`, `in_use`, `peak_in_use`, `waits`, `active_sessions`.
 > server existed. Expect to need a round or two of adjustment.
 >
 > To confirm properly: press `F12` → **Network** tab → filter **WS**. You should
-> see connections with status **101**. A **4004** disconnect means
-> `WEB_CONCURRENCY` is not `1` in `hireflow-proctor.service`.
+> see connections with status **101**. Anything else — including a **503** — means
+> the request never reached the proctor service; check the port ownership test in
+> Step 11 before touching the Apache rules. A **4004** disconnect means the socket
+> reached a process that does not hold the session, i.e. more than one proctor
+> worker, which `ROLE=proctor` should now make impossible.
 
 ---
 
@@ -990,8 +1019,12 @@ Record `capacity`, `in_use`, `peak_in_use`, `waits`, `active_sessions`.
 | Service will not start | Missing/placeholder `SECRET_KEY` | Redo Step 7.1–7.3 |
 | `table_count: 0` | Wrong database in `DATABASE_URL` | Check names include the `innomaxskills_` prefix |
 | `libGL.so.1: cannot open...` | Graphics libraries missing | Redo Step 2.3, then `systemctl restart hireflow-proctor` |
+| Proctoring stuck on "Checking…", results all clean | Nothing listening on 8001 — usually the proctor bound 8000 instead | Run the port-ownership check in Step 11 |
+| Proctoring WebSocket returns 503 | Proctor service down, or on the wrong port | `ss -ltnp \| grep :8001`, then `journalctl -u hireflow-proctor` |
+| Proctoring WebSocket returns 200/404 | Upgrade forwarded as plain HTTP — `ProxyPass` beat `RewriteRule [P]` | Redo Step 12; the `ws://` entries must precede the general `ProxyPass` |
 | Proctoring video never connects | `mod_proxy_wstunnel` missing | Redo Step 2.1, then `/scripts/restartsrv_httpd` |
-| Proctoring drops with 4004 | More than one proctor worker | `WEB_CONCURRENCY=1` in `hireflow-proctor.service` |
+| Proctoring drops with 4004 | Socket reached a process without the session | Confirm `ROLE=proctor` is in effect (Step 11) |
+| API restarts every few seconds | Port 8000 taken by another service | `ss -ltnp \| grep :8000`; remove `PORT` from `.env` |
 | Code judge returns PENDING | Docker down or images not built | `systemctl status docker`, redo Step 9 |
 | AI features fail | Missing/invalid `GEMINI_API_KEY` | Check the key in `.env`, restart `hireflow-api` |
 | Site loads, API 404s | Apache config not applied | Redo Step 12 |
@@ -1015,16 +1048,22 @@ systemctl restart hireflow-api hireflow-proctor
 ## Tuning after real load
 
 **Where a setting lives decides how you change it.** systemd applies
-`Environment=` *after* `EnvironmentFile=`, so anything pinned in a `.service`
-file overrides `.env` — edit the wrong place and a restart appears to do nothing.
+`EnvironmentFile=` *after* `Environment=`, so **`.env` overrides the `.service`
+file** — regardless of the order the directives appear in the unit. Verify what
+actually took effect rather than trusting either file:
+
+```bash
+tr ' ' '
+' < /proc/$(systemctl show hireflow-proctor -p MainPID --value)/environ
+```
 
 | Setting | Default | Edit in | Change when |
 |---|---|---|---|
 | `PROCTOR_INFERENCE_SLOTS` | 6 | **`.env`** | `waits` keeps climbing. Each slot uses ~115 MB and does **not** grow with candidate numbers |
 | `PROCTOR_MAX_SESSIONS` | 9 | **`.env`** | Candidates see "at capacity" while `peak_in_use` stays below `capacity` |
 | `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | 5 / 5 | **`.env`** | `QueuePool limit` errors appear in the logs |
-| `WEB_CONCURRENCY` (api) | 3 | `hireflow-api.service` | The site feels slow under load and memory allows |
-| `WEB_CONCURRENCY` (proctor) | **1** | — | **Never change this** — correctness constraint |
+| `WEB_CONCURRENCY` (api) | 3 | `hireflow-api.service` — **never `.env`**, which would also hit the proctor | The site feels slow under load and memory allows |
+| proctor worker count | **1** | — hardcoded in `entrypoint.sh` | **Never.** Correctness constraint; raise `PROCTOR_INFERENCE_SLOTS` instead |
 | `MemoryMax` / `CPUWeight` | see units | the `.service` files | Another account is being starved, or ours is being killed |
 
 After editing **`.env`**:
