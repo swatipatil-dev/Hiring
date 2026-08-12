@@ -26,7 +26,8 @@ _JOB_TIMEOUT = int(os.getenv("JUDGE_JOB_TIMEOUT_S", "300"))
 _WAIT_TIMEOUT = int(os.getenv("JUDGE_WAIT_TIMEOUT_S", "120"))
 _POLL_INTERVAL = float(os.getenv("JUDGE_POLL_INTERVAL_S", "0.15"))
 
-_redis = None
+_redis = None          # decode_responses=True  — pub/sub JSON
+_redis_raw = None      # decode_responses=False — RQ (pickled payloads)
 _redis_checked = False
 _redis_ok = False
 
@@ -36,7 +37,10 @@ def _channel(submission_id: str) -> str:
 
 
 def get_redis():
-    """Lazily create a shared Redis client (or None if redis-py isn't installed)."""
+    """Shared Redis client for the JSON pub/sub channel — decodes to str.
+
+    NOT for RQ. See get_redis_raw().
+    """
     global _redis
     if _redis is None:
         try:
@@ -48,6 +52,32 @@ def get_redis():
         except Exception:
             _redis = None
     return _redis
+
+
+def get_redis_raw():
+    """Shared Redis client for RQ — returns bytes, never decodes.
+
+    RQ stores job arguments and results as **pickle**. Handing it a client with
+    ``decode_responses=True`` makes every read try to UTF-8 decode binary pickle
+    data, which fails as:
+
+        'utf-8' codec can't decode byte 0x9c in position 1: invalid start byte
+
+    (0x9c is pickle protocol framing.) Enqueueing appears to work — writing bytes
+    is fine — so the fault only shows up when a result is read back, which is
+    exactly what run_in_worker does. Every RQ Queue and Job must use this client.
+    """
+    global _redis_raw
+    if _redis_raw is None:
+        try:
+            import redis  # noqa
+            _redis_raw = redis.Redis.from_url(
+                _REDIS_URL, socket_connect_timeout=2, socket_timeout=5,
+                decode_responses=False,
+            )
+        except Exception:
+            _redis_raw = None
+    return _redis_raw
 
 
 def redis_available() -> bool:
@@ -81,7 +111,7 @@ def enqueue_submission(submission_id: str) -> dict:
         return {"mode": "sync", "submission_id": submission_id}
 
     from rq import Queue
-    q = Queue(_QUEUE_NAME, connection=get_redis())
+    q = Queue(_QUEUE_NAME, connection=get_redis_raw())
     job = q.enqueue(
         "src.judge.worker.judge_submission_job",
         submission_id,
@@ -136,7 +166,7 @@ def run_in_worker(func_path: str, *args, wait_s: Optional[int] = None, **kwargs)
     from rq import Queue
     from rq.job import Job
 
-    q = Queue(_QUEUE_NAME, connection=get_redis())
+    q = Queue(_QUEUE_NAME, connection=get_redis_raw())
     job = q.enqueue(func_path, *args, job_timeout=_JOB_TIMEOUT,
                     result_ttl=600, failure_ttl=86400, **kwargs)
 
@@ -144,7 +174,7 @@ def run_in_worker(func_path: str, *args, wait_s: Optional[int] = None, **kwargs)
     while True:
         # Re-fetch rather than refresh(): with a worker pool the job may be
         # picked up by any process, and a stale local object never updates.
-        job = Job.fetch(job.id, connection=get_redis())
+        job = Job.fetch(job.id, connection=get_redis_raw())
         if job.is_finished:
             return job.return_value()
         if job.is_failed:

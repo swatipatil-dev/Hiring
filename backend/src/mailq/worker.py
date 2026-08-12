@@ -41,12 +41,12 @@ def _smtp_config_from(sender: dict):
 
 
 def _reschedule(payload: dict, attempt: int, delay: int, reason: str) -> None:
-    from .queue import get_redis, redis_available
+    from .queue import get_redis_raw, redis_available
     if not redis_available():
         return
     try:
         from rq import Queue
-        q = Queue(_QUEUE_NAME, connection=get_redis())
+        q = Queue(_QUEUE_NAME, connection=get_redis_raw())
         q.enqueue_in(
             timedelta(seconds=int(delay)),
             "src.mailq.worker.send_email_job",

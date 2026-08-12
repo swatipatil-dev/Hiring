@@ -32,8 +32,8 @@ from datetime import datetime
 
 # Load environment variables from .env (if present) before importing modules
 # that read os.getenv() at import time (e.g., src/services/email_service.py).
-from dotenv import load_dotenv
-load_dotenv()
+from src.env_boot import load_env
+load_env()
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware

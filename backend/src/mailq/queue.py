@@ -16,13 +16,17 @@ _REDIS_URL = os.getenv(
 _QUEUE_NAME = os.getenv("EMAIL_QUEUE", "email")
 _JOB_TIMEOUT = int(os.getenv("EMAIL_JOB_TIMEOUT_S", "60"))
 
-_redis = None
+_redis = None          # decode_responses=True  — plain string keys (rate limits, llen)
+_redis_raw = None      # decode_responses=False — RQ (pickled payloads)
 _redis_checked = False
 _redis_ok = False
 
 
 def get_redis():
-    """Lazily create a shared Redis client (or None if redis-py isn't installed)."""
+    """Lazily create a shared Redis client (or None if redis-py isn't installed).
+
+    Decodes to str — for our own string/counter keys. NOT for RQ; see get_redis_raw().
+    """
     global _redis
     if _redis is None:
         try:
@@ -34,6 +38,26 @@ def get_redis():
         except Exception:
             _redis = None
     return _redis
+
+
+def get_redis_raw():
+    """Shared Redis client for RQ — returns bytes, never decodes.
+
+    RQ stores job arguments and results as pickle, so a client with
+    ``decode_responses=True`` breaks on the first binary read. Same reasoning as
+    ``src/judge/queue.py:get_redis_raw`` — see the fuller note there.
+    """
+    global _redis_raw
+    if _redis_raw is None:
+        try:
+            import redis  # noqa
+            _redis_raw = redis.Redis.from_url(
+                _REDIS_URL, socket_connect_timeout=2, socket_timeout=5,
+                decode_responses=False,
+            )
+        except Exception:
+            _redis_raw = None
+    return _redis_raw
 
 
 def redis_available() -> bool:
@@ -64,7 +88,7 @@ def enqueue_email(payload: dict) -> dict:
         return {"mode": "sync", **res}
 
     from rq import Queue
-    q = Queue(_QUEUE_NAME, connection=get_redis())
+    q = Queue(_QUEUE_NAME, connection=get_redis_raw())
     job = q.enqueue(
         "src.mailq.worker.send_email_job",
         payload,

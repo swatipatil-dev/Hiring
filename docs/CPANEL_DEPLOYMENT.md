@@ -860,13 +860,50 @@ If that prints `Enforcing`, run:
 setsebool -P httpd_can_network_connect 1
 ```
 
-**Check:**
+**Check 1 — plain HTTP proxying:**
 
 ```bash
 curl -s https://career.innomaxskills.com/health
 ```
 
 Returns the same healthy JSON as Step 11.
+
+**Check 2 — WebSocket proxying.** This is a *separate* path through Apache and it
+has failed silently before, so check it directly rather than assuming Check 1
+covers it. Proctoring needs a real WebSocket upgrade; without one the candidate's
+face badge sits on "Checking…" forever, zero frames are analysed, and every result
+comes back clean:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+  -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+  'https://career.innomaxskills.com/api/v1/proctor/ws/video/probe'
+```
+
+**Expected: `101`.** The app calls `ws.accept()` before it validates the session
+(`proctoring/routes.py:1146`), so a made-up session id still completes the
+handshake and is then closed with code 4004 — which is the correct outcome here.
+
+Anything else — `200`, `400`, `404`, `502` — means the upgrade was forwarded as
+ordinary HTTP by `mod_proxy_http`. The cause is almost always directive
+precedence: **Apache evaluates `ProxyPass` before mod_rewrite's `[P]` flag**, so a
+`RewriteRule … [P]` for a path that a later `ProxyPass` also matches never runs.
+`hireflow.conf` therefore declares the WebSocket paths as `ProxyPass … ws://`
+entries *above* the general `ProxyPass`. Confirm yours did get installed:
+
+```bash
+grep -c '^ProxyPass.*ws://127.0.0.1' \
+  /etc/apache2/conf.d/userdata/ssl/2_4/innomaxskills/career.innomaxskills.com/hireflow.conf
+grep -rn 'career.innomaxskills.com' /etc/apache2/conf/httpd.conf | head
+```
+
+The first prints `4`. The second shows the `Include` lines cPanel generated —
+note the main config is `/etc/apache2/conf/httpd.conf`; `/etc/apache2/conf.d/` is
+the *includes* directory, not a config file. cPanel includes the userdata files by
+reference, so the rules never appear inside `httpd.conf` itself. If the `Include`
+lines are missing, `/scripts/ensure_vhost_includes --user=innomaxskills` did not
+take — re-run it and restart Apache.
 
 ---
 

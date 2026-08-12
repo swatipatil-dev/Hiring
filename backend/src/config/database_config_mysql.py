@@ -5,10 +5,13 @@ pooling, caching, and better error handling for recruitment_db
 """
 
 import os
-from dotenv import load_dotenv
 import pymysql
 
-load_dotenv()
+# Tolerant loader: the judge worker runs as a different user that cannot read the
+# 0600 .env, and systemd has already injected its contents. See src/env_boot.py.
+from src.env_boot import load_env
+
+load_env()
 from sqlalchemy import create_engine, text, event
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.pool import StaticPool, QueuePool

@@ -64,6 +64,48 @@ instructive: ultralytics treats an unfound weights *name* as something to
 **download into the CWD**, so the failure was a permissions error rather than a
 "file not found".
 
+### RQ must never be given a decoding Redis client
+
+Both queue modules keep **two** clients, and the distinction is load-bearing:
+
+| Client | `decode_responses` | Used for |
+|---|---|---|
+| `get_redis()` | `True` | our own keys — pub/sub JSON, rate-limit counters, `llen` probes |
+| `get_redis_raw()` | `False` | every `rq.Queue` and `rq.job.Job` |
+
+RQ stores job arguments and results as **pickle**. Hand it the decoding client and
+every read tries to UTF-8 decode binary data:
+
+```
+'utf-8' codec can't decode byte 0x9c in position 1: invalid start byte
+```
+
+`0x9c` is pickle framing. The trap is that **enqueueing still works** — writing
+bytes is fine — so the fault only appears when a result is read back, i.e. on the
+candidate's first "Run Code", reported as `Judge error`. `test/test_queue_redis_serialization.py`
+asserts the connection every RQ object is constructed with, because behavioural
+tests pass either way.
+
+The CLI workers (`rq worker-pool --url …`) build their own connection and default
+to no decoding, so only the in-process call sites matter.
+
+### `.env` is not readable by every service user
+
+`backend/.env` is mode 0600 owned by `hireflow` — it holds `SECRET_KEY`, the
+database password and the Gemini key. The judge worker runs as **`hfjudge`**, which
+holds the Docker access the API deliberately lacks, and therefore cannot read it.
+That is the intended state: systemd reads the file as root and injects it via
+`EnvironmentFile=` before dropping privileges, so every variable is already in
+`os.environ` by the time Python starts.
+
+A bare `load_dotenv()` raises `PermissionError` there and kills the worker on
+import. Application code must call `src.env_boot.load_env()`, which treats an
+unreadable file as normal and logs at INFO. Genuinely missing configuration still
+fails loudly and specifically afterwards — `src/auth.py` refuses to start without
+`SECRET_KEY`. The two standalone scripts that still call `load_dotenv()` directly
+(`alembic/env.py`, `create_departments.py`) are always run by the file's owner;
+`test/test_env_boot.py` enforces the rule for everything else.
+
 ---
 
 ## 2. Failures that produce no error
