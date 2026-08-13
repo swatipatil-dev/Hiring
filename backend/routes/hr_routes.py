@@ -2449,6 +2449,30 @@ async def delete_job_permanent(
     bulk_delete(Offer,
                 Offer.candidate_id.in_(cand_ids) if _in_cand else None,
                 Offer.job_id == job_id)
+    # 4a) Talent-pool pointers, BEFORE the candidates they reference.
+    # resume_pool rows are independent records — an uploaded CV outlives the job it
+    # happened to match — so clear the pointers rather than deleting the rows. All
+    # three columns are nullable. Skipping this is what made the whole delete fail
+    # with MySQL 1451 on resume_pool_ibfk_*, rolling back the entire transaction.
+    if _in_cand:
+        # Reset the lane first, while moved_candidate_id still identifies the rows.
+        # The Candidate this entry produced is about to be destroyed, so the entry is
+        # no longer promoted — return it to the pool for HR to move onto another job.
+        # Only 'moved' is rewound; an 'archived' row stays archived.
+        db.query(ResumePoolEntry).filter(
+            ResumePoolEntry.moved_candidate_id.in_(cand_ids),
+            ResumePoolEntry.status == "moved",
+        ).update({ResumePoolEntry.status: "new"}, synchronize_session=False)
+        db.query(ResumePoolEntry).filter(
+            ResumePoolEntry.moved_candidate_id.in_(cand_ids)
+        ).update({ResumePoolEntry.moved_candidate_id: None}, synchronize_session=False)
+        db.query(ResumePoolEntry).filter(
+            ResumePoolEntry.source_candidate_id.in_(cand_ids)
+        ).update({ResumePoolEntry.source_candidate_id: None}, synchronize_session=False)
+    db.query(ResumePoolEntry).filter(
+        ResumePoolEntry.best_job_id == job_id
+    ).update({ResumePoolEntry.best_job_id: None}, synchronize_session=False)
+
     bulk_delete(Candidate, Candidate.id.in_(cand_ids) if _in_cand else None)
     bulk_delete(CandidateRequest, CandidateRequest.job_id == job_id)
 

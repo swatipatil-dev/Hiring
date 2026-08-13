@@ -1019,3 +1019,51 @@ def test_history_survives_a_job_with_no_company(client, db, hr_headers, hr_compa
     assert result["application_count"] == 1, "the application was dropped by a join"
     assert result["applications"][0]["job_title"] == "Legacy Role"
     assert result["outcome"] == "rejected"
+
+
+def test_hard_deleting_a_job_survives_pool_references(client, db, hr_headers, hr_company):
+    """Hard-deleting a job must not trip over resume_pool's foreign keys.
+
+    A pool entry that was moved to ATS points at both the job it matched
+    (best_job_id) and the Candidate the move produced (moved_candidate_id).
+    delete_job_permanent deletes the job and its candidates but never clears
+    either column, so MySQL's default RESTRICT blocks the whole transaction.
+    """
+    job = JobPosting(id=_uid(), company_id=hr_company.id, title="Backend Engineer",
+                     description="d", requirements="r", status="active")
+    db.add(job)
+    db.flush()
+
+    cand = Candidate(id=_uid(), company_id=hr_company.id, job_id=job.id,
+                     email="pooled@example.com", first_name="Pooled", last_name="Person")
+    db.add(cand)
+    db.flush()
+
+    entry = ResumePoolEntry(id=_uid(), company_id=hr_company.id,
+                            filename="cv.pdf", resume_path="resumes/pool/x.pdf",
+                            full_name="Pooled Person", email="pooled@example.com",
+                            best_job_id=job.id, status="moved",
+                            moved_candidate_id=cand.id)
+    db.add(entry)
+    db.flush()
+
+    # Hold the ids as plain strings: expire_all() below makes any later attribute
+    # access on a deleted instance re-query and raise instead of returning the value.
+    job_id, cand_id, entry_id = job.id, cand.id, entry.id
+
+    resp = client.delete(f"/api/v1/hr/jobs/{job_id}/permanent", headers=hr_headers)
+    assert resp.status_code == 200, resp.text
+
+    db.expire_all()
+    assert db.query(Candidate).filter(Candidate.id == cand_id).first() is None
+    assert db.query(JobPosting).filter(JobPosting.id == job_id).first() is None
+
+    # The pool row is an independent record — HR's uploaded CV outlives the job it
+    # happened to match — so it must survive with its pointers cleared, not be deleted.
+    survivor = db.query(ResumePoolEntry).filter(ResumePoolEntry.id == entry_id).first()
+    assert survivor is not None, "the pool entry was deleted along with the job"
+    assert survivor.best_job_id is None
+    assert survivor.moved_candidate_id is None
+    # No longer promoted: the Candidate the move produced is gone, so the entry goes
+    # back in the pool rather than claiming a move that no longer exists.
+    assert survivor.status == "new"
