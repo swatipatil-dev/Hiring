@@ -610,6 +610,10 @@ class PoolApplication(BaseModel):
     stage: str
     applied_at: Optional[datetime] = None
     ats_score: Optional[float] = None
+    # Replayed from resume_pool.archived_applications rather than read live, because the
+    # job was hard-deleted and took the Candidate row with it. The title survives here
+    # and nowhere else, so this is the one application record that cannot self-update.
+    archived: bool = False
 
 
 class ResumeMatchResult(BaseModel):
@@ -834,6 +838,42 @@ def _person_key(user_id: Optional[str], email: Optional[str]) -> Optional[str]:
     return email.lower() if email else None
 
 
+def _archived_applications(entry: ResumePoolEntry) -> List[PoolApplication]:
+    """Applications replayed off the pool row because their job posting was deleted.
+
+    `_load_application_history` cannot produce these: it reads `candidates` joined to
+    `job_postings`, and a hard delete removes both. The snapshot written at delete time
+    is the only surviving record of what this person applied for.
+    """
+    try:
+        raw = json.loads(entry.archived_applications) if entry.archived_applications else []
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return []
+    if not isinstance(raw, list):
+        return []
+
+    out: List[PoolApplication] = []
+    for a in raw:
+        if not isinstance(a, dict) or not a.get("candidate_id"):
+            continue
+        applied_at = a.get("applied_at")
+        if isinstance(applied_at, str):
+            try:
+                applied_at = datetime.fromisoformat(applied_at)
+            except ValueError:
+                applied_at = None
+        out.append(PoolApplication(
+            candidate_id=a["candidate_id"],
+            job_id=a.get("job_id"),
+            job_title=a.get("job_title"),
+            stage=a.get("stage") or "applied",
+            applied_at=applied_at,
+            ats_score=a.get("ats_score"),
+            archived=True,
+        ))
+    return out
+
+
 def _entry_to_result(entry: ResumePoolEntry,
                      history: Optional[Dict[str, List[PoolApplication]]] = None
                      ) -> ResumeMatchResult:
@@ -852,7 +892,18 @@ def _entry_to_result(entry: ResumePoolEntry,
     job_matches = [JobMatch(**m) for m in matches if isinstance(m, dict)]
 
     key = _person_key(entry.source_user_id, entry.email)
-    applications = (history or {}).get(key, []) if key else []
+    applications = list((history or {}).get(key, []) if key else [])
+
+    # Applications whose job was hard-deleted exist only on the row — the live query
+    # cannot find them, because both the Candidate and the job posting are gone. Dedupe
+    # by candidate_id so a retried delete cannot list one application twice.
+    live_ids = {a.candidate_id for a in applications}
+    applications += [a for a in _archived_applications(entry)
+                     if a.candidate_id not in live_ids]
+    applications.sort(key=lambda a: a.applied_at or datetime.min, reverse=True)
+
+    # Archived stages feed the outcome too: without them, someone whose only application
+    # was to a deleted job reads as "never applied", which is plainly untrue.
     outcome = derive_outcome(a.stage for a in applications)
     last_activity = next((a.applied_at for a in applications if a.applied_at), None)
 
@@ -2337,6 +2388,24 @@ async def delete_job(
     job.status = "closed"
     job.updated_at = datetime.utcnow()
     db.commit()
+
+    # Return this job's candidates to the talent pool so HR can resurface them onto
+    # another role. They stay in this job's pipeline as well — a close is reversible, and
+    # removing them would make reopening lossy.
+    #
+    # Committed AFTER the close, in its own transaction, on purpose: rolling back a pool
+    # failure must not also undo the close the user asked for.
+    try:
+        from src.services.resume_pool_import import return_candidates_to_pool
+        candidates = db.query(Candidate).filter(Candidate.job_id == job_id).all()
+        if candidates:
+            return_candidates_to_pool(db, job=job, candidates=candidates,
+                                      actor_user_id=current_user.id)
+            db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.warning("Talent pool sync skipped when closing job %s: %s", job_id, e)
+
     return {"message": "Job closed successfully"}
 
 
@@ -2412,6 +2481,24 @@ async def delete_job_permanent(
     _in_iv = interview_ids or None
     _in_cand = cand_ids or None
     _in_q = question_ids or None
+
+    # 0) Preserve the people BEFORE anything is destroyed.
+    # This has to run first, not just before the candidates are deleted: it snapshots
+    # each application's ATS score, and ATSResult is removed in step 4 below. It also
+    # needs job.title, which step 5 destroys. For an HR-created candidate (no portal
+    # account — everyone promoted via Move to ATS) the Candidate row is the only copy of
+    # their name, email, phone, skills and resume pointer, so losing this loses them.
+    # Deliberately NOT wrapped in try/except: if the pool copy fails, the delete must
+    # roll back and leave the job intact rather than destroy what it could not preserve.
+    if _in_cand:
+        from src.services.resume_pool_import import return_candidates_to_pool
+        return_candidates_to_pool(
+            db,
+            job=job,
+            candidates=db.query(Candidate).filter(Candidate.id.in_(cand_ids)).all(),
+            actor_user_id=current_user.id,
+            archive_applications=True,
+        )
 
     # 1) Proctoring (deepest — references interviews via test_id)
     if session_ids:

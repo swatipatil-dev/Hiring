@@ -470,6 +470,129 @@ def sync_pool_on_apply(db: Session, *, candidate, job, ats_result,
         logger.warning(f"Talent pool sync skipped for candidate {getattr(candidate, 'id', '?')}: {e}")
 
 
+def return_candidates_to_pool(db: Session, *, job, candidates,
+                              actor_user_id: Optional[str] = None,
+                              archive_applications: bool = False) -> int:
+    """Put a job's candidates back into the talent pool, so closing or hard-deleting the
+    job does not strand them. Returns the number of entries created or updated.
+
+    **This one raises.** `sync_pool_on_apply` swallows everything because a pool write
+    must never be able to fail a candidate's application. Here the pool write *is* the
+    point: on the hard-delete path a failure has to roll the transaction back and leave
+    the job intact, rather than destroy candidates it failed to preserve. The close path
+    catches it at the call site, where a pool problem must not fail the close.
+
+    Does not commit — it runs inside the caller's transaction, which on the delete path
+    is the same one that removes the candidates.
+
+    `archive_applications` snapshots each application onto the entry. Only the hard-delete
+    path needs it, because the Candidate row and the job title are both about to be
+    destroyed; on close both still exist and the live history already names the job.
+    """
+    from src.models.models import ATSResult
+
+    company_id = job.company_id
+    if not company_id:
+        return 0
+
+    scores: Dict[str, Any] = {}
+    if archive_applications:
+        cand_ids = [c.id for c in candidates]
+        if cand_ids:
+            scores = {r.candidate_id: r.ats_score for r in
+                      db.query(ATSResult.candidate_id, ATSResult.ats_score)
+                        .filter(ATSResult.candidate_id.in_(cand_ids)).all()}
+
+    touched = 0
+    for candidate in candidates:
+        # Find the person before creating anything. This lookup is the ONLY thing
+        # preventing a duplicate: a candidate promoted via Move to ATS carries
+        # user_id=None and leaves both source_* columns NULL on its pool row, so a blind
+        # insert violates neither unique constraint and silently splits one human in two.
+        # Order mirrors _person_key: the account when there is one, then the explicit
+        # links, then the email of an account-less row.
+        entry = None
+        if candidate.user_id:
+            entry = db.query(ResumePoolEntry).filter(
+                ResumePoolEntry.company_id == company_id,
+                ResumePoolEntry.source_user_id == candidate.user_id,
+            ).first()
+        if entry is None:
+            entry = db.query(ResumePoolEntry).filter(
+                ResumePoolEntry.company_id == company_id,
+                or_(ResumePoolEntry.moved_candidate_id == candidate.id,
+                    ResumePoolEntry.source_candidate_id == candidate.id),
+            ).first()
+        if entry is None and candidate.email:
+            entry = db.query(ResumePoolEntry).filter(
+                ResumePoolEntry.company_id == company_id,
+                ResumePoolEntry.source_user_id.is_(None),
+                ResumePoolEntry.email == candidate.email,
+            ).first()
+
+        if entry is None:
+            entry = ResumePoolEntry(
+                company_id=company_id,
+                uploaded_by_id=actor_user_id,
+                uploaded_at=candidate.created_at or datetime.utcnow(),
+                source="registered" if candidate.user_id else "applied",
+            )
+            db.add(entry)
+
+        # Gap-fill only, same as sync_pool_on_apply: never overwrite a value HR curated
+        # by hand with one scraped off a Candidate row.
+        if candidate.user_id and not entry.source_user_id:
+            entry.source_user_id = candidate.user_id
+        entry.source_candidate_id = candidate.id
+        entry.imported_at = datetime.utcnow()
+        entry.full_name = (f"{candidate.first_name or ''} {candidate.last_name or ''}".strip()
+                           or entry.full_name or candidate.email)
+        entry.email = entry.email or candidate.email
+        entry.phone = entry.phone or candidate.phone
+        entry.resume_path = entry.resume_path or candidate.resume_path
+        if not entry.resume_text and candidate.resume_text:
+            entry.resume_text = candidate.resume_text
+            entry.content_hash = hashlib.sha256(
+                candidate.resume_text.encode("utf-8", "ignore")).hexdigest()
+        if not entry.filename:
+            entry.filename = (candidate.resume_path.rsplit("/", 1)[-1]
+                              if candidate.resume_path
+                              else entry.full_name or candidate.email)
+        if not entry.extracted_skills and candidate.extracted_skills:
+            entry.extracted_skills = candidate.extracted_skills
+        if entry.experience_years is None and candidate.experience_years is not None:
+            entry.experience_years = _clamp_experience_local(candidate.experience_years)
+
+        if archive_applications:
+            try:
+                archived = json.loads(entry.archived_applications) if entry.archived_applications else []
+            except (json.JSONDecodeError, TypeError, ValueError):
+                archived = []
+            if not isinstance(archived, list):
+                archived = []
+            # Keyed on candidate_id, so a retried delete does not list the same
+            # application twice.
+            archived = [a for a in archived
+                        if isinstance(a, dict) and a.get("candidate_id") != candidate.id]
+            score = scores.get(candidate.id)
+            if score is None:
+                score = candidate.ats_score
+            archived.append({
+                "candidate_id": candidate.id,
+                "job_id": str(job.id),
+                "job_title": job.title,
+                "stage": candidate.current_stage or "applied",
+                "applied_at": candidate.created_at.isoformat() if candidate.created_at else None,
+                "ats_score": float(score) if score is not None else None,
+            })
+            entry.archived_applications = json.dumps(archived)
+
+        touched += 1
+
+    db.flush()
+    return touched
+
+
 def _uncovered_candidate_query(db: Session, company_id: str):
     """Candidates whose person has no pool row yet.
 

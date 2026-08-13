@@ -115,8 +115,14 @@ function History({ applications }) {
         <div className="rm-hist__rows">
           {applications.map(a => (
             <div key={a.candidate_id} className="rm-hist__row">
-              <span className="rm-hist__job" title={a.job_title || 'This job posting was removed'}>
+              {/* `archived` means the job was hard-deleted and this row was replayed from
+                  the pool entry's snapshot — the title survives there and nowhere else.
+                  A missing title is the older case: the job went before we kept a copy. */}
+              <span className="rm-hist__job"
+                    title={a.archived ? `${a.job_title} — this job posting was deleted`
+                                      : (a.job_title || 'This job posting was removed')}>
                 {a.job_title || 'Removed job'}
+                {a.archived && <em className="rm-hist__gone"> (job removed)</em>}
               </span>
               <span className={`rm-stage rm-stage--${stageTone(a.stage)}`}>
                 {stageLabel(a.stage)}

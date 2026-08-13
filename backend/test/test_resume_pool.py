@@ -1067,3 +1067,129 @@ def test_hard_deleting_a_job_survives_pool_references(client, db, hr_headers, hr
     # No longer promoted: the Candidate the move produced is gone, so the entry goes
     # back in the pool rather than claiming a move that no longer exists.
     assert survivor.status == "new"
+
+
+# ── Returning candidates to the pool when their job goes away ─────────────────
+# Closing or deleting a job used to strand its candidates. Hard delete is the worse
+# case: for an HR-created candidate the Candidate row is the only copy of them, and it
+# was destroyed outright along with any record of what they applied for.
+
+def _job_and_candidate(db, company, *, title="Backend Engineer", stage="hr_review"):
+    job = JobPosting(id=_uid(), company_id=company.id, title=title,
+                     description="d", requirements="r", status="active")
+    db.add(job)
+    db.flush()
+    cand = Candidate(id=_uid(), company_id=company.id, job_id=job.id,
+                     email=f"pooled-{_uid()[:8]}@example.com",
+                     first_name="Pooled", last_name="Person",
+                     phone="555-0100", resume_path="resumes/abc.pdf",
+                     resume_text="python fastapi", extracted_skills=json.dumps(["Python"]),
+                     experience_years=4, current_stage=stage, ats_score=71.5)
+    db.add(cand)
+    db.flush()
+    return job, cand
+
+
+def _pool_rows(db, company, email):
+    return db.query(ResumePoolEntry).filter(
+        ResumePoolEntry.company_id == company.id,
+        ResumePoolEntry.email == email,
+    ).all()
+
+
+def test_closing_a_job_puts_its_candidates_in_the_pool(client, db, hr_headers, hr_company):
+    """A closed job's candidates become reachable in the talent pool — and stay in the
+    job's pipeline, because a close is reversible and reopening must not be lossy."""
+    job, cand = _job_and_candidate(db, hr_company)
+    email, job_id, cand_id = cand.email, job.id, cand.id
+    assert _pool_rows(db, hr_company, email) == []
+
+    assert client.delete(f"/api/v1/hr/jobs/{job_id}", headers=hr_headers).status_code == 200
+
+    db.expire_all()
+    rows = _pool_rows(db, hr_company, email)
+    assert len(rows) == 1, "expected exactly one pool entry for the candidate"
+    entry = rows[0]
+    assert entry.full_name == "Pooled Person"
+    assert entry.phone == "555-0100"
+    assert entry.resume_path == "resumes/abc.pdf"
+
+    # Still in the pipeline: the candidate row is untouched and still on the job.
+    survivor = db.query(Candidate).filter(Candidate.id == cand_id).first()
+    assert survivor is not None and survivor.job_id == job_id
+
+
+def test_closing_a_job_twice_does_not_duplicate_the_pool_entry(client, db, hr_headers, hr_company):
+    """Close/reopen/close must be idempotent — the lookup, not the DB, prevents this."""
+    job, cand = _job_and_candidate(db, hr_company)
+    email, job_id = cand.email, job.id
+
+    assert client.delete(f"/api/v1/hr/jobs/{job_id}", headers=hr_headers).status_code == 200
+    assert client.put(f"/api/v1/hr/jobs/{job_id}/reopen", headers=hr_headers).status_code == 200
+    assert client.delete(f"/api/v1/hr/jobs/{job_id}", headers=hr_headers).status_code == 200
+
+    db.expire_all()
+    assert len(_pool_rows(db, hr_company, email)) == 1
+
+
+def test_hard_delete_preserves_the_candidate_and_the_job_they_applied_for(
+        client, db, hr_headers, hr_company):
+    """The person survives in the pool, and the job title survives with them.
+
+    This is the case with no other copy: the Candidate row carries the only record of an
+    HR-created person, and the job posting carries the only copy of its own title.
+    """
+    job, cand = _job_and_candidate(db, hr_company, title="Staff Platform Engineer")
+    email, job_id, cand_id = cand.email, job.id, cand.id
+
+    resp = client.delete(f"/api/v1/hr/jobs/{job_id}/permanent", headers=hr_headers)
+    assert resp.status_code == 200, resp.text
+
+    db.expire_all()
+    assert db.query(Candidate).filter(Candidate.id == cand_id).first() is None
+    assert db.query(JobPosting).filter(JobPosting.id == job_id).first() is None
+
+    rows = _pool_rows(db, hr_company, email)
+    assert len(rows) == 1
+    entry = rows[0]
+    assert entry.full_name == "Pooled Person"
+    assert entry.resume_path == "resumes/abc.pdf"
+    assert json.loads(entry.extracted_skills) == ["Python"]
+
+    # And the API replays the application, by title, after the job is gone.
+    listed = client.get("/api/v1/hr/resume-pool", headers=hr_headers, params={"limit": 50})
+    assert listed.status_code == 200, listed.text
+    result = next(r for r in listed.json()["results"] if r["email"] == email)
+    apps = result["applications"]
+    assert len(apps) == 1, apps
+    assert apps[0]["job_title"] == "Staff Platform Engineer"
+    assert apps[0]["archived"] is True
+    assert result["application_count"] == 1
+    # Not "never_applied": they demonstrably applied, the job just no longer exists.
+    assert result["outcome"] != "never_applied"
+
+
+def test_hard_delete_does_not_duplicate_a_candidate_moved_from_the_pool(
+        client, db, hr_headers, hr_company):
+    """The duplicate the database cannot catch.
+
+    Move to ATS leaves source_user_id and source_candidate_id NULL on the pool row and
+    creates the Candidate with user_id=None, so a blind insert violates neither unique
+    constraint and silently splits one person into two rows. Only the lookup stops it.
+    """
+    job, cand = _job_and_candidate(db, hr_company)
+    entry = ResumePoolEntry(id=_uid(), company_id=hr_company.id, filename="cv.pdf",
+                            resume_path="resumes/pool/x.pdf", full_name="Pooled Person",
+                            email=cand.email, status="moved", moved_candidate_id=cand.id)
+    db.add(entry)
+    db.flush()
+    email, job_id, entry_id = cand.email, job.id, entry.id
+
+    resp = client.delete(f"/api/v1/hr/jobs/{job_id}/permanent", headers=hr_headers)
+    assert resp.status_code == 200, resp.text
+
+    db.expire_all()
+    rows = _pool_rows(db, hr_company, email)
+    assert len(rows) == 1, f"the person was split into {len(rows)} pool rows"
+    assert rows[0].id == entry_id, "a second entry was created instead of reusing theirs"
+    assert json.loads(rows[0].archived_applications)[0]["job_title"] == "Backend Engineer"

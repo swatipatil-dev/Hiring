@@ -710,6 +710,14 @@
   white-space: nowrap;
 }
 
+/* The job behind this application no longer exists — the title is a preserved copy.
+   Muted and italic so it reads as an annotation on the title, not part of it. */
+.rm-hist__gone {
+  font-style: italic;
+  color: var(--text-tertiary);
+  font-size: 0.68rem;
+}
+
 .rm-hist__when {
   font-family: var(--rm-mono);
   font-size: 0.68rem;

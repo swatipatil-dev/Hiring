@@ -460,6 +460,16 @@ class ResumePoolEntry(Base, TenantScoped):
     best_score         = Column(DECIMAL(5, 2), index=True)
     match_results      = Column(Text)                     # JSON: ranked jobs + ATS sub-scores
 
+    # Applications whose job posting has since been hard-deleted. JSON list shaped like
+    # PoolApplication: {candidate_id, job_id, job_title, stage, applied_at, ats_score}.
+    #
+    # The only field on this row deliberately allowed to go stale. Live applications are
+    # read from `candidates` joined to `job_postings` on every request precisely so a
+    # stored copy cannot drift — but a hard delete destroys both sides of that join, so
+    # "which job did they apply for" has nowhere else to survive. A foreign key is not an
+    # option: it would either be NULLed with best_job_id or block the delete (MySQL 1451).
+    archived_applications = Column(Text)
+
     status             = Column(String(20), default="new")  # new | moved | archived
     # The Candidate this entry PRODUCED via Move to ATS. Kept distinct from
     # source_candidate_id below: this one also guards the stored file from deletion.
