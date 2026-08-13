@@ -2339,6 +2339,34 @@ async def delete_job(
     return {"message": "Job closed successfully"}
 
 
+@router.put("/jobs/{job_id}/reopen")
+async def reopen_job(
+    job_id: str,
+    current_user: User = Depends(AuthMiddleware.get_current_hr),
+    db: Session = Depends(get_db)
+):
+    """Reopen a soft-closed job posting (sets status back to active).
+
+    The counterpart to the soft close above. Without this a close is permanent —
+    `update_job` never writes `status`, and `approve_job` refuses a closed job.
+
+    Reopening always lands on `active`: the column keeps no history, so a job that
+    was closed while still a draft comes back published. The `!= "closed"` guard
+    keeps this from being a general-purpose status setter."""
+    job = db.query(JobPosting).filter(
+        JobPosting.id == job_id,
+        JobPosting.company_id == current_user.company_id
+    ).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != "closed":
+        raise HTTPException(status_code=400, detail="Only a closed job can be reopened")
+    job.status = "active"
+    job.updated_at = datetime.utcnow()
+    db.commit()
+    return {"message": "Job reopened successfully"}
+
+
 @router.delete("/jobs/{job_id}/permanent")
 async def delete_job_permanent(
     job_id: str,

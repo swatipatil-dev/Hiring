@@ -305,10 +305,14 @@ async def get_job_details(
     db: Session = Depends(get_db),
     current_user: User = Depends(AuthMiddleware.get_current_candidate),
 ):
-    """Get detailed information about a specific job posting"""
+    """Get detailed information about a specific job posting.
+
+    Scoped to `active` to match the browse list above — a closed, draft or
+    pending-approval job must not stay readable through a saved link."""
     job = db.query(JobPosting).filter(
         JobPosting.id == job_id,
         JobPosting.company_id == current_user.company_id,
+        JobPosting.status == "active",
     ).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -1532,8 +1536,17 @@ async def generate_cover_letter(
 ):
     """Generate an AI-drafted cover letter tailored to a job, from the candidate's
     profile. Returns prose for the candidate to edit before applying — nothing is
-    persisted here. Returns 503 if the AI service (Ollama) is unavailable."""
-    job = db.query(JobPosting).filter(JobPosting.id == data.job_id).first()
+    persisted here. Returns 503 if the AI service (Ollama) is unavailable.
+
+    Scoped to the caller's company and to `active` jobs: the job's title,
+    description and requirements are fed into the prompt below and come back in
+    the generated prose, so an unfiltered lookup would hand any candidate the
+    contents of any job in any tenant."""
+    job = db.query(JobPosting).filter(
+        JobPosting.id == data.job_id,
+        JobPosting.company_id == current_user.company_id,
+        JobPosting.status == "active",
+    ).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 

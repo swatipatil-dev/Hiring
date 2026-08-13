@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
-import { Briefcase, Users, Calendar, Gift, Plus, Eye, Edit3, Trash2, GripVertical, ChevronRight, FileText, ClipboardList, Mic, UserCheck, Award, Search, X } from 'lucide-react'
+import { Briefcase, Users, Calendar, Gift, Plus, Eye, Edit3, Trash2, Archive, RotateCcw, GripVertical, ChevronRight, FileText, ClipboardList, Mic, UserCheck, Award, Search, X } from 'lucide-react'
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, LabelList } from 'recharts'
 import api from '../../api/client'
 import Header from '../../components/Header'
@@ -468,12 +468,15 @@ export default function HRDashboard() {
     setNotifications(prev => prev.map(n => ({ ...n, is_read: true })))
   }
 
-  const fetchJobs = () => {
+  // The status filter is server-side: GET /hr/jobs hides soft-closed jobs unless an
+  // explicit ?status= is sent, so filtering the fetched array client-side could never
+  // surface a closed job. Defaulted so the ~12 bare fetchJobs() call sites still work.
+  const fetchJobs = (statusFilter = jobFilters.status) => {
     const currentFetchId = ++fetchJobsId.current  // stamp this fetch; stale callbacks will bail
     setJobsLoading(true)
     setPipelineCandidates({})
     setJobPipelines({})
-    return api.get('/hr/jobs').then(r => {
+    return api.get('/hr/jobs', { params: statusFilter ? { status: statusFilter } : {} }).then(r => {
       if (fetchJobsId.current !== currentFetchId) return  // a newer fetch started; discard
       const data = r.data || []
       setJobs(data)
@@ -505,8 +508,13 @@ export default function HRDashboard() {
     }).catch(() => { if (fetchJobsId.current === currentFetchId) setJobsLoading(false) })
   }
 
+  // Owns the initial job fetch too, so changing the status filter re-queries the
+  // server rather than re-filtering a list it was already excluded from.
   useEffect(() => {
     fetchJobs()
+  }, [jobFilters.status])
+
+  useEffect(() => {
     fetchRequirements()
     fetchNotifications()
     api.get('/hr/departments').then(r => setDepartments(r.data || [])).catch(() => {})
@@ -560,13 +568,30 @@ export default function HRDashboard() {
     setSubmitting(false)
   }
 
-  const handleDeleteJob = async (jobId) => {
-    if (!confirm('Are you sure you want to close this job posting?')) return
+  // Soft close — archives the job (status='closed'), reversible via handleReopenJob.
+  // Closing the modal happens HERE, not in the onClick: doing it there meant a
+  // cancelled confirm still dismissed the modal, which looked identical to success.
+  const handleCloseJob = async (jobId) => {
+    if (!confirm('Close this job posting?\n\nIt stops accepting applications and is hidden from candidates. You can reopen it later from the Closed filter.')) return
     try {
-      await api.delete(`/hr/jobs/${jobId}`)
+      const res = await api.delete(`/hr/jobs/${jobId}`)
+      alert(res.data?.message || 'Job closed')
+      setViewJob(null)
       fetchJobs()
     } catch (err) {
-      alert(err.response?.data?.detail || 'Failed to delete job')
+      alert(err.response?.data?.detail || 'Failed to close job')
+    }
+  }
+
+  const handleReopenJob = async (jobId) => {
+    if (!confirm('Reopen this job posting?\n\nIt becomes active again and visible to candidates.')) return
+    try {
+      const res = await api.put(`/hr/jobs/${jobId}/reopen`)
+      alert(res.data?.message || 'Job reopened')
+      setViewJob(null)
+      fetchJobs()
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Failed to reopen job')
     }
   }
 
@@ -3770,9 +3795,17 @@ export default function HRDashboard() {
 
             <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', borderTop: '1px solid var(--border-subtle)', paddingTop: 16 }}>
               <button className="btn btn-secondary" onClick={() => setViewJob(null)}>Close</button>
-              <button className="btn btn-ghost" style={{ color: 'var(--status-danger)' }} onClick={() => { handleDeleteJob(viewJob.id); setViewJob(null) }}>
-                <Trash2 size={15} /> Close Job
-              </button>
+              {viewJob.status === 'closed' ? (
+                <button className="btn btn-ghost" style={{ color: 'var(--status-success)' }} onClick={() => handleReopenJob(viewJob.id)}>
+                  <RotateCcw size={15} /> Reopen Job
+                </button>
+              ) : (
+                /* Archive, not Trash2 — the neighbouring Delete Job is irreversible and
+                   destroys every candidate, interview and offer attached to the job. */
+                <button className="btn btn-ghost" style={{ color: 'var(--status-danger)' }} onClick={() => handleCloseJob(viewJob.id)}>
+                  <Archive size={15} /> Close Job
+                </button>
+              )}
               <button className="btn" style={{ background: 'var(--status-danger)', color: '#fff' }} onClick={() => handleDeleteJobPermanent(viewJob.id)}>
                 <Trash2 size={15} /> Delete Job
               </button>
