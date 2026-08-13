@@ -547,12 +547,13 @@ async def get_my_jobs(
         hr_profile = get_hr_profile(db, current_user)
         query = query.filter(JobPosting.hr_id == hr_profile.id)
     
+    # Closed jobs stay in the HR list. HR owns the job's lifecycle and needs to see
+    # a closed posting to reopen it, so hiding it here made a close look like a
+    # delete — the job simply vanished with nothing to act on. Candidates and the
+    # public careers pages are filtered separately (status == "active"), so this
+    # does not expose a closed job to applicants.
     if status:
         query = query.filter(JobPosting.status == status)
-    else:
-        # Hide archived (soft-closed) jobs from the default list; still reachable
-        # by explicitly filtering with status=closed.
-        query = query.filter(JobPosting.status != "closed")
 
     jobs = query.order_by(JobPosting.created_at.desc()).offset(skip).limit(limit).all()
 

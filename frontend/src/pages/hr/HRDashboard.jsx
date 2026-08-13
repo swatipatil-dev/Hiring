@@ -468,9 +468,10 @@ export default function HRDashboard() {
     setNotifications(prev => prev.map(n => ({ ...n, is_read: true })))
   }
 
-  // The status filter is server-side: GET /hr/jobs hides soft-closed jobs unless an
-  // explicit ?status= is sent, so filtering the fetched array client-side could never
-  // surface a closed job. Defaulted so the ~12 bare fetchJobs() call sites still work.
+  // The status filter is server-side. With no ?status= the HR list returns every
+  // job including closed ones, so a closed posting stays visible (with a Closed
+  // badge and a Reopen button) instead of vanishing. Defaulted so the ~12 bare
+  // fetchJobs() call sites still work.
   const fetchJobs = (statusFilter = jobFilters.status) => {
     const currentFetchId = ++fetchJobsId.current  // stamp this fetch; stale callbacks will bail
     setJobsLoading(true)
@@ -1229,7 +1230,7 @@ export default function HRDashboard() {
                         <div className="flex-between" style={{ marginBottom: 4 }}>
                           <h3 style={{ fontSize: '1.05rem', margin: 0 }}>{j.title}</h3>
                           <span className={`badge ${j.status === 'active' ? 'badge-green' : j.status === 'closed' ? 'badge-neutral' : 'badge-amber'}`}>
-                            {j.status === 'active' ? 'Open' : j.status}
+                            {j.status === 'active' ? 'Open' : j.status === 'closed' ? 'Closed' : j.status}
                           </span>
                         </div>
                         <div style={{ fontSize: '0.78rem', color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono)', marginBottom: 16 }}>
@@ -3735,7 +3736,7 @@ export default function HRDashboard() {
                 </div>
               </div>
               <span className={`badge ${viewJob.status === 'active' ? 'badge-green' : 'badge-neutral'}`} style={{ fontSize: '0.8rem' }}>
-                {viewJob.status === 'active' ? 'Open' : viewJob.status}
+                {viewJob.status === 'active' ? 'Open' : viewJob.status === 'closed' ? 'Closed' : viewJob.status}
               </span>
             </div>
 
