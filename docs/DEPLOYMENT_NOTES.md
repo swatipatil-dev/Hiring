@@ -156,6 +156,8 @@ These all leave the deployment looking healthy. Check them explicitly.
 | Docker CLI warnings | Candidates see them as *their* program's stderr | `docker run` merges container stderr into its own ([above](#the-judge-workers-home-directory-is-unreachable)) |
 | `create_all` without `import main` | Plausible table count | Judge and question tables silently absent |
 | Wrong schema name | `/health` reports 0 tables | App works; only the reporting queries were hardcoded |
+| Stamped at head, schema is not | `alembic current` says `(head)`, upgrade says "nothing to do" | A migration older than the stamp never ran ([§3](#a-database-can-be-stamped-at-head-while-its-schema-is-not)) |
+| `POST /api/v1/db/backup` | A `.sql` file appears | It does not restore — see [§3](#backups-backup_database-is-not-a-backup) |
 | `en_core_web_trf` missing | ATS scores fine | NER skill extraction returns `[]` |
 | `whisper` / `resemblyzer` absent | Audio proctoring runs | Transcription and neural diarization are off — neither is in any requirements file |
 
@@ -183,10 +185,51 @@ Two details that bite:
   (`question_models.py`) models live in separate modules. Importing only
   `src.models.models` silently omits their tables.
 - **`stamp` creates nothing.** It writes a version marker. Running it alone
-  yields `x4n5o6p7q8r9 (head)` and an empty database.
+  yields `(head)` and an empty database.
 
 Do not use `setup_db.py` — it hardcodes `root`/`recruitment_db` credentials and
 **drops tables**.
+
+### A database can be stamped at head while its schema is not
+
+`alembic current` is **not** evidence that a schema is correct, and this is a
+permanent property of any database built the "fresh install" way above.
+
+`create_all()` creates missing *tables* but never `ALTER`s an existing one.
+`stamp head` then records that every migration ran. So the next release that adds
+a **column** to a table `create_all` already built is skipped by `alembic upgrade
+head` — Alembic considers ancestors of the stamped revision applied — while
+nothing reports a problem.
+
+Seen for real in the GCP export: stamped at `x4n5o6p7q8r9`, missing
+`company_mailboxes.hourly_limit`, which `s9i0j1k2l3m4` adds. No automatic path
+repairs it. Because SQLAlchemy emits every mapped column in its `SELECT`s, one
+missing column takes out the whole model — the admin mailbox screen and every
+outbound email that resolves a sender, all 500.
+
+```bash
+sudo -u hireflow /opt/hireflow/venv/bin/python scripts/schema_diff.py
+```
+
+Run that after an upgrade instead of trusting `alembic current`. It exits non-zero
+on any missing table, column or index, so it works as a deployment gate. When it
+reports a missing column on a database already at head, apply the DDL directly —
+do **not** `downgrade` and re-`upgrade`, which replays a stamped chain over a
+populated schema and is how the problem is created in the first place.
+
+`repair_schema.py` answers a narrower question (stamp-or-upgrade, against a
+hardcoded list of talent-pool columns) and would not have caught this.
+
+### Backups: `backup_database()` is not a backup
+
+`db_manager.backup_database()` — exposed as `POST /api/v1/db/backup` — writes
+INSERT statements built from Python `tuple(row)` reprs: `None` instead of `NULL`,
+`datetime.datetime(2026, 8, 12, …)` instead of a quoted literal, no `CREATE
+TABLE`, and per-table failures downgraded to log warnings. **The output does not
+restore.**
+
+Use `mysqldump --single-transaction --no-tablespaces` for anything you would ever
+need to restore from.
 
 ---
 

@@ -252,8 +252,10 @@ Gather these now. **Two of them cannot be recovered later.**
 > The same applies to the uploaded files. Once the old storage bucket is deleted,
 > the resumes are gone.
 
-**Decide now: fresh install, or migrating existing data?** Steps 10.2 and 10.3
-are for migration only — skip them for a fresh install.
+**Decide now: fresh install, or migrating existing data?** This guide covers the
+fresh install. Bringing real data across is a separate runbook —
+[GCP_DATA_MIGRATION.md](GCP_DATA_MIGRATION.md) — and it is usually done *after*
+the site is up and working, not during.
 
 ---
 
@@ -745,42 +747,38 @@ sudo -u hireflow /opt/hireflow/venv/bin/alembic current
 
 > `stamp` only writes a version marker — it creates no tables. Both commands are
 > needed, in either order.
->
-> **Migrating data later is the opposite case.** A dump from a working
-> deployment already contains the tables *and* its own `alembic_version` row, so
-> after importing it you run `alembic upgrade head` normally — that applies any
-> revisions newer than the dump. Never `create_all` over an imported dump.
+
+> **This leaves you exposed to one specific trap later.** `create_all` + `stamp
+> head` means the version table now claims every migration ran, when none did.
+> That is fine *today* — the models already reflect all of them. But a future
+> release that adds a **column** to a table `create_all` already built will be
+> skipped by `alembic upgrade head`, silently, because Alembic thinks it is
+> already applied. `scripts/schema_diff.py` is the check for that; run it after
+> any upgrade rather than trusting `alembic current`.
 
 Do not use `setup_db.py`. It hardcodes `root`/`recruitment_db` credentials and
 **drops tables**.
 
-### 10.2 Import existing data — *migration only*
+### 10.2 Importing existing data — *see the separate runbook*
 
-Skip for a fresh install.
+**→ [GCP_DATA_MIGRATION.md](GCP_DATA_MIGRATION.md)**
 
-Before importing, open the dump and delete any `CREATE DATABASE` or `USE` lines —
-the target database is `innomaxskills_hireflow`, not the old name.
+Migrating real data is not a step in this guide, for two reasons.
 
-`[root]`
+If you are doing it **as part of a fresh install**, the target is empty and a
+straight `mysql < dump.sql` works — but the dump still needs inspecting first
+(`CREATE DATABASE`/`USE` lines, `DEFINER=`, `GTID_PURGED`, syntax newer than the
+target server), and a dump can be stamped at head while its schema is not.
 
-```bash
-mysql -u innomaxskills_hf -p innomaxskills_hireflow < /root/dump.sql
-mysql -u innomaxskills_hf -p innomaxskills_hireflow -e "SELECT COUNT(*) FROM users;"
-```
+If you are doing it **into a deployment that is already running** — which is the
+common case, because you usually stand the site up first and move the data once it
+works — then importing into the production database means the site is broken from
+the first `DROP TABLE` until verification passes, with no way back except a
+restore. The runbook imports into a separate database and switches with one line in
+`.env` instead.
 
-**Check:** the user count looks right.
-
-### 10.3 Import uploaded files — *migration only*
-
-`[root]`
-
-```bash
-gsutil -m rsync -r gs://YOUR-BUCKET-NAME/ /opt/hireflow/backend/
-chown -R hireflow:hireflow /opt/hireflow/backend/
-```
-
-**Check:** `ls /opt/hireflow/backend/resumes | wc -l` roughly matches the old
-storage.
+Either way, uploaded files need no database rewriting: storage keys are identical
+across backends, so it is a copy to matching relative paths.
 
 ---
 
