@@ -166,9 +166,30 @@ scp hireflow-migration.zip root@66.116.207.71:/root/
 
 ```bash
 df -h /opt /root
-mkdir -p /root/migration && cd /root/migration && unzip /root/hireflow-migration.zip
-du -sh */ && find . -type f | wc -l
+mkdir -p /root/migration && unzip -q /root/hireflow-migration.zip -d /root/migration
+
+# The zip has its own top-level folder, so the payload is one level deeper than
+# where you unzipped it. Find it rather than assuming either layout:
+cd "$(dirname "$(find /root/migration -name '*.sql' | head -1)")"
+pwd
+du -sh */ ; find . -type f | wc -l
 ```
+
+Expect ~1,700 files. `cover_letters` will be absent — see [step 8](#step-8--move-the-files-in).
+
+Everything from here on runs from that directory, and the dump is addressed
+through `$F` rather than by name, because it contains spaces and parentheses:
+
+```bash
+F=$(ls *.sql | head -1)
+echo "using: [$F]" && ls -lh "$F"
+```
+
+An unquoted or mistyped filename fails in a way that is easy to misread: `sed` and
+`grep` say "No such file or directory", but the `mysql < "$F"` line fails as a
+*bash redirect* error, so `mysql` never runs at all and no import happens. The next
+command then reports `Table '….users' doesn't exist`, which looks like a failed
+import rather than one that never started.
 
 ## Step 3 — Back up what is live
 
@@ -200,8 +221,8 @@ cosmetic: every query uses MySQL's `DATABASE()` rather than a hardcoded name, an
 ## Step 5 — Import
 
 ```bash
-cd /root/migration
-F='Cloud_SQL_Export_2026-08-13 (17_58_10).sql'    # the quotes matter: spaces + parens
+cd "$(dirname "$(find /root/migration -name '*.sql' | head -1)")"
+F=$(ls *.sql | head -1)                       # set in step 2; re-set if you reconnected
 
 sed -i '/^CREATE DATABASE/d; /^USE `recruitment_db`/d' "$F"
 grep -cE '^(CREATE DATABASE|USE )' "$F"      # must print 0
@@ -289,12 +310,26 @@ checked here rather than discovered next week.
 ## Step 8 — Move the files in
 
 ```bash
+# Same nesting as step 2 — derive the source, do not assume it.
+SRC="$(dirname "$(find /root/migration -name '*.sql' | head -1)")"
+echo "copying from: $SRC" && ls "$SRC"
+
 for p in resumes uploads logos cover_letters evidence_frames; do
-  [ -d "/root/migration/$p" ] && rsync -a "/root/migration/$p/" "/opt/hireflow/backend/$p/"
   mkdir -p "/opt/hireflow/backend/$p"
+  if [ -d "$SRC/$p" ]; then
+    rsync -a "$SRC/$p/" "/opt/hireflow/backend/$p/"
+    echo "  copied   $p"
+  else
+    echo "  ABSENT   $p  (expected only for cover_letters)"
+  fi
 done
 chown -R hireflow:hireflow /opt/hireflow/backend/{resumes,uploads,logos,cover_letters,evidence_frames}
 ```
+
+Read that output. A wrong `SRC` makes every prefix print `ABSENT`, the `mkdir` still
+creates the directories, and nothing errors — so the copy silently does nothing and
+the first sign is thousands of missing keys in the reconciliation below. Only
+`cover_letters` should be absent.
 
 Safe to do before the cutover: filenames are UUIDs so nothing collides, and
 unreferenced files are inert.
