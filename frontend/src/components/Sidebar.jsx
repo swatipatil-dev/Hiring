@@ -4,7 +4,7 @@ import {
   LayoutDashboard, Users, Building2, BarChart3, Briefcase, KanbanSquare,
   Calendar, Gift, ScanSearch, ClipboardList, MessageSquare,
   Search, FileText, Clock, LogOut, Shield, UserCircle, UserPlus, Crown, Mail,
-  LifeBuoy, BookOpen, SlidersHorizontal,
+  LifeBuoy, BookOpen, SlidersHorizontal, History,
 } from 'lucide-react'
 
 const NAV = {
@@ -40,6 +40,7 @@ const NAV = {
     { to: '/interviewer/create-test', icon: ScanSearch, label: 'Create Test' },
     { to: '/interviewer/edit-exam', icon: SlidersHorizontal, label: 'Edit Exam/Questions' },
     { to: '/interviewer/interviews', icon: ClipboardList, label: 'My Interviews' },
+    { to: '/interviewer/feedback-history', icon: History, label: 'Feedback History' },
   ],
   candidate: [
     { to: '/candidate', icon: LayoutDashboard, label: 'Dashboard' },

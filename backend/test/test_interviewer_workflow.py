@@ -196,3 +196,66 @@ def test_interviewer_profile_accessible(client, interviewer_headers):
     """Interviewer can access their own profile."""
     resp = client.get("/api/v1/interviewer/profile", headers=interviewer_headers)
     assert resp.status_code == 200
+
+
+# ── Feedback history ───────────────────────────────────────────────────────
+
+@pytest.mark.interviewer
+def test_interview_history_is_reachable(client, interviewer_headers):
+    """/interviews/history must not be swallowed by /interviews/{interview_id}.
+
+    Starlette matches routes in registration order. While the catch-all was declared
+    first, this path resolved to get_interview_details with interview_id="history"
+    and 404'd — the endpoint was unreachable from the day it was written. Asserting
+    the envelope here is what stops the ordering regressing.
+    """
+    resp = client.get("/api/v1/interviewer/interviews/history", headers=interviewer_headers)
+    assert resp.status_code == 200, resp.text
+    assert "interviews" in resp.json()
+
+
+@pytest.mark.interviewer
+def test_interview_history_returns_the_feedback_that_was_submitted(
+        client, interviewer_headers, db):
+    """A scored interview comes back with its scores, candidate and job."""
+    from src.models.models import User, Interview
+
+    iv_user = db.query(User).filter(User.email == "interviewer_test@test.com").first()
+    if not iv_user:
+        pytest.skip("Interviewer user not found")
+
+    iid = _make_interview(db, interviewer_email=iv_user.email)
+    submitted = client.post(
+        f"/api/v1/interviewer/interviews/{iid}/feedback",
+        headers=interviewer_headers,
+        json={
+            "technical_score": 80,
+            "communication_score": 75,
+            "problem_solving_score": 85,
+            "cultural_fit_score": 70,
+            "strengths": ["Python", "FastAPI"],
+            "weaknesses": ["Kubernetes"],
+            "recommendations": "Good candidate",
+            "hire_recommendation": "hire",
+            "additional_notes": "Strong backend skills",
+        },
+    )
+    assert submitted.status_code in (200, 201), submitted.text
+
+    # Only completed interviews appear in history.
+    db.query(Interview).filter(Interview.id == int(iid)).update({"status": "COMPLETED"})
+    db.flush()
+
+    resp = client.get("/api/v1/interviewer/interviews/history", headers=interviewer_headers)
+    assert resp.status_code == 200, resp.text
+    rows = resp.json()["interviews"]
+
+    row = next((r for r in rows if r["interview_id"] == iid), None)
+    assert row is not None, f"scored interview {iid} missing from history: {rows}"
+    # The per-competency scores are the point of the screen — an overall alone
+    # cannot tell an interviewer whether they score consistently.
+    assert row["technical_score"] == 80
+    assert row["communication_score"] == 75
+    assert row["hire_recommendation"] == "hire"
+    assert row["candidate_name"].startswith("Cand")
+    assert row["job_title"] == "Test Role"

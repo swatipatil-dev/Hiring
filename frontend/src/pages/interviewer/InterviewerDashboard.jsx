@@ -105,7 +105,15 @@ function TestCasesEditor({ testCases, onChange }) {
   )
 }
 
-const TAB_MAP = { dashboard: 'dashboard', interviews: 'interviews', 'create-test': 'create-test', 'request-candidates': 'request-candidates', 'edit-exam': 'edit-exam' }
+const TAB_MAP = { dashboard: 'dashboard', interviews: 'interviews', 'create-test': 'create-test', 'request-candidates': 'request-candidates', 'edit-exam': 'edit-exam', 'feedback-history': 'feedback-history' }
+
+const HIRE_REC_TONE = {
+  strong_hire: { label: 'Strong hire', bg: '#dcfce7', fg: '#15803d' },
+  hire:        { label: 'Hire',        bg: '#ecfdf5', fg: '#16a34a' },
+  maybe:       { label: 'Maybe',       bg: '#fef9c3', fg: '#a16207' },
+  no_hire:     { label: 'No hire',     bg: '#fee2e2', fg: '#b91c1c' },
+  strong_no_hire: { label: 'Strong no hire', bg: '#fecaca', fg: '#991b1b' },
+}
 
 // Fallback used only when GET /interviewer/templates is unreachable (offline / auth issue).
 // The same set is seeded into the DB as is_builtin=True via scripts/seed_templates.py, so
@@ -277,6 +285,12 @@ export default function InterviewerDashboard() {
   })
   const [crSubmitting, setCrSubmitting] = useState(false)
   const [crRequests, setCrRequests] = useState([])
+
+  // Feedback history — interviews this interviewer has already scored.
+  const [history, setHistory] = useState([])
+  const [historyLoading, setHistoryLoading] = useState(false)
+  const [historyError, setHistoryError] = useState('')
+  const [historyOpen, setHistoryOpen] = useState(null)   // interview_id of the expanded row
   const [jdPanel, setJdPanel] = useState(null)
   const [templateSearch, setTemplateSearch] = useState('')
   const [templates, setTemplates] = useState([])
@@ -459,6 +473,18 @@ export default function InterviewerDashboard() {
   const fetchCandidateRequests = () => {
     api.get('/interviewer/candidate-requests').then(r => setCrRequests(r.data || [])).catch(() => {})
   }
+
+  const fetchHistory = () => {
+    setHistoryLoading(true); setHistoryError('')
+    api.get('/interviewer/interviews/history', { params: { limit: 100 } })
+      .then(r => setHistory(r.data?.interviews || []))
+      .catch(err => { setHistory([]); setHistoryError(`Couldn't load your history — ${eeErrText(err)}`) })
+      .finally(() => setHistoryLoading(false))
+  }
+
+  useEffect(() => {
+    if (tab === 'feedback-history') fetchHistory()
+  }, [tab])
 
   const fetchTemplates = (jobCategory) => {
     const filterFallback = (cat) => cat ? FALLBACK_TEMPLATES.filter(t => t.job_category === cat) : FALLBACK_TEMPLATES
@@ -4111,6 +4137,171 @@ export default function InterviewerDashboard() {
       )}
 
       {/* ═══════════ EDIT EXAM / QUESTIONS TAB ═══════════ */}
+      {tab === 'feedback-history' && (() => {
+        const n = history.length
+        const avg = (key) => {
+          const vals = history.map(h => h[key]).filter(v => v !== null && v !== undefined)
+          return vals.length ? (vals.reduce((s, v) => s + v, 0) / vals.length) : null
+        }
+        const fmt = (v) => v === null || v === undefined ? '—' : Number(v).toFixed(1)
+        const fmtDate = (d) => d ? new Date(d).toLocaleDateString(undefined,
+          { day: 'numeric', month: 'short', year: 'numeric' }) : '—'
+
+        // Distribution of your own recommendations. An interviewer who has never said
+        // "no hire" is not calibrated, and that is only visible in aggregate.
+        const recCounts = history.reduce((acc, h) => {
+          const k = h.hire_recommendation || 'unknown'
+          acc[k] = (acc[k] || 0) + 1
+          return acc
+        }, {})
+
+        const competencies = [
+          ['technical_score', 'Technical'],
+          ['communication_score', 'Communication'],
+          ['problem_solving_score', 'Problem Solving'],
+          ['cultural_fit_score', 'Cultural Fit'],
+        ]
+
+        return (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+            <div>
+              <h2 style={{ margin: 0, fontSize: '1.5rem' }}>Feedback History</h2>
+              <div style={{ color: 'var(--text-secondary)', fontSize: '0.88rem', marginTop: 4 }}>
+                Every interview you have scored. Use it to revisit what you said, and to check
+                your own scoring stays consistent across candidates.
+              </div>
+            </div>
+
+            {historyError && (
+              <div style={{ padding: '12px 16px', borderRadius: 10, background: '#fef2f2',
+                            border: '1px solid #fecaca', color: '#b91c1c', fontSize: '0.86rem' }}>
+                {historyError}
+              </div>
+            )}
+
+            {historyLoading ? (
+              <div style={{ padding: 60, textAlign: 'center', color: 'var(--text-tertiary)' }}>Loading…</div>
+            ) : n === 0 && !historyError ? (
+              <div className="card" style={{ padding: 60, textAlign: 'center', color: 'var(--text-tertiary)' }}>
+                You haven't submitted feedback for any interview yet.
+              </div>
+            ) : (
+              <>
+                {/* Self-calibration strip */}
+                <div style={{ display: 'grid', gridTemplateColumns: `repeat(${competencies.length + 2}, 1fr)`, gap: 14 }}>
+                  <div style={{ background: 'var(--bg-secondary)', borderRadius: 12, padding: '16px 18px',
+                                border: '1px solid var(--border-subtle)', borderLeft: '4px solid #6ba3d6' }}>
+                    <div style={{ fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.05em',
+                                  color: 'var(--text-secondary)', fontWeight: 600 }}>Interviews Scored</div>
+                    <div style={{ fontSize: '1.8rem', fontWeight: 700, color: '#6ba3d6', lineHeight: 1.2 }}>{n}</div>
+                  </div>
+                  <div style={{ background: 'var(--bg-secondary)', borderRadius: 12, padding: '16px 18px',
+                                border: '1px solid var(--border-subtle)', borderLeft: '4px solid #a855f7' }}>
+                    <div style={{ fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.05em',
+                                  color: 'var(--text-secondary)', fontWeight: 600 }}>Your Avg Overall</div>
+                    <div style={{ fontSize: '1.8rem', fontWeight: 700, color: '#a855f7', lineHeight: 1.2 }}>{fmt(avg('overall_score'))}</div>
+                  </div>
+                  {competencies.map(([key, label]) => (
+                    <div key={key} style={{ background: 'var(--bg-secondary)', borderRadius: 12, padding: '16px 18px',
+                                            border: '1px solid var(--border-subtle)' }}>
+                      <div style={{ fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.05em',
+                                    color: 'var(--text-secondary)', fontWeight: 600 }}>Avg {label}</div>
+                      <div style={{ fontSize: '1.5rem', fontWeight: 700, lineHeight: 1.4 }}>{fmt(avg(key))}</div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Recommendation mix */}
+                <div className="card" style={{ padding: '16px 20px' }}>
+                  <div style={{ fontSize: '0.78rem', fontWeight: 700, marginBottom: 10,
+                                fontFamily: 'var(--font-display)' }}>Your recommendation mix</div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}>
+                    {Object.entries(recCounts).map(([k, count]) => {
+                      const tone = HIRE_REC_TONE[k] || { label: k.replace(/_/g, ' '), bg: '#f1f5f9', fg: '#475569' }
+                      return (
+                        <span key={k} style={{ padding: '5px 12px', borderRadius: 999, background: tone.bg,
+                                               color: tone.fg, fontSize: '0.8rem', fontWeight: 600 }}>
+                          {tone.label} · {count} ({Math.round((count / n) * 100)}%)
+                        </span>
+                      )
+                    })}
+                  </div>
+                </div>
+
+                {/* The interviews themselves */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                  {history.map(h => {
+                    const open = historyOpen === h.interview_id
+                    const tone = HIRE_REC_TONE[h.hire_recommendation]
+                      || { label: (h.hire_recommendation || '—').replace(/_/g, ' '), bg: '#f1f5f9', fg: '#475569' }
+                    return (
+                      <div key={h.interview_id} className="card" style={{ padding: 0, overflow: 'hidden' }}>
+                        <button
+                          onClick={() => setHistoryOpen(open ? null : h.interview_id)}
+                          aria-expanded={open}
+                          style={{ width: '100%', display: 'grid',
+                                   gridTemplateColumns: '1fr 150px 110px 90px 130px 24px',
+                                   alignItems: 'center', gap: 12, padding: '14px 18px',
+                                   background: 'none', border: 'none', cursor: 'pointer', textAlign: 'left' }}>
+                          <span style={{ fontWeight: 600 }}>{h.candidate_name}</span>
+                          <span style={{ fontSize: '0.84rem', color: 'var(--text-secondary)' }}>{h.job_title || '—'}</span>
+                          <span style={{ fontSize: '0.8rem', color: 'var(--text-tertiary)' }}>{h.interview_type || '—'}</span>
+                          <span style={{ fontFamily: 'var(--font-mono)', fontWeight: 700 }}>{fmt(h.overall_score)}</span>
+                          <span style={{ justifySelf: 'start', padding: '4px 10px', borderRadius: 999,
+                                         background: tone.bg, color: tone.fg, fontSize: '0.75rem', fontWeight: 600 }}>
+                            {tone.label}
+                          </span>
+                          <span style={{ color: 'var(--text-tertiary)' }}>{open ? '▾' : '▸'}</span>
+                        </button>
+
+                        {open && (
+                          <div style={{ padding: '4px 18px 18px', borderTop: '1px solid var(--border-subtle)' }}>
+                            <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap', margin: '14px 0 16px' }}>
+                              {competencies.map(([key, label]) => (
+                                <div key={key}>
+                                  <div style={{ fontSize: '0.7rem', textTransform: 'uppercase',
+                                                color: 'var(--text-tertiary)', fontWeight: 600 }}>{label}</div>
+                                  <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 700, fontSize: '1.05rem' }}>
+                                    {fmt(h[key])}
+                                  </div>
+                                </div>
+                              ))}
+                              <div>
+                                <div style={{ fontSize: '0.7rem', textTransform: 'uppercase',
+                                              color: 'var(--text-tertiary)', fontWeight: 600 }}>Interviewed</div>
+                                <div style={{ fontSize: '0.9rem' }}>{fmtDate(h.interview_date)}</div>
+                              </div>
+                              <div>
+                                <div style={{ fontSize: '0.7rem', textTransform: 'uppercase',
+                                              color: 'var(--text-tertiary)', fontWeight: 600 }}>Feedback given</div>
+                                <div style={{ fontSize: '0.9rem' }}>{fmtDate(h.feedback_date)}</div>
+                              </div>
+                            </div>
+                            {[['Strengths', h.strengths], ['Areas to improve', h.weaknesses],
+                              ['Recommendations', h.recommendations], ['Notes', h.additional_notes]]
+                              .filter(([, v]) => v && String(v).trim())
+                              .map(([label, v]) => (
+                                <div key={label} style={{ marginBottom: 12 }}>
+                                  <div style={{ fontSize: '0.7rem', textTransform: 'uppercase',
+                                                color: 'var(--text-tertiary)', fontWeight: 600, marginBottom: 3 }}>{label}</div>
+                                  <div style={{ fontSize: '0.9rem', lineHeight: 1.6, whiteSpace: 'pre-wrap',
+                                                color: 'var(--text-secondary)' }}>
+                                    {Array.isArray(v) ? v.join(', ') : String(v)}
+                                  </div>
+                                </div>
+                              ))}
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              </>
+            )}
+          </div>
+        )
+      })()}
+
       {tab === 'edit-exam' && (
         <div>
           {/* Section switcher */}

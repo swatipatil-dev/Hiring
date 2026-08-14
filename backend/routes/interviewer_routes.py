@@ -151,6 +151,56 @@ async def get_my_interviews(
     
     return [create_interview_response(interview) for interview in interviews]
 
+# IMPORTANT: this must stay ABOVE /interviews/{interview_id}. Starlette matches routes
+# in registration order, so with the catch-all first every request to
+# /interviews/history was served by get_interview_details with interview_id="history"
+# and 404'd — the endpoint was unreachable from the day it was written.
+@router.get("/interviews/history")
+async def get_interview_history(
+    skip: int = 0,
+    limit: int = 50,
+    current_user: User = Depends(AuthMiddleware.get_current_interviewer),
+    db: Session = Depends(get_db)
+):
+    """Interviews this interviewer has already scored, newest first."""
+    get_interviewer_profile(db, current_user)
+
+    interviews = db.query(Interview).join(InterviewFeedback).filter(
+        Interview.company_id == current_user.company_id,
+        (Interview.interviewer_email == current_user.email) | (Interview.created_by == current_user.email),
+        Interview.status == "COMPLETED"
+    ).order_by(Interview.scheduled_datetime.desc()).offset(skip).limit(limit).all()
+
+    result = []
+    for interview in interviews:
+        # The relationship is `interview_feedback` (models.py:608); `interview.feedback`
+        # raised AttributeError, so this endpoint 500'd even when reached directly.
+        feedback = interview.interview_feedback
+        if feedback is None:
+            continue
+        result.append({
+            "interview_id": str(interview.id),
+            "candidate_name": (f"{interview.candidate.first_name} {interview.candidate.last_name}"
+                               if interview.candidate else "Unknown candidate"),
+            "job_title": interview.job.title if interview.job else None,
+            "interview_type": interview.interview_type,
+            "interview_date": interview.scheduled_datetime,
+            "technical_score": float(feedback.technical_score) if feedback.technical_score is not None else None,
+            "communication_score": float(feedback.communication_score) if feedback.communication_score is not None else None,
+            "problem_solving_score": float(feedback.problem_solving_score) if feedback.problem_solving_score is not None else None,
+            "cultural_fit_score": float(feedback.cultural_fit_score) if feedback.cultural_fit_score is not None else None,
+            "overall_score": float(feedback.overall_score) if feedback.overall_score is not None else None,
+            "hire_recommendation": feedback.hire_recommendation,
+            "strengths": feedback.strengths,
+            "weaknesses": feedback.weaknesses,
+            "recommendations": feedback.recommendations,
+            "additional_notes": feedback.additional_notes,
+            "feedback_date": feedback.created_at,
+        })
+
+    return {"interviews": result}
+
+
 @router.get("/interviews/{interview_id}", response_model=InterviewResponse)
 async def get_interview_details(
     interview_id: str,
@@ -376,39 +426,6 @@ async def get_interview_feedback(
         "additional_notes": feedback.additional_notes,
         "created_at": feedback.created_at
     }
-
-@router.get("/interviews/history")
-async def get_interview_history(
-    skip: int = 0,
-    limit: int = 50,
-    current_user: User = Depends(AuthMiddleware.get_current_interviewer),
-    db: Session = Depends(get_db)
-):
-    """Get interview history for the interviewer"""
-    interviewer_profile = get_interviewer_profile(db, current_user)
-    
-    # Get interviews with feedback
-    interviews = db.query(Interview).join(InterviewFeedback).filter(
-        Interview.company_id == current_user.company_id,
-        (Interview.interviewer_email == current_user.email) | (Interview.created_by == current_user.email),
-        Interview.status == "completed"
-    ).order_by(Interview.scheduled_datetime.desc()).offset(skip).limit(limit).all()
-    
-    result = []
-    for interview in interviews:
-        feedback = interview.feedback
-        result.append({
-            "interview_id": str(interview.id),
-            "candidate_name": f"{interview.candidate.first_name} {interview.candidate.last_name}",
-            "job_title": interview.job.title,
-            "interview_type": interview.interview_type,
-            "interview_date": interview.scheduled_datetime,
-            "overall_score": float(feedback.overall_score),
-            "hire_recommendation": feedback.hire_recommendation,
-            "feedback_date": feedback.created_at
-        })
-    
-    return {"interviews": result}
 
 # ==================== INTERVIEWER PROFILE ENDPOINTS ====================
 
