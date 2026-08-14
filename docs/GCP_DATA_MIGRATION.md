@@ -452,6 +452,18 @@ people skip.
       every password hash, the Fernet ciphertexts, any plaintext API keys in
       `companies`, and all candidate PII.
 - [ ] Delete or encrypt the local export, for the same reason.
-- [ ] Keep `/root/pre-migration-*.sql` until you have logged in as a migrated user,
-      opened a migrated CV, and sent a real email.
+- [ ] Keep `/root/pre-migration-*.sql` **and the old database** until you have
+      logged in as a migrated user, opened a migrated CV, and sent a real email.
+      Dropping the old database is what makes the migration irreversible — a week
+      of clean running is a reasonable wait, and it costs nothing to keep.
+- [ ] Rotate the admin passwords from inside the app, and the database password.
+      A migration puts credentials through terminals, notes and chat logs; assume
+      everything that passed through one is known.
+- [ ] **Lock down SSH.** Check the login banner — this server reported *13,435
+      failed attempts* since the previous successful login, with root password
+      auth on port 22. On shared hosting a successful guess is not only your
+      problem. Do it *after* the migration, never during: WHM → *Security Center*
+      → *cPHulk Brute Force Protection* (whitelist your own IP, or it will block
+      you mid-transfer), then key-based auth with `PermitRootLogin
+      prohibit-password`.
 - [ ] Only then shut down the source deployment.
