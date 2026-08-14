@@ -117,6 +117,26 @@ completely different key.
 You do **not** need to carry `SECRET_KEY` itself. Password hashes are bcrypt with
 embedded salts, so every migrated user logs in unchanged.
 
+> ### What this actually turned up for the 2026-08-13 export
+>
+> Neither `EMAIL_ENCRYPTION_KEY` **nor `SECRET_KEY`** was present in the Cloud Run
+> environment. A `SECRET_KEY` existed in Secret Manager but was never wired into
+> the service, so `_derive_key()` (`src/security.py`) fell all the way through to
+> its hardcoded development fallback:
+>
+> ```python
+> secret = os.getenv("SECRET_KEY") or "hireflow-dev-key-change-me"
+> ```
+>
+> All 11 ciphertexts decrypt with `SHA-256("hireflow-dev-key-change-me")`, and
+> none with the Secret Manager value. **Test, do not assume** — the "obvious"
+> answer was wrong here, and the failure is silent.
+>
+> The security consequence is separate from the migration and matters more: those
+> SMTP passwords were encrypted under a constant that is checked into this
+> repository. Anyone with the source and a copy of the database can read them.
+> Treat every affected mailbox password as compromised — see [Afterwards](#afterwards).
+
 ## Step 1 — Deploy the current code first
 
 If any commits are undeployed, deploy them **now**, not after. A dump stamped at an
@@ -232,6 +252,20 @@ Anything else — stop and resolve it. Do not proceed on row counts alone.
 
 ## Step 7 — Prove the encryption key
 
+**For the 2026-08-13 export this is already answered** — all 11 ciphertexts were
+tested against every candidate and exactly one works:
+
+```
+EMAIL_ENCRYPTION_KEY=9cByOR1y9qkcTo2VBUlwEbLDeQQVOYrWnYO49UHfX-g=
+```
+
+That is `SHA-256("hireflow-dev-key-change-me")`, base64 — derived from a constant
+in `src/security.py`, so writing it here leaks nothing that the repository does not
+already give away. It is **not** a secret, which is the whole problem with it; see
+Step 0 and [Afterwards](#afterwards).
+
+For any other export, work it out rather than guessing:
+
 ```bash
 mysql -u innomaxskills_hf -p innomaxskills_hfmig -N -e \
   "SELECT smtp_pass FROM company_mailboxes WHERE smtp_pass LIKE 'gAAAA%' LIMIT 1;"
@@ -315,6 +349,13 @@ Edit `/opt/hireflow/backend/.env` — everything in one pass:
 > If you cannot log in as any of them, point `PLATFORM_ADMIN_EMAIL` at an address
 > **not** in that list. Bootstrap then creates a fresh admin on the next restart,
 > under the existing platform company.
+>
+> **For the 2026-08-13 export this is resolved.** The Cloud Run environment carried
+> `SUPERADMIN_EMAIL` / `SUPERADMIN_PASSWORD` and `PLATFORM_ADMIN_EMAIL` /
+> `PLATFORM_ADMIN_PASSWORD`, and the platform admin address and password are the
+> same pair already in the cPanel `.env` — so the credentials you use today keep
+> working after the swap. No `PLATFORM_ADMIN_EMAIL` change is needed. Confirm with
+> the query above rather than taking this on trust.
 
 ```bash
 systemctl restart hireflow-api hireflow-proctor hireflow-judge-worker hireflow-email-worker
@@ -358,6 +399,19 @@ people skip.
 
 ## Afterwards
 
+- [ ] **Rotate every SMTP app password, then move off the fallback key.** The
+      migrated passwords were encrypted under a constant checked into this
+      repository (Step 0), so they are readable by anyone with the source and a
+      copy of the database. In order:
+      1. Rotate the Gmail app passwords at the provider.
+      2. Generate a real key — `python -c "from cryptography.fernet import Fernet;
+         print(Fernet.generate_key().decode())"` — and put it in `EMAIL_ENCRYPTION_KEY`.
+      3. Re-enter each mailbox password in the admin UI, which re-encrypts it under
+         the new key.
+
+      Do these in that order. Changing the key first makes the existing rows
+      undecryptable and email stops — silently, because `decrypt()` returns `""`
+      and the caller falls back to the raw stored value.
 - [ ] **Delete the `.sql` export from the bucket.** Cloud SQL exports to GCS, and
       that is very likely the same bucket the app serves files from. It contains
       every password hash, the Fernet ciphertexts, any plaintext API keys in
