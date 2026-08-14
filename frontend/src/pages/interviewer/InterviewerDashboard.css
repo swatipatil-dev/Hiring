@@ -19,7 +19,9 @@
   --fh-mid:  #ddd8d2;
   --fh-pos:  #0b6e5c;
 
-  --fh-rail-h: 26px;
+  /* Tall enough for five tiers of tied dots (±2 × 5px, plus the 7px dot) without any
+     of them crossing the row boundary. */
+  --fh-rail-h: 30px;
   display: flex;
   flex-direction: column;
   gap: 34px;
@@ -120,16 +122,47 @@
 
 .fh__dot {
   position: absolute;
-  top: 50%;
+  /* --tier stacks tied scores vertically. A surface ring alone cannot do this: two dots
+     at the same `left` superimpose perfectly and the ring hides behind the upper one, so
+     a tie silently reads as a single score. The ring's real job is the one below. */
+  top: calc(50% + var(--tier, 0) * 5px);
   width: 7px; height: 7px;
   margin: -3.5px 0 0 -3.5px;
   border-radius: 50%;
   background: var(--fh-dot);
-  /* 2px surface ring so coincident scores stay countable where they overlap */
+  /* Keeps near-neighbours legible where they crowd but do not coincide. */
   box-shadow: 0 0 0 2px var(--surface-card);
   left: var(--to);
   animation: fh-settle 460ms var(--ease-out-expo) var(--delay, 0ms) both;
 }
+
+/* Each dot names itself. Not native `title` — its ~1s delay makes scanning a
+   distribution useless, and scanning is the entire interaction here. */
+.fh__dot::after {
+  content: attr(data-tip);
+  position: absolute;
+  bottom: calc(100% + 7px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--text-primary);
+  color: var(--text-inverse);
+  font-family: var(--font-body);
+  font-size: 0.75rem;
+  line-height: 1.3;
+  white-space: nowrap;
+  padding: 5px 9px;
+  border-radius: 5px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 90ms var(--ease-out-quart);
+}
+
+.fh__dot:hover {
+  background: var(--text-primary);
+  z-index: 3;             /* over later siblings, so the tip is never clipped by a dot */
+}
+
+.fh__dot:hover::after { opacity: 1; }
 
 /* The dots begin stacked at the mean and settle outward — the animation is the
    message, since spread is the thing the page exists to show. Nothing else moves. */

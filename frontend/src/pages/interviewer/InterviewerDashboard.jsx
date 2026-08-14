@@ -4153,10 +4153,30 @@ export default function InterviewerDashboard() {
         ]
         const clamp = (v) => Math.max(0, Math.min(100, Number(v)))
         const statsFor = (key) => {
-          const v = history.map(h => h[key]).filter(x => x !== null && x !== undefined).map(clamp)
-          if (!v.length) return null
+          const raw = history
+            .filter(h => h[key] !== null && h[key] !== undefined)
+            .map(h => ({ v: clamp(h[key]), name: h.candidate_name, job: h.job_title }))
+          if (!raw.length) return null
+          const v = raw.map(p => p.v)
           const min = Math.min(...v), max = Math.max(...v)
-          return { values: v, mean: v.reduce((s, x) => s + x, 0) / v.length, min, max, spread: max - min }
+
+          // Ties superimpose exactly — three candidates who all scored 72 would render
+          // as one dot, making a clustered scorer look more spread than they are, which
+          // is backwards from what this page is for. Give each member of a tie group a
+          // vertical tier: 0, +1, -1, +2, -2, so the group grows symmetrically about the
+          // baseline. Derived from position in the group, not random, so it is stable
+          // across renders. Past five ties the tiers clamp and overlap resumes; with a
+          // handful of interviews that is not reachable.
+          const seen = new Map()
+          const points = raw.map(p => {
+            const bucket = Math.round(p.v)
+            const i = seen.get(bucket) ?? 0
+            seen.set(bucket, i + 1)
+            const tier = i === 0 ? 0 : (i % 2 ? Math.ceil(i / 2) : -i / 2)
+            return { ...p, tier: Math.max(-2, Math.min(2, tier)) }
+          })
+
+          return { points, mean: v.reduce((s, x) => s + x, 0) / v.length, min, max, spread: max - min }
         }
         const rows = COMPETENCIES
           .map(([key, label]) => ({ key, label, s: statsFor(key) }))
@@ -4190,12 +4210,20 @@ export default function InterviewerDashboard() {
 
         // Every observation as a dot on the shared 0–100 axis, the mean as a rule, the
         // min–max as a band behind. Dots start stacked at the mean and settle outward.
+        //
+        // Each dot names itself on hover via a CSS-only tooltip — a distribution that
+        // cannot answer "who is the 45?" only tells half the story. The marks stay
+        // aria-hidden and are deliberately NOT focusable: making 44 dots tab stops would
+        // wreck keyboard navigation, and the interview list below is this chart's table
+        // view, already reachable and carrying the same numbers.
         const Rail = ({ s }) => (
           <div className="fh__plot" aria-hidden="true">
             <div className="fh__band" style={{ left: `${s.min}%`, width: `${Math.max(s.spread, 0.8)}%` }} />
-            {s.values.map((v, i) => (
+            {s.points.map((p, i) => (
               <span key={i} className="fh__dot"
-                    style={{ '--to': `${v}%`, '--from': `${s.mean}%`, '--delay': `${i * 45}ms` }} />
+                    data-tip={`${p.name} · ${Math.round(p.v)}${p.job ? ` · ${p.job}` : ''}`}
+                    style={{ '--to': `${p.v}%`, '--from': `${s.mean}%`,
+                             '--tier': p.tier, '--delay': `${i * 45}ms` }} />
             ))}
             <div className="fh__mean" style={{ left: `${s.mean}%` }} />
           </div>
