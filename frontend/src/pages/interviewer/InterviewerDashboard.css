@@ -1,0 +1,345 @@
+/* ═══════════════════════════════════════════════════════
+   Interviewer → Feedback History
+   A mark book, not an article. The page's job is to let an
+   interviewer see their own scoring bias, so the hero is the
+   distribution of their scores — not a mean, which is the one
+   statistic that hides the answer.
+   ═══════════════════════════════════════════════════════ */
+
+.fh {
+  --fh-dot:  #78716c;   /* every observation — one series. Position already encodes
+                           magnitude, so colour must not encode it a second time. */
+  --fh-mean: #7c5cbf;   /* your mean — a reference marker, not a series */
+
+  /* Recommendation, diverging. Three steps, not five: the poles are what carry
+     polarity, and strong-vs-plain intensity is already in the word beside them.
+     The midpoint is LIGHT so lightness separates the poles independently of hue —
+     a mid-dark neutral put the green at ΔE 1.7 under protanopia. */
+  --fh-neg:  #a83a2c;
+  --fh-mid:  #ddd8d2;
+  --fh-pos:  #0b6e5c;
+
+  --fh-rail-h: 26px;
+  display: flex;
+  flex-direction: column;
+  gap: 34px;
+}
+
+/* ── Masthead ─────────────────────────────────────────── */
+
+.fh__title {
+  font-family: var(--font-display);
+  font-size: 1.6rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin: 0;
+  color: var(--text-primary);
+}
+
+.fh__sub {
+  font-family: var(--font-body);
+  font-size: 0.92rem;
+  color: var(--text-secondary);
+  margin-top: 6px;
+  max-width: 62ch;
+  line-height: 1.6;
+}
+
+/* ── The rail ─────────────────────────────────────────────
+   One 0–100 axis for the whole page. The competency strips and
+   the interview rows below share it, so a candidate's score can
+   be read against the interviewer's own distribution without any
+   connecting chart junk. */
+
+/* ONE grid template, shared by the scale header, the competency rows and the interview
+   rows. This is load-bearing, not tidiness: the page's whole argument is that a
+   candidate's dot can be read against the distribution above it, and that only holds
+   while every rail starts and ends at the same x. The competency rows leave the last
+   cell empty rather than using a shorter template. */
+.fh__scale,
+.fh__row,
+.fh__entry-btn {
+  display: grid;
+  grid-template-columns: 150px 1fr 62px 104px;
+  gap: 18px;
+  align-items: center;
+}
+
+.fh__scale {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--text-tertiary);
+  letter-spacing: 0.06em;
+}
+
+/* Ticks are centred on their value, matching how the dots are positioned — so this is
+   a 3-column grid, not space-between, whose unequal label widths would drift the
+   midpoint off 50%. */
+.fh__scale-track {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  border-bottom: 1px solid var(--border-subtle);
+  padding-bottom: 5px;
+}
+
+.fh__scale-track span:nth-child(1) { text-align: left; }
+.fh__scale-track span:nth-child(2) { text-align: center; }
+.fh__scale-track span:nth-child(3) { text-align: right; }
+
+.fh__row { padding: 7px 0; }
+
+.fh__label {
+  font-family: var(--font-body);
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+
+.fh__plot {
+  position: relative;
+  height: var(--fh-rail-h);
+}
+
+/* Baseline is recessive: it orients, it does not compete with the marks. */
+.fh__plot::after {
+  content: '';
+  position: absolute;
+  left: 0; right: 0; top: 50%;
+  height: 1px;
+  background: var(--border-subtle);
+}
+
+/* min–max spread, behind everything */
+.fh__band {
+  position: absolute;
+  top: 50%;
+  height: 8px;
+  transform: translateY(-50%);
+  background: var(--bg-tertiary);
+  border-radius: 4px;
+}
+
+.fh__dot {
+  position: absolute;
+  top: 50%;
+  width: 7px; height: 7px;
+  margin: -3.5px 0 0 -3.5px;
+  border-radius: 50%;
+  background: var(--fh-dot);
+  /* 2px surface ring so coincident scores stay countable where they overlap */
+  box-shadow: 0 0 0 2px var(--surface-card);
+  left: var(--to);
+  animation: fh-settle 460ms var(--ease-out-expo) var(--delay, 0ms) both;
+}
+
+/* The dots begin stacked at the mean and settle outward — the animation is the
+   message, since spread is the thing the page exists to show. Nothing else moves. */
+@keyframes fh-settle {
+  from { left: var(--from); opacity: 0; }
+  to   { left: var(--to);   opacity: 1; }
+}
+
+.fh__mean {
+  position: absolute;
+  top: 50%;
+  width: 2px; height: 15px;
+  margin: -7.5px 0 0 -1px;
+  background: var(--fh-mean);
+  border-radius: 1px;
+}
+
+.fh__val {
+  font-family: var(--font-mono);
+  font-size: 1.05rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  color: var(--text-primary);
+}
+
+/* ── Verdict ──────────────────────────────────────────────
+   One plain sentence naming what the distribution means. This is
+   what separates a tool from a log. */
+
+.fh__verdict {
+  font-family: var(--font-body);
+  font-size: 0.95rem;
+  line-height: 1.65;
+  color: var(--text-primary);
+  border-left: 2px solid var(--fh-mean);
+  padding-left: 16px;
+  max-width: 64ch;
+}
+
+.fh__verdict em {
+  font-style: normal;
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Interview list (also the chart's table view) ─────── */
+
+.fh__section-head {
+  font-family: var(--font-body);
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-tertiary);
+  border-bottom: 1px solid var(--border-subtle);
+  padding-bottom: 8px;
+}
+
+.fh__entry { border-bottom: 1px solid var(--border-subtle); }
+
+/* Grid comes from the shared rule above — do not redeclare it here, or the rails stop
+   lining up with the distribution. */
+.fh__entry-btn {
+  width: 100%;
+  padding: 13px 0;
+  background: none;
+  border: none;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  transition: background 140ms var(--ease-out-quart);
+}
+
+.fh__entry-btn:hover { background: var(--bg-hover); }
+
+.fh__entry-btn:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: -2px;
+}
+
+.fh__who {
+  font-family: var(--font-body);
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fh__who span {
+  display: block;
+  font-weight: 400;
+  font-size: 0.78rem;
+  color: var(--text-tertiary);
+}
+
+/* Recommendation carries a text label always — colour is secondary encoding. */
+.fh__rec {
+  justify-self: start;
+  font-family: var(--font-body);
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 4px 11px;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+
+.fh__rec--neg { background: var(--fh-neg); color: #fff; }
+.fh__rec--mid { background: var(--fh-mid); color: var(--text-primary); }
+.fh__rec--pos { background: var(--fh-pos); color: #fff; }
+
+.fh__detail {
+  padding: 4px 0 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.fh__scores {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 30px;
+}
+
+.fh__score-k {
+  font-family: var(--font-body);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text-tertiary);
+  margin-bottom: 2px;
+}
+
+.fh__score-v {
+  font-family: var(--font-mono);
+  font-size: 1.25rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+}
+
+.fh__prose-k {
+  font-family: var(--font-body);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text-tertiary);
+  margin-bottom: 4px;
+}
+
+.fh__prose-v {
+  font-family: var(--font-body);
+  font-size: 0.9rem;
+  line-height: 1.7;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  max-width: 72ch;
+}
+
+.fh__empty {
+  font-family: var(--font-body);
+  font-size: 0.95rem;
+  line-height: 1.7;
+  color: var(--text-secondary);
+  border: 1px dashed var(--border-medium);
+  border-radius: 12px;
+  padding: 44px;
+  text-align: center;
+  max-width: 52ch;
+  margin: 0 auto;
+}
+
+.fh__error {
+  font-family: var(--font-body);
+  font-size: 0.88rem;
+  color: var(--fh-neg);
+  border-left: 2px solid var(--fh-neg);
+  padding-left: 14px;
+}
+
+/* ── Responsive ───────────────────────────────────────────
+   Below 720px the rail stacks: label above, plot full width. It
+   must never scroll horizontally — a distribution you have to
+   scroll is not a distribution you can read. */
+
+@media (max-width: 720px) {
+  .fh__scale { display: none; }
+
+  /* Two columns: the rail keeps its full width and the value sits beside it. The rail
+     must never scroll — a distribution you have to scroll is not one you can read. */
+  .fh__row,
+  .fh__entry-btn {
+    grid-template-columns: 1fr 56px;
+    gap: 8px 12px;
+  }
+
+  .fh__label,
+  .fh__who,
+  .fh__rec { grid-column: 1 / -1; }
+
+  .fh__plot { grid-column: 1; }
+  .fh__val  { grid-column: 2; }
+
+  .fh__scores { gap: 20px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fh__dot { animation: none; left: var(--to); opacity: 1; }
+  .fh__entry-btn { transition: none; }
+}

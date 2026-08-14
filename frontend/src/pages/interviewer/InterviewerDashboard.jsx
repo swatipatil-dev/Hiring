@@ -8,6 +8,7 @@ import {
   Upload, FileText
 } from 'lucide-react'
 import api from '../../api/client'
+import './InterviewerDashboard.css'
 // This dashboard carries its own inlined copy of the create-test wizard; the timing rules are
 // shared with the HR one so both produce the same duration.
 import { TYPE_LABELS, TYPE_TIME_DEFAULTS, computeDuration } from '../shared/CreateTestWizard'
@@ -107,12 +108,17 @@ function TestCasesEditor({ testCases, onChange }) {
 
 const TAB_MAP = { dashboard: 'dashboard', interviews: 'interviews', 'create-test': 'create-test', 'request-candidates': 'request-candidates', 'edit-exam': 'edit-exam', 'feedback-history': 'feedback-history' }
 
-const HIRE_REC_TONE = {
-  strong_hire: { label: 'Strong hire', bg: '#dcfce7', fg: '#15803d' },
-  hire:        { label: 'Hire',        bg: '#ecfdf5', fg: '#16a34a' },
-  maybe:       { label: 'Maybe',       bg: '#fef9c3', fg: '#a16207' },
-  no_hire:     { label: 'No hire',     bg: '#fee2e2', fg: '#b91c1c' },
-  strong_no_hire: { label: 'Strong no hire', bg: '#fecaca', fg: '#991b1b' },
+// Recommendation is an ordered scale, so the encoding is diverging: two poles either
+// side of a light neutral. Three tones rather than five — the poles carry the polarity
+// and the word carries the intensity, which is why the label is never dropped. A
+// five-step version put two adjacent reds at ΔE 9.0, indistinguishable even with full
+// colour vision. Values live in InterviewerDashboard.css.
+const HIRE_REC = {
+  strong_hire:    { label: 'Strong hire',    tone: 'pos' },
+  hire:           { label: 'Hire',           tone: 'pos' },
+  maybe:          { label: 'Maybe',          tone: 'mid' },
+  no_hire:        { label: 'No hire',        tone: 'neg' },
+  strong_no_hire: { label: 'Strong no hire', tone: 'neg' },
 }
 
 // Fallback used only when GET /interviewer/templates is unreachable (offline / auth issue).
@@ -4139,155 +4145,157 @@ export default function InterviewerDashboard() {
       {/* ═══════════ EDIT EXAM / QUESTIONS TAB ═══════════ */}
       {tab === 'feedback-history' && (() => {
         const n = history.length
-        const avg = (key) => {
-          const vals = history.map(h => h[key]).filter(v => v !== null && v !== undefined)
-          return vals.length ? (vals.reduce((s, v) => s + v, 0) / vals.length) : null
+        const COMPETENCIES = [
+          ['technical_score', 'Technical'],
+          ['communication_score', 'Communication'],
+          ['problem_solving_score', 'Problem solving'],
+          ['cultural_fit_score', 'Cultural fit'],
+        ]
+        const clamp = (v) => Math.max(0, Math.min(100, Number(v)))
+        const statsFor = (key) => {
+          const v = history.map(h => h[key]).filter(x => x !== null && x !== undefined).map(clamp)
+          if (!v.length) return null
+          const min = Math.min(...v), max = Math.max(...v)
+          return { values: v, mean: v.reduce((s, x) => s + x, 0) / v.length, min, max, spread: max - min }
         }
-        const fmt = (v) => v === null || v === undefined ? '—' : Number(v).toFixed(1)
+        const rows = COMPETENCIES
+          .map(([key, label]) => ({ key, label, s: statsFor(key) }))
+          .filter(r => r.s)
+        const overall = statsFor('overall_score')
+
+        const WORDS = ['No', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven',
+                       'Eight', 'Nine', 'Ten', 'Eleven', 'Twelve']
+        const countWord = (c) => WORDS[c] ?? String(c)
         const fmtDate = (d) => d ? new Date(d).toLocaleDateString(undefined,
           { day: 'numeric', month: 'short', year: 'numeric' }) : '—'
 
-        // Distribution of your own recommendations. An interviewer who has never said
-        // "no hire" is not calibrated, and that is only visible in aggregate.
-        const recCounts = history.reduce((acc, h) => {
-          const k = h.hire_recommendation || 'unknown'
-          acc[k] = (acc[k] || 0) + 1
-          return acc
-        }, {})
+        // One plain sentence naming what the distribution means. A mean cannot answer
+        // "am I calibrated?" — the spread can, so the spread is what gets spoken.
+        const verdict = (() => {
+          if (!rows.length) return null
+          const tightest = rows.reduce((a, b) => (a.s.spread <= b.s.spread ? a : b))
+          if (tightest.s.spread < 15) {
+            return <>Your <strong>{tightest.label.toLowerCase()}</strong> scores sit within <em>{Math.round(tightest.s.spread)}</em> points
+              of each other. That is not a scale you are using.</>
+          }
+          const anyAgainst = history.some(h => HIRE_REC[h.hire_recommendation]?.tone === 'neg')
+          if (!anyAgainst && n >= 3) {
+            return <>You have never recommended against a hire, across <em>{n}</em> interviews.
+              Worth knowing before your next debrief.</>
+          }
+          const widest = rows.reduce((a, b) => (a.s.spread >= b.s.spread ? a : b))
+          return <>You use most of the scale. Your <strong>{widest.label.toLowerCase()}</strong> scores
+            run <em>{Math.round(widest.s.min)}</em> to <em>{Math.round(widest.s.max)}</em>.</>
+        })()
 
-        const competencies = [
-          ['technical_score', 'Technical'],
-          ['communication_score', 'Communication'],
-          ['problem_solving_score', 'Problem Solving'],
-          ['cultural_fit_score', 'Cultural Fit'],
-        ]
+        // Every observation as a dot on the shared 0–100 axis, the mean as a rule, the
+        // min–max as a band behind. Dots start stacked at the mean and settle outward.
+        const Rail = ({ s }) => (
+          <div className="fh__plot" aria-hidden="true">
+            <div className="fh__band" style={{ left: `${s.min}%`, width: `${Math.max(s.spread, 0.8)}%` }} />
+            {s.values.map((v, i) => (
+              <span key={i} className="fh__dot"
+                    style={{ '--to': `${v}%`, '--from': `${s.mean}%`, '--delay': `${i * 45}ms` }} />
+            ))}
+            <div className="fh__mean" style={{ left: `${s.mean}%` }} />
+          </div>
+        )
 
         return (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+          <div className="fh">
             <div>
-              <h2 style={{ margin: 0, fontSize: '1.5rem' }}>Feedback History</h2>
-              <div style={{ color: 'var(--text-secondary)', fontSize: '0.88rem', marginTop: 4 }}>
-                Every interview you have scored. Use it to revisit what you said, and to check
-                your own scoring stays consistent across candidates.
-              </div>
+              <h2 className="fh__title">Your scoring record</h2>
+              <p className="fh__sub">
+                {countWord(n)} interview{n === 1 ? '' : 's'} scored. This is how you rate people —
+                every score you have given, on one scale.
+              </p>
             </div>
 
-            {historyError && (
-              <div style={{ padding: '12px 16px', borderRadius: 10, background: '#fef2f2',
-                            border: '1px solid #fecaca', color: '#b91c1c', fontSize: '0.86rem' }}>
-                {historyError}
-              </div>
-            )}
+            {historyError && <div className="fh__error">{historyError}</div>}
 
             {historyLoading ? (
-              <div style={{ padding: 60, textAlign: 'center', color: 'var(--text-tertiary)' }}>Loading…</div>
+              <div className="fh__empty">Loading your record…</div>
             ) : n === 0 && !historyError ? (
-              <div className="card" style={{ padding: 60, textAlign: 'center', color: 'var(--text-tertiary)' }}>
-                You haven't submitted feedback for any interview yet.
+              <div className="fh__empty">
+                You haven’t scored an interview yet. Once you do, this page shows how your
+                scoring holds up across candidates.
               </div>
             ) : (
               <>
-                {/* Self-calibration strip */}
-                <div style={{ display: 'grid', gridTemplateColumns: `repeat(${competencies.length + 2}, 1fr)`, gap: 14 }}>
-                  <div style={{ background: 'var(--bg-secondary)', borderRadius: 12, padding: '16px 18px',
-                                border: '1px solid var(--border-subtle)', borderLeft: '4px solid #6ba3d6' }}>
-                    <div style={{ fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.05em',
-                                  color: 'var(--text-secondary)', fontWeight: 600 }}>Interviews Scored</div>
-                    <div style={{ fontSize: '1.8rem', fontWeight: 700, color: '#6ba3d6', lineHeight: 1.2 }}>{n}</div>
-                  </div>
-                  <div style={{ background: 'var(--bg-secondary)', borderRadius: 12, padding: '16px 18px',
-                                border: '1px solid var(--border-subtle)', borderLeft: '4px solid #a855f7' }}>
-                    <div style={{ fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.05em',
-                                  color: 'var(--text-secondary)', fontWeight: 600 }}>Your Avg Overall</div>
-                    <div style={{ fontSize: '1.8rem', fontWeight: 700, color: '#a855f7', lineHeight: 1.2 }}>{fmt(avg('overall_score'))}</div>
-                  </div>
-                  {competencies.map(([key, label]) => (
-                    <div key={key} style={{ background: 'var(--bg-secondary)', borderRadius: 12, padding: '16px 18px',
-                                            border: '1px solid var(--border-subtle)' }}>
-                      <div style={{ fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.05em',
-                                    color: 'var(--text-secondary)', fontWeight: 600 }}>Avg {label}</div>
-                      <div style={{ fontSize: '1.5rem', fontWeight: 700, lineHeight: 1.4 }}>{fmt(avg(key))}</div>
+                {rows.length > 0 && (
+                  <div>
+                    <div className="fh__scale">
+                      <span />
+                      <span className="fh__scale-track"><span>0</span><span>50</span><span>100</span></span>
+                      <span style={{ textAlign: 'right' }}>MEAN</span>
                     </div>
-                  ))}
-                </div>
-
-                {/* Recommendation mix */}
-                <div className="card" style={{ padding: '16px 20px' }}>
-                  <div style={{ fontSize: '0.78rem', fontWeight: 700, marginBottom: 10,
-                                fontFamily: 'var(--font-display)' }}>Your recommendation mix</div>
-                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}>
-                    {Object.entries(recCounts).map(([k, count]) => {
-                      const tone = HIRE_REC_TONE[k] || { label: k.replace(/_/g, ' '), bg: '#f1f5f9', fg: '#475569' }
-                      return (
-                        <span key={k} style={{ padding: '5px 12px', borderRadius: 999, background: tone.bg,
-                                               color: tone.fg, fontSize: '0.8rem', fontWeight: 600 }}>
-                          {tone.label} · {count} ({Math.round((count / n) * 100)}%)
-                        </span>
-                      )
-                    })}
+                    {rows.map(r => (
+                      <div className="fh__row" key={r.key}>
+                        <span className="fh__label">{r.label}</span>
+                        <Rail s={r.s} />
+                        <span className="fh__val">{r.s.mean.toFixed(0)}</span>
+                      </div>
+                    ))}
                   </div>
-                </div>
+                )}
 
-                {/* The interviews themselves */}
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                {verdict && <p className="fh__verdict">{verdict}</p>}
+
+                <div>
+                  <div className="fh__section-head">
+                    Every interview, newest first
+                  </div>
                   {history.map(h => {
                     const open = historyOpen === h.interview_id
-                    const tone = HIRE_REC_TONE[h.hire_recommendation]
-                      || { label: (h.hire_recommendation || '—').replace(/_/g, ' '), bg: '#f1f5f9', fg: '#475569' }
+                    const rec = HIRE_REC[h.hire_recommendation]
+                      || { label: (h.hire_recommendation || 'Not recorded').replace(/_/g, ' '), tone: 'mid' }
+                    const score = h.overall_score === null || h.overall_score === undefined
+                      ? null : clamp(h.overall_score)
                     return (
-                      <div key={h.interview_id} className="card" style={{ padding: 0, overflow: 'hidden' }}>
-                        <button
-                          onClick={() => setHistoryOpen(open ? null : h.interview_id)}
-                          aria-expanded={open}
-                          style={{ width: '100%', display: 'grid',
-                                   gridTemplateColumns: '1fr 150px 110px 90px 130px 24px',
-                                   alignItems: 'center', gap: 12, padding: '14px 18px',
-                                   background: 'none', border: 'none', cursor: 'pointer', textAlign: 'left' }}>
-                          <span style={{ fontWeight: 600 }}>{h.candidate_name}</span>
-                          <span style={{ fontSize: '0.84rem', color: 'var(--text-secondary)' }}>{h.job_title || '—'}</span>
-                          <span style={{ fontSize: '0.8rem', color: 'var(--text-tertiary)' }}>{h.interview_type || '—'}</span>
-                          <span style={{ fontFamily: 'var(--font-mono)', fontWeight: 700 }}>{fmt(h.overall_score)}</span>
-                          <span style={{ justifySelf: 'start', padding: '4px 10px', borderRadius: 999,
-                                         background: tone.bg, color: tone.fg, fontSize: '0.75rem', fontWeight: 600 }}>
-                            {tone.label}
+                      <div className="fh__entry" key={h.interview_id}>
+                        <button className="fh__entry-btn" aria-expanded={open}
+                                onClick={() => setHistoryOpen(open ? null : h.interview_id)}>
+                          <span className="fh__who">
+                            {h.candidate_name}
+                            <span>{h.job_title || 'Job removed'}</span>
                           </span>
-                          <span style={{ color: 'var(--text-tertiary)' }}>{open ? '▾' : '▸'}</span>
+                          {score === null ? <span /> : (
+                            <div className="fh__plot" aria-hidden="true">
+                              {overall && <div className="fh__mean" style={{ left: `${overall.mean}%`, opacity: 0.3 }} />}
+                              <span className="fh__dot" style={{ '--to': `${score}%`, '--from': `${score}%` }} />
+                            </div>
+                          )}
+                          <span className="fh__val">{score === null ? '—' : score.toFixed(0)}</span>
+                          <span className={`fh__rec fh__rec--${rec.tone}`}>{rec.label}</span>
                         </button>
 
                         {open && (
-                          <div style={{ padding: '4px 18px 18px', borderTop: '1px solid var(--border-subtle)' }}>
-                            <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap', margin: '14px 0 16px' }}>
-                              {competencies.map(([key, label]) => (
+                          <div className="fh__detail">
+                            <div className="fh__scores">
+                              {COMPETENCIES.map(([key, label]) => (
                                 <div key={key}>
-                                  <div style={{ fontSize: '0.7rem', textTransform: 'uppercase',
-                                                color: 'var(--text-tertiary)', fontWeight: 600 }}>{label}</div>
-                                  <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 700, fontSize: '1.05rem' }}>
-                                    {fmt(h[key])}
+                                  <div className="fh__score-k">{label}</div>
+                                  <div className="fh__score-v">
+                                    {h[key] === null || h[key] === undefined ? '—' : Number(h[key]).toFixed(0)}
                                   </div>
                                 </div>
                               ))}
                               <div>
-                                <div style={{ fontSize: '0.7rem', textTransform: 'uppercase',
-                                              color: 'var(--text-tertiary)', fontWeight: 600 }}>Interviewed</div>
-                                <div style={{ fontSize: '0.9rem' }}>{fmtDate(h.interview_date)}</div>
+                                <div className="fh__score-k">Interviewed</div>
+                                <div className="fh__score-v" style={{ fontSize: '0.95rem' }}>{fmtDate(h.interview_date)}</div>
                               </div>
                               <div>
-                                <div style={{ fontSize: '0.7rem', textTransform: 'uppercase',
-                                              color: 'var(--text-tertiary)', fontWeight: 600 }}>Feedback given</div>
-                                <div style={{ fontSize: '0.9rem' }}>{fmtDate(h.feedback_date)}</div>
+                                <div className="fh__score-k">Scored</div>
+                                <div className="fh__score-v" style={{ fontSize: '0.95rem' }}>{fmtDate(h.feedback_date)}</div>
                               </div>
                             </div>
                             {[['Strengths', h.strengths], ['Areas to improve', h.weaknesses],
                               ['Recommendations', h.recommendations], ['Notes', h.additional_notes]]
                               .filter(([, v]) => v && String(v).trim())
                               .map(([label, v]) => (
-                                <div key={label} style={{ marginBottom: 12 }}>
-                                  <div style={{ fontSize: '0.7rem', textTransform: 'uppercase',
-                                                color: 'var(--text-tertiary)', fontWeight: 600, marginBottom: 3 }}>{label}</div>
-                                  <div style={{ fontSize: '0.9rem', lineHeight: 1.6, whiteSpace: 'pre-wrap',
-                                                color: 'var(--text-secondary)' }}>
-                                    {Array.isArray(v) ? v.join(', ') : String(v)}
-                                  </div>
+                                <div key={label}>
+                                  <div className="fh__prose-k">{label}</div>
+                                  <div className="fh__prose-v">{Array.isArray(v) ? v.join(', ') : String(v)}</div>
                                 </div>
                               ))}
                           </div>
