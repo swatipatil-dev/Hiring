@@ -29,6 +29,29 @@ resolves to a GCS object or a file under `HIREFLOW_DATA_DIR`, and the database
 stores the key rather than a URL. Copy the objects to the same relative paths and
 every existing row resolves unchanged.
 
+### Values used in the commands below
+
+Every command in this runbook is written with these filled in. Confirm the first
+three against your own server before you start — the rest are fixed by the export.
+
+| Placeholder | This deployment | Confirm with |
+|---|---|---|
+| Server | `root@66.116.207.71` | — |
+| DB user | `innomaxskills_hf` | `grep ^DATABASE_URL /opt/hireflow/backend/.env` |
+| Live database | `innomaxskills_hireflow` | `curl -s localhost:8000/health` |
+| Staging database | `innomaxskills_hfmig` | you create it in step 4 |
+| App root | `/opt/hireflow`, backend at `/opt/hireflow/backend` | — |
+| Service user | `hireflow` | — |
+| Site | `https://career.innomaxskills.com` | — |
+| Export bundle | `C:\Users\ADMIN\Downloads\hireflow-migration.zip` | — |
+| Dump inside it | `Cloud_SQL_Export_2026-08-13 (17_58_10).sql` | — |
+| GCP project | `payyalas-project`, service `hire-flow-api`, region `us-central1` | — |
+| GCP bucket | `gs://hireflow-uploads` | — |
+
+The database password is never written into a command here — every `mysql` and
+`mysqldump` call uses `-p` and prompts for it, so it stays out of your shell
+history and out of `ps`.
+
 ---
 
 ## Before you start — inspect your own dump
@@ -81,8 +104,8 @@ The dump's `company_mailboxes.smtp_pass` and `tenant_configs.smtp_pass` hold
 Fernet ciphertext, encrypted under the **GCP** deployment's key.
 
 ```bash
-gcloud secrets versions access latest --secret=SECRET_KEY --project=<project>
-gcloud run services describe <service> --region=<region> --project=<project> \
+gcloud secrets versions access latest --secret=SECRET_KEY --project=payyalas-project
+gcloud run services describe hire-flow-api --region=us-central1 --project=payyalas-project \
   --format="yaml(spec.template.spec.containers[0].env)"
 ```
 
@@ -116,7 +139,7 @@ failure has two possible causes instead of one.
 ## Step 2 — Upload the export
 
 ```bash
-scp hireflow-migration.zip root@<server>:/root/
+scp hireflow-migration.zip root@66.116.207.71:/root/
 ```
 
 `[root]` — check free space first; a shared server has other accounts on this disk:
@@ -137,14 +160,14 @@ du -sh */ && find . -type f | wc -l
 > not produce a restorable file.** Your entire rollback rests on this backup.
 
 ```bash
-mysqldump -u <db_user> -p --single-transaction --no-tablespaces \
-  <live_db> > /root/pre-migration-$(date +%F).sql
+mysqldump -u innomaxskills_hf -p --single-transaction --no-tablespaces \
+  innomaxskills_hireflow > /root/pre-migration-$(date +%F).sql
 ls -lh /root/pre-migration-*.sql
 ```
 
 ## Step 4 — Create the staging database
 
-cPanel → **MySQL Databases** → create `<acct>_hfmig`, then **Add User To Database**
+cPanel → **MySQL Databases** → create `innomaxskills_hfmig`, then **Add User To Database**
 granting your existing DB user ALL PRIVILEGES. Use the UI rather than raw SQL, so
 cPanel's own tooling and backups know the database exists.
 
@@ -156,12 +179,14 @@ cosmetic: every query uses MySQL's `DATABASE()` rather than a hardcoded name, an
 
 ```bash
 cd /root/migration
+F='Cloud_SQL_Export_2026-08-13 (17_58_10).sql'    # the quotes matter: spaces + parens
+
 sed -i '/^CREATE DATABASE/d; /^USE `recruitment_db`/d' "$F"
 grep -cE '^(CREATE DATABASE|USE )' "$F"      # must print 0
 
-mysql -u <db_user> -p --max-allowed-packet=512M <acct>_hfmig < "$F"
+mysql -u innomaxskills_hf -p --max-allowed-packet=512M innomaxskills_hfmig < "$F"
 
-mysql -u <db_user> -p <acct>_hfmig -e \
+mysql -u innomaxskills_hf -p innomaxskills_hfmig -e \
   "SELECT COUNT(*) AS users FROM users; SELECT COUNT(*) AS candidates FROM candidates;"
 ```
 
@@ -173,7 +198,7 @@ see it here — and only the staging database is affected.
 Two different fixes, in this order:
 
 ```bash
-STAGE='mysql+pymysql://<db_user>:<password>@localhost:3306/<acct>_hfmig'
+STAGE='mysql+pymysql://innomaxskills_hf:PASSWORD@localhost:3306/innomaxskills_hfmig'
 cd /opt/hireflow/backend
 
 # a) revisions NEWER than the dump's stamp — Alembic applies these normally
@@ -182,7 +207,7 @@ sudo -u hireflow env DATABASE_URL="$STAGE" /opt/hireflow/venv/bin/alembic curren
 
 # b) migrations OLDER than the stamp that never actually ran (see the trap above).
 #    Alembic believes these are applied and will never revisit them.
-mysql -u <db_user> -p <acct>_hfmig \
+mysql -u innomaxskills_hf -p innomaxskills_hfmig \
   -e "ALTER TABLE company_mailboxes ADD COLUMN hourly_limit INT NULL;"
 ```
 
@@ -206,7 +231,7 @@ Anything else — stop and resolve it. Do not proceed on row counts alone.
 ## Step 7 — Prove the encryption key
 
 ```bash
-mysql -u <db_user> -p <acct>_hfmig -N -e \
+mysql -u innomaxskills_hf -p innomaxskills_hfmig -N -e \
   "SELECT smtp_pass FROM company_mailboxes WHERE smtp_pass LIKE 'gAAAA%' LIMIT 1;"
 
 cd /opt/hireflow/backend
@@ -268,7 +293,7 @@ cp /opt/hireflow/backend/.env /root/.env.pre-migration
 
 Edit `/opt/hireflow/backend/.env` — everything in one pass:
 
-1. `DATABASE_URL` → `…/<acct>_hfmig`
+1. `DATABASE_URL` → `…/innomaxskills_hfmig`
 2. `EMAIL_ENCRYPTION_KEY=` → the value from step 7
 3. `PLATFORM_ADMIN_EMAIL` → see the warning below
 
@@ -282,7 +307,7 @@ Edit `/opt/hireflow/backend/.env` — everything in one pass:
 >
 > Check first:
 > ```bash
-> mysql -u <db_user> -p <acct>_hfmig -e \
+> mysql -u innomaxskills_hf -p innomaxskills_hfmig -e \
 >   "SELECT email, role FROM users WHERE role IN ('superadmin','admin');"
 > ```
 > If you cannot log in as any of them, point `PLATFORM_ADMIN_EMAIL` at an address
