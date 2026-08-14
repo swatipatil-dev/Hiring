@@ -282,11 +282,14 @@ async def create_database_backup(
         backup_path = request.backup_path or db_manager.default_backup_path()
 
         def backup_task():
-            written = db_manager.backup_database(backup_path)
-            if written:
+            # backup_database raises on failure and removes any partial file, so the
+            # only thing to do here is record why. The HTTP response has already been
+            # sent by this point — the log is the sole record that it did not work.
+            try:
+                written = db_manager.backup_database(backup_path)
                 logging.info(f"Database backup completed: {written}")
-            else:
-                logging.error("Database backup failed")
+            except Exception as e:
+                logging.error(f"Database backup FAILED, no file written: {e}")
 
         background_tasks.add_task(backup_task)
 
@@ -311,9 +314,12 @@ async def list_backups():
         import glob
         import pathlib
         
-        # Look for backup files
-        backup_pattern = "backup_recruitment_db_*.sql"
-        backup_dir = "."
+        # Look where backups are actually written. This used to glob "." for
+        # "backup_recruitment_db_*.sql" — the process working directory, which varies
+        # between systemd, cron and a shell, and the local dev database name rather than
+        # the deployed one. It could never list a real backup on any deployment.
+        backup_dir = os.path.dirname(db_manager.default_backup_path())
+        backup_pattern = "backup_*.sql"
         backup_files = []
         
         for backup_file in glob.glob(os.path.join(backup_dir, backup_pattern)):

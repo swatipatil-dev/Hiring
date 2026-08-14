@@ -58,7 +58,19 @@ def test_candidate_company_id_not_null(client, hr_headers, candidate_headers, db
     Fix: Add `company_id=job.company_id` in routes/candidate_routes.py
          inside the Candidate() constructor call.
     """
-    from src.models.models import Candidate
+    from src.models.models import Candidate, User
+
+    # Put the candidate in the HR's company before applying. The stock fixtures do not
+    # line up — hr_headers builds a fresh "Test Company" while a bare candidate
+    # registration resolves to the platform org — and applying across that boundary is
+    # exactly what BUG-09 closed. Production has no such gap: a candidate reaches a
+    # company through its portal key or tenant domain and is assigned that company_id.
+    # This test is about whether the Candidate row gets a company_id at all, so the
+    # alignment restores its subject rather than weakening it.
+    _hr = db.query(User).filter(User.email == "hr_test@test.com").first()
+    _cand = db.query(User).filter(User.email == "candidate_test@test.com").first()
+    _cand.company_id = _hr.company_id
+    db.flush()
 
     # Create and approve a job
     job_resp = client.post("/api/v1/hr/jobs", headers=hr_headers, json={
@@ -274,3 +286,121 @@ def test_main_py_reads_port_from_env():
         "R-07 CONFIRMED: main.py has hardcoded port in uvicorn.run(). "
         "Fix: port=int(os.getenv('PORT', 8000))"
     )
+
+
+# ── BUG-08: every /api/v1/ats route was reachable with no account ────────────
+
+@pytest.mark.security
+def test_ats_endpoints_require_auth(client):
+    """
+    BUG-08 (HIGH): the ATS router declared no dependencies and none of its seven
+    endpoints declared one either, so all were callable anonymously. Two run work
+    on caller-supplied text — /score does a sentence-transformer pass and
+    /score/hybrid calls an LLM — so anyone who found the path could saturate a
+    shared box for free.
+
+    Fix: dependencies=[Depends(get_current_user)] on the router, the same way
+         database_management_routes.py guards /api/v1/db.
+    """
+    scored = client.post("/api/v1/ats/score",
+                         json={"resume_text": "python fastapi", "job_description": "python role"})
+    assert scored.status_code in (401, 403), \
+        f"/ats/score answered {scored.status_code} with no credentials"
+
+    for path in ("/api/v1/ats/demo", "/api/v1/ats/metrics", "/api/v1/ats/system/status"):
+        resp = client.get(path)
+        assert resp.status_code in (401, 403), \
+            f"{path} answered {resp.status_code} with no credentials"
+
+
+# ── BUG-09: a candidate could apply into another tenant ──────────────────────
+
+@pytest.mark.security
+def test_cannot_apply_to_another_companys_job(client, db, hr_headers, candidate_headers):
+    """
+    BUG-09 (HIGH): POST /candidate/jobs/{id}/apply selected on `status == "active"`
+    and named no company, so a candidate in one tenant could apply to another
+    tenant's active job by id and get a 200 back. Measured, not assumed — removing
+    the company clause makes this test fail with 200.
+
+    Note the endpoint choice. An earlier version of this test used /quick-apply and
+    was worthless: that endpoint 404s with "Candidate profile not found" for a
+    candidate with no CandidateProfileExt, which every fixture candidate lacks. It
+    asserted 404 and got 404 for an unrelated reason, and passed with the fix
+    reverted. /apply takes its identity from form fields, so it reaches the job
+    lookup and the assertion means something.
+    """
+    from src.models.models import User, JobPosting
+
+    hr = db.query(User).filter(User.email == "hr_test@test.com").first()
+    cand = db.query(User).filter(User.email == "candidate_test@test.com").first()
+    assert hr and cand
+    assert hr.company_id != cand.company_id, \
+        "this test is meaningless unless the fixtures sit in different companies"
+
+    job = JobPosting(id=str(uuid.uuid4()), company_id=hr.company_id,
+                     title="Other Co Role", description="d", requirements="r",
+                     status="active")
+    db.add(job)
+    db.flush()
+
+    resp = client.post(
+        f"/api/v1/candidate/jobs/{job.id}/apply",
+        headers=candidate_headers,
+        files={"resume": ("r.pdf", io.BytesIO(b"%PDF fake"), "application/pdf")},
+        data={
+            "first_name": "Cross", "last_name": "Tenant",
+            "email": "candidate_test@test.com", "phone": "0000000000",
+            "years_experience": "1",
+        },
+    )
+    assert resp.status_code == 404, \
+        f"cross-tenant apply returned {resp.status_code}: {resp.text}"
+
+
+# ── BUG-10: the backup feature produced unrestorable files ───────────────────
+
+@pytest.mark.security
+def test_backup_refuses_rather_than_writing_an_unrestorable_file(tmp_path, monkeypatch):
+    """
+    BUG-10 (HIGH): backup_database built SQL by interpolating Python's tuple repr —
+    no CREATE TABLE at all, None where NULL belongs, datetime.datetime(...) and
+    Decimal('1.5') as literals, a trailing comma on every single-column row, and no
+    column list. Every file it produced was unrestorable, which is worse than having
+    no backup because it stops you taking a real one.
+
+    It now shells out to mysqldump. The property under test is the one that makes
+    that safe: with no mysqldump available it must refuse loudly and leave nothing
+    behind, never fall back to writing something that merely looks like a backup.
+    """
+    import os
+    import shutil as _shutil
+    from src.config.database_config_mysql import db_manager
+
+    monkeypatch.delenv("MYSQLDUMP_PATH", raising=False)
+    monkeypatch.setattr(_shutil, "which", lambda *a, **k: None)
+
+    target = str(tmp_path / "backup_should_not_exist.sql")
+    with pytest.raises(RuntimeError, match="mysqldump"):
+        db_manager.backup_database(target)
+
+    assert not os.path.exists(target), "a failed backup must not leave a file behind"
+
+
+@pytest.mark.security
+def test_backup_writes_a_dump_with_schema_when_mysqldump_exists(tmp_path):
+    """The positive case, skipped where the client is not installed: a real dump
+    carries DDL and the completion trailer, neither of which the old code emitted."""
+    import os
+    import shutil as _shutil
+    from src.config.database_config_mysql import db_manager
+
+    if not (os.getenv("MYSQLDUMP_PATH") or _shutil.which("mysqldump")):
+        pytest.skip("mysqldump not installed in this environment")
+
+    target = str(tmp_path / "backup_real.sql")
+    written = db_manager.backup_database(target)
+
+    body = open(written, encoding="utf-8", errors="ignore").read()
+    assert "CREATE TABLE" in body, "a dump with no DDL cannot rebuild an empty database"
+    assert "-- Dump completed" in body, "missing trailer means the dump was truncated"

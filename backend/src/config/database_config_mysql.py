@@ -5,6 +5,8 @@ pooling, caching, and better error handling for recruitment_db
 """
 
 import os
+import shutil
+import subprocess
 import pymysql
 
 # Tolerant loader: the judge worker runs as a different user that cannot read the
@@ -283,44 +285,106 @@ class DatabaseManager:
         stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         return os.path.join(backup_dir, f"backup_{db_name}_{stamp}.sql")
 
-    def backup_database(self, backup_path: str = None) -> Optional[str]:
-        """Create a database backup. Returns the path written, or None on failure."""
+    def _mysqldump_binary(self) -> str:
+        """Locate mysqldump, or say plainly that we cannot.
+
+        Honoured first is MYSQLDUMP_PATH, because the client is frequently installed
+        outside PATH (notably on Windows, under Program Files).
+        """
+        explicit = os.getenv("MYSQLDUMP_PATH")
+        if explicit:
+            if os.path.isfile(explicit):
+                return explicit
+            raise RuntimeError(f"MYSQLDUMP_PATH is set to '{explicit}', which is not a file")
+
+        found = shutil.which("mysqldump")
+        if found:
+            return found
+
+        raise RuntimeError(
+            "mysqldump was not found on PATH. Install the MySQL client tools or set "
+            "MYSQLDUMP_PATH to the binary. Refusing to write a backup without it."
+        )
+
+    def backup_database(self, backup_path: str = None) -> str:
+        """Write a real, restorable dump with mysqldump. Returns the path written.
+
+        Raises rather than returning None on failure, and deletes any partial file, so
+        a failed backup can never be mistaken for a good one.
+
+        This used to build SQL by interpolating Python's ``tuple`` repr into
+        ``INSERT INTO t VALUES {tuple(row)};``. Every file it produced was unrestorable:
+        no CREATE TABLE at all, ``None`` where ``NULL`` belongs, ``datetime.datetime(...)``
+        and ``Decimal('1.5')`` as literals, a trailing comma on every single-column row,
+        and no column list, so any column reorder would silently misalign the data. A
+        backup that cannot be restored is worse than none, because it stops you taking a
+        real one.
+        """
+        if not backup_path:
+            backup_path = self.default_backup_path()
+
+        url = self.engine.url
+        binary = self._mysqldump_binary()
+
+        args = [
+            binary,
+            f"--host={url.host or '127.0.0.1'}",
+            f"--port={url.port or 3306}",
+            f"--user={url.username or 'root'}",
+            "--single-transaction",   # consistent InnoDB snapshot without a global lock
+            "--no-tablespaces",       # the PROCESS privilege it needs is not granted on managed hosts
+            "--default-character-set=utf8mb4",
+            "--hex-blob",
+            "--add-drop-table",
+            f"--result-file={backup_path}",
+            url.database,
+        ]
+        # GTID servers otherwise emit SET @@GLOBAL.GTID_PURGED, which a restore under a
+        # non-SUPER user rejects. The option does not exist on MariaDB, so a server that
+        # refuses it is retried without.
+        gtid_flag = "--set-gtid-purged=OFF"
+
+        # Password via the environment, never argv — argv is world-readable in `ps`.
+        env = dict(os.environ)
+        if url.password:
+            env["MYSQL_PWD"] = str(url.password)
+
+        def _run(argv):
+            return subprocess.run(argv, env=env, capture_output=True, text=True, timeout=1800)
+
         try:
-            if not backup_path:
-                backup_path = self.default_backup_path()
+            result = _run(args[:-1] + [gtid_flag, args[-1]])
+            if result.returncode != 0 and "gtid" in (result.stderr or "").lower():
+                logger.info("mysqldump rejected %s; retrying without it", gtid_flag)
+                result = _run(args)
 
-            with self.engine.connect() as connection:
-                # Get all table data
-                tables_result = connection.execute(text(
-                    "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE()"
-                ))
-                tables = [row[0] for row in tables_result.fetchall()]
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"mysqldump exited {result.returncode}: "
+                    f"{(result.stderr or '').strip()[:500]}"
+                )
 
-                backup_content = []
-                for table in tables:
-                    try:
-                        table_data = connection.execute(text(f"SELECT * FROM {table}"))
-                        columns = table_data.keys()
-                        rows = table_data.fetchall()
-                        backup_content.append(f"-- Table: {table}")
-                        backup_content.append(f"-- Columns: {', '.join(columns)}")
-                        for row in rows:
-                            backup_content.append(f"INSERT INTO {table} VALUES {tuple(row)};")
-                        backup_content.append("\n")
-                    except Exception as e:
-                        logger.warning(f"Failed to backup table {table}: {e}")
-                
-                # Write backup to file
-                with open(backup_path, 'w', encoding='utf-8') as f:
-                    f.write(f"-- Database backup: {datetime.now()}\n")
-                    f.write("\n".join(backup_content))
-                
-                logger.info(f"Database backup created: {backup_path}")
-                return backup_path
+            # mysqldump writes the trailer only after finishing, so its absence means a
+            # truncated dump. Checking it is the difference between a backup and a file.
+            with open(backup_path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                fh.seek(max(0, fh.tell() - 512))
+                tail = fh.read().decode("utf-8", "ignore")
+            if "-- Dump completed" not in tail:
+                raise RuntimeError("mysqldump produced no completion marker — dump is truncated")
 
-        except Exception as e:
-            logger.error(f"Database backup failed: {e}")
-            return None
+            logger.info("Database backup created: %s (%d bytes)",
+                        backup_path, os.path.getsize(backup_path))
+            return backup_path
+
+        except Exception:
+            # Never leave a half-written file behind wearing a backup's name.
+            try:
+                if os.path.exists(backup_path):
+                    os.remove(backup_path)
+            except OSError:
+                logger.warning("Could not remove partial backup at %s", backup_path)
+            raise
     
     def optimize_database(self) -> Dict[str, Any]:
         """Optimize database performance"""

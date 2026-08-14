@@ -352,14 +352,21 @@ async def apply_for_job_enhanced(
     - Detailed candidate analysis
     - Personalized recommendations
     """
-    # Check if job exists and is active
+    # Check the job exists, is active, and belongs to the caller's company.
+    #
+    # The company clause IS the guard here — do not remove it on the assumption that
+    # the TenantScoped auto-filter (src/tenancy/events.py:71) covers it. Measured: with
+    # this clause absent, a candidate in one company could apply to another company's
+    # active job by id and receive a 200. Whatever the auto-filter does for other
+    # queries, it did not stop this one.
     job = db.query(JobPosting).filter(
-        JobPosting.id == job_id, 
+        JobPosting.id == job_id,
+        JobPosting.company_id == current_user.company_id,
         JobPosting.status == "active"
     ).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found or not active")
-    
+
     # Parse application data — accept either JSON string or individual form fields
     try:
         if application:
@@ -643,9 +650,10 @@ async def quick_apply_for_job(
 ):
     """Submit a job application using the candidate's saved profile data. Only a photo is required."""
 
-    # Check job exists and is active
+    # Company clause required for the same reason as /apply above.
     job = db.query(JobPosting).filter(
         JobPosting.id == job_id,
+        JobPosting.company_id == current_user.company_id,
         JobPosting.status == "active"
     ).first()
     if not job:

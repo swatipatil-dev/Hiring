@@ -8,6 +8,27 @@ application emits a notification. Pure DB + API — no Ollama, runs in CI.
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _candidates_share_the_hr_company(db, hr_headers, candidate_headers):
+    """Put the applying candidates in the company whose job they apply to.
+
+    Same reason as the fixture of this name in test_candidate_workflow.py: hr_headers
+    builds its own company while a bare candidate registration lands in the platform org,
+    and applying across that boundary stopped working once BUG-09 was closed. candidate2
+    is aligned too when its fixture has already run, since the per-user isolation test
+    applies as both people.
+    """
+    from src.models.models import User
+    hr = db.query(User).filter(User.email == "hr_test@test.com").first()
+    if not hr:
+        return
+    for email in ("candidate_test@test.com", "candidate2_test@test.com"):
+        user = db.query(User).filter(User.email == email).first()
+        if user:
+            user.company_id = hr.company_id
+    db.flush()
+
+
 def _create_active_job(client, hr_headers):
     """Create and approve a job, return its id. Mirrors test_candidate_workflow."""
     resp = client.post("/api/v1/hr/jobs", headers=hr_headers, json={

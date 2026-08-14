@@ -13,9 +13,22 @@ from pydantic import BaseModel, EmailStr
 from src.services.enhanced_ats_service import EnhancedATSScoringService
 from src.services.llm_ats_service import LLMATSService, HybridATSResult
 from src.config.database_config_mysql import get_db
+from src.auth import get_current_user
 from src.models.ats_models import InterviewStatus, InterviewType, DifficultyLevel
 
-router = APIRouter(prefix="/api/v1/ats", tags=["ATS"])
+# Authenticated at the router, not per endpoint — every route here was reachable
+# anonymously, and two of them (/score and /score/hybrid) run scoring on
+# caller-supplied text: a sentence-transformer pass and an LLM call respectively.
+# On shared hosting that is a free way for anyone to saturate the box.
+#
+# The bar is "logged in", not a specific role: these take raw text and hold no
+# tenant data, and a candidate self-checking a resume against a JD is a legitimate
+# use. What must not be possible is calling them with no account at all.
+router = APIRouter(
+    prefix="/api/v1/ats",
+    tags=["ATS"],
+    dependencies=[Depends(get_current_user)],
+)
 
 # Pydantic models
 class ScoreRequest(BaseModel):

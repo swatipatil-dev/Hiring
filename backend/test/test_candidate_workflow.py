@@ -6,6 +6,28 @@ import pytest
 import io
 
 
+@pytest.fixture(autouse=True)
+def _candidate_shares_the_hr_company(db, hr_headers, candidate_headers):
+    """Put the candidate in the company whose job they apply to.
+
+    The stock fixtures do not line up: hr_headers builds a fresh "Test Company" while a
+    bare candidate registration resolves to the platform org. Applying across that
+    boundary used to return 200 — that was BUG-09, and closing it made every apply test
+    in this module 404. Production has no such gap, because a candidate reaches a company
+    through its portal key or tenant domain and is assigned that company_id, so this
+    alignment makes the fixtures realistic rather than papering over the fix.
+
+    Deliberately NOT done in conftest: test_security_bugs.py needs the two fixtures to
+    stay in different companies to prove the cross-tenant case is still refused.
+    """
+    from src.models.models import User
+    hr = db.query(User).filter(User.email == "hr_test@test.com").first()
+    cand = db.query(User).filter(User.email == "candidate_test@test.com").first()
+    if hr and cand:
+        cand.company_id = hr.company_id
+        db.flush()
+
+
 def _create_active_job(client, hr_headers):
     """Helper: create and approve a job, return job dict."""
     resp = client.post("/api/v1/hr/jobs", headers=hr_headers, json={
