@@ -331,6 +331,12 @@ class DatabaseManager:
             f"--host={url.host or '127.0.0.1'}",
             f"--port={url.port or 3306}",
             f"--user={url.username or 'root'}",
+            # Connect the way the application does. MySQL's client libraries treat the
+            # literal host "localhost" as "use the unix socket", while PyMySQL — which
+            # the app uses — opens a TCP connection to it. Without this, mysqldump can
+            # fail to reach a server the app is talking to perfectly well, reporting a
+            # missing /var/run/mysqld/mysqld.sock on a host where nothing listens there.
+            "--protocol=TCP",
             "--single-transaction",   # consistent InnoDB snapshot without a global lock
             "--no-tablespaces",       # the PROCESS privilege it needs is not granted on managed hosts
             "--default-character-set=utf8mb4",

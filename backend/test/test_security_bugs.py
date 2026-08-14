@@ -388,19 +388,74 @@ def test_backup_refuses_rather_than_writing_an_unrestorable_file(tmp_path, monke
 
 
 @pytest.mark.security
-def test_backup_writes_a_dump_with_schema_when_mysqldump_exists(tmp_path):
-    """The positive case, skipped where the client is not installed: a real dump
-    carries DDL and the completion trailer, neither of which the old code emitted."""
-    import os
-    import shutil as _shutil
-    from src.config.database_config_mysql import db_manager
+def test_backup_invokes_mysqldump_safely(tmp_path, monkeypatch):
+    """The positive case, with mysqldump stubbed so it needs no server.
 
-    if not (os.getenv("MYSQLDUMP_PATH") or _shutil.which("mysqldump")):
-        pytest.skip("mysqldump not installed in this environment")
+    An earlier version ran the real binary against db_manager, which points at
+    DATABASE_URL rather than the test database — so it depended on a live server
+    holding the app's production schema. CI had mysqldump installed but no such
+    database, so it failed rather than skipping. A test whose result depends on
+    the machine tells you about the machine, not the code.
+
+    What is worth pinning is the invocation, and that is fully checkable here: the
+    flags a restorable dump needs, and that the password reaches mysqldump through
+    the environment rather than argv, where `ps` would show it to every user on a
+    shared host.
+    """
+    import subprocess as _sp
+    from src.config import database_config_mysql as mod
+
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        seen["env"] = kwargs.get("env") or {}
+        # Stand in for mysqldump: write what it would write, trailer included.
+        dest = next(a.split("=", 1)[1] for a in argv if a.startswith("--result-file="))
+        with open(dest, "w", encoding="utf-8") as fh:
+            fh.write("CREATE TABLE t (id int);\n-- Dump completed on 2026-08-13\n")
+        return _sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.delenv("MYSQLDUMP_PATH", raising=False)
+    monkeypatch.setattr(mod.shutil, "which", lambda *a, **k: "/usr/bin/mysqldump")
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
 
     target = str(tmp_path / "backup_real.sql")
-    written = db_manager.backup_database(target)
+    assert mod.db_manager.backup_database(target) == target
 
-    body = open(written, encoding="utf-8", errors="ignore").read()
-    assert "CREATE TABLE" in body, "a dump with no DDL cannot rebuild an empty database"
-    assert "-- Dump completed" in body, "missing trailer means the dump was truncated"
+    argv = seen["argv"]
+    for flag in ("--single-transaction", "--no-tablespaces",
+                 "--default-character-set=utf8mb4", "--protocol=TCP"):
+        assert flag in argv, f"{flag} missing from invocation: {argv}"
+
+    password = mod.db_manager.engine.url.password
+    if password:
+        assert not any(str(password) in a for a in argv), \
+            "password leaked into argv, where ps would expose it"
+        assert seen["env"].get("MYSQL_PWD") == str(password), \
+            "password must reach mysqldump through MYSQL_PWD"
+
+
+@pytest.mark.security
+def test_backup_rejects_a_truncated_dump(tmp_path, monkeypatch):
+    """mysqldump writes its trailer only on success, so a dump without one is
+    truncated. It must be treated as a failure and the file removed, or a partial
+    dump sits there wearing a backup's name."""
+    import os
+    import subprocess as _sp
+    from src.config import database_config_mysql as mod
+
+    def fake_run(argv, **kwargs):
+        dest = next(a.split("=", 1)[1] for a in argv if a.startswith("--result-file="))
+        with open(dest, "w", encoding="utf-8") as fh:
+            fh.write("CREATE TABLE t (id int);\n-- cut off here")   # no trailer
+        return _sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.delenv("MYSQLDUMP_PATH", raising=False)
+    monkeypatch.setattr(mod.shutil, "which", lambda *a, **k: "/usr/bin/mysqldump")
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+
+    target = str(tmp_path / "truncated.sql")
+    with pytest.raises(RuntimeError, match="truncated"):
+        mod.db_manager.backup_database(target)
+    assert not os.path.exists(target), "a truncated dump must not be left behind"
