@@ -152,12 +152,14 @@ du -sh */ && find . -type f | wc -l
 
 ## Step 3 — Back up what is live
 
-> ### Do not use `POST /api/v1/db/backup` for this
+> ### Run this yourself rather than using `POST /api/v1/db/backup`
 >
-> `db_manager.backup_database()` builds INSERTs from Python `tuple(row)` reprs —
-> `None` instead of `NULL`, `datetime.datetime(...)` instead of a quoted literal,
-> no `CREATE TABLE`, and per-table failures downgraded to log warnings. **It does
-> not produce a restorable file.** Your entire rollback rests on this backup.
+> The endpoint does produce a real `mysqldump` now (it did not before `0ad127f`),
+> but it runs the dump in a **background task** — it returns `success: true` and a
+> path before the work happens, and a failure after that exists only in the log.
+>
+> Your entire rollback rests on this file, so run the command and read its exit
+> code. Any backup taken before 2026-08-14 will not restore; do not rely on one.
 
 ```bash
 mysqldump -u innomaxskills_hf -p --single-transaction --no-tablespaces \

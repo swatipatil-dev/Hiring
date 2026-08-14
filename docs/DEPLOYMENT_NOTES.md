@@ -157,7 +157,7 @@ These all leave the deployment looking healthy. Check them explicitly.
 | `create_all` without `import main` | Plausible table count | Judge and question tables silently absent |
 | Wrong schema name | `/health` reports 0 tables | App works; only the reporting queries were hardcoded |
 | Stamped at head, schema is not | `alembic current` says `(head)`, upgrade says "nothing to do" | A migration older than the stamp never ran ([§3](#a-database-can-be-stamped-at-head-while-its-schema-is-not)) |
-| `POST /api/v1/db/backup` | A `.sql` file appears | It does not restore — see [§3](#backups-backup_database-is-not-a-backup) |
+| `POST /api/v1/db/backup` | `success: true` and a path | The dump runs in a background task *after* the response; a failure is log-only ([§3](#backups-the-apis-backup-is-real-now-but-it-is-asynchronous)) |
 | `en_core_web_trf` missing | ATS scores fine | NER skill extraction returns `[]` |
 | `whisper` / `resemblyzer` absent | Audio proctoring runs | Transcription and neural diarization are off — neither is in any requirements file |
 
@@ -220,16 +220,29 @@ populated schema and is how the problem is created in the first place.
 `repair_schema.py` answers a narrower question (stamp-or-upgrade, against a
 hardcoded list of talent-pool columns) and would not have caught this.
 
-### Backups: `backup_database()` is not a backup
+### Backups: the API's backup is real now, but it is asynchronous
 
-`db_manager.backup_database()` — exposed as `POST /api/v1/db/backup` — writes
-INSERT statements built from Python `tuple(row)` reprs: `None` instead of `NULL`,
-`datetime.datetime(2026, 8, 12, …)` instead of a quoted literal, no `CREATE
-TABLE`, and per-table failures downgraded to log warnings. **The output does not
-restore.**
+`db_manager.backup_database()` shells out to `mysqldump` with the flags a managed
+host needs (`--single-transaction --no-tablespaces --set-gtid-purged=OFF
+--protocol=TCP`), raises on failure, and deletes any partial file. It produces a
+restorable dump.
 
-Use `mysqldump --single-transaction --no-tablespaces` for anything you would ever
-need to restore from.
+> Until `0ad127f` (2026-08-14) it did not. It built SQL by interpolating Python's
+> `tuple` repr — no `CREATE TABLE`, `None` where `NULL` belongs,
+> `datetime.datetime(…)` as a literal, no column list. If you have any backup file
+> from before that date, it will not restore. Take a fresh one.
+
+The remaining caveat is the **endpoint**, not the function. `POST /api/v1/db/backup`
+runs the dump in a FastAPI background task, so it returns `success: true` and a
+path *before* the work happens. A failure after that point exists only in the log:
+
+```bash
+journalctl -u hireflow-api | grep 'Database backup'
+ls -lh /opt/hireflow/backups/
+```
+
+So for a backup something depends on — before a migration, before a schema change —
+run `mysqldump` yourself and read the exit code, rather than trusting a 200.
 
 ---
 
