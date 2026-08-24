@@ -1,0 +1,57 @@
+# HireFlow judge re-grade sweep — recovers coding marks deferred during an outage.
+#
+# WHY THIS EXISTS: when the judge is unreachable at submit time, the API does not
+# fail the submission — it saves the code, drops that question from the score
+# denominator, and flags the answer pending_regrade (routes/candidate_routes.py).
+# That promise is only kept if something later re-grades it. Nothing did: the
+# recovery endpoint existed with no caller, so every candidate who submitted during
+# an outage kept a permanently short denominator.
+#
+# Oneshot rather than a ROLE in entrypoint.sh: every branch there is a long-running
+# `exec`, and test/test_entrypoint_roles.py asserts that structure. A sweep is not a
+# service, so it stays a curl from a timer.
+#
+# Hits the API port (8000) directly rather than going through Apache — the vhost
+# adds nothing here, and this way the sweep still runs if the web frontend is down.
+#
+# Prerequisites:
+#   JUDGE_REGRADE_TOKEN must be set in /opt/hireflow/backend/.env (openssl rand -hex 32).
+#   Without it the endpoint rejects the call with 401 and the sweep silently does nothing.
+#
+# Install:
+#   cp hireflow-regrade.service hireflow-regrade.timer /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now hireflow-regrade.timer
+#   systemctl list-timers hireflow-regrade.timer     # confirm it is scheduled
+#   journalctl -u hireflow-regrade.service           # see what each sweep recovered
+
+[Unit]
+Description=HireFlow judge re-grade sweep (recovers deferred coding marks)
+After=network.target hireflow-api.service
+Wants=hireflow-api.service
+
+[Service]
+Type=oneshot
+User=hireflow
+Group=hireflow
+WorkingDirectory=/opt/hireflow/backend
+EnvironmentFile=/opt/hireflow/backend/.env
+
+# -f so an HTTP error becomes a non-zero exit (visible in systemctl status) rather
+# than a silent success with an error body. -m 300 because a backlog of submissions
+# is re-judged synchronously, one sandboxed container per test case.
+ExecStart=/usr/bin/curl -fsS -m 300 -X POST \
+    -H "X-Judge-Regrade-Token: ${JUDGE_REGRADE_TOKEN}" \
+    http://127.0.0.1:8000/api/v1/judge/regrade-pending
+
+# A 503 here is normal and expected: it means the judge is still down, and the
+# endpoint left everything pending for the next run rather than mis-scoring it.
+SuccessExitStatus=0 22
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/hireflow
+
+[Install]
+WantedBy=multi-user.target

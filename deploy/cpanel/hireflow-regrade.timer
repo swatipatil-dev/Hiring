@@ -1,0 +1,22 @@
+# Schedule for hireflow-regrade.service. See that unit for why the sweep exists.
+
+[Unit]
+Description=Run the HireFlow judge re-grade sweep every 15 minutes
+Requires=hireflow-regrade.service
+
+[Timer]
+# Every 15 minutes. The sweep is idempotent — pass 1 flips pending→graded and pass 2
+# pops the pending_regrade key — so a run that finds nothing costs one HTTP request.
+OnCalendar=*:0/15
+
+# Catch up after a reboot or a long outage. Without this, an outage that spans the
+# scheduled window means the deferred marks are never recovered — which is exactly
+# the case this whole unit exists for.
+Persistent=true
+
+# The box hosts other cPanel accounts. Jitter keeps the sweep off the :00/:15/:30/:45
+# boundary that every other cron on the machine also fires at.
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

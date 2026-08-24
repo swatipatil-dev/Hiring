@@ -30,11 +30,12 @@ function DepartmentCard({ dept, stat, accent, logo, initials, onUploadLogo, onRe
   const [hovering, setHovering] = useState(false)
   const [dragOver, setDragOver] = useState(false)
 
+  // Hands the raw File to the parent, which uploads it. Previously this read the
+  // file into a base64 data URL and stashed it in localStorage, so the logo only
+  // existed in whichever browser uploaded it.
   const processFile = (file) => {
     if (!file || !file.type.startsWith('image/')) return
-    const reader = new FileReader()
-    reader.onload = (e) => onUploadLogo(dept.id, e.target.result)
-    reader.readAsDataURL(file)
+    onUploadLogo(dept.id, file)
   }
 
   const handleFileChange = (e) => processFile(e.target.files[0])
@@ -214,9 +215,9 @@ export default function AdminDashboard() {
   const [hrComparison, setHrComparison] = useState([])
   const [genderData, setGenderData] = useState([])
   const [ageData, setAgeData] = useState([])
-  const [deptLogos, setDeptLogos] = useState(() => {
-    try { return JSON.parse(localStorage.getItem('hireflow_dept_logos') || '{}') } catch { return {} }
-  })
+  // Logos now come back on the department row itself (dept.logo_url) — they used to
+  // be base64 blobs in this browser's localStorage, invisible to other admins.
+  const [logoError, setLogoError] = useState('')
 
   // ── Per-company email (SMTP) configuration ─────────────────────────────
   const [emailConfig, setEmailConfig] = useState(null)          // server snapshot
@@ -296,21 +297,30 @@ export default function AdminDashboard() {
     }
   }
 
-  const saveLogo = useCallback((deptId, dataUrl) => {
-    setDeptLogos(prev => {
-      const next = { ...prev, [deptId]: dataUrl }
-      localStorage.setItem('hireflow_dept_logos', JSON.stringify(next))
-      return next
-    })
+  const saveLogo = useCallback(async (deptId, file) => {
+    setLogoError('')
+    const fd = new FormData()
+    fd.append('file', file)
+    try {
+      // The Content-Type override is required: api's default is application/json,
+      // which would suppress the multipart boundary and the upload would fail.
+      await api.post(`/admin/departments/${deptId}/logo`, fd, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      })
+      fetchDepartments()
+    } catch (err) {
+      setLogoError(err.response?.data?.detail || 'Failed to upload logo')
+    }
   }, [])
 
-  const removeLogo = useCallback((deptId) => {
-    setDeptLogos(prev => {
-      const next = { ...prev }
-      delete next[deptId]
-      localStorage.setItem('hireflow_dept_logos', JSON.stringify(next))
-      return next
-    })
+  const removeLogo = useCallback(async (deptId) => {
+    setLogoError('')
+    try {
+      await api.delete(`/admin/departments/${deptId}/logo`)
+      fetchDepartments()
+    } catch (err) {
+      setLogoError(err.response?.data?.detail || 'Failed to remove logo')
+    }
   }, [])
 
   const segment = location.pathname.split('/').pop()
@@ -1303,6 +1313,11 @@ export default function AdminDashboard() {
             <div className="flex-between mb-16">
               <h3>Departments ({departments.length})</h3>
             </div>
+            {logoError && (
+              <div style={{ padding: '10px 14px', marginBottom: 14, borderRadius: 8, background: '#fef2f2', border: '1px solid #fca5a5', color: '#dc2626', fontSize: '0.85rem' }}>
+                {logoError}
+              </div>
+            )}
             {departments.length === 0 ? (
               <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-tertiary)' }}>No departments found</div>
             ) : (
@@ -1310,7 +1325,7 @@ export default function AdminDashboard() {
                 {departments.map((d, i) => {
                   const stat = deptStats.find(s => s.name === d.name) || {}
                   const accent = CHART_COLORS[i % CHART_COLORS.length]
-                  const logo = deptLogos[d.id]
+                  const logo = d.logo_url
                   const initials = d.name.split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase()
                   return (
                     <DepartmentCard

@@ -160,6 +160,7 @@ These all leave the deployment looking healthy. Check them explicitly.
 | `POST /api/v1/db/backup` | `success: true` and a path | The dump runs in a background task *after* the response; a failure is log-only ([§3](#backups-the-apis-backup-is-real-now-but-it-is-asynchronous)) |
 | `en_core_web_trf` missing | ATS scores fine | NER skill extraction returns `[]` |
 | `whisper` / `resemblyzer` absent | Audio proctoring runs | Transcription and neural diarization are off — neither is in any requirements file |
+| `JUDGE_REGRADE_TOKEN` unset, or `hireflow-regrade.timer` not enabled | Tests submit fine during a judge outage; scores look plausible | Coding answers deferred during the outage are never re-graded. The marks stay out of the denominator, so the candidate is scored out of a silently reduced total. `systemctl list-timers hireflow-regrade.timer` is the check |
 
 ---
 

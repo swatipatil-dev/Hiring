@@ -133,6 +133,11 @@ class ProctorPipeline:
         self._pose = PoseAnalyzer(self.cfg.pose)
 
     def _init_behavioral(self):
+        # Leaving self._behavioral as None is what keeps "behavioral" out of
+        # module_scores, so _compute_cheating_score stops counting its weight.
+        if not self.cfg.behavioral.enabled:
+            logger.info("Behavioral engine disabled — excluded from cheating score")
+            return
         from .core.behavioral_engine import BehavioralEngine
         self._behavioral = BehavioralEngine(self.cfg.behavioral)
 

@@ -3,7 +3,7 @@
 Handles user management, department creation, system configuration, and analytics
 """
 
-from fastapi import APIRouter, HTTPException, status, Depends
+from fastapi import APIRouter, HTTPException, status, Depends, UploadFile, File
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func, desc, case, extract
 from datetime import date
@@ -106,6 +106,7 @@ class DepartmentResponse(BaseModel):
     id: str
     name: str
     description: Optional[str]
+    logo_url: Optional[str] = None
     created_at: datetime
 
 class SystemAnalytics(BaseModel):
@@ -583,6 +584,7 @@ async def create_department(
         id=str(department.id),
         name=department.name,
         description=department.description,
+        logo_url=department.logo_url,
         created_at=department.created_at
     )
 
@@ -604,6 +606,7 @@ async def get_departments(
             id=str(dept.id),
             name=dept.name,
             description=dept.description,
+            logo_url=dept.logo_url,
             created_at=dept.created_at
         )
         for dept in departments
@@ -744,6 +747,89 @@ async def update_department(
     db.commit()
     
     return {"message": "Department updated successfully"}
+
+
+DEPT_LOGOS_DIR = "logos"
+DEPT_LOGO_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp", "svg"}
+DEPT_LOGO_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _owned_department(db: Session, department_id: str, company_id: Optional[str]) -> Department:
+    dept = db.query(Department).filter(
+        Department.id == department_id,
+        Department.company_id == company_id,
+    ).first()
+    if not dept:
+        raise HTTPException(status_code=404, detail="Department not found")
+    return dept
+
+
+@router.post("/departments/{department_id}/logo")
+async def upload_department_logo(
+    department_id: str,
+    file: UploadFile = File(...),
+    current_user: User = Depends(AuthMiddleware.get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """Upload a department logo. Replaces (and deletes) any existing one.
+
+    Served by the static/GCS file route already registered for the `logos` prefix
+    in main.py, so nothing new is needed to read these back.
+    """
+    dept = _owned_department(db, department_id, current_user.company_id)
+
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+
+    ext = ""
+    if file.filename and "." in file.filename:
+        ext = file.filename.rsplit(".", 1)[-1].lower()
+    if ext not in DEPT_LOGO_EXTENSIONS:
+        ext = "png"
+
+    contents = await file.read()
+    # Bounded read: these are inlined into the departments list, and the upload is
+    # reachable by any company admin.
+    if len(contents) > DEPT_LOGO_MAX_BYTES:
+        raise HTTPException(status_code=400, detail="Logo must be 2 MB or smaller")
+    if not contents:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    from src.services.storage import storage
+
+    old_url = dept.logo_url
+    filename = f"{uuid.uuid4()}.{ext}"
+    key = f"{DEPT_LOGOS_DIR}/{filename}"
+    storage.save_bytes(contents, key)
+
+    dept.logo_url = f"/{DEPT_LOGOS_DIR}/{filename}"
+    db.commit()
+    db.refresh(dept)
+
+    # Only after the new one is committed — a failed save must not lose the old logo.
+    if old_url:
+        storage.delete(old_url.lstrip("/"))
+
+    return {"id": dept.id, "logo_url": dept.logo_url}
+
+
+@router.delete("/departments/{department_id}/logo")
+async def delete_department_logo(
+    department_id: str,
+    current_user: User = Depends(AuthMiddleware.get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """Remove a department's logo."""
+    dept = _owned_department(db, department_id, current_user.company_id)
+    old_url = dept.logo_url
+    dept.logo_url = None
+    db.commit()
+
+    if old_url:
+        from src.services.storage import storage
+        storage.delete(old_url.lstrip("/"))
+
+    return {"id": department_id, "logo_url": None}
 
 
 @router.delete("/departments/{department_id}")

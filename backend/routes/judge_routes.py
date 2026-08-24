@@ -485,9 +485,9 @@ async def reap_judge(request: Request, db: Session = Depends(get_db)):
 
 @router.post("/regrade-pending")
 async def regrade_pending(
+    request: Request,
     interview_id: Optional[int] = Query(None),
     limit: int = Query(200, le=1000),
-    current_user: User = Depends(require_role(["admin", "hr", "superadmin"])),
     db: Session = Depends(get_db),
 ):
     """Re-judge coding work that couldn't be graded while the judge was down — the
@@ -500,11 +500,54 @@ async def regrade_pending(
          coding answer → re-grade and fold the awarded points back into the
          interview's ``test_score`` / ``total_marks``.
     Submissions that still can't be graded (judge still down) are left pending.
+
+    Idempotent: pass 1 flips ``pending``→``graded`` and pass 2 pops the
+    ``pending_regrade`` key, so a second run finds nothing. Safe on a timer.
+
+    Auth: the ``JUDGE_REGRADE_TOKEN`` shared secret (header ``X-Judge-Regrade-Token``
+    or ``?token=``), or an admin/HR JWT — same shape as ``/reap``.
+
+    **Scope differs by caller, deliberately.** ``Interview`` and
+    ``InterviewCodeSubmission`` are tenant-scoped, and the read auto-filter is a
+    no-op when no company is bound. So an HR JWT sweeps only that company (what the
+    HR "re-grade now" button wants), while the token-authenticated timer sweeps every
+    tenant (what a platform sweeper wants). The token path binds company to None
+    explicitly so it can never inherit a stale contextvar from a previous request.
     """
     from src.models.question_models import Question as InterviewQuestion
     from src.judge.interview_grading import grade_interview_question
 
+    # Both branches bind the tenant contextvar explicitly. There is no
+    # get_current_user dependency on this route to do it, and the contextvar is
+    # per-thread state that would otherwise carry over from an earlier request.
+    token = request.headers.get("X-Judge-Regrade-Token") or request.query_params.get("token")
+    expected = os.getenv("JUDGE_REGRADE_TOKEN", "").strip()
+    authorized = bool(expected and token and token == expected)
+    if authorized:
+        set_current_company(None)   # platform-wide sweep
+    else:
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            try:
+                payload = jwt.decode(auth[7:], SECRET_KEY, algorithms=[ALGORITHM])
+                u = db.query(User).filter(User.id == payload.get("sub")).first()
+                authorized = bool(u and u.role in _ADMIN_ROLES)
+                if authorized:
+                    set_current_company(u.company_id if u.role != "superadmin" else None)
+            except JWTError:
+                authorized = False
+    if not authorized:
+        raise HTTPException(401, "Unauthorized")
+
+    # An on-demand judge VM is stopped precisely because nobody is testing, so an
+    # unattended sweeper would otherwise always hit the 503 below and never recover
+    # anything. Boot it first, then re-check.
     ready, engine = _engine_ready()
+    if not ready:
+        from src.judge.provisioner import autostart_enabled, ensure_judge_running
+        if autostart_enabled():
+            ensure_judge_running()   # best-effort; never raises
+            ready, engine = _engine_ready()
     if not ready:
         raise HTTPException(503, {"message": "Judge backend is not reachable; "
                                              "start it before re-grading.", "engine": engine})

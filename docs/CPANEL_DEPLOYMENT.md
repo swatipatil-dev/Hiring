@@ -788,17 +788,27 @@ across backends, so it is a copy to matching relative paths.
 
 ```bash
 cp /opt/hireflow/deploy/cpanel/*.service /etc/systemd/system/
+cp /opt/hireflow/deploy/cpanel/*.timer /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now hireflow-api hireflow-proctor hireflow-judge-worker hireflow-email-worker
+systemctl enable --now hireflow-regrade.timer
 ```
 
 **Wait 2–3 minutes.** The proctoring service loads large AI libraries on first
 start — this is normal and only happens once.
 
+`hireflow-regrade.timer` is the re-grade sweep. When the judge is unreachable at
+submit time the candidate's coding answer is saved but left ungraded, and its marks
+are taken out of the denominator; this timer is the only thing that puts them back.
+It needs `JUDGE_REGRADE_TOKEN` set in `/opt/hireflow/backend/.env` — without it every
+run gets a 401 and the recovery silently never happens. There is no
+`hireflow-regrade` service to *enable*: it is a `Type=oneshot` the timer triggers.
+
 **Check:**
 
 ```bash
 systemctl is-active hireflow-api hireflow-proctor hireflow-judge-worker hireflow-email-worker
+systemctl list-timers hireflow-regrade.timer     # NEXT/LEFT columns populated
 ```
 
 Four lines of `active`. `activating` on a repeat check means a restart loop —

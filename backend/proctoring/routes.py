@@ -70,7 +70,10 @@ class StartSessionResponse(BaseModel):
     session_id: str
     ws_video_url: str
     ws_audio_url: str
-    ws_behavioral_url: str
+    # No ws_behavioral_url: the behavioral engine is disabled (see
+    # core/behavioral_engine.py), so advertising a stream nothing consumes only
+    # invites a client to feed a module that would manufacture violations. The
+    # WS handler itself is kept as the on-ramp if the feature is revived.
     status: str
     face_registered: bool
     # True while the stored reference photo is still being loaded/registered in the
@@ -293,7 +296,7 @@ FLAG_SEVERITY = {
     "BACKGROUND_NOISE": "MEDIUM",
     "CANDIDATE_LEFT": "CRITICAL", "LEANING_FORWARD": "LOW", "HEAD_DOWN": "LOW",
     "LEANING_SIDEWAYS": "LOW",
-    "BEHAVIORAL_ANOMALY": "MEDIUM", "LSTM_HIGH_CHEAT_PROB": "MEDIUM",
+    "BEHAVIORAL_ANOMALY": "MEDIUM",
     "TAB_SWITCH": "HIGH",
     # Objects YOLO can see besides a phone. MEDIUM, not HIGH: they are worth showing HR
     # with the annotated frame, but they are single-model calls with no second
@@ -312,7 +315,7 @@ FLAG_MODULE = {
     "BACKGROUND_NOISE": "audio",
     "CANDIDATE_LEFT": "pose", "LEANING_FORWARD": "pose", "HEAD_DOWN": "pose",
     "LEANING_SIDEWAYS": "pose",
-    "BEHAVIORAL_ANOMALY": "behavioral", "LSTM_HIGH_CHEAT_PROB": "behavioral",
+    "BEHAVIORAL_ANOMALY": "behavioral",
     "TAB_SWITCH": "behavioral",
     "PERSON_DETECTED": "object", "BOOK_DETECTED": "object",
     "TABLET_DETECTED": "object", "REMOTE_DETECTED": "object",
@@ -662,7 +665,6 @@ async def start_session(req: StartSessionRequest):
         session_id=session_id,
         ws_video_url=f"/api/v1/proctor/ws/video/{session_id}",
         ws_audio_url=f"/api/v1/proctor/ws/audio/{session_id}",
-        ws_behavioral_url=f"/api/v1/proctor/ws/behavioral/{session_id}",
         status="active",
         face_registered=False,
         enrollment_pending=True,
@@ -1011,8 +1013,12 @@ async def verify_face_endpoint(session_id: str, req: VerifyFaceRequest):
 class BehaviorCheckRequest(BaseModel):
     keystrokes: Optional[list] = None
     mouse_positions: Optional[list] = None
-    copy_paste: Optional[int] = 0
-    tab_switches: Optional[int] = 0
+    # Lists of events, not counts. BehavioralEngine.extract_features derives
+    # copy_paste_count/tab_switch_count from len(deque), and ingest_signals appends
+    # a non-list value as a single item — so typing these as int made the deque
+    # count *requests* rather than events. The WS path always sent lists.
+    copy_paste: Optional[list] = None
+    tab_switches: Optional[list] = None
     question_times: Optional[list] = None
 
 
@@ -1027,8 +1033,8 @@ async def behavior_check(session_id: str, req: BehaviorCheckRequest):
     payload = {
         "keystrokes": req.keystrokes or [],
         "mouse_positions": req.mouse_positions or [],
-        "copy_paste": req.copy_paste,
-        "tab_switches": req.tab_switches,
+        "copy_paste": req.copy_paste or [],
+        "tab_switches": req.tab_switches or [],
         "question_times": req.question_times or [],
     }
     pipeline.ingest_behavioral_signals(payload)

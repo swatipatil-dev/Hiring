@@ -13,7 +13,8 @@ from src.auth import get_current_user, require_role, AuthMiddleware
 from src.models.models import (
     User, JobPosting, Candidate, ATSResult, CandidateStageHistory,
     Interview, InterviewFeedback, Offer, HRProfile, Department, InterviewerProfile,
-    CandidateRequest, Notification, ResumePoolEntry, ResumePoolAttachment
+    CandidateRequest, Notification, ResumePoolEntry, ResumePoolAttachment,
+    MailTemplate
 )
 from src.services.resume_pool_import import (
     import_registered_users, import_orphan_candidates,
@@ -3719,6 +3720,13 @@ async def get_test_result_answers(
                 "selected_option": a.get("selected_option"),
                 "is_correct": a.get("is_correct"),
                 "correct_answer": q.correct_answer if q else None,
+                # Judge was unreachable at submit time, so this question was left
+                # ungraded AND dropped from total_marks. Without surfacing it, HR
+                # sees a confidently-wrong score over a silently shortened
+                # denominator. Cleared by POST /api/v1/judge/regrade-pending.
+                "pending_regrade": bool(a.get("pending_regrade")),
+                "verdict": a.get("verdict"),
+                "max_points": a.get("max_points"),
             })
         answers.append(entry)
 
@@ -3726,6 +3734,7 @@ async def get_test_result_answers(
         "interview_id": interview_id,
         "test_score": float(interview.test_score) if interview.test_score is not None else None,
         "total_marks": interview.total_marks,
+        "has_pending_regrade": any(a.get("pending_regrade") for a in answers),
         "answers": answers,
     }
 
@@ -5150,6 +5159,237 @@ async def hr_mail_preview(
         "enabled": step["enabled"],
         "mailboxes": _selectable_mailboxes(db, cid),
     }
+
+
+class ComposeMailRequest(BaseModel):
+    to: EmailStr
+    cc: List[EmailStr] = Field(default_factory=list)
+    subject: str
+    body: str
+    mailbox_id: Optional[str] = None
+    # Lets the offer-resend dialog reuse this endpoint and still resolve its sender
+    # through the offer_letter mailbox HR configured for that stage.
+    step_key: str = "custom_mail"
+
+
+@router.post("/send-mail")
+async def hr_send_mail(
+    request: ComposeMailRequest,
+    current_user: User = Depends(require_role(["hr", "admin"])),
+    db: Session = Depends(get_db),
+):
+    """Send an ad-hoc email from the HR dashboard's Compose Mail dialog.
+
+    Goes through ``dispatch``, not ``_send``: dispatch is the only path that
+    enqueues onto the RQ queue hireflow-email-worker consumes, and therefore the
+    only one that honours the mailbox's hourly_limit. A direct _send would bypass
+    the provider cap and get the company's SMTP account throttled or blocked.
+
+    Returns dispatch's own result, so the caller can tell "queued" from "sent" —
+    the UI must not claim delivery for a job that has not run yet.
+    """
+    if not current_user.company_id:
+        raise HTTPException(status_code=400, detail="User is not associated with a company")
+
+    from src.services import pipeline_notifications as pn
+    from src.services.pipeline_notifications import resolve_step_sender
+    from src.services.email_service import dispatch
+
+    if not pn.is_valid_step(request.step_key):
+        raise HTTPException(status_code=400, detail=f"Unknown step '{request.step_key}'")
+
+    subject = (request.subject or "").strip()
+    if not subject:
+        raise HTTPException(status_code=400, detail="Subject is required")
+    if not (request.body or "").strip():
+        raise HTTPException(status_code=400, detail="Message body is required")
+
+    # One call for the whole precedence chain (HR's pick → step mailbox → company
+    # default → env). It also verifies the chosen mailbox belongs to this company,
+    # so a guessed id cannot borrow another tenant's SMTP credentials.
+    smtp, disp = resolve_step_sender(
+        db, current_user.company_id, request.step_key,
+        request.mailbox_id, category="candidate",
+    )
+
+    # dispatch de-dupes CC case-insensitively and drops the primary recipient.
+    cc = list(disp["cc"]) + [str(a) for a in request.cc]
+
+    body_html = request.body.replace("\n", "<br>")
+    result = dispatch(
+        str(request.to), subject,
+        f"<div style='font-family:sans-serif;line-height:1.7'>{body_html}</div>",
+        smtp_config=smtp, cc=cc or None,
+        hourly_limit=(smtp or {}).get("hourly_limit"),
+    )
+
+    logger.info("HR ad-hoc mail from %s to %s (step=%s, mode=%s)",
+                current_user.id, request.to, request.step_key, result.get("mode"))
+    return {"queued": True, "cc": cc, **result}
+
+
+# ── Mail templates ───────────────────────────────────────────────────────────
+# Starter set seeded per company on first read. Kept server-side so the ids stay
+# stable across browsers — they used to be re-created from a hardcoded array in
+# HRDashboard.jsx, so two HR users could hold different "tpl-1"s.
+_DEFAULT_MAIL_TEMPLATES = [
+    ("offer", "Standard Offer Letter", "Offer Letter – {{job_title}}",
+     "Dear {{candidate_name}},\n\nWe are pleased to extend an offer of employment for the position of {{job_title}}.\n\nPosition: {{job_title}}\nEmployment Type: {{offer_type}}\nAnnual Salary: ₹{{salary}}\nSigning Bonus: ₹{{bonus}}\nStart Date: {{start_date}}\nOffer Expires: {{expiry_date}}\n\nPlease respond to this offer by the expiry date.\n\nCongratulations and welcome to the team!\nHireFlow Recruitment Team"),
+    ("offer", "Informal Offer (Warm Tone)", "Great news, {{candidate_name}}! – {{job_title}} Offer",
+     "Hi {{candidate_name}},\n\nExciting news — we'd love to officially welcome you aboard as our new {{job_title}}!\n\nHere's a quick summary of your offer:\n• Salary: ₹{{salary}} per year\n• Bonus: ₹{{bonus}}\n• Start Date: {{start_date}}\n• Offer valid until: {{expiry_date}}\n\nWe're really excited to have you join the team. Please let us know if you have any questions!\n\nWarm regards,\nHireFlow Team"),
+    ("rejection", "Application Rejection", "Your Application for {{job_title}}",
+     "Dear {{candidate_name}},\n\nThank you for your interest in the {{job_title}} position and for taking the time to go through our interview process.\n\nAfter careful consideration, we have decided to move forward with another candidate whose experience more closely matches our current needs.\n\nWe appreciate your time and encourage you to apply for future openings that align with your skills.\n\nBest regards,\nHireFlow Recruitment Team"),
+    ("rejection", "Post-Interview Rejection", "Follow-up on Your Interview – {{job_title}}",
+     "Dear {{candidate_name}},\n\nThank you for taking the time to interview with us for the {{job_title}} role. It was a pleasure getting to know you.\n\nAfter careful deliberation, we have decided to proceed with another candidate who more closely fits our requirements at this time.\n\nWe were impressed by your background and would encourage you to apply again for future roles that match your profile.\n\nWe wish you all the best in your job search.\n\nKind regards,\nHireFlow Recruitment Team"),
+    ("rejection", "ATS / Early Stage Rejection", "Your Application Status – {{job_title}}",
+     "Dear {{candidate_name}},\n\nThank you for applying for the {{job_title}} position at our company.\n\nWe have reviewed your application and, after consideration, we will not be moving forward with your candidacy at this time as we are looking for a slightly different skill set for this role.\n\nWe appreciate your interest and wish you success in your future endeavours.\n\nRegards,\nHireFlow Recruitment Team"),
+    ("interview_invite", "Interview Invitation", "Interview Invitation – {{job_title}}",
+     "Dear {{candidate_name}},\n\nWe are pleased to invite you for an interview for the position of {{job_title}}.\n\nPlease confirm your availability at your earliest convenience.\n\nBest regards,\nHireFlow Recruitment Team"),
+    ("interview_invite", "Technical Round Invite", "Technical Interview – {{job_title}}",
+     "Dear {{candidate_name}},\n\nCongratulations on progressing to the Technical Interview round for the {{job_title}} position!\n\nThis round will assess your technical skills and problem-solving ability. Please be prepared to discuss your past projects and complete a short technical exercise.\n\nWe will share the interview schedule and joining details separately.\n\nPlease confirm your availability by replying to this email.\n\nBest regards,\nHireFlow Recruitment Team"),
+    ("interview_invite", "Final Round Invite", "Final Interview Round – {{job_title}}",
+     "Dear {{candidate_name}},\n\nWe are delighted to invite you to the Final Interview round for the {{job_title}} position.\n\nThis is the last stage of our selection process and will include a discussion with senior leadership.\n\nPlease confirm your availability and we will coordinate a suitable time slot.\n\nWe look forward to speaking with you!\n\nWarm regards,\nHireFlow Recruitment Team"),
+    ("welcome", "Welcome Onboard", "Welcome to the Team, {{candidate_name}}!",
+     "Dear {{candidate_name}},\n\nWelcome aboard! We are thrilled to have you join us as {{job_title}}.\n\nYour start date is {{start_date}}. Please arrive at 9:00 AM and ask for HR at reception.\n\nLooking forward to working with you!\n\nHireFlow Team"),
+]
+
+MAIL_TEMPLATE_STAGES = ("offer", "rejection", "interview_invite", "welcome", "custom")
+
+
+class MailTemplateRequest(BaseModel):
+    stage: str = "custom"
+    name: str
+    subject: Optional[str] = ""
+    body: Optional[str] = ""
+
+
+def _mail_template_dict(t: MailTemplate) -> Dict[str, Any]:
+    return {
+        "id": t.id, "stage": t.stage, "name": t.name,
+        "subject": t.subject or "", "body": t.body or "",
+        "is_builtin": bool(t.is_builtin), "is_active": bool(t.is_active),
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+        "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+    }
+
+
+def _owned_mail_template(db: Session, template_id: str, company_id: str) -> MailTemplate:
+    """Fetch a template, 404ing on another company's id rather than 403ing — a 403
+    would confirm the id exists."""
+    t = (
+        db.query(MailTemplate)
+        .filter(MailTemplate.id == template_id,
+                MailTemplate.company_id == company_id)
+        .first()
+    )
+    if not t:
+        raise HTTPException(status_code=404, detail="Template not found")
+    return t
+
+
+@router.get("/mail-templates")
+async def list_mail_templates(
+    current_user: User = Depends(require_role(["hr", "admin"])),
+    db: Session = Depends(get_db),
+):
+    """List this company's mail templates, seeding the starter set on first read."""
+    if not current_user.company_id:
+        raise HTTPException(status_code=400, detail="User is not associated with a company")
+    cid = current_user.company_id
+
+    rows = (
+        db.query(MailTemplate)
+        .filter(MailTemplate.company_id == cid)
+        .order_by(MailTemplate.created_at.asc())
+        .all()
+    )
+    if not rows:
+        for stage, name, subject, body in _DEFAULT_MAIL_TEMPLATES:
+            # company_id set explicitly rather than relying on the before_flush
+            # auto-stamp — see docs/DASHBOARD_DATA_PITFALLS.md #1.
+            db.add(MailTemplate(company_id=cid, created_by=current_user.id,
+                                stage=stage, name=name, subject=subject,
+                                body=body, is_builtin=True))
+        db.commit()
+        rows = (
+            db.query(MailTemplate)
+            .filter(MailTemplate.company_id == cid)
+            .order_by(MailTemplate.created_at.asc())
+            .all()
+        )
+        logger.info("Seeded %d default mail templates for company %s", len(rows), cid)
+
+    return [_mail_template_dict(t) for t in rows]
+
+
+@router.post("/mail-templates")
+async def create_mail_template(
+    request: MailTemplateRequest,
+    current_user: User = Depends(require_role(["hr", "admin"])),
+    db: Session = Depends(get_db),
+):
+    if not current_user.company_id:
+        raise HTTPException(status_code=400, detail="User is not associated with a company")
+    if not (request.name or "").strip():
+        raise HTTPException(status_code=400, detail="Template name is required")
+    stage = request.stage if request.stage in MAIL_TEMPLATE_STAGES else "custom"
+
+    existing = (
+        db.query(MailTemplate)
+        .filter(MailTemplate.company_id == current_user.company_id,
+                MailTemplate.name == request.name.strip())
+        .first()
+    )
+    if existing:
+        raise HTTPException(status_code=400, detail="A template with that name already exists")
+
+    t = MailTemplate(
+        company_id=current_user.company_id, created_by=current_user.id,
+        stage=stage, name=request.name.strip(),
+        subject=request.subject or "", body=request.body or "",
+        is_builtin=False,
+    )
+    db.add(t)
+    db.commit()
+    db.refresh(t)   # company_id/defaults are not populated on the instance until this
+    return _mail_template_dict(t)
+
+
+@router.put("/mail-templates/{template_id}")
+async def update_mail_template(
+    template_id: str,
+    request: MailTemplateRequest,
+    current_user: User = Depends(require_role(["hr", "admin"])),
+    db: Session = Depends(get_db),
+):
+    if not current_user.company_id:
+        raise HTTPException(status_code=400, detail="User is not associated with a company")
+    t = _owned_mail_template(db, template_id, current_user.company_id)
+
+    if (request.name or "").strip():
+        t.name = request.name.strip()
+    if request.stage in MAIL_TEMPLATE_STAGES:
+        t.stage = request.stage
+    t.subject = request.subject or ""
+    t.body = request.body or ""
+    t.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(t)
+    return _mail_template_dict(t)
+
+
+@router.delete("/mail-templates/{template_id}")
+async def delete_mail_template(
+    template_id: str,
+    current_user: User = Depends(require_role(["hr", "admin"])),
+    db: Session = Depends(get_db),
+):
+    if not current_user.company_id:
+        raise HTTPException(status_code=400, detail="User is not associated with a company")
+    t = _owned_mail_template(db, template_id, current_user.company_id)
+    db.delete(t)
+    db.commit()
+    return {"deleted": True, "id": template_id}
 
 
 @router.get("/pipeline-notifications")

@@ -1,6 +1,28 @@
 """
-Module 5 — Behavioral AI Engine: Isolation Forest anomaly detection + optional LSTM.
+Module 5 — Behavioral AI Engine: Isolation Forest anomaly detection.
 Analyzes typing rhythm, mouse dynamics, focus events, and time-on-question patterns.
+
+DISABLED BY DEFAULT (``BehavioralConfig.enabled = False``). Kept because the ingest
+path is complete and this is the on-ramp if the feature is revived — but it must not
+be switched on as-is. Three reasons, in order of severity:
+
+1. It would manufacture violations. ``contamination`` is handed straight to
+   IsolationForest, which is fitted on the candidate's *own* session, so a fixed
+   rate of every candidate's windows is labelled anomalous by construction. That
+   becomes a BEHAVIORAL_ANOMALY flag and a persisted proctoring_violations row
+   that HR reads as evidence.
+2. The features are not actually windowed. ``_raw_signals`` are append-only deques
+   that nothing clears per window, and copy_paste_count/tab_switch_count are
+   ``len(deque)`` — monotonic, so the newest window is always the extreme of its
+   own training distribution and the flag is guaranteed to fire late in every test.
+3. ``window_seconds`` (30) disagrees with the real 5s cadence that pipeline.py
+   drives ``analyze()`` at, so ``baseline_minutes`` does not mean what it says.
+
+Before enabling: clear ``_raw_signals`` per window, replace the fixed contamination
+with an absolute threshold (or make the flag advisory and non-persisted until there
+is labelled data), and reconcile the cadence. The signals that actually correlate
+with cheating — copy/paste and tab switches — already flow through
+``POST /proctor/sessions/{id}/tab-switch``, which has a real strike policy.
 """
 import time
 import logging
@@ -42,7 +64,6 @@ class BehavioralFeatures:
 class BehavioralResult:
     anomaly_score: float = 0.0  # -1 (anomaly) to 1 (normal) from IsolationForest
     is_anomaly: bool = False
-    cheat_probability: float = 0.0  # from LSTM if available
     top_contributing_features: List[str] = field(default_factory=list)
     flags: List[str] = field(default_factory=list)
     processing_time_ms: float = 0.0
@@ -57,10 +78,7 @@ FEATURE_NAMES = [
 
 
 class BehavioralEngine:
-    """
-    Detects anomalous exam-taking behavior using Isolation Forest (primary)
-    and optional LSTM sequence model (upgrade layer).
-    """
+    """Detects anomalous exam-taking behavior using Isolation Forest."""
 
     def __init__(self, config=None):
         from ..config import BehavioralConfig
@@ -68,7 +86,6 @@ class BehavioralEngine:
 
         self._feature_history: List[np.ndarray] = []
         self._iso_forest = None
-        self._lstm_model = None
         self._baseline_collected = False
         self._last_train_time = 0.0
         self._raw_signals: Dict[str, deque] = {
@@ -174,12 +191,6 @@ class BehavioralEngine:
                 result.flags.append("BEHAVIORAL_ANOMALY")
                 result.top_contributing_features = self._explain_anomaly(feat_array.flatten())
 
-        # Optional LSTM layer
-        if self.cfg.lstm_enabled and len(self._feature_history) >= 20:
-            result.cheat_probability = self._run_lstm()
-            if result.cheat_probability > 0.7:
-                result.flags.append("LSTM_HIGH_CHEAT_PROB")
-
         result.processing_time_ms = (time.perf_counter() - t0) * 1000
         return result
 
@@ -210,44 +221,6 @@ class BehavioralEngine:
         z_scores = np.abs((features - means) / stds)
         top_indices = np.argsort(z_scores)[-3:][::-1]
         return [FEATURE_NAMES[i] for i in top_indices if i < len(FEATURE_NAMES)]
-
-    def _run_lstm(self) -> float:
-        """Run LSTM model on last 20 feature windows."""
-        try:
-            import torch
-            import torch.nn as nn
-            from pathlib import Path
-
-            model_path = Path(self.cfg.lstm_model_path)
-            if not model_path.exists():
-                return 0.0
-
-            if self._lstm_model is None:
-                class CheatLSTM(nn.Module):
-                    def __init__(self):
-                        super().__init__()
-                        self.lstm = nn.LSTM(8, 64, batch_first=True)
-                        self.fc1 = nn.Linear(64, 32)
-                        self.fc2 = nn.Linear(32, 1)
-                        self.sigmoid = nn.Sigmoid()
-
-                    def forward(self, x):
-                        out, _ = self.lstm(x)
-                        out = torch.relu(self.fc1(out[:, -1, :]))
-                        return self.sigmoid(self.fc2(out))
-
-                self._lstm_model = CheatLSTM()
-                self._lstm_model.load_state_dict(torch.load(str(model_path), map_location="cpu"))
-                self._lstm_model.eval()
-
-            window = np.array(self._feature_history[-20:])
-            tensor = torch.FloatTensor(window).unsqueeze(0)
-            with torch.no_grad():
-                prob = self._lstm_model(tensor).item()
-            return round(prob, 4)
-        except Exception as e:
-            logger.debug("LSTM inference skipped: %s", e)
-            return 0.0
 
     def reset(self):
         """Reset all state."""

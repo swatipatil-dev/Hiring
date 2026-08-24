@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react'
+﻿import React, { useState, useEffect, useRef } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { Briefcase, Users, Calendar, Gift, Plus, Eye, Edit3, Trash2, Archive, RotateCcw, GripVertical, ChevronRight, FileText, ClipboardList, Mic, UserCheck, Award, Search, X } from 'lucide-react'
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, LabelList } from 'recharts'
@@ -115,6 +115,8 @@ export default function HRDashboard() {
   const [testResultJob, setTestResultJob] = useState(null)
   const [testResultCandidates, setTestResultCandidates] = useState([])
   const [answerDetail, setAnswerDetail] = useState(null) // { loading, candidate_name, data }
+  const [regrading, setRegrading] = useState(false)
+  const [regradeError, setRegradeError] = useState('')
   const [proctorDetail, setProctorDetail] = useState(null) // the clicked test-result row `r`
 
   const openAnswerDetail = async (r) => {
@@ -125,6 +127,26 @@ export default function HRDashboard() {
     } catch {
       setAnswerDetail({ loading: false, candidate_name: r.candidate_name, data: null, error: true })
     }
+  }
+
+  // Re-grade coding answers that were deferred because the judge was down. Uses the
+  // HR JWT, so the sweep is scoped to this company; the systemd timer covers the
+  // platform-wide case.
+  const regradeInterview = async (interviewId) => {
+    setRegrading(true); setRegradeError('')
+    try {
+      await api.post(`/judge/regrade-pending?interview_id=${interviewId}`)
+      const res = await api.get(`/hr/test-results/${interviewId}/answers`)
+      setAnswerDetail(prev => ({ ...prev, loading: false, data: res.data }))
+      await refreshTestResults()
+    } catch (err) {
+      const d = err.response?.data?.detail
+      setRegradeError(
+        (typeof d === 'object' ? d?.message : d) ||
+        'Re-grade failed. The judge may still be unavailable.'
+      )
+    }
+    setRegrading(false)
   }
   const [feedbackData, setFeedbackData] = useState([])
   const [feedbackJob, setFeedbackJob] = useState(null)
@@ -144,32 +166,18 @@ export default function HRDashboard() {
   const [offerMailboxId, setOfferMailboxId] = useState(undefined)
   const [offerMailPreview, setOfferMailPreview] = useState(null)
 
-  // Mail Templates (persisted to localStorage)
-  const defaultMailTemplates = [
-    { id: 'tpl-1', stage: 'offer', name: 'Standard Offer Letter', subject: 'Offer Letter – {{job_title}}', body: 'Dear {{candidate_name}},\n\nWe are pleased to extend an offer of employment for the position of {{job_title}}.\n\nPosition: {{job_title}}\nEmployment Type: {{offer_type}}\nAnnual Salary: ₹{{salary}}\nSigning Bonus: ₹{{bonus}}\nStart Date: {{start_date}}\nOffer Expires: {{expiry_date}}\n\nPlease respond to this offer by the expiry date.\n\nCongratulations and welcome to the team!\nHireFlow Recruitment Team' },
-    { id: 'tpl-2', stage: 'offer', name: 'Informal Offer (Warm Tone)', subject: 'Great news, {{candidate_name}}! – {{job_title}} Offer', body: 'Hi {{candidate_name}},\n\nExciting news — we\'d love to officially welcome you aboard as our new {{job_title}}!\n\nHere\'s a quick summary of your offer:\n• Salary: ₹{{salary}} per year\n• Bonus: ₹{{bonus}}\n• Start Date: {{start_date}}\n• Offer valid until: {{expiry_date}}\n\nWe\'re really excited to have you join the team. Please let us know if you have any questions!\n\nWarm regards,\nHireFlow Team' },
-    { id: 'tpl-3', stage: 'rejection', name: 'Application Rejection', subject: 'Your Application for {{job_title}}', body: 'Dear {{candidate_name}},\n\nThank you for your interest in the {{job_title}} position and for taking the time to go through our interview process.\n\nAfter careful consideration, we have decided to move forward with another candidate whose experience more closely matches our current needs.\n\nWe appreciate your time and encourage you to apply for future openings that align with your skills.\n\nBest regards,\nHireFlow Recruitment Team' },
-    { id: 'tpl-3b', stage: 'rejection', name: 'Post-Interview Rejection', subject: 'Follow-up on Your Interview – {{job_title}}', body: 'Dear {{candidate_name}},\n\nThank you for taking the time to interview with us for the {{job_title}} role. It was a pleasure getting to know you.\n\nAfter careful deliberation, we have decided to proceed with another candidate who more closely fits our requirements at this time.\n\nWe were impressed by your background and would encourage you to apply again for future roles that match your profile.\n\nWe wish you all the best in your job search.\n\nKind regards,\nHireFlow Recruitment Team' },
-    { id: 'tpl-3c', stage: 'rejection', name: 'ATS / Early Stage Rejection', subject: 'Your Application Status – {{job_title}}', body: 'Dear {{candidate_name}},\n\nThank you for applying for the {{job_title}} position at our company.\n\nWe have reviewed your application and, after consideration, we will not be moving forward with your candidacy at this time as we are looking for a slightly different skill set for this role.\n\nWe appreciate your interest and wish you success in your future endeavours.\n\nRegards,\nHireFlow Recruitment Team' },
-    { id: 'tpl-4', stage: 'interview_invite', name: 'Interview Invitation', subject: 'Interview Invitation – {{job_title}}', body: 'Dear {{candidate_name}},\n\nWe are pleased to invite you for an interview for the position of {{job_title}}.\n\nPlease confirm your availability at your earliest convenience.\n\nBest regards,\nHireFlow Recruitment Team' },
-    { id: 'tpl-4b', stage: 'interview_invite', name: 'Technical Round Invite', subject: 'Technical Interview – {{job_title}}', body: 'Dear {{candidate_name}},\n\nCongratulations on progressing to the Technical Interview round for the {{job_title}} position!\n\nThis round will assess your technical skills and problem-solving ability. Please be prepared to discuss your past projects and complete a short technical exercise.\n\nWe will share the interview schedule and joining details separately.\n\nPlease confirm your availability by replying to this email.\n\nBest regards,\nHireFlow Recruitment Team' },
-    { id: 'tpl-4c', stage: 'interview_invite', name: 'Final Round Invite', subject: 'Final Interview Round – {{job_title}}', body: 'Dear {{candidate_name}},\n\nWe are delighted to invite you to the Final Interview round for the {{job_title}} position.\n\nThis is the last stage of our selection process and will include a discussion with senior leadership.\n\nPlease confirm your availability and we will coordinate a suitable time slot.\n\nWe look forward to speaking with you!\n\nWarm regards,\nHireFlow Recruitment Team' },
-    { id: 'tpl-5', stage: 'welcome', name: 'Welcome Onboard', subject: 'Welcome to the Team, {{candidate_name}}!', body: 'Dear {{candidate_name}},\n\nWelcome aboard! We are thrilled to have you join us as {{job_title}}.\n\nYour start date is {{start_date}}. Please arrive at 9:00 AM and ask for HR at reception.\n\nLooking forward to working with you!\n\nHireFlow Team' },
-  ]
-  const [mailTemplates, setMailTemplates] = useState(() => {
-    try {
-      const saved = JSON.parse(localStorage.getItem('hf_mail_templates') || 'null')
-      if (!saved) return defaultMailTemplates
-      // merge: add any default templates not already present (by id)
-      const savedIds = new Set(saved.map(t => t.id))
-      const newDefaults = defaultMailTemplates.filter(t => !savedIds.has(t.id))
-      return newDefaults.length > 0 ? [...saved, ...newDefaults] : saved
-    } catch { return defaultMailTemplates }
-  })
-  const saveTemplates = (tpls) => { setMailTemplates(tpls); localStorage.setItem('hf_mail_templates', JSON.stringify(tpls)) }
+  // Server-backed: templates belong to the company, not the browser. The starter
+  // set is seeded server-side on first read, so it is not duplicated here.
+  const [mailTemplates, setMailTemplates] = useState([])
+  const [templatesError, setTemplatesError] = useState('')
   const [showTemplateManager, setShowTemplateManager] = useState(false)
   const [showComposeMail, setShowComposeMail] = useState(false)
   const [composeMail, setComposeMail] = useState({ to: '', subject: '', body: '' })
+  const [composeMailboxId, setComposeMailboxId] = useState(undefined)
+  const [composeSending, setComposeSending] = useState(false)
+  const [composeError, setComposeError] = useState('')
+  const [offerMailSending, setOfferMailSending] = useState(false)
+  const [offerMailError, setOfferMailError] = useState('')
   const [composeDropdownOpen, setComposeDropdownOpen] = useState(false)
   const [templateStageFilter, setTemplateStageFilter] = useState('all')
   const [templateForm, setTemplateForm] = useState({ id: null, stage: 'offer', name: '', subject: '', body: '' })
@@ -287,6 +295,129 @@ export default function HRDashboard() {
       await refreshTestResults()
     } catch (err) { alert(err.response?.data?.detail || 'Failed to send Round 2') }
     setRound2Sending(false)
+  }
+
+  // Report what actually happened. dispatch() queues the mail when Redis is up, so
+  // the worker may not have sent it yet — claiming "Sent!" here would be the same
+  // lie this button used to tell, just better disguised.
+  const describeSendResult = (data) =>
+    data?.mode === 'async' ? 'Queued for delivery.'
+      : data?.sent === false ? `Could not send: ${data?.error || 'unknown error'}`
+        : 'Sent.'
+
+  const handleSendComposeMail = async () => {
+    if (!composeMail.to) { setComposeError('Please enter a recipient email.'); return }
+    if (!composeMail.subject) { setComposeError('Please enter a subject.'); return }
+    if (!composeMail.body?.trim()) { setComposeError('Please enter a message.'); return }
+    setComposeSending(true); setComposeError('')
+    try {
+      const res = await api.post('/hr/send-mail', {
+        to: composeMail.to,
+        cc: [],
+        subject: composeMail.subject,
+        body: composeMail.body,
+        mailbox_id: composeMailboxId ?? null,
+      })
+      alert(`${describeSendResult(res.data)} (${composeMail.to})`)
+      setShowComposeMail(false)
+      setComposeMail({ to: '', subject: '', body: '' })
+    } catch (err) {
+      setComposeError(err.response?.data?.detail || 'Failed to send mail')
+    }
+    setComposeSending(false)
+  }
+
+  const handleSendOfferMail = async () => {
+    setOfferMailSending(true); setOfferMailError('')
+    try {
+      const res = await api.post('/hr/send-mail', {
+        to: offerMailPreview.emailTo,
+        cc: [],
+        subject: offerMailPreview.emailSubject,
+        body: offerMailPreview.emailBody,
+        mailbox_id: offerMailboxId ?? null,
+        step_key: 'offer_letter',
+      })
+      alert(`${describeSendResult(res.data)} (${offerMailPreview.candidate_name})`)
+      setOfferMailPreview(null)
+    } catch (err) {
+      setOfferMailError(err.response?.data?.detail || 'Failed to send offer email')
+    }
+    setOfferMailSending(false)
+  }
+
+  const loadMailTemplates = async () => {
+    try {
+      const res = await api.get('/hr/mail-templates')
+      setMailTemplates(res.data || [])
+      setTemplatesError('')
+      return res.data || []
+    } catch (err) {
+      // Not swallowed: an empty template list and a failed load look identical in
+      // the UI otherwise, and HR would think their templates had been deleted.
+      setTemplatesError(err.response?.data?.detail || 'Could not load mail templates')
+      return null
+    }
+  }
+
+  // One-shot: lift any templates still sitting in this browser onto the server, so
+  // upgrading does not appear to delete the ones HR wrote before the change.
+  const migrateLocalTemplates = async (serverTemplates) => {
+    let local
+    try { local = JSON.parse(localStorage.getItem('hf_mail_templates') || 'null') }
+    catch { local = null }
+    if (!Array.isArray(local) || local.length === 0) {
+      localStorage.removeItem('hf_mail_templates')
+      return
+    }
+    const known = new Set((serverTemplates || []).map(t => (t.name || '').trim().toLowerCase()))
+    const missing = local.filter(t => t?.name && !known.has(t.name.trim().toLowerCase()))
+    for (const t of missing) {
+      try {
+        await api.post('/hr/mail-templates', {
+          stage: t.stage || 'custom', name: t.name,
+          subject: t.subject || '', body: t.body || '',
+        })
+      } catch { /* name collision or invalid row — skip it, keep the rest */ }
+    }
+    localStorage.removeItem('hf_mail_templates')
+    if (missing.length) await loadMailTemplates()
+  }
+
+  useEffect(() => {
+    let cancelled = false
+    loadMailTemplates().then(rows => {
+      if (!cancelled && rows) migrateLocalTemplates(rows)
+    })
+    return () => { cancelled = true }
+  }, [])
+
+  const saveTemplate = async () => {
+    if (!templateForm.name.trim() || !templateForm.subject.trim() || !templateForm.body.trim()) {
+      alert('Please fill in all fields.'); return
+    }
+    const payload = {
+      stage: templateForm.stage, name: templateForm.name,
+      subject: templateForm.subject, body: templateForm.body,
+    }
+    try {
+      if (editingTemplate === 'new') await api.post('/hr/mail-templates', payload)
+      else await api.put(`/hr/mail-templates/${editingTemplate}`, payload)
+      setEditingTemplate(null)
+      await loadMailTemplates()
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Failed to save template')
+    }
+  }
+
+  const deleteTemplate = async (tpl) => {
+    if (!window.confirm(`Delete "${tpl.name}"?`)) return
+    try {
+      await api.delete(`/hr/mail-templates/${tpl.id}`)
+      await loadMailTemplates()
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Failed to delete template')
+    }
   }
 
   const refreshTestResults = async () => {
@@ -1740,15 +1871,7 @@ export default function HRDashboard() {
                   </div>
                   <div style={{ display: 'flex', gap: 10 }}>
                     <button
-                      onClick={() => {
-                        if (!templateForm.name.trim() || !templateForm.subject.trim() || !templateForm.body.trim()) return alert('Please fill in all fields.')
-                        if (editingTemplate === 'new') {
-                          saveTemplates([...mailTemplates, { ...templateForm, id: 'tpl-' + Date.now() }])
-                        } else {
-                          saveTemplates(mailTemplates.map(t => t.id === editingTemplate ? { ...templateForm, id: editingTemplate } : t))
-                        }
-                        setEditingTemplate(null)
-                      }}
+                      onClick={saveTemplate}
                       style={{ background: 'var(--accent-primary)', color: '#fff', border: 'none', padding: '7px 18px', borderRadius: 7, fontWeight: 600, fontSize: '0.84rem', cursor: 'pointer' }}
                     >
                       {editingTemplate === 'new' ? 'Save Template' : 'Update Template'}
@@ -1760,7 +1883,12 @@ export default function HRDashboard() {
 
               {/* Templates grid */}
               <div style={{ padding: '18px 22px' }}>
-                {filteredTemplates.length === 0 && (
+                {templatesError && (
+                  <div style={{ padding: '10px 14px', marginBottom: 12, borderRadius: 8, background: '#fef2f2', border: '1px solid #fca5a5', color: '#dc2626', fontSize: '0.84rem' }}>
+                    {templatesError} <button onClick={loadMailTemplates} style={{ marginLeft: 8, background: 'none', border: 'none', color: '#dc2626', fontWeight: 700, cursor: 'pointer', textDecoration: 'underline' }}>Retry</button>
+                  </div>
+                )}
+                {!templatesError && filteredTemplates.length === 0 && (
                   <div style={{ padding: '30px 0', textAlign: 'center', color: '#9ca3af', fontSize: '0.9rem' }}>No templates for this stage yet.</div>
                 )}
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 14 }}>
@@ -1784,7 +1912,7 @@ export default function HRDashboard() {
                             style={{ flex: 1, padding: '5px 0', borderRadius: 6, border: '1px solid #e5e7eb', background: '#fff', fontSize: '0.78rem', fontWeight: 600, cursor: 'pointer', color: '#374151' }}
                           >Edit</button>
                           <button
-                            onClick={() => { if (window.confirm(`Delete "${tpl.name}"?`)) saveTemplates(mailTemplates.filter(t => t.id !== tpl.id)) }}
+                            onClick={() => deleteTemplate(tpl)}
                             style={{ padding: '5px 12px', borderRadius: 6, border: '1px solid #fca5a5', background: '#fff', fontSize: '0.78rem', fontWeight: 600, cursor: 'pointer', color: '#dc2626' }}
                           >Delete</button>
                         </div>
@@ -1940,6 +2068,9 @@ export default function HRDashboard() {
               </div>
             </div>
 
+            <MailFromPicker stepKey="custom_mail" label="Send from"
+              value={composeMailboxId} onChange={setComposeMailboxId} />
+
             {/* To */}
             <div className="input-group" style={{ marginBottom: 14 }}>
               <label>To (Email)</label>
@@ -1963,18 +2094,14 @@ export default function HRDashboard() {
             </div>
 
             {/* Footer */}
+            {composeError && (
+              <div style={{ color: 'var(--danger, #dc2626)', fontSize: '0.85rem', marginBottom: 10 }}>{composeError}</div>
+            )}
             <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', borderTop: '1px solid var(--border-subtle)', paddingTop: 16 }}>
               <button className="btn btn-secondary" onClick={() => setShowComposeMail(false)}>Cancel</button>
-              <button className="btn btn-primary"
-                onClick={() => {
-                  if (!composeMail.to) return alert('Please enter a recipient email.')
-                  if (!composeMail.subject) return alert('Please enter a subject.')
-                  alert(`Mail sent to ${composeMail.to}!`)
-                  setShowComposeMail(false)
-                }}
-              >
+              <button className="btn btn-primary" disabled={composeSending} onClick={handleSendComposeMail}>
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-                Send Mail
+                {composeSending ? 'Sending…' : 'Send Mail'}
               </button>
             </div>
           </div>
@@ -2090,6 +2217,9 @@ export default function HRDashboard() {
               </div>
             </div>
 
+            {offerMailError && (
+              <div style={{ color: 'var(--danger, #dc2626)', fontSize: '0.85rem', marginBottom: 10 }}>{offerMailError}</div>
+            )}
             <div className="flex gap-12" style={{ justifyContent: 'flex-end' }}>
               <button className="btn btn-secondary" onClick={() => setOfferMailPreview(null)}>Cancel</button>
               {!offerMailPreview._editing && (
@@ -2097,12 +2227,9 @@ export default function HRDashboard() {
                   <Edit3 size={14} /> Edit Before Sending
                 </button>
               )}
-              <button className="btn btn-primary" onClick={() => {
-                alert(`Offer email sent to ${offerMailPreview.candidate_name} (${offerMailPreview.emailTo})!`)
-                setOfferMailPreview(null)
-              }}>
+              <button className="btn btn-primary" disabled={offerMailSending} onClick={handleSendOfferMail}>
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-                Send Email
+                {offerMailSending ? 'Sending…' : 'Send Email'}
               </button>
             </div>
           </div>
@@ -2571,12 +2698,29 @@ export default function HRDashboard() {
                 <div style={{ padding: 40, textAlign: 'center', color: '#dc2626' }}>Could not load answers.</div>
               ) : answerDetail.data.answers.length === 0 ? (
                 <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-tertiary)' }}>No answer detail recorded.</div>
-              ) : (
-                answerDetail.data.answers.map((a, i) => (
+              ) : (<>
+                {answerDetail.data.has_pending_regrade && (
+                  <div style={{ padding: '12px 14px', marginBottom: 14, borderRadius: 10, background: '#fffbeb', border: '1px solid #fcd34d', fontSize: '0.85rem', color: '#92400e' }}>
+                    <strong>Grading deferred.</strong> The code judge was unavailable when this
+                    test was submitted, so one or more coding answers were saved but not graded —
+                    and were left out of the total shown above.
+                    <button className="btn btn-sm" disabled={regrading} onClick={() => regradeInterview(answerDetail.data.interview_id)}
+                      style={{ marginLeft: 10, background: '#92400e', color: '#fff', border: 'none', padding: '4px 12px', borderRadius: 6, fontWeight: 600, cursor: 'pointer', fontSize: '0.8rem' }}>
+                      {regrading ? 'Re-grading…' : 'Re-grade now'}
+                    </button>
+                    {regradeError && <div style={{ marginTop: 8, color: '#dc2626' }}>{regradeError}</div>}
+                  </div>
+                )}
+                {answerDetail.data.answers.map((a, i) => (
                   <div key={a.question_id || i} style={{ border: '1px solid #e5e7eb', borderRadius: 10, padding: 14, marginBottom: 12 }}>
                     <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 6 }}>
                       <span style={{ fontSize: '0.7rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: 0.5, color: '#6b7280', background: '#f3f4f6', padding: '2px 8px', borderRadius: 6 }}>{a.question_type || 'question'}</span>
                       <span style={{ fontSize: '0.78rem', color: '#9ca3af' }}>Q{i + 1}</span>
+                      {a.pending_regrade && (
+                        <span style={{ fontSize: '0.68rem', fontWeight: 700, color: '#92400e', background: '#fef3c7', border: '1px solid #fcd34d', padding: '2px 8px', borderRadius: 6 }}>
+                          NOT GRADED
+                        </span>
+                      )}
                     </div>
                     {a.question_text && <div style={{ fontSize: '0.9rem', color: '#111', marginBottom: 10, lineHeight: 1.5 }}>{a.question_text}</div>}
 
@@ -2635,8 +2779,8 @@ export default function HRDashboard() {
                       </div>
                     )}
                   </div>
-                ))
-              )}
+                ))}
+              </>)}
             </div>
           </div>
         </div>

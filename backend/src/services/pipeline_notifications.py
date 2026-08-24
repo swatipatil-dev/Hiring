@@ -31,6 +31,11 @@ STEP_LABELS: Dict[str, str] = {
     "offer_accepted":      "Offer Accepted (notify HR)",
     "offer_rejected":      "Offer Declined (notify HR)",
     "candidate_rejected":  "Candidate Rejected",
+    # Not a pipeline stage — the HR dashboard's ad-hoc Compose Mail. Present so that
+    # ad-hoc sends resolve their sender through the same precedence chain as every
+    # automated send, and so Admin can give them a default sender + CC in the
+    # Pipeline Notifications UI. Keep it last: STEP_KEYS order drives that UI.
+    "custom_mail":         "Custom / Ad-hoc Mail",
 }
 STEP_KEYS: List[str] = list(STEP_LABELS.keys())
 

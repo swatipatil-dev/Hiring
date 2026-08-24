@@ -264,6 +264,9 @@ class Department(Base, TenantScoped):
     company_id  = Column(String(36), ForeignKey("companies.id"), nullable=True, index=True)
     name        = Column(String(100), nullable=False)
     description = Column(Text)
+    # Named *_url, not *_path, so scripts/verify_storage_keys.py picks it up — that
+    # checker allow-lists storage-key columns by name and walks Base.metadata.
+    logo_url    = Column(String(500), nullable=True)
     created_at  = Column(DateTime, default=datetime.utcnow)
 
     company              = relationship("Company", back_populates="departments")
@@ -711,6 +714,37 @@ class JDTemplate(Base, TenantScoped):
     source                = Column(String(20), default="manual")   # manual | ai | builtin
     created_at            = Column(DateTime, default=datetime.utcnow)
     updated_at            = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    creator = relationship("User", foreign_keys=[created_by])
+
+
+class MailTemplate(Base, TenantScoped):
+    """Reusable subject/body templates for HR's outgoing mail.
+
+    Previously these lived in each browser's localStorage, so a company's templates
+    were invisible to every other HR user and lost when the browser was cleared.
+    """
+    __tablename__ = "mail_templates"
+    __table_args__ = (
+        UniqueConstraint("company_id", "name", name="uq_mail_tpl_company_name"),
+    )
+
+    id         = Column(String(36), primary_key=True, default=_uuid)
+    company_id = Column(String(36), ForeignKey("companies.id"), nullable=True, index=True)
+    created_by = Column(String(36), ForeignKey("users.id"), nullable=True)
+    # offer | rejection | interview_invite | welcome | custom — matches the stage
+    # filter the HR dashboard already renders.
+    stage      = Column(String(50), default="custom")
+    name       = Column(String(255), nullable=False)
+    subject    = Column(String(500), nullable=True)
+    body       = Column(Text, nullable=True)
+    # Seeded starter template rather than one HR wrote. Seeded per company, not as
+    # company_id=NULL: the tenant read filter compares company_id to the current
+    # company, which excludes NULL, so NULL-tenant rows would be invisible.
+    is_builtin = Column(Boolean, default=False)
+    is_active  = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     creator = relationship("User", foreign_keys=[created_by])
 

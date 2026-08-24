@@ -166,8 +166,12 @@ async function startSession() {
 
   connectVideoWs(data.ws_video_url);
   connectAudioWs(data.ws_audio_url);
-  connectBehavioralWs(data.ws_behavioral_url);
-  startBehavioralCollection();
+  // The server no longer advertises ws_behavioral_url — the behavioral engine is
+  // disabled. Guarded rather than deleted so this harness still works if it returns.
+  if (data.ws_behavioral_url) {
+    connectBehavioralWs(data.ws_behavioral_url);
+    startBehavioralCollection();
+  }
 
   addTimeline('Session started: ' + sessionId);
 }

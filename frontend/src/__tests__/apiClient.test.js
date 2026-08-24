@@ -63,3 +63,56 @@ describe('parseJWT utility (AuthContext)', () => {
     expect(result.company_name).toBe('Acme')
   })
 })
+
+describe('multipart uploads', () => {
+  // Must run with no stored token. The request interceptor proactively refreshes a
+  // token that is near expiry, and that refresh is a real axios.post the stub
+  // adapter below does not intercept — so a token left behind by another test file
+  // (they share a worker when file parallelism is off) would hang this request.
+  beforeEach(() => {
+    localStorage.clear()
+  })
+
+  // The client sets a default Content-Type of application/json. A FormData POST
+  // must override it, otherwise axios cannot attach the multipart boundary and
+  // the upload fails server-side with no useful error — the failure mode that
+  // would silently break the department-logo upload.
+  //
+  // Asserted through a stub adapter rather than api.defaults, so this tests what
+  // actually goes on the wire rather than axios's internal header bookkeeping.
+  async function captureRequest(url, data, config) {
+    const api = (await import('../api/client')).default
+    let seen = null
+    const original = api.defaults.adapter
+    api.defaults.adapter = async (cfg) => {
+      seen = cfg
+      return { data: {}, status: 200, statusText: 'OK', headers: {}, config: cfg }
+    }
+    try {
+      await api.post(url, data, config)
+    } finally {
+      api.defaults.adapter = original
+    }
+    return seen
+  }
+
+  it('sends multipart/form-data when the request overrides the default', async () => {
+    const fd = new FormData()
+    fd.append('file', new Blob(['x'], { type: 'image/png' }), 'logo.png')
+
+    const cfg = await captureRequest('/admin/departments/d1/logo', fd, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+
+    const contentType = cfg.headers['Content-Type'] || cfg.headers['content-type']
+    expect(String(contentType)).toMatch(/multipart\/form-data/)
+    expect(cfg.data).toBeInstanceOf(FormData)
+    expect(cfg.data.get('file')).toBeInstanceOf(Blob)
+  })
+
+  it('still defaults to JSON for ordinary posts', async () => {
+    const cfg = await captureRequest('/hr/send-mail', { to: 'a@b.com' })
+    const contentType = cfg.headers['Content-Type'] || cfg.headers['content-type']
+    expect(String(contentType)).toMatch(/application\/json/)
+  })
+})

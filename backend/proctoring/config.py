@@ -93,12 +93,16 @@ class PoseConfig:
 
 @dataclass
 class BehavioralConfig:
+    # Off by default. No client feeds the behavioral WebSocket, so analyze() ran on
+    # empty signals and wrote a constant 0.0 into module_scores — and since
+    # _compute_cheating_score only sums the weights of modules that reported, that
+    # zero dropped every composite score by the module's 0.10 weight. See the module
+    # docstring in core/behavioral_engine.py for why it stays off.
+    enabled: bool = False
     window_seconds: int = 30
     contamination: float = 0.1
     baseline_minutes: int = 5
     retrain_interval_minutes: int = 10
-    lstm_enabled: bool = False
-    lstm_model_path: str = "models/behavioral_lstm.pt"
 
 
 @dataclass
@@ -124,7 +128,7 @@ class ProctorConfig:
         "PHONE_DETECTED": 50, "PHONE_GESTURE": 35,
         "MULTIPLE_VOICES": 40, "FLAGGED_SPEECH": 20, "MIC_MUTED": 15,
         "CANDIDATE_LEFT": 50, "LEANING_FORWARD": 15, "HEAD_DOWN": 10,
-        "BEHAVIORAL_ANOMALY": 30, "LSTM_HIGH_CHEAT_PROB": 40,
+        "BEHAVIORAL_ANOMALY": 30,
         "TAB_SWITCH": 25,
     })
 
