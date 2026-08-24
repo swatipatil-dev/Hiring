@@ -157,6 +157,8 @@ These all leave the deployment looking healthy. Check them explicitly.
 | `create_all` without `import main` | Plausible table count | Judge and question tables silently absent |
 | Wrong schema name | `/health` reports 0 tables | App works; only the reporting queries were hardcoded |
 | Stamped at head, schema is not | `alembic current` says `(head)`, upgrade says "nothing to do" | A migration older than the stamp never ran ([§3](#a-database-can-be-stamped-at-head-while-its-schema-is-not)) |
+| Deploy without `alembic upgrade head` | One feature empty or 500; everything else fine | The code selects a table or column the database lacks — run `scripts/schema_diff.py` |
+| cPanel database left on `utf8mb3` | Imports fine, works for months | The next migration that adds a foreign key fails with MySQL 3780 ([§3](#cpanel-databases-are-utf8mb3-imported-tables-are-utf8mb4)) |
 | `POST /api/v1/db/backup` | `success: true` and a path | The dump runs in a background task *after* the response; a failure is log-only ([§3](#backups-the-apis-backup-is-real-now-but-it-is-asynchronous)) |
 | `en_core_web_trf` missing | ATS scores fine | NER skill extraction returns `[]` |
 | `whisper` / `resemblyzer` absent | Audio proctoring runs | Transcription and neural diarization are off — neither is in any requirements file |
@@ -220,6 +222,35 @@ populated schema and is how the problem is created in the first place.
 
 `repair_schema.py` answers a narrower question (stamp-or-upgrade, against a
 hardcoded list of talent-pool columns) and would not have caught this.
+
+### cPanel databases are utf8mb3; imported tables are utf8mb4
+
+cPanel creates a database with a default of `utf8mb3`. Tables restored from a
+`mysqldump` carry `utf8mb4` on each `CREATE TABLE`, so after an import the tables
+and the database they live in disagree — and nothing complains, because every
+imported table is internally consistent.
+
+The mismatch only bites when a *later* migration creates a table with a foreign
+key. That table inherits the `utf8mb3` default and MySQL rejects the constraint:
+
+```
+(3780, "Referencing column 'company_id' and referenced column 'id' ... are incompatible")
+```
+
+One line, safe to run at any time, and it rewrites nothing:
+
+```bash
+mysql -u <user> -p -e "ALTER DATABASE <db> CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;"
+```
+
+`utf8mb3` also cannot store 4-byte characters, so a table left on it silently
+mangles emoji and several scripts in candidate names and résumé text. After any
+import, check that nothing was left behind:
+
+```bash
+mysql -u <user> -p <db> -e "SELECT TABLE_NAME, TABLE_COLLATION FROM information_schema.TABLES
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_COLLATION NOT LIKE 'utf8mb4%';"
+```
 
 ### Backups: the API's backup is real now, but it is asynchronous
 
