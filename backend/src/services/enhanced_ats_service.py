@@ -58,20 +58,22 @@ CLUSTER_PARTIAL_CREDIT = 0.6  # 60% of full credit for a same-category skill
 
 SENTENCE_TRANSFORMERS_AVAILABLE = False
 _SEMANTIC_MODEL = None
+st_util = None
 _SEMANTIC_LOAD_ATTEMPTED = False
 _CLUSTER_EMBEDDINGS: Dict[str, Any] = {}
 
 def _get_semantic_model():
-    global _SEMANTIC_MODEL, _SEMANTIC_LOAD_ATTEMPTED, SENTENCE_TRANSFORMERS_AVAILABLE
+    global _SEMANTIC_MODEL, _SEMANTIC_LOAD_ATTEMPTED, SENTENCE_TRANSFORMERS_AVAILABLE, st_util
     if not _SEMANTIC_LOAD_ATTEMPTED:
         _SEMANTIC_LOAD_ATTEMPTED = True
         try:
-            from sentence_transformers import SentenceTransformer
+            from sentence_transformers import SentenceTransformer, util as st_util
             _SEMANTIC_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
             SENTENCE_TRANSFORMERS_AVAILABLE = True
         except Exception as _st_err:
             logging.warning("Semantic model unavailable (%s). Falling back to TF-IDF.", _st_err)
             _SEMANTIC_MODEL = None
+            st_util = None
             SENTENCE_TRANSFORMERS_AVAILABLE = False
     return _SEMANTIC_MODEL
 
