@@ -706,7 +706,14 @@ def init_db():
 
         # Create all tables from ORM models (safe — skips existing tables)
         from src.models.models import Base
-        Base.metadata.create_all(db_manager.engine)
+        try:
+            with db_manager.engine.begin() as conn:
+                conn.execute(text("SET FOREIGN_KEY_CHECKS=0"))
+                Base.metadata.create_all(conn)
+                conn.execute(text("SET FOREIGN_KEY_CHECKS=1"))
+        except Exception as e_m:
+            logger.warning(f"Metadata create_all with FK checks disabled fallback: {e_m}")
+            Base.metadata.create_all(db_manager.engine)
         logger.info("ORM tables created/verified successfully!")
 
         # Test connection

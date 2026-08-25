@@ -35,7 +35,19 @@ export default function ResumeImportReview({ data, onClose, onApplied }) {
   // Projects are the least reliable extraction, so they default to OFF —
   // the candidate opts in deliberately after checking each title.
   const [projects, setProjects] = useState(
-    () => (data.projects || []).map(p => ({ value: p.name || '', include: false }))
+    () => (data.projects || []).map(p => ({
+      value: p.title || p.name || '',
+      description: p.description || '',
+      technologies_used: p.technologies_used || p.tech_stack || '',
+      role: p.role || '',
+      project_type: p.project_type || 'Personal',
+      start_date: p.start_date || null,
+      end_date: p.end_date || null,
+      ongoing: p.ongoing || false,
+      project_url: p.project_url || null,
+      repository_url: p.repository_url || null,
+      include: false
+    }))
   )
   const expYears = data.total_experience_years
   const [includeExp, setIncludeExp] = useState(!!expYears)
@@ -64,7 +76,19 @@ export default function ResumeImportReview({ data, onClose, onApplied }) {
       education: education.filter(e => e.include && (e.degree.trim() || e.institution.trim()))
         .map(e => ({ degree: e.degree.trim(), institution: e.institution.trim() })),
       certifications: certs.filter(c => c.include && c.value.trim()).map(c => c.value.trim()),
-      projects: projects.filter(p => p.include && p.value.trim()).map(p => ({ name: p.value.trim() })),
+      projects: projects.filter(p => p.include && p.value.trim()).map(p => ({
+        name: p.value.trim(),
+        title: p.value.trim(),
+        description: p.description || null,
+        technologies_used: p.technologies_used || null,
+        role: p.role || null,
+        project_type: p.project_type || 'Personal',
+        start_date: p.start_date || null,
+        end_date: p.end_date || null,
+        ongoing: p.ongoing || false,
+        project_url: p.project_url || null,
+        repository_url: p.repository_url || null,
+      })),
       total_experience_years: includeExp ? expYears : null,
     }
     try {
@@ -108,7 +132,26 @@ export default function ResumeImportReview({ data, onClose, onApplied }) {
             <div style={{ display: 'flex', flexDirection: 'column', gap: 18, marginTop: 14 }}>
               {/* Skills */}
               {skills.length > 0 && (
-                <Group title="Skills" count={skills.filter(s => s.include).length}>
+                <Group
+                  title="Skills"
+                  count={skills.filter(s => s.include).length}
+                  action={
+                    <button
+                      type="button"
+                      style={{
+                        background: 'none', border: 'none', padding: 0,
+                        fontSize: '0.73rem', fontWeight: 600, color: TEAL,
+                        cursor: 'pointer', textTransform: 'none', letterSpacing: 'normal'
+                      }}
+                      onClick={() => {
+                        const allSelected = skills.every(s => s.include)
+                        setSkills(prev => prev.map(x => ({ ...x, include: !allSelected })))
+                      }}
+                    >
+                      {skills.every(s => s.include) ? 'Deselect all' : 'Select all'}
+                    </button>
+                  }
+                >
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
                     {skills.map((s, i) => (
                       <button
@@ -136,7 +179,26 @@ export default function ResumeImportReview({ data, onClose, onApplied }) {
 
               {/* Work experience */}
               {work.length > 0 && (
-                <Group title="Work experience" count={work.filter(w => w.include).length}>
+                <Group
+                  title="Work experience"
+                  count={work.filter(w => w.include).length}
+                  action={
+                    <button
+                      type="button"
+                      style={{
+                        background: 'none', border: 'none', padding: 0,
+                        fontSize: '0.73rem', fontWeight: 600, color: TEAL,
+                        cursor: 'pointer', textTransform: 'none', letterSpacing: 'normal'
+                      }}
+                      onClick={() => {
+                        const allSelected = work.every(w => w.include)
+                        setWork(prev => prev.map(x => ({ ...x, include: !allSelected })))
+                      }}
+                    >
+                      {work.every(w => w.include) ? 'Deselect all' : 'Select all'}
+                    </button>
+                  }
+                >
                   {work.map((w, i) => (
                     <div key={i} className="rir-row">
                       <input type="checkbox" checked={w.include}
@@ -152,7 +214,26 @@ export default function ResumeImportReview({ data, onClose, onApplied }) {
 
               {/* Education */}
               {education.length > 0 && (
-                <Group title="Education" count={education.filter(e => e.include).length}>
+                <Group
+                  title="Education"
+                  count={education.filter(e => e.include).length}
+                  action={
+                    <button
+                      type="button"
+                      style={{
+                        background: 'none', border: 'none', padding: 0,
+                        fontSize: '0.73rem', fontWeight: 600, color: TEAL,
+                        cursor: 'pointer', textTransform: 'none', letterSpacing: 'normal'
+                      }}
+                      onClick={() => {
+                        const allSelected = education.every(e => e.include)
+                        setEducation(prev => prev.map(x => ({ ...x, include: !allSelected })))
+                      }}
+                    >
+                      {education.every(e => e.include) ? 'Deselect all' : 'Select all'}
+                    </button>
+                  }
+                >
                   {education.map((e, i) => (
                     <div key={i} className="rir-row">
                       <input type="checkbox" checked={e.include}
@@ -168,7 +249,26 @@ export default function ResumeImportReview({ data, onClose, onApplied }) {
 
               {/* Certifications */}
               {certs.length > 0 && (
-                <Group title="Certifications" count={certs.filter(c => c.include).length}>
+                <Group
+                  title="Certifications"
+                  count={certs.filter(c => c.include).length}
+                  action={
+                    <button
+                      type="button"
+                      style={{
+                        background: 'none', border: 'none', padding: 0,
+                        fontSize: '0.73rem', fontWeight: 600, color: TEAL,
+                        cursor: 'pointer', textTransform: 'none', letterSpacing: 'normal'
+                      }}
+                      onClick={() => {
+                        const allSelected = certs.every(c => c.include)
+                        setCerts(prev => prev.map(x => ({ ...x, include: !allSelected })))
+                      }}
+                    >
+                      {certs.every(c => c.include) ? 'Deselect all' : 'Select all'}
+                    </button>
+                  }
+                >
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
                     {certs.map((c, i) => (
                       <button key={i} type="button"
@@ -183,7 +283,26 @@ export default function ResumeImportReview({ data, onClose, onApplied }) {
 
               {/* Projects */}
               {projects.length > 0 && (
-                <Group title="Projects" count={projects.filter(p => p.include).length}>
+                <Group
+                  title="Projects"
+                  count={projects.filter(p => p.include).length}
+                  action={
+                    <button
+                      type="button"
+                      style={{
+                        background: 'none', border: 'none', padding: 0,
+                        fontSize: '0.73rem', fontWeight: 600, color: TEAL,
+                        cursor: 'pointer', textTransform: 'none', letterSpacing: 'normal'
+                      }}
+                      onClick={() => {
+                        const allSelected = projects.every(p => p.include)
+                        setProjects(prev => prev.map(x => ({ ...x, include: !allSelected })))
+                      }}
+                    >
+                      {projects.every(p => p.include) ? 'Deselect all' : 'Select all'}
+                    </button>
+                  }
+                >
                   {projects.map((p, i) => (
                     <div key={i} className="rir-row">
                       <input type="checkbox" checked={p.include}
@@ -250,14 +369,16 @@ export default function ResumeImportReview({ data, onClose, onApplied }) {
   )
 }
 
-function Group({ title, count, children }) {
+function Group({ title, count, children, action }) {
   return (
     <div>
       <div style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
         fontSize: '0.7rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em',
         color: 'var(--text-tertiary)', marginBottom: 8,
       }}>
-        {title}{typeof count === 'number' ? ` · ${count} selected` : ''}
+        <span>{title}{typeof count === 'number' ? ` · ${count} selected` : ''}</span>
+        {action}
       </div>
       {children}
     </div>

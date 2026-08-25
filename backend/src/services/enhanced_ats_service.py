@@ -56,24 +56,24 @@ SKILL_TO_CLUSTER: Dict[str, str] = {
 }
 CLUSTER_PARTIAL_CREDIT = 0.6  # 60% of full credit for a same-category skill
 
-# --- C4.2: Sentence Transformer (eager load — reused across requests) ---
-# Catch ANY failure, not just ImportError: loading the model can hit the network
-# (HuggingFace download) and fail with HfHubHTTPError/OSError — e.g. a 429 rate-limit
-# on a fresh container. That must degrade to the TF-IDF fallback, NEVER crash app
-# import (which would take the whole API down). The model is baked into the Docker
-# image at build time, so this normally loads instantly from the local cache.
-try:
-    from sentence_transformers import SentenceTransformer, util as st_util
-    _SEMANTIC_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
-    SENTENCE_TRANSFORMERS_AVAILABLE = True
-except Exception as _st_err:  # noqa: BLE001 — intentional broad fallback
-    SENTENCE_TRANSFORMERS_AVAILABLE = False
-    _SEMANTIC_MODEL = None
-    st_util = None
-    logging.warning(
-        "Semantic model unavailable (%s). Falling back to TF-IDF for semantic scoring.",
-        _st_err,
-    )
+SENTENCE_TRANSFORMERS_AVAILABLE = False
+_SEMANTIC_MODEL = None
+_SEMANTIC_LOAD_ATTEMPTED = False
+_CLUSTER_EMBEDDINGS: Dict[str, Any] = {}
+
+def _get_semantic_model():
+    global _SEMANTIC_MODEL, _SEMANTIC_LOAD_ATTEMPTED, SENTENCE_TRANSFORMERS_AVAILABLE
+    if not _SEMANTIC_LOAD_ATTEMPTED:
+        _SEMANTIC_LOAD_ATTEMPTED = True
+        try:
+            from sentence_transformers import SentenceTransformer
+            _SEMANTIC_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+            SENTENCE_TRANSFORMERS_AVAILABLE = True
+        except Exception as _st_err:
+            logging.warning("Semantic model unavailable (%s). Falling back to TF-IDF.", _st_err)
+            _SEMANTIC_MODEL = None
+            SENTENCE_TRANSFORMERS_AVAILABLE = False
+    return _SEMANTIC_MODEL
 
 # FIXED: No embedding cache — LRU cache for JD embeddings
 _EMBEDDING_CACHE: Dict[str, Any] = {}
@@ -81,59 +81,40 @@ _EMBEDDING_CACHE_MAXSIZE = 128
 
 
 def _get_text_embedding(text: str) -> Any:
-    """
-    Get embedding for a text string with SHA-256 based LRU caching.
-
-    Caches up to _EMBEDDING_CACHE_MAXSIZE embeddings keyed on the SHA-256
-    hash of the input text. Cache hits avoid the 200-800ms encode() call.
-
-    Args:
-        text: Input text to embed.
-
-    Returns:
-        Embedding tensor/array from SentenceTransformer, or None if unavailable.
-    """
-    if not SENTENCE_TRANSFORMERS_AVAILABLE or _SEMANTIC_MODEL is None:
+    model = _get_semantic_model()
+    if model is None:
         return None
     text_hash = hashlib.sha256(text.encode()).hexdigest()
     if text_hash in _EMBEDDING_CACHE:
         logger.debug("JD embedding cache hit: %s", text_hash[:8])
         return _EMBEDDING_CACHE[text_hash]
-    embedding = _SEMANTIC_MODEL.encode(text, convert_to_tensor=True)
-    # Evict oldest if at capacity (simple FIFO eviction)
+    embedding = model.encode(text, convert_to_tensor=True)
     if len(_EMBEDDING_CACHE) >= _EMBEDDING_CACHE_MAXSIZE:
         oldest_key = next(iter(_EMBEDDING_CACHE))
         del _EMBEDDING_CACHE[oldest_key]
     _EMBEDDING_CACHE[text_hash] = embedding
     return embedding
 
-
-# --- Cache skill cluster embeddings at module load time (they never change) ---
-_CLUSTER_EMBEDDINGS: Dict[str, Any] = {}
-if SENTENCE_TRANSFORMERS_AVAILABLE and _SEMANTIC_MODEL is not None:
-    try:
-        for cluster_name, members in SKILL_CLUSTERS.items():
-            cluster_text = ", ".join(members)
-            _CLUSTER_EMBEDDINGS[cluster_name] = _SEMANTIC_MODEL.encode(
-                cluster_text, convert_to_tensor=True
-            )
-        logging.info("Cached %d skill cluster embeddings at module load.", len(_CLUSTER_EMBEDDINGS))
-    except Exception as e:
-        logging.warning("Failed to cache skill cluster embeddings: %s", e)
-
 # --- C4.3: spaCy NER (lazy load — transformer model is large) ---
 _NLP = None
 
 def _get_nlp():
-    """Lazy-load spaCy en_core_web_trf on first use (production-grade NER accuracy)."""
+    """Lazy-load spaCy model instantly without network timeouts."""
     global _NLP
     if _NLP is None:
         try:
+            import importlib.util
             import spacy
-            _NLP = spacy.load("en_core_web_trf")
+            if importlib.util.find_spec("en_core_web_trf") is not None:
+                _NLP = spacy.load("en_core_web_trf")
+            elif importlib.util.find_spec("en_core_web_sm") is not None:
+                _NLP = spacy.load("en_core_web_sm")
+            else:
+                _NLP = False
         except Exception as e:
-            logging.warning(f"spaCy en_core_web_trf not available: {e}. NER features disabled.")
-    return _NLP
+            logging.warning(f"spaCy model not available: {e}. NER features disabled.")
+            _NLP = False
+    return _NLP if _NLP is not False else None
 
 # --- C4.4: Fuzzy matching ---
 try:
@@ -198,6 +179,8 @@ SECTION_HEADERS: Dict[str, List[str]] = {
         "programming languages", "my technical skills", "technical expertise", "languages & frameworks",
         "it skills", "domain skills", "areas of expertise", "core competencies", "technical proficiencies",
         "skills & abilities", "technical toolkit", "platforms & tools", "programming",
+        "core technical skills", "core technical skill", "technical skills & expertise", "key technical skills",
+        "technical proficiency", "skills & tools", "tools & technologies",
     ],
     "experience": [
         "experience", "work experience", "employment", "professional experience", "work history", "career",
@@ -235,6 +218,8 @@ SECTION_HEADERS: Dict[str, List[str]] = {
     "hobbies": [
         "hobbies", "interests", "activities", "extracurricular",
         "personal interests", "outside interests", "volunteer work", "hobbies & interests",
+        "extracurricular activities", "extra curricular activities", "extra-curricular activities",
+        "achievements", "awards", "declaration", "publications", "honors & awards",
     ],
     "job_preferences": [
         "job preferences", "career preferences", "preferred location", "target role",
