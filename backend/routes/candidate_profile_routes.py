@@ -361,6 +361,8 @@ def _education_from_section(section_text: str) -> List[Dict[str, Any]]:
             else:
                 out.append({"degree": "", "institution": inst, "confidence": 0.6})
 
+        i += 1
+
     return out[:10]
 
 
