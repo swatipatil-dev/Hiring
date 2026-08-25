@@ -267,6 +267,39 @@ def _complete_degree_title(deg_text: str, next_line_text: str = "") -> str:
     return deg_text.strip(" .,-–—|")
 
 
+# Terms that name a qualification but also appear inside institution names ("Sri
+# Chaitanya Junior College", "Zilla Parishad High School"). A line whose only
+# degree hits are these is an institution, not a qualification.
+_SCHOOL_TYPE_KW = re.compile(r'\b(junior\s*college|high\s*school|secondary\s*school)\b', re.IGNORECASE)
+
+
+def _is_degree_line(text: str) -> bool:
+    """True when the line names a qualification rather than an institution."""
+    if not _DEGREE_KW.search(text):
+        return False
+    return bool(_DEGREE_KW.search(_SCHOOL_TYPE_KW.sub(" ", text)))
+
+
+def _trim_institution(text: str) -> str:
+    """Cut an institution name after its institution keyword so the trailing
+    location drops ("Malla Reddy University Hyderabad" -> "Malla Reddy
+    University"), while keeping a following "of <Name>" intact so
+    "University of Madrid" survives."""
+    im = _INSTITUTION_KW.search(text)
+    if not im:
+        return text.strip(" .,-–—|")
+    end = im.end()
+    of_match = re.match(r"\s+of\s+[A-Za-z][\w&.'-]*(?:\s+[A-Za-z][\w&.'-]*){0,3}", text[end:])
+    if of_match:
+        end += of_match.end()
+    # A comma-qualified campus belongs to the name ("University of
+    # California, Berkeley"); a bare trailing word is the city and goes.
+    campus = re.match(r",\s*[A-Z][\w&.'-]*(?:\s+[A-Z][\w&.'-]*){0,2}", text[end:])
+    if campus:
+        end += campus.end()
+    return text[:end].strip(" .,-–—|")
+
+
 def _education_from_section(section_text: str) -> List[Dict[str, Any]]:
     """Extract (degree, institution) pairs dynamically across single-line and multi-line education layouts."""
     if not section_text or not section_text.strip():
@@ -314,10 +347,10 @@ def _education_from_section(section_text: str) -> List[Dict[str, Any]]:
                 p2 = clean_line[m_sep.end():].strip(" .,-–—|")
                 if _DEGREE_KW.search(p1):
                     degree_part = p1
-                    inst_part = p2
+                    inst_part = _trim_institution(p2)
                 elif _DEGREE_KW.search(p2):
                     degree_part = p2
-                    inst_part = p1
+                    inst_part = _trim_institution(p1)
             elif _INSTITUTION_KW.search(clean_line):
                 parts = [p.strip() for p in clean_line.split(',') if p.strip()]
                 deg_parts = [p for p in parts if _DEGREE_KW.search(p)]
@@ -334,7 +367,7 @@ def _education_from_section(section_text: str) -> List[Dict[str, Any]]:
             if not inst_part and i + 1 < len(lines):
                 next_raw = _LEADING_BULLET.sub("", lines[i + 1]).strip(" .,-–—|")
                 next_raw = _CID_EMOJI_CLEAN.sub("", next_raw).strip(" .,-–—|")
-                if next_raw and not _DEGREE_KW.search(next_raw) and not _is_section_header(next_raw):
+                if next_raw and not _is_degree_line(next_raw) and not _is_section_header(next_raw):
                     is_inst_kw = bool(_INSTITUTION_KW.search(next_raw))
                     is_not_cgpa_date = (
                         not bool(_DATE_TOKEN.search(next_raw))
@@ -346,7 +379,7 @@ def _education_from_section(section_text: str) -> List[Dict[str, Any]]:
                         clean_next = _GRADE_CGPA_RE.sub("", clean_next).strip(" .,-–—|")
                         # Split off specialization details like "— Specialization: Computer Science & AI"
                         clean_next_parts = re.split(r'\s+[–—|]\s+|\s+-\s+|,\s*Specialization', clean_next, maxsplit=1, flags=re.I)
-                        inst_part = clean_next_parts[0].strip(" .,-–—|")
+                        inst_part = _trim_institution(clean_next_parts[0])
                         i += 1  # consumed institution line
 
             out.append({
@@ -355,7 +388,7 @@ def _education_from_section(section_text: str) -> List[Dict[str, Any]]:
                 "confidence": 0.85 if inst_part else 0.6
             })
         elif _INSTITUTION_KW.search(raw_line):
-            inst = raw_line.strip(" .,-–—|")
+            inst = _trim_institution(raw_line)
             if out and not out[-1]["institution"]:
                 out[-1]["institution"] = inst
             else:
