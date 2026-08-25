@@ -189,7 +189,7 @@ def _match_alias(prefix: str, alias_set: set, threshold: int = 78) -> bool:
         from rapidfuzz import process, fuzz
         best = process.extractOne(prefix.lower().strip(), alias_set, scorer=fuzz.ratio)
         return best is not None and best[1] >= threshold
-    except ImportError:
+    except Exception:
         # Fallback: exact or substring match
         p = prefix.lower().strip()
         return p in alias_set or any(a in p for a in alias_set)
