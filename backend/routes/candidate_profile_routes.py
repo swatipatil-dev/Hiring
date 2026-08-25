@@ -55,15 +55,34 @@ def _json_list(value) -> list:
 
 
 # Lines that begin like a sentence/description rather than a project title.
+# Only words that essentially never open a real project title belong here.
 _PROJECT_DESC_STARTERS = re.compile(
     r'^(developed|built|created|designed|implemented|worked|using|used|responsible|'
-    r'led|managed|the|a|an|this|it|we|i|my|preprocessed|trained|achieved|deployed|'
-    r'applied|verified|delivered|evaluated|fine-tuned|optimized|integrated|engineered|'
-    r'extracted|automated|analyzed|constructed|configured|formulated|maintained|'
-    r'conducted|calculated|performed|generated|utilizing|utilizes|leverages|leveraging|'
+    r'led|managed|this|it|we|i|my|preprocessed|trained|achieved|deployed|'
+    r'applied|verified|delivered|evaluated|fine-tuned|formulated|maintained|'
+    r'conducted|calculated|performed|utilizing|utilizes|leverages|leveraging|'
     r'spearheaded|orchestrated|established|accelerated|pioneered|transformed)\b',
     re.IGNORECASE,
 )
+# Participles and articles that open descriptions AND plenty of genuine titles
+# ("Automated Attendance System", "Integrated Payment Gateway", "The Weather
+# App"). These disqualify a line only when a second description signal agrees —
+# see the is_action_desc block in _projects_from_section().
+_AMBIGUOUS_TITLE_STARTERS = re.compile(
+    r'^(automated|integrated|optimized|engineered|extracted|analyzed|constructed|'
+    r'configured|generated|the|a|an)\b',
+    re.IGNORECASE,
+)
+# A line made up entirely of links, link labels and separators carries no
+# description text — its URLs are captured separately.
+_URL_ONLY = re.compile(
+    r'^(?:(?:github|gitlab|repo|repository|demo|live|url|link|site|website)\s*[:\-]\s*'
+    r'|https?://\S+|www\.\S+|[\s|,;.\-–—]+)+$',
+    re.IGNORECASE,
+)
+# Institution words that never appear in a project title, unlike "school",
+# "institute", "academy", "center" or "campus", which routinely do.
+_STRONG_INSTITUTION_KW = re.compile(r'\b(university|college|vidyalaya)\b', re.IGNORECASE)
 # Infinitive phrases: "Payroll to manage HR data" → description, not a title
 _INFINITIVE_PHRASE = re.compile(
     r'\bto\s+(manage|handle|process|predict|detect|analyze|analyse|build|support|create|'
@@ -88,6 +107,99 @@ _DATE_TOKEN = re.compile(
     r'\b((jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s*\d{4}|(19|20)\d{2})\b',
     re.IGNORECASE,
 )
+# "Jan 2020 - Mar 2021", "2018 – Present", "2016-2020"
+_DATE_RANGE = re.compile(
+    r'(\d{4}|\w{3,9}\.?\s*\d{4})\s*(?:[-–—]|to)+\s*'
+    r'(\d{4}|\w{3,9}\.?\s*\d{4}|present|current|ongoing)',
+    re.IGNORECASE,
+)
+_ONGOING_WORDS = ("present", "current", "ongoing")
+_MONTHS = {
+    "jan": "01", "feb": "02", "mar": "03", "apr": "04", "may": "05", "jun": "06",
+    "jul": "07", "aug": "08", "sep": "09", "oct": "10", "nov": "11", "dec": "12",
+}
+
+
+def _normalize_month_year(token: str) -> Optional[str]:
+    """Normalise a date token to YYYY-MM or YYYY.
+
+    start_date/end_date are String(7) on CandidateProject, CandidateWorkExperience
+    and friends, so "Jan 2020" (8 chars) has to become "2020-01" before it can be
+    stored.
+    """
+    if not token:
+        return None
+    token = token.strip().strip(" .,-–—|")
+    m_month = re.match(r'([A-Za-z]{3,9})\.?\s*((?:19|20)\d{2})$', token)
+    if m_month:
+        mon = _MONTHS.get(m_month.group(1)[:3].lower())
+        if mon:
+            return "%s-%s" % (m_month.group(2), mon)
+        return m_month.group(2)
+    m_year = re.match(r'((?:19|20)\d{2})$', token)
+    return m_year.group(1) if m_year else None
+
+
+def _parse_date_range(text: str) -> tuple:
+    """Pull (start_date, end_date, ongoing) out of a free-text date range."""
+    if not text:
+        return None, None, False
+    m = _DATE_RANGE.search(text)
+    if not m:
+        # A lone year/month with no range still tells us when it started.
+        m_single = _DATE_TOKEN.search(text)
+        return (_normalize_month_year(m_single.group(0)) if m_single else None), None, False
+    start = _normalize_month_year(m.group(1))
+    end_raw = m.group(2).strip()
+    if end_raw.lower() in _ONGOING_WORDS:
+        return start, None, True
+    return start, _normalize_month_year(end_raw), False
+
+
+def _year_of(token: str) -> Optional[int]:
+    """The four-digit year inside a date token, as an int, for *_year columns."""
+    if not token:
+        return None
+    m = re.search(r'(19|20)\d{2}', token)
+    return int(m.group(0)) if m else None
+
+
+def _coerce_year(value) -> Optional[int]:
+    """A plausible four-digit year from client-supplied JSON, else None."""
+    try:
+        year = int(value)
+    except (TypeError, ValueError):
+        return None
+    return year if 1900 <= year <= 2100 else None
+
+
+def _months_between(start: Optional[str], end: Optional[str], ongoing: bool = False) -> Optional[int]:
+    """Whole months spanned by two YYYY[-MM] strings; counts to today when ongoing.
+
+    Feeds duration_months, which the parse route hands to
+    calculate_work_experience_years_from_entries() to total up experience.
+    """
+    def _ym(token):
+        if not token:
+            return None
+        parts = token.split("-")
+        try:
+            return int(parts[0]), (int(parts[1]) if len(parts) > 1 else 1)
+        except ValueError:
+            return None
+
+    begin = _ym(start)
+    if not begin:
+        return None
+    if ongoing:
+        now = datetime.utcnow()
+        finish = (now.year, now.month)
+    else:
+        finish = _ym(end)
+        if not finish:
+            return None
+    months = (finish[0] - begin[0]) * 12 + (finish[1] - begin[1])
+    return months if months >= 0 else None
 _DEGREE_KW = re.compile(
     r'\b('
     r'b[\.\- ]?tech|m[\.\- ]?tech|b[\.\- ]?e|m[\.\- ]?e|b[\.\- ]?sc|m[\.\- ]?sc|'
@@ -196,25 +308,28 @@ def _match_alias(prefix: str, alias_set: set, threshold: int = 78) -> bool:
 
 
 def _spacy_is_description(line: str) -> bool:
-    """Use spaCy to determine if a line is a description sentence (has main verb).
-    Returns True  → line is a description sentence (reject as title).
-    Returns False → line could be a title OR spaCy not available (don't block)."""
+    """True when a line reads as a description sentence rather than a project title.
+
+    Prefers spaCy — a description has verbs dominating proper nouns — and falls
+    back to _keyword_is_description() when spaCy is unavailable, so the answer is
+    defined either way rather than silently permissive.
+    """
     try:
         from src.services.enhanced_ats_service import _get_nlp
         nlp = _get_nlp()
-        if nlp is None:
-            return False
-        doc = nlp(line)
-        verb_count = sum(1 for t in doc if t.pos_ == "VERB")
-        propn_count = sum(1 for t in doc if t.pos_ in ("PROPN", "NOUN"))
-        # A description typically has verbs dominating over proper nouns
-        return verb_count > 0 and verb_count >= propn_count
+        if nlp is not None:
+            doc = nlp(line)
+            verb_count = sum(1 for t in doc if t.pos_ == "VERB")
+            propn_count = sum(1 for t in doc if t.pos_ in ("PROPN", "NOUN"))
+            # A description typically has verbs dominating over proper nouns
+            return verb_count > 0 and verb_count >= propn_count
     except Exception:
-        return False
+        pass
+    return _keyword_is_description(line)
 
 
 def _work_experience_from_section(section_text: str) -> List[Dict[str, Any]]:
-    """Extract (company, title) pairs from the detected Experience section only."""
+    """Extract (company, title, dates) from the detected Experience section only."""
     if not section_text or not section_text.strip():
         return []
     lines = [ln.strip() for ln in section_text.split("\n") if ln.strip()]
@@ -228,13 +343,24 @@ def _work_experience_from_section(section_text: str) -> List[Dict[str, Any]]:
         m = _DATE_TOKEN.search(line)
         if m:
             company = line[: m.start()].strip(" .,-–—|")
+            # The date half of the line was already matched to split the
+            # company name off; keep it rather than discarding it.
+            start_date, end_date, currently_working = _parse_date_range(line[m.start():])
             title = ""
             j = i + 1
             if j < n and not _LEADING_BULLET.match(lines[j]) and not _DATE_TOKEN.search(lines[j]):
                 title = lines[j].strip(" .,-–—|")
                 i = j
             if company or title:
-                out.append({"title": title, "company": company, "confidence": 0.6})
+                out.append({
+                    "title": title,
+                    "company": company,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "currently_working": currently_working,
+                    "duration_months": _months_between(start_date, end_date, currently_working),
+                    "confidence": 0.6,
+                })
         i += 1
     return out[:15]
 
@@ -338,6 +464,20 @@ def _education_from_section(section_text: str) -> List[Dict[str, Any]]:
                 clean_line = clean_line[: m_grade.start()]
             clean_line = clean_line.strip(" .,-–—|")
 
+            # The date and grade were matched only to trim the degree string;
+            # keep their values too, for start_year/end_year/grade.
+            start_year = end_year = None
+            currently_pursuing = False
+            if m_date:
+                d_start, d_end, d_ongoing = _parse_date_range(raw_line[m_date.start():])
+                start_year, end_year = _year_of(d_start), _year_of(d_end)
+                currently_pursuing = d_ongoing
+            # m_grade searched the already-date-truncated line; the grade often
+            # sits after the dates ("... 2018 - 2022 CGPA: 8.6"), so read the
+            # value off the full line.
+            m_grade_full = _GRADE_CGPA_RE.search(raw_line)
+            grade = m_grade_full.group(0).strip(" .,-–—|")[:50] if m_grade_full else None
+
             degree_part = clean_line
             inst_part = ""
 
@@ -385,6 +525,10 @@ def _education_from_section(section_text: str) -> List[Dict[str, Any]]:
             out.append({
                 "degree": degree_part,
                 "institution": inst_part,
+                "start_year": start_year,
+                "end_year": end_year,
+                "currently_pursuing": currently_pursuing,
+                "grade": grade,
                 "confidence": 0.85 if inst_part else 0.6
             })
         elif _INSTITUTION_KW.search(raw_line):
@@ -440,8 +584,12 @@ def _certifications_from_section(section_text: str) -> List[str]:
     return out[:20]
 
 
-def _spacy_is_description(text: str) -> bool:
-    """Fast description sentence detector (action verbs, period termination, or past-tense verbs)."""
+def _keyword_is_description(text: str) -> bool:
+    """Fast description sentence detector (action verbs, period termination, or past-tense verbs).
+
+    The no-spaCy fallback for _spacy_is_description(); it used to shadow that
+    function outright, which left the spaCy tiebreaker dead code.
+    """
     if not text:
         return False
     if text.rstrip().endswith('.'):
@@ -521,10 +669,22 @@ def _projects_from_section(section_text: str, section_header: str = "") -> List[
         is_bullet = bool(_LEADING_BULLET.match(raw)) or bool(
             re.match(r'^\s*[•\*·▪‣◦►■\u2022\u25cf\u25aa\u25b6]', raw)
         )
-        is_action_desc = bool(_PROJECT_DESC_STARTERS.match(line))
         # Phase 1: infinitive phrases and description-tail adverbs
         is_infinitive = bool(_INFINITIVE_PHRASE.search(line))
         is_desc_tail  = bool(_DESC_TAIL.search(line))
+
+        is_action_desc = bool(_PROJECT_DESC_STARTERS.match(line))
+        if not is_action_desc and _AMBIGUOUS_TITLE_STARTERS.match(line):
+            # "Automated Attendance System" is a title; "Automated the nightly
+            # export." is not. Require corroboration before rejecting.
+            is_action_desc = (
+                is_bullet
+                # `line` has had trailing punctuation stripped, so the sentence
+                # period only survives on the raw line.
+                or raw.rstrip().endswith('.')
+                or is_infinitive
+                or is_desc_tail
+            )
 
         # ── Phase 2: detect labeled field lines using alias maps ──────────────
         # A labeled field line looks like   "<label>: <value>"
@@ -556,7 +716,9 @@ def _projects_from_section(section_text: str, section_header: str = "") -> List[
         _title_word_count = len(_title_part.split())
 
         is_location = bool(_LOCATION_PATTERN.search(line))
-        is_degree   = bool(_DEGREE_KW.search(line)) or bool(_INSTITUTION_KW.search(line))
+        # Reject education lines, but not titles that merely mention a school,
+        # institute, academy or centre ("Online Learning Platform for Schools").
+        is_degree   = _is_degree_line(line) or bool(_STRONG_INSTITUTION_KW.search(line))
         is_job_title = bool(re.search(r'\b(?:Full-?Stack|Software|Backend|Frontend|Data|Machine Learning)\s+(?:Engineer|Developer|Manager|Intern|Architect)\b', line, re.I))
         _comma_parts = [p.strip() for p in line.split(',')]
         is_raw_skill_list = len(_comma_parts) >= 3 and all(len(p) <= 25 for p in _comma_parts)
@@ -640,22 +802,17 @@ def _projects_from_section(section_text: str, section_header: str = "") -> List[
 
         elif is_date_label:
             date_src = _value if _label_val else line
-            m_d = re.search(
-                r'(\d{4}|\w{3,9}\.?\s*\d{4})\s*[-–—to]+\s*(\d{4}|\w{3,9}\.?\s*\d{4}|present|current|ongoing)',
-                date_src, re.I
-            )
-            if m_d:
-                current_proj["start_date"] = m_d.group(1).strip()
-                end_str = m_d.group(2).lower()
-                if any(kw in end_str for kw in ["present", "current", "ongoing"]):
-                    current_proj["ongoing"] = True
-                    current_proj["end_date"] = None
-                else:
-                    current_proj["end_date"] = m_d.group(2).strip()
+            if _DATE_RANGE.search(date_src):
+                start, end, ongoing = _parse_date_range(date_src)
+                current_proj["start_date"] = start
+                current_proj["end_date"] = end
+                current_proj["ongoing"] = ongoing
 
         else:
-            # Accumulate description lines — only real sentences (len >= 10)
-            if len(line) >= 10:
+            # Accumulate description lines — only real sentences (len >= 10).
+            # A line that is nothing but links was already captured as a URL
+            # above, so it would otherwise show up twice.
+            if len(line) >= 10 and not _URL_ONLY.match(line):
                 current_proj["description"].append(line)
 
     _save_current()
@@ -1769,7 +1926,9 @@ async def parse_resume_for_import(
             suffix = ".pdf"
 
     import tempfile
-    from src.services.enhanced_ats_service import EnhancedATSScoringService, detect_sections
+    from src.services.enhanced_ats_service import (
+        EnhancedATSScoringService, detect_sections, _is_section_header,
+    )
 
     tmp_path = None
     try:
@@ -1821,6 +1980,9 @@ async def parse_resume_for_import(
                 {
                     "title": w["title"],
                     "company": w["company"],
+                    "start_date": w.get("start_date"),
+                    "end_date": w.get("end_date"),
+                    "currently_working": w.get("currently_working", False),
                     "duration_months": w.get("duration_months"),
                     "confidence": w["confidence"],
                 }
@@ -1863,6 +2025,10 @@ async def parse_resume_for_import(
                 {
                     "degree": e["degree"],
                     "institution": e["institution"],
+                    "start_year": e.get("start_year"),
+                    "end_year": e.get("end_year"),
+                    "currently_pursuing": e.get("currently_pursuing", False),
+                    "grade": e.get("grade"),
                     "confidence": e["confidence"],
                 }
                 for e in section_edu
@@ -1888,12 +2054,15 @@ async def parse_resume_for_import(
 
         # 8. Projects — pass section_header for project_type inference (Phase 3)
         _proj_section_text = sections.get("projects", "")
-        # Scan raw resume text for the actual projects section header (e.g. "PERSONAL PROJECTS")
-        _proj_hdr_match = re.search(
-            r'(?:personal|academic|professional|open[\s\-]source|work|side|freelance|college|university|course)?\s*projects?\b',
-            parsed.text, re.IGNORECASE
-        )
-        _proj_header = _proj_hdr_match.group(0).strip() if _proj_hdr_match else "projects"
+        # detect_sections() drops the header line from the section body, so
+        # recover it with the same classifier that drew the boundary. A plain
+        # text search would take the first "projects" anywhere in the document
+        # -- "led 3 projects" in a work bullet would then type every project.
+        _proj_header = "projects"
+        for _ln in parsed.text.split("\n"):
+            if _is_section_header(_ln) == "projects":
+                _proj_header = _ln.strip()
+                break
         projects = _projects_from_section(_proj_section_text, section_header=_proj_header)
 
         # 9. Job Preferences
@@ -1982,6 +2151,12 @@ async def apply_resume_import(
             profile_id=profile.id,
             job_title=(title or "Role")[:255],
             company_name=(company or "Company")[:255],
+            start_date=(w.get("start_date") or None),
+            end_date=(w.get("end_date") or None),
+            currently_working=bool(w.get("currently_working") or False),
+            location=((w.get("location") or "").strip()[:100] or None),
+            employment_type=((w.get("employment_type") or "").strip()[:50] or None),
+            description=(w.get("description") or None),
         ))
         counts["work_experience_added"] += 1
 
@@ -1995,6 +2170,11 @@ async def apply_resume_import(
             profile_id=profile.id,
             degree=(degree[:100] or None),
             institution_name=(institution or degree or "Institution")[:255],
+            field_of_study=((e.get("field_of_study") or "").strip()[:100] or None),
+            start_year=_coerce_year(e.get("start_year")),
+            end_year=_coerce_year(e.get("end_year")),
+            currently_pursuing=bool(e.get("currently_pursuing") or False),
+            grade=((e.get("grade") or "").strip()[:50] or None),
         ))
         counts["education_added"] += 1
 

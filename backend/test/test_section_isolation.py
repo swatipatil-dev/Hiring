@@ -7,6 +7,10 @@ from routes.candidate_profile_routes import (
     _education_from_section,
     _infer_project_type,
     _match_alias,
+    _work_experience_from_section,
+    _normalize_month_year,
+    _spacy_is_description,
+    _keyword_is_description,
     _TECH_ALIASES,
     _ROLE_ALIASES,
 )
@@ -381,4 +385,160 @@ CGPA: 7.89 / 10
     assert "🎓" not in edus[0]["degree"]
 
 
+# --- Titles that the description-starter list used to swallow ----------------
 
+def test_participle_titles_survive():
+    """"Automated ...", "Integrated ...", "Optimized ..." open real project titles."""
+    text = """
+PROJECTS
+Automated Attendance System
+Tech: Python, OpenCV
+- Recognises faces at the gate and marks attendance
+
+Integrated Payment Gateway
+Tech: Node.js, Stripe
+- Handles refunds and webhooks
+"""
+    projs = _projects_from_section(text)
+    names = [p["name"] for p in projs]
+    assert "Automated Attendance System" in names
+    assert "Integrated Payment Gateway" in names
+
+
+def test_participle_sentence_still_rejected():
+    """The same word inside an actual sentence is still a description."""
+    text = """
+PROJECTS
+Smart Resume Parser
+Tech: Python, spaCy
+Automated the nightly export of parsed candidates.
+"""
+    projs = _projects_from_section(text)
+    assert [p["name"] for p in projs] == ["Smart Resume Parser"]
+    assert "Automated the nightly export" in (projs[0]["description"] or "")
+
+
+def test_title_mentioning_a_school_is_not_an_education_line():
+    """"school"/"institute"/"centre" belong in plenty of product names."""
+    text = """
+PROJECTS
+Online Learning Platform for Schools
+Tech: React, Firebase
+- Live classes and attendance
+
+Health Centre Tracker
+Tech: Django
+- Tracks stock across rural clinics
+"""
+    names = [p["name"] for p in _projects_from_section(text)]
+    assert "Online Learning Platform for Schools" in names
+    assert "Health Centre Tracker" in names
+
+
+def test_real_education_line_still_rejected_as_a_project():
+    text = """
+PROJECTS
+Bachelor of Technology, Malla Reddy University
+"""
+    assert _projects_from_section(text) == []
+
+
+# --- Link lines must not become description text -----------------------------
+
+def test_link_only_line_not_in_description():
+    text = """
+PROJECTS
+Smart Resume Parser
+Tech: Python, spaCy
+GitHub: https://github.com/someone/resume-parser
+- Built an NER pipeline
+"""
+    projs = _projects_from_section(text)
+    assert len(projs) == 1
+    assert projs[0]["repository_url"] == "https://github.com/someone/resume-parser"
+    assert "github.com" not in (projs[0]["description"] or "")
+    assert "Built an NER pipeline" in (projs[0]["description"] or "")
+
+
+# --- Dates now survive extraction, normalised to fit String(7) ---------------
+
+def test_project_dates_normalised_for_storage():
+    text = """
+PROJECTS
+Smart Resume Parser
+Duration: Jan 2020 - Mar 2021
+"""
+    projs = _projects_from_section(text)
+    assert projs[0]["start_date"] == "2020-01"
+    assert projs[0]["end_date"] == "2021-03"
+    assert projs[0]["ongoing"] is False
+    assert len(projs[0]["start_date"]) <= 7
+
+
+def test_project_ongoing_dates():
+    text = """
+PROJECTS
+Smart Resume Parser
+Duration: 2020 - Present
+"""
+    projs = _projects_from_section(text)
+    assert projs[0]["start_date"] == "2020"
+    assert projs[0]["end_date"] is None
+    assert projs[0]["ongoing"] is True
+
+
+def test_work_experience_keeps_its_dates():
+    text = """
+EXPERIENCE
+Acme Corp Jan 2019 - Dec 2021
+Backend Engineer
+"""
+    work = _work_experience_from_section(text)
+    assert len(work) == 1
+    assert work[0]["company"] == "Acme Corp"
+    assert work[0]["title"] == "Backend Engineer"
+    assert work[0]["start_date"] == "2019-01"
+    assert work[0]["end_date"] == "2021-12"
+    assert work[0]["currently_working"] is False
+    assert work[0]["duration_months"] == 35
+
+
+def test_work_experience_ongoing_role():
+    text = """
+EXPERIENCE
+Acme Corp 2022 - Present
+Staff Engineer
+"""
+    work = _work_experience_from_section(text)
+    assert work[0]["currently_working"] is True
+    assert work[0]["end_date"] is None
+    assert work[0]["duration_months"] > 0
+
+
+def test_education_keeps_years_and_grade():
+    text = """
+EDUCATION
+B-Tech Computer Science and Engineering 2018 - 2022 CGPA: 8.6
+Malla Reddy University Hyderabad
+"""
+    edus = _education_from_section(text)
+    assert edus[0]["institution"] == "Malla Reddy University"
+    assert edus[0]["start_year"] == 2018
+    assert edus[0]["end_year"] == 2022
+    assert edus[0]["grade"] and "8.6" in edus[0]["grade"]
+
+
+# --- Date helpers ------------------------------------------------------------
+
+def test_normalize_month_year_fits_the_column():
+    assert _normalize_month_year("Jan 2020") == "2020-01"
+    assert _normalize_month_year("September 2019") == "2019-09"
+    assert _normalize_month_year("2021") == "2021"
+    assert _normalize_month_year("sometime") is None
+
+
+def test_spacy_and_keyword_detectors_are_distinct_functions():
+    """Regression: the keyword detector used to shadow the spaCy one outright."""
+    assert _spacy_is_description is not _keyword_is_description
+    assert _keyword_is_description("Built an NER pipeline.") is True
+    assert _keyword_is_description("Smart Resume Parser") is False
