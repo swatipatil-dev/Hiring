@@ -64,7 +64,7 @@ _PROJECT_DESC_STARTERS = re.compile(
     r'spearheaded|orchestrated|established|accelerated|pioneered|transformed)\b',
     re.IGNORECASE,
 )
-# Infinitive phrases: "Payroll to manage HR data" â†’ description, not a title
+# Infinitive phrases: "Payroll to manage HR data" → description, not a title
 _INFINITIVE_PHRASE = re.compile(
     r'\bto\s+(manage|handle|process|predict|detect|analyze|analyse|build|support|create|'
     r'generate|develop|monitor|track|store|provide|enable|improve|reduce|automate|'
@@ -111,7 +111,7 @@ _EMAIL_PATTERN = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\
 _PHONE_PATTERN = re.compile(r'(?:\+?\d{1,3}[\s\.\-]*)?\(?\d{2,5}\)?[\s\.\-]*\d{3,5}[\s\.\-]*\d{3,5}')
 _LOCATION_PATTERN = re.compile(r'\b([A-Z][a-zA-Z\s]{2,25}),\s*([A-Z][a-zA-Z\s]{2,20}|[A-Z]{2})\b')
 
-# â”€â”€ Phase 2: Alias Mapping for Field Labels â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Phase 2: Alias Mapping for Field Labels ───────────────────────────────────
 _TECH_ALIASES: set = {
     "tech", "technologies", "tech stack", "techstack", "stack",
     "tools", "built with", "languages", "language", "frameworks",
@@ -141,7 +141,7 @@ _REPO_ALIASES: set = {
     "github url", "repo url",
 }
 
-# â”€â”€ Phase 3: project_type Inference â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Phase 3: project_type Inference ──────────────────────────────────────────
 _PROJECT_TYPE_MAP: dict = {
     "personal": "Personal",
     "individual": "Personal",
@@ -173,7 +173,7 @@ _PROJECT_TYPE_MAP: dict = {
 
 def _infer_project_type(section_header: str) -> Optional[str]:
     """Infer project_type from the section header string.
-    Returns None if no confident match â€” don't default blindly."""
+    Returns None if no confident match — don't default blindly."""
     if not section_header:
         return None
     low = section_header.lower()
@@ -197,8 +197,8 @@ def _match_alias(prefix: str, alias_set: set, threshold: int = 78) -> bool:
 
 def _spacy_is_description(line: str) -> bool:
     """Use spaCy to determine if a line is a description sentence (has main verb).
-    Returns True  â†’ line is a description sentence (reject as title).
-    Returns False â†’ line could be a title OR spaCy not available (don't block)."""
+    Returns True  → line is a description sentence (reject as title).
+    Returns False → line could be a title OR spaCy not available (don't block)."""
     try:
         from src.services.enhanced_ats_service import _get_nlp
         nlp = _get_nlp()
@@ -373,7 +373,7 @@ def _certifications_from_section(section_text: str) -> List[str]:
     seen = set()
 
     for raw in section_text.split("\n"):
-        line = _LEADING_BULLET.sub("", raw).strip(" .,-â€“â€”|")
+        line = _LEADING_BULLET.sub("", raw).strip(" .,-–—|")
         if not line or len(line) < 3 or len(line) > 100:
             continue
 
@@ -395,7 +395,7 @@ def _certifications_from_section(section_text: str) -> List[str]:
 
         m = _DATE_TOKEN.search(line)
         if m and m.start() > 0:
-            line = line[: m.start()].strip(" .,-â€“â€”|")
+            line = line[: m.start()].strip(" .,-–—|")
 
         key = line.lower()
         if key not in seen:
@@ -425,16 +425,16 @@ def _projects_from_section(section_text: str, section_header: str = "") -> List[
     """Extract structured projects from the Projects section.
 
     Uses all 5 precision phases:
-      Phase 1 â€” Title classifier hardening (infinitive-phrase / desc-tail rejection)
-      Phase 2 â€” Alias mapping for field labels (tech / role / date / url / repo)
-      Phase 3 â€” project_type inference from section header
-      Phase 4 â€” spaCy NER tiebreaker for borderline lines
-      Phase 5 â€” rapidfuzz fuzzy alias matching
+      Phase 1 — Title classifier hardening (infinitive-phrase / desc-tail rejection)
+      Phase 2 — Alias mapping for field labels (tech / role / date / url / repo)
+      Phase 3 — project_type inference from section header
+      Phase 4 — spaCy NER tiebreaker for borderline lines
+      Phase 5 — rapidfuzz fuzzy alias matching
 
     Fields extracted (all 10 from Edit Project modal):
       title, project_type, role, technologies_used, description,
       ongoing, start_date, end_date, project_url, repository_url
-    Empty fields are left None â€” never filled with garbage.
+    Empty fields are left None — never filled with garbage.
     """
     if not section_text or not section_text.strip():
         return []
@@ -459,7 +459,7 @@ def _projects_from_section(section_text: str, section_header: str = "") -> List[
                 if isinstance(current_proj.get("description"), list):
                     desc_text = " ".join(current_proj["description"]).strip()
                     current_proj["description"] = desc_text if desc_text else None
-                # Normalise empty strings to None â€” never send blank strings to DB
+                # Normalise empty strings to None — never send blank strings to DB
                 for field in ("role", "technologies_used", "project_url", "repository_url",
                                "start_date", "end_date", "project_type"):
                     if current_proj.get(field) == "":
@@ -470,11 +470,11 @@ def _projects_from_section(section_text: str, section_header: str = "") -> List[
     from src.services.enhanced_ats_service import _is_section_header
 
     for raw in lines:
-        line = _LEADING_BULLET.sub("", raw).strip(" .,-â€“â€”|")
+        line = _LEADING_BULLET.sub("", raw).strip(" .,-–—|")
         if not line:
             continue
 
-        # â”€â”€ Section boundary â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Section boundary ──────────────────────────────────────────────────
         matched_hdr = _is_section_header(raw.strip())
         if matched_hdr == "projects":
             continue
@@ -482,16 +482,16 @@ def _projects_from_section(section_text: str, section_header: str = "") -> List[
             _save_current()
             break
 
-        # â”€â”€ Phase 1: classify this line â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Phase 1: classify this line ───────────────────────────────────────
         is_bullet = bool(_LEADING_BULLET.match(raw)) or bool(
-            re.match(r'^\s*[â€¢\*Â·â–ªâ€£â—¦â–ºâ– \u2022\u25cf\u25aa\u25b6]', raw)
+            re.match(r'^\s*[•\*·▪‣◦►■\u2022\u25cf\u25aa\u25b6]', raw)
         )
         is_action_desc = bool(_PROJECT_DESC_STARTERS.match(line))
         # Phase 1: infinitive phrases and description-tail adverbs
         is_infinitive = bool(_INFINITIVE_PHRASE.search(line))
         is_desc_tail  = bool(_DESC_TAIL.search(line))
 
-        # â”€â”€ Phase 2: detect labeled field lines using alias maps â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Phase 2: detect labeled field lines using alias maps ──────────────
         # A labeled field line looks like   "<label>: <value>"
         _label_val = re.match(r'^([A-Za-z][\w &\-/]{1,35})\s*[:\-]\s*(.+)$', line)
         _prefix    = _label_val.group(1).strip() if _label_val else ""
@@ -514,7 +514,7 @@ def _projects_from_section(section_text: str, section_header: str = "") -> List[
         is_repo_label  = bool(_label_val) and _match_alias(_prefix, _REPO_ALIASES)
         is_live_label  = bool(_label_val) and _match_alias(_prefix, _LINK_ALIASES)
 
-        # â”€â”€ is_title_candidate â€” all phases combined â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── is_title_candidate — all phases combined ──────────────────────────
         # Title candidate evaluation with separator awareness
         _sep_match = re.search(r'\s+[-\u2013\u2014|]\s+', line)
         _title_part = line[:_sep_match.start()].strip() if _sep_match else line
@@ -549,12 +549,12 @@ def _projects_from_section(section_text: str, section_header: str = "") -> List[
             if _spacy_is_description(_title_part):
                 is_title_candidate = False
 
-        # â”€â”€ Handle title candidate â†’ start new project â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Handle title candidate → start new project ────────────────────────
         if is_title_candidate:
             _save_current()
 
             tech_in_title = ""
-            m_bracket = re.search(r'\[(.*?)\]', line)   # only square brackets â†’ tech tags
+            m_bracket = re.search(r'\[(.*?)\]', line)   # only square brackets → tech tags
             if m_bracket:
                 tech_in_title = m_bracket.group(1).strip()
 
@@ -581,7 +581,7 @@ def _projects_from_section(section_text: str, section_header: str = "") -> List[
         if current_proj is None:
             continue
 
-        # â”€â”€ Field population using alias maps (Phase 2) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Field population using alias maps (Phase 2) ───────────────────────
         # ── URL extraction (unconditional on any line) ─────────────────────────
         m_gh = re.search(r'https?://(?:www\.)?(?:github|gitlab)\.com/[\w\-]+(?:/[\w\-]+)?', line, re.I)
         if m_gh and not current_proj.get("repository_url"):
@@ -606,7 +606,7 @@ def _projects_from_section(section_text: str, section_header: str = "") -> List[
         elif is_date_label:
             date_src = _value if _label_val else line
             m_d = re.search(
-                r'(\d{4}|\w{3,9}\.?\s*\d{4})\s*[-â€“â€”to]+\s*(\d{4}|\w{3,9}\.?\s*\d{4}|present|current|ongoing)',
+                r'(\d{4}|\w{3,9}\.?\s*\d{4})\s*[-–—to]+\s*(\d{4}|\w{3,9}\.?\s*\d{4}|present|current|ongoing)',
                 date_src, re.I
             )
             if m_d:
@@ -619,7 +619,7 @@ def _projects_from_section(section_text: str, section_header: str = "") -> List[
                     current_proj["end_date"] = m_d.group(2).strip()
 
         else:
-            # Accumulate description lines â€” only real sentences (len >= 10)
+            # Accumulate description lines — only real sentences (len >= 10)
             if len(line) >= 10:
                 current_proj["description"].append(line)
 
@@ -699,7 +699,7 @@ def _skills_from_section(section_text: str, fallback_skills: List[str]) -> List[
         out.append(clean_s)
 
     if section_text and section_text.strip():
-        raw_items = re.split(r'[\n,;â€¢Â·â–ª|:]\s*', section_text)
+        raw_items = re.split(r'[\n,;•·▪|:]\s*', section_text)
         for item in raw_items:
             item_str = item.strip()
             if not item_str or len(item_str) > 40 or _PROJECT_DESC_STARTERS.match(item_str):
@@ -741,13 +741,13 @@ def _serialize_profile(user: User, profile: CandidateProfileExt) -> dict:
         "marital_status": profile.marital_status,
         "languages": _json_list(profile.languages),
         "profile_photo_path": profile.profile_photo_path,
-        # Location â€” Current Address
+        # Location — Current Address
         "current_address_line": profile.current_address_line,
         "current_city": profile.current_city,
         "state": profile.state,
         "country": profile.country,
         "pincode": profile.pincode,
-        # Location â€” Permanent Address
+        # Location — Permanent Address
         "permanent_address_line": profile.permanent_address_line,
         "permanent_city": profile.permanent_city,
         "permanent_state": profile.permanent_state,
@@ -876,7 +876,7 @@ def build_profile_text(profile: CandidateProfileExt) -> str:
     section-aware scoring (weighted skills + weighted semantic) kicks in.
 
     Returns "" when the profile has no usable scoring substance
-    (no skills, work experience, or education) â€” the caller then falls back
+    (no skills, work experience, or education) — the caller then falls back
     to the resume file's extracted text.
     """
     if profile is None:
@@ -889,7 +889,7 @@ def build_profile_text(profile: CandidateProfileExt) -> str:
 
     parts: List[str] = []
 
-    # â”€â”€ Professional Summary (also carries explicit experience for the engine) â”€â”€
+    # ── Professional Summary (also carries explicit experience for the engine) ──
     summary_bits: List[str] = []
     if profile.headline:
         summary_bits.append(profile.headline)
@@ -901,11 +901,11 @@ def build_profile_text(profile: CandidateProfileExt) -> str:
     if summary_bits:
         parts.append("Professional Summary\n" + "\n".join(summary_bits))
 
-    # â”€â”€ Skills â”€â”€
+    # ── Skills ──
     if skill_names:
         parts.append("Skills\n" + ", ".join(skill_names))
 
-    # â”€â”€ Work Experience (year ranges help the date-range experience extractor) â”€â”€
+    # ── Work Experience (year ranges help the date-range experience extractor) ──
     if profile.work_experiences:
         exp_lines: List[str] = []
         for w in profile.work_experiences:
@@ -922,14 +922,14 @@ def build_profile_text(profile: CandidateProfileExt) -> str:
             exp_lines.append(line.strip())
         parts.append("Work Experience\n" + "\n\n".join(exp_lines))
 
-    # â”€â”€ Education â”€â”€
+    # ── Education ──
     if profile.educations:
         edu_lines: List[str] = []
         for e in profile.educations:
             bits = [b for b in [e.degree, e.field_of_study, e.institution_name, e.university_or_board] if b]
             line = ", ".join(bits)
             if e.grade:
-                line += f" â€” {e.grade}"
+                line += f" — {e.grade}"
             if e.description:
                 line += "\n" + e.description
             if line.strip():
@@ -937,17 +937,17 @@ def build_profile_text(profile: CandidateProfileExt) -> str:
         if edu_lines:
             parts.append("Education\n" + "\n".join(edu_lines))
 
-    # â”€â”€ Certifications â”€â”€
+    # ── Certifications ──
     if profile.certifications:
         cert_lines = [
-            " â€” ".join(b for b in [c.certificate_name, c.issuing_organization] if b)
+            " — ".join(b for b in [c.certificate_name, c.issuing_organization] if b)
             for c in profile.certifications
         ]
         cert_lines = [c for c in cert_lines if c.strip()]
         if cert_lines:
             parts.append("Certifications\n" + "\n".join(cert_lines))
 
-    # â”€â”€ Projects â”€â”€
+    # ── Projects ──
     if profile.projects:
         proj_lines: List[str] = []
         for p in profile.projects:
@@ -969,50 +969,50 @@ def _compute_completion(user: User, profile: CandidateProfileExt) -> dict:
     score = 0
     missing = []
 
-    # Personal Info â€” 10 %
+    # Personal Info — 10 %
     if user.first_name and user.last_name and user.phone and user.gender and user.date_of_birth:
         score += 10
     else:
         missing.append("Complete personal information (name, phone, gender, date of birth)")
 
-    # Profile photo â€” 5 %
+    # Profile photo — 5 %
     if profile.profile_photo_path:
         score += 5
     else:
         missing.append("Upload a profile photo")
 
-    # Headline / About â€” 10 %
+    # Headline / About — 10 %
     if profile.headline or profile.about:
         score += 10
     else:
         missing.append("Add a professional headline or summary")
 
-    # Work experience â€” 20 %
+    # Work experience — 20 %
     if profile.work_experiences:
         score += 20
     else:
         missing.append("Add at least one work experience entry")
 
-    # Education â€” 15 %
+    # Education — 15 %
     if profile.educations:
         score += 15
     else:
         missing.append("Add at least one education entry")
 
-    # Skills (â‰¥ 3) â€” 15 %
+    # Skills (≥ 3) — 15 %
     skill_count = len(profile.skills)
     if skill_count >= 3:
         score += 15
     else:
         missing.append(f"Add at least 3 skills (currently {skill_count})")
 
-    # Resume uploaded â€” 15 %
+    # Resume uploaded — 15 %
     if profile.resume_path:
         score += 15
     else:
         missing.append("Upload your resume / CV")
 
-    # Job preferences â€” 10 %
+    # Job preferences — 10 %
     if profile.preferred_job_type or profile.work_mode_preference or profile.expected_salary_min:
         score += 10
     else:
@@ -1030,7 +1030,7 @@ def _compute_completion(user: User, profile: CandidateProfileExt) -> dict:
     return {"score": score, "label": label, "missing": missing}
 
 
-# â”€â”€ Pydantic models â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Pydantic models ───────────────────────────────────────────────────────────
 
 class PersonalUpdate(BaseModel):
     first_name: Optional[str] = None
@@ -1199,7 +1199,7 @@ class LinksUpdate(BaseModel):
     other_url_label: Optional[str] = None
 
 
-# â”€â”€ Personal / Location / Summary â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Personal / Location / Summary ─────────────────────────────────────────────
 
 @router.put("/personal")
 async def update_personal(
@@ -1301,7 +1301,7 @@ async def update_summary(
     return {"message": "Summary updated"}
 
 
-# â”€â”€ Work Experience â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Work Experience ───────────────────────────────────────────────────────────
 
 @router.post("/work-experience")
 async def add_work_experience(
@@ -1356,7 +1356,7 @@ async def delete_work_experience(
     return {"message": "Work experience deleted"}
 
 
-# â”€â”€ Education â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Education ─────────────────────────────────────────────────────────────────
 
 @router.post("/education")
 async def add_education(
@@ -1411,7 +1411,7 @@ async def delete_education(
     return {"message": "Education deleted"}
 
 
-# â”€â”€ Skills â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Skills ────────────────────────────────────────────────────────────────────
 
 @router.post("/skills")
 async def add_skill(
@@ -1447,7 +1447,7 @@ async def delete_skill(
     return {"message": "Skill removed"}
 
 
-# â”€â”€ Certifications â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Certifications ────────────────────────────────────────────────────────────
 
 @router.post("/certifications")
 async def add_certification(
@@ -1502,7 +1502,7 @@ async def delete_certification(
     return {"message": "Certification deleted"}
 
 
-# â”€â”€ Projects â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Projects ──────────────────────────────────────────────────────────────────
 
 @router.post("/projects")
 async def add_project(
@@ -1562,7 +1562,7 @@ async def delete_project(
     return {"message": "Project deleted"}
 
 
-# â”€â”€ Preferences & Links â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Preferences & Links ───────────────────────────────────────────────────────
 
 @router.put("/preferences")
 async def update_preferences(
@@ -1577,7 +1577,7 @@ async def update_preferences(
         setattr(profile, field, val)
     db.commit()
 
-    # Sync expected_salary_min â†’ Candidate.expected_salary so HR sees it
+    # Sync expected_salary_min → Candidate.expected_salary so HR sees it
     if data.expected_salary_min is not None:
         from src.models.models import Candidate as _Cand
         db.query(_Cand).filter(_Cand.user_id == current_user.id).update(
@@ -1612,7 +1612,7 @@ async def update_links(
     return {"message": "Links updated"}
 
 
-# â”€â”€ File uploads â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── File uploads ──────────────────────────────────────────────────────────────
 
 @router.post("/photo")
 async def upload_profile_photo(
@@ -1691,7 +1691,7 @@ async def upload_cover_letter(
     return {"message": "Cover letter uploaded", "path": path, "filename": file.filename}
 
 
-# â”€â”€ Completion â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Completion ────────────────────────────────────────────────────────────────
 
 @router.get("/completion")
 async def get_completion(
@@ -1702,7 +1702,7 @@ async def get_completion(
     return _compute_completion(current_user, profile)
 
 
-# â”€â”€ Resume Auto-Fill (Smart Profile Import) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Resume Auto-Fill (Smart Profile Import) ───────────────────────────────────
 
 @router.post("/import/parse")
 async def parse_resume_for_import(
@@ -1712,7 +1712,7 @@ async def parse_resume_for_import(
 ):
     """Parse an uploaded resume and return structured, editable data for review.
 
-    Writes NOTHING to the profile â€” the candidate reviews/edits the result and
+    Writes NOTHING to the profile — the candidate reviews/edits the result and
     only then calls /import/apply. Reuses the same extraction the ATS uses.
     """
     if resume and resume.filename:
@@ -1851,7 +1851,7 @@ async def parse_resume_for_import(
         # 7. Certifications (STRICT: only from certifications section, NO fallback if section missing)
         certifications = _certifications_from_section(sections.get("certifications", ""))
 
-        # 8. Projects â€” pass section_header for project_type inference (Phase 3)
+        # 8. Projects — pass section_header for project_type inference (Phase 3)
         _proj_section_text = sections.get("projects", "")
         # Scan raw resume text for the actual projects section header (e.g. "PERSONAL PROJECTS")
         _proj_hdr_match = re.search(
@@ -1919,7 +1919,7 @@ async def apply_resume_import(
         "education_added": 0, "certifications_added": 0, "projects_added": 0,
     }
 
-    # Skills â€” dedupe case-insensitively, respect the 30-skill cap
+    # Skills — dedupe case-insensitively, respect the 30-skill cap
     existing_skills = {s.skill_name.lower() for s in profile.skills if s.skill_name}
     slots = 30 - len(profile.skills)
     for name in data.skills:
@@ -1937,7 +1937,7 @@ async def apply_resume_import(
         slots -= 1
         counts["skills_added"] += 1
 
-    # Work experience â€” job_title & company_name are NOT NULL, so fill sensibly
+    # Work experience — job_title & company_name are NOT NULL, so fill sensibly
     for w in data.work_experience:
         title = (w.get("title") or "").strip()
         company = (w.get("company") or "").strip()
@@ -1950,7 +1950,7 @@ async def apply_resume_import(
         ))
         counts["work_experience_added"] += 1
 
-    # Education â€” institution_name is NOT NULL
+    # Education — institution_name is NOT NULL
     for e in data.education:
         degree = (e.get("degree") or "").strip()
         institution = (e.get("institution") or "").strip()
@@ -1963,7 +1963,7 @@ async def apply_resume_import(
         ))
         counts["education_added"] += 1
 
-    # Certifications â€” dedupe case-insensitively
+    # Certifications — dedupe case-insensitively
     existing_certs = {c.certificate_name.lower() for c in profile.certifications if c.certificate_name}
     for name in data.certifications:
         nm = (name or "").strip()
@@ -1973,7 +1973,7 @@ async def apply_resume_import(
         existing_certs.add(nm.lower())
         counts["certifications_added"] += 1
 
-    # Projects â€” populate all fields matching the CandidateProject model & Edit Project modal
+    # Projects — populate all fields matching the CandidateProject model & Edit Project modal
     for p in data.projects:
         title = (p.get("name") or p.get("title") or "").strip()
         if not title:
@@ -1993,7 +1993,7 @@ async def apply_resume_import(
         ))
         counts["projects_added"] += 1
 
-    # Scalars â€” fill only if currently empty (never clobber curated data)
+    # Scalars — fill only if currently empty (never clobber curated data)
     if data.total_experience_years is not None and not profile.total_experience_years:
         profile.total_experience_years = data.total_experience_years
     if data.headline and not profile.headline:
