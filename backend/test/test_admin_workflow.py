@@ -174,3 +174,136 @@ def test_non_admin_cannot_upload_logo(client, admin_headers, hr_headers):
                        headers=hr_headers,
                        files={"file": ("logo.png", _PNG_1PX, "image/png")})
     assert resp.status_code in (401, 403, 404)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Role segregation — the Users page's category tabs
+# ───────────────────────────────────────────────────────────────────────────
+
+def _seed_user(db, email, role, company_id):
+    import uuid
+    from src.models.models import User
+    from src.auth import get_password_hash
+    user = User(
+        id=str(uuid.uuid4()),
+        email=email,
+        password_hash=get_password_hash("Pass@1234"),
+        role=role,
+        first_name=role.capitalize(),
+        last_name="Seed",
+        is_active=True,
+        email_verified=True,
+        company_id=company_id,
+    )
+    db.add(user)
+    db.flush()
+    return user.id
+
+
+def _admin_company_id(db):
+    from src.models.models import User
+    return db.query(User).filter(User.email == "admin_test@test.com").first().company_id
+
+
+@pytest.mark.admin
+def test_list_users_filtered_by_role(client, admin_headers, db):
+    """?role=X returns only that role, and `total` counts the filtered set."""
+    company_id = _admin_company_id(db)
+    for role in ("hr", "interviewer", "candidate"):
+        _seed_user(db, f"seg_{role}@test.com", role, company_id)
+    db.commit()
+
+    for role in ("admin", "hr", "interviewer", "candidate"):
+        resp = client.get(f"/api/v1/admin/users?role={role}", headers=admin_headers)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert all(u["role"] == role for u in body["users"]), f"{role} tab leaked another role"
+        assert body["total"] >= 1
+        # No page is larger than its own total.
+        assert len(body["users"]) <= body["total"]
+
+
+@pytest.mark.admin
+def test_user_counts_match_role_listings(client, admin_headers, db):
+    """Each tab's badge equals the `total` that tab's listing reports."""
+    company_id = _admin_company_id(db)
+    _seed_user(db, "counts_hr@test.com", "hr", company_id)
+    _seed_user(db, "counts_iv@test.com", "interviewer", company_id)
+    db.commit()
+
+    counts = client.get("/api/v1/admin/users/counts", headers=admin_headers).json()
+    roles = ["admin", "hr", "interviewer", "candidate"]
+    assert counts["all"] == sum(counts[r] for r in roles)
+
+    for role in roles:
+        listed = client.get(f"/api/v1/admin/users?role={role}", headers=admin_headers).json()
+        assert listed["total"] == counts[role], f"{role} badge disagrees with its listing"
+
+
+@pytest.mark.admin
+def test_candidate_tab_includes_cross_portal_applicants(client, admin_headers, db):
+    """A candidate who signed up elsewhere but applied to us must still appear.
+
+    Bare HireFlow sign-ups land in the platform org, so an applicant's
+    `users.company_id` can belong to another company while the application row
+    they created is ours. Scoping on `users.company_id` alone hid them.
+    """
+    import uuid
+    from src.models.models import Company, Candidate
+
+    company_id = _admin_company_id(db)
+    other = Company(id=str(uuid.uuid4()), name="Other Co", slug=f"co-{uuid.uuid4().hex[:8]}")
+    db.add(other)
+    db.flush()
+
+    outsider_email = f"outsider_{uuid.uuid4().hex[:6]}@test.com"
+    outsider_id = _seed_user(db, outsider_email, "candidate", other.id)
+
+    # They applied to *our* company — the application row carries our id.
+    db.add(Candidate(
+        id=str(uuid.uuid4()),
+        company_id=company_id,
+        user_id=outsider_id,
+        email=outsider_email,
+        first_name="Out",
+        last_name="Sider",
+        current_stage="applied",
+    ))
+
+    # A candidate of the other company who never applied to us must stay hidden.
+    stranger_email = f"stranger_{uuid.uuid4().hex[:6]}@test.com"
+    _seed_user(db, stranger_email, "candidate", other.id)
+    db.commit()
+
+    body = client.get("/api/v1/admin/users?role=candidate&limit=500", headers=admin_headers).json()
+    emails = {u["email"] for u in body["users"]}
+    assert outsider_email in emails, "cross-portal applicant missing from the Candidate tab"
+    assert stranger_email not in emails, "leaked a candidate who never applied to this company"
+
+
+@pytest.mark.admin
+def test_users_search_is_server_side(client, admin_headers, db):
+    """Search matches on name or email and narrows `total`, not just the page."""
+    company_id = _admin_company_id(db)
+    _seed_user(db, "zzsearchable@test.com", "hr", company_id)
+    db.commit()
+
+    body = client.get("/api/v1/admin/users?search=zzsearchable", headers=admin_headers).json()
+    assert body["total"] == 1
+    assert body["users"][0]["email"] == "zzsearchable@test.com"
+
+
+@pytest.mark.admin
+def test_users_pagination_does_not_hide_rows(client, admin_headers, db):
+    """skip/limit walk the whole set; `total` stays constant across pages."""
+    company_id = _admin_company_id(db)
+    for i in range(6):
+        _seed_user(db, f"page_{i}@test.com", "interviewer", company_id)
+    db.commit()
+
+    first = client.get("/api/v1/admin/users?role=interviewer&skip=0&limit=4", headers=admin_headers).json()
+    second = client.get("/api/v1/admin/users?role=interviewer&skip=4&limit=4", headers=admin_headers).json()
+
+    assert first["total"] == second["total"] >= 6
+    assert len(first["users"]) == 4
+    assert not ({u["id"] for u in first["users"]} & {u["id"] for u in second["users"]}), "pages overlap"

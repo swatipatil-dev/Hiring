@@ -5,7 +5,7 @@ Handles job creation, ATS screening, interview scheduling, and offer management
 
 from fastapi import APIRouter, HTTPException, status, Depends, Query, UploadFile, File
 from fastapi.responses import StreamingResponse
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import func, desc, and_, or_
 from typing import List, Optional, Dict, Any
 from src.config.database_config_mysql import get_db
@@ -21,7 +21,9 @@ from src.services.resume_pool_import import (
     count_importable_users, count_orphan_candidates,
     score_backlog, count_unscored,
 )
-from src.services.talent_pool import derive_outcome, outcome_filter
+from src.services.talent_pool import (
+    derive_outcome, outcome_filter, outcome_sum_columns,
+)
 from pydantic import BaseModel, EmailStr, Field
 from datetime import datetime, timedelta
 import hashlib
@@ -771,6 +773,20 @@ class NamedCount(BaseModel):
     count: int
 
 
+class TrendPoint(BaseModel):
+    """One bucket of the additions-over-time series."""
+    period: str          # ISO date of the bucket start: 2026-08-24 (week) / 2026-08-01
+    label: str           # what the axis shows: "24 Aug" / "Aug 2026"
+    count: int
+
+
+class BandCount(BaseModel):
+    """One 10-point band of the match-score histogram."""
+    band: str            # "0-9" … "90-100"
+    floor: int           # lower bound — sort key, and what the tooltip reads back
+    count: int
+
+
 class ScoreBacklogRequest(BaseModel):
     limit: int = 3
 
@@ -785,7 +801,10 @@ class ScoreBacklogResponse(BaseModel):
 
 
 class TalentPoolMetrics(BaseModel):
-    total: int
+    # Everything here obeys the caller's filter EXCEPT `pool_total`, `unscored` and
+    # `unscoreable`, which are whole-pool on purpose — see the endpoint for why.
+    total: int                 # people matching the current filter
+    pool_total: int = 0        # people in the whole pool, so the UI can say "312 of 4180"
     new_count: int
     ongoing_count: int
     archived_count: int
@@ -798,6 +817,49 @@ class TalentPoolMetrics(BaseModel):
     with_resume: int = 0
     unscored: int = 0         # ranked against nothing yet, but could be
     unscoreable: int = 0      # no resume or profile text to score at all
+
+    # ── Dashboard series ──────────────────────────────────────────────────────
+    added_over_time: List[TrendPoint] = []
+    trend_granularity: str = "month"      # "week" | "month" — what one point covers
+    score_bands: List[BandCount] = []
+    unscored_in_view: int = 0             # filtered rows with no score. NOT a 0-9 band:
+                                          # "never ranked" is not "scored zero".
+    avg_score: Optional[float] = None
+    top_colleges: List[NamedCount] = []
+    top_roles: List[NamedCount] = []
+
+
+class SkillCount(BaseModel):
+    skill: str
+    count: int
+
+
+class SkillDemandRow(BaseModel):
+    """One demanded skill, measured against the people currently in view."""
+    skill: str                       # canonical casing: "Kubernetes", not "kubernetes"
+    roles: int                       # active postings asking for it
+    role_titles: List[str] = []      # a few, for the tooltip
+    candidates: int                  # people who have it outright
+    related: int = 0                 # people with a cluster sibling instead (Docker for
+                                     # Kubernetes). Only computed when candidates == 0.
+    related_examples: List[str] = []
+    related_cluster: str = ""        # the grouping that called them related, so the
+                                     # reader can judge it rather than trust it
+    coverage: float = 0.0            # candidates as a % of people with skills on record
+
+
+class TalentPoolSkills(BaseModel):
+    people: int                      # people scanned in the current view
+    people_with_skills: int          # of those, how many have any skill recorded
+    no_skills_on_record: int         # the rest. NOT "people with no skills".
+    distinct_skills: int
+    active_roles: int
+    demanded_skills: int
+    fully_unmet: int                 # demanded by a live role, held by nobody at all
+    scanned: int
+    truncated: bool = False          # the scan hit its ceiling; counts are a lower bound
+    demand: List[SkillDemandRow] = []
+    top_skills: List[SkillCount] = []
 
 
 class MoveToATSRequest(BaseModel):
@@ -1261,36 +1323,71 @@ def _get_pool_entry(db: Session, entry_id: str, current_user: User) -> ResumePoo
     return entry
 
 
-@router.get("/resume-pool", response_model=ResumePoolListResponse)
-async def list_resume_pool(
-    search: Optional[str] = Query(None, description="Match name, email, college, role or skills"),
-    college: Optional[str] = Query(
-        None, description="College name, or a comma-separated list — matches ANY of them"),
-    year_of_passing: Optional[int] = Query(None),
-    job_role: Optional[str] = Query(None),
-    min_score: Optional[float] = Query(None, ge=0, le=100),
-    status: Optional[str] = Query(None, description="new | moved | archived"),
-    source: Optional[str] = Query(None, description="upload | registered | applied"),
-    outcome: Optional[str] = Query(
-        None, description="never_applied | in_process | offer | hired | declined | rejected | applied"),
-    stage: Optional[str] = Query(None, description="new | ongoing | archived"),
-    sort: str = Query("score", description="score | recent | name | contact"),
-    uploaded_from: Optional[datetime] = Query(None),
-    uploaded_to: Optional[datetime] = Query(None),
-    skip: int = 0,
-    limit: int = 50,
-    current_user: User = Depends(AuthMiddleware.get_current_hr),
-    db: Session = Depends(get_db),
-):
-    """Search the stored resume pool. This is what makes an uploaded resume findable
-    by name, college, year of passing or role long after the upload."""
-    query = db.query(ResumePoolEntry).filter(
-        ResumePoolEntry.company_id == current_user.company_id
-    )
+class PoolFilters:
+    """The Talent Pool's filter set, declared once and shared.
 
-    if search:
-        term = f"%{search.strip()}%"
-        query = query.filter(or_(
+    Both the Candidates list and the Dashboard narrow the pool with these, and they
+    have to narrow it identically -- a dashboard that disagrees with the list sitting
+    under it is worse than no dashboard. Declaring the parameters twice is exactly how
+    that drift starts, so they are declared here and taken by `Depends()`.
+
+    A plain class rather than a Pydantic query model: this works on every FastAPI
+    version the project has been pinned to, and keeps each parameter's description
+    attached to the parameter.
+
+    `sort`, `skip` and `limit` are deliberately NOT here. They order and slice a list;
+    they mean nothing to an aggregate.
+    """
+
+    def __init__(
+        self,
+        search: Optional[str] = Query(None, description="Match name, email, college, role or skills"),
+        college: Optional[str] = Query(
+            None, description="College name, or a comma-separated list - matches ANY of them"),
+        year_of_passing: Optional[int] = Query(None),
+        job_role: Optional[str] = Query(None),
+        min_score: Optional[float] = Query(None, ge=0, le=100),
+        status: Optional[str] = Query(None, description="new | moved | archived"),
+        source: Optional[str] = Query(None, description="upload | registered | applied"),
+        outcome: Optional[str] = Query(
+            None, description="never_applied | in_process | offer | hired | declined | rejected | applied"),
+        stage: Optional[str] = Query(None, description="new | ongoing | archived"),
+        skill: Optional[str] = Query(
+            None, description="Exactly one skill, as spelled in the profile"),
+        uploaded_from: Optional[datetime] = Query(None),
+        uploaded_to: Optional[datetime] = Query(None),
+    ):
+        self.search = search
+        self.college = college
+        self.year_of_passing = year_of_passing
+        self.job_role = job_role
+        self.min_score = min_score
+        self.status = status
+        self.source = source
+        self.outcome = outcome
+        self.stage = stage
+        self.skill = skill
+        self.uploaded_from = uploaded_from
+        self.uploaded_to = uploaded_to
+
+    def is_active(self) -> bool:
+        """Is anything actually narrowing the pool right now?"""
+        return any(v not in (None, "") for v in vars(self).values())
+
+
+def _pool_predicates(db: Session, company_id: str, f: PoolFilters) -> List[Any]:
+    """Every WHERE clause the current filter implies, as a list.
+
+    Predicates rather than a Query object, because the list endpoint wants
+    `db.query(ResumePoolEntry)` and the dashboard wants a dozen different aggregate
+    selects over the same rows. Handing both the same list is what keeps them honest:
+    the dashboard's total and the list's total are the same number by construction.
+    """
+    preds: List[Any] = [ResumePoolEntry.company_id == company_id]
+
+    if f.search:
+        term = f"%{f.search.strip()}%"
+        preds.append(or_(
             ResumePoolEntry.full_name.ilike(term),
             ResumePoolEntry.email.ilike(term),
             ResumePoolEntry.college.ilike(term),
@@ -1298,44 +1395,88 @@ async def list_resume_pool(
             ResumePoolEntry.filename.ilike(term),
             ResumePoolEntry.extracted_skills.ilike(term),
         ))
-    if college:
-        # Campus hiring is a set operation — HR picks a whole region or every IIIT at
-        # once — so this is a comma-separated OR, not a single name. One value behaves
+    if f.college:
+        # Campus hiring is a set operation - HR picks a whole region or every IIIT at
+        # once - so this is a comma-separated OR, not a single name. One value behaves
         # exactly as it did before. The cap bounds a pathological query string; the
         # largest curated group the UI can send is 30 colleges (~60 spellings).
-        terms = [t.strip() for t in college.split(",") if t.strip()][:MAX_COLLEGE_TERMS]
+        terms = [t.strip() for t in f.college.split(",") if t.strip()][:MAX_COLLEGE_TERMS]
         if terms:
-            query = query.filter(or_(*[
-                ResumePoolEntry.college.ilike(f"%{t}%") for t in terms
-            ]))
-    if year_of_passing:
-        query = query.filter(ResumePoolEntry.year_of_passing == year_of_passing)
-    if job_role:
-        query = query.filter(ResumePoolEntry.job_role.ilike(f"%{job_role.strip()}%"))
-    if min_score is not None:
-        query = query.filter(ResumePoolEntry.best_score >= min_score)
-    if status:
-        query = query.filter(ResumePoolEntry.status == status)
-    if source:
-        query = query.filter(ResumePoolEntry.source == source)
-    if stage:
+            preds.append(or_(*[ResumePoolEntry.college.ilike(f"%{t}%") for t in terms]))
+    if f.year_of_passing:
+        preds.append(ResumePoolEntry.year_of_passing == f.year_of_passing)
+    if f.job_role:
+        preds.append(ResumePoolEntry.job_role.ilike(f"%{f.job_role.strip()}%"))
+    if f.min_score is not None:
+        preds.append(ResumePoolEntry.best_score >= f.min_score)
+    if f.status:
+        preds.append(ResumePoolEntry.status == f.status)
+    if f.source:
+        preds.append(ResumePoolEntry.source == f.source)
+    if f.stage:
         # Rows predating the stage column read as NULL and belong in the New lane.
-        query = query.filter(ResumePoolEntry.stage == stage) if stage != "new" else query.filter(
-            or_(ResumePoolEntry.stage == "new", ResumePoolEntry.stage.is_(None)))
-    if uploaded_from:
-        query = query.filter(ResumePoolEntry.uploaded_at >= uploaded_from)
-    if uploaded_to:
-        query = query.filter(ResumePoolEntry.uploaded_at <= uploaded_to)
-    if outcome:
-        # Applied BEFORE count() and offset/limit — filtering per page instead would
-        # report a total that doesn't match what paging can actually reach.
-        predicate = outcome_filter(db, current_user.company_id, outcome)
+        preds.append(
+            or_(ResumePoolEntry.stage == "new", ResumePoolEntry.stage.is_(None))
+            if f.stage == "new" else ResumePoolEntry.stage == f.stage
+        )
+    if f.skill and f.skill.strip():
+        # Whole array elements only. `extracted_skills` is a JSON array of strings, so
+        # matching the QUOTED token is what separates "java" from "javascript" — the
+        # free-text `search` above deliberately does not, and cannot back a drill-down
+        # that claims to list the people who have exactly this skill.
+        #
+        # Case-insensitive for free under utf8mb4_unicode_ci, the same property the
+        # email identity match relies on (src/services/talent_pool.py:108). No JSON
+        # functions, so this still runs on MariaDB.
+        #
+        # The wildcards are ESCAPED, not stripped. Stripping them turns `skill=%` into
+        # an empty term, and an empty term into no predicate at all — a filter that
+        # silently matches everything, which is the worst of the three outcomes. And
+        # `_` is a single-character wildcard too, so unescaped it would let
+        # `Java_cript` match JavaScript.
+        esc = (f.skill.strip()
+               .replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_"))
+        preds.append(ResumePoolEntry.extracted_skills.ilike(f'%"{esc}"%', escape="\\"))
+    if f.uploaded_from:
+        preds.append(ResumePoolEntry.uploaded_at >= f.uploaded_from)
+    if f.uploaded_to:
+        preds.append(ResumePoolEntry.uploaded_at <= f.uploaded_to)
+    if f.outcome:
+        # For the list this must be applied BEFORE count() and offset/limit - filtering
+        # per page instead would report a total that paging cannot actually reach.
+        # Living in the predicate list is what guarantees that for every caller.
+        predicate = outcome_filter(db, company_id, f.outcome)
         if predicate is not None:
-            query = query.filter(predicate)
+            preds.append(predicate)
+
+    return preds
+
+
+@router.get("/resume-pool", response_model=ResumePoolListResponse)
+async def list_resume_pool(
+    filters: PoolFilters = Depends(),
+    sort: str = Query("score", description="score | recent | name | contact"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    current_user: User = Depends(AuthMiddleware.get_current_hr),
+    db: Session = Depends(get_db),
+):
+    """Search the stored resume pool. This is what makes an uploaded resume findable
+    by name, college, year of passing or role long after the upload.
+
+    Takes the same filters as `/talent-pool/metrics`, through the same dependency, so
+    the dashboard above this list always describes exactly these people.
+    """
+    query = (db.query(ResumePoolEntry)
+             # Every rendered row reads `entry.attachments`. Without this that is one
+             # extra SELECT per row - a whole page of them on every keystroke, now that
+             # the dashboard re-queries as you type.
+             .options(selectinload(ResumePoolEntry.attachments))
+             .filter(*_pool_predicates(db, current_user.company_id, filters)))
 
     total = query.count()
     if sort == "contact":
-        # Longest-neglected first — the working order for a follow-up session. NULLs
+        # Longest-neglected first - the working order for a follow-up session. NULLs
         # (never contacted) sort first on ASC in MySQL, which is exactly right.
         query = query.order_by(ResumePoolEntry.last_contact_at.asc())
     elif sort == "recent":
@@ -1348,14 +1489,17 @@ async def list_resume_pool(
         # why the never-applied and rejected views default to `recent` instead.
         query = query.order_by(desc(ResumePoolEntry.best_score),
                                desc(ResumePoolEntry.uploaded_at))
-    entries = query.offset(skip).limit(min(limit, 200)).all()
+    entries = query.offset(skip).limit(limit).all()
 
     history = _load_application_history(db, current_user.company_id, entries)
 
-    active_jobs = db.query(JobPosting).filter(
-        JobPosting.company_id == current_user.company_id,
-        JobPosting.status == "active",
-    ).all()
+    active_jobs = (db.query(JobPosting)
+                   # `.department.name` below is read once per job; eager-load it or
+                   # that is another SELECT per open role on every list call.
+                   .options(selectinload(JobPosting.department))
+                   .filter(JobPosting.company_id == current_user.company_id,
+                           JobPosting.status == "active")
+                   .all())
 
     return ResumePoolListResponse(
         results=[_entry_to_result(e, history) for e in entries],
@@ -1371,24 +1515,89 @@ async def list_resume_pool(
     )
 
 
+
+# The dashboard's trend chart is bounded on purpose: an unbounded GROUP BY over
+# uploaded_at grows a series nobody can read and a query nobody capped.
+TREND_DEFAULT_DAYS = 365
+# Below this span a month is too coarse to show anything - a campus drive lasts weeks.
+TREND_WEEKLY_MAX_DAYS = 120
+
+
+def _trend_window(f: PoolFilters) -> tuple:
+    """(start, end, granularity) for the additions-over-time series.
+
+    Honours the caller's date filter when there is one, because the chart has to agree
+    with the rows it sits above. With no date filter it falls back to the last year.
+    """
+    # End of the current UTC day, not this instant. `uploaded_at` is a 0-precision
+    # DATETIME and MySQL ROUNDS the fractional seconds on insert, so a row written
+    # moments ago can store a timestamp marginally in the future - and `<= utcnow()`
+    # would drop the newest person in the pool out of the newest bucket.
+    end = f.uploaded_to or datetime.utcnow().replace(
+        hour=23, minute=59, second=59, microsecond=0)
+    start = f.uploaded_from or (end - timedelta(days=TREND_DEFAULT_DAYS))
+    if start > end:
+        start = end
+    span = (end - start).days
+    return start, end, ("week" if span <= TREND_WEEKLY_MAX_DAYS else "month")
+
+
+def _trend_periods(start: datetime, end: datetime, granularity: str) -> List[datetime]:
+    """Every bucket start in the window, including the empty ones.
+
+    MySQL returns no row for a week nobody joined. Charting only the rows that came
+    back closes that gap and draws a flat line over a hiring freeze - so the zero-fill
+    happens here, not in the query.
+    """
+    out: List[datetime] = []
+    if granularity == "week":
+        cursor = (start - timedelta(days=start.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        while cursor <= end:
+            out.append(cursor)
+            cursor += timedelta(days=7)
+    else:
+        cursor = start.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        while cursor <= end:
+            out.append(cursor)
+            cursor = (cursor.replace(day=28) + timedelta(days=4)).replace(day=1)
+    return out
+
+
 @router.get("/talent-pool/metrics", response_model=TalentPoolMetrics)
 async def talent_pool_metrics(
+    filters: PoolFilters = Depends(),
     current_user: User = Depends(AuthMiddleware.get_current_hr),
     db: Session = Depends(get_db),
 ):
-    """Counts behind the Overview and Analytics tabs.
+    """Every number and series behind the Dashboard tab.
 
-    Deliberately aggregate queries rather than loading rows and counting in Python —
+    Takes the same filters as `GET /resume-pool`, through the same dependency, so the
+    charts describe exactly the people the Candidates list would show. `total` is the
+    filtered count and `pool_total` the whole pool, so the UI can always say which of
+    the two the reader is looking at.
+
+    Three fields deliberately ignore the filter: `pool_total`, and `unscored` /
+    `unscoreable`. The last two drive the "Rank all N" button, and `score_backlog()`
+    ranks the whole backlog rather than the current view - a filtered count there would
+    promise something the button does not do.
+
+    Deliberately aggregate queries rather than loading rows and counting in Python -
     this has to stay cheap as the pool grows past what one page can show.
     """
     cid = current_user.company_id
-    base = db.query(ResumePoolEntry).filter(ResumePoolEntry.company_id == cid)
+    preds = _pool_predicates(db, cid, filters)
 
-    stage_rows = dict(
-        db.query(ResumePoolEntry.stage, func.count(ResumePoolEntry.id))
-          .filter(ResumePoolEntry.company_id == cid)
-          .group_by(ResumePoolEntry.stage).all()
-    )
+    def agg(*cols):
+        """One aggregate query over the filtered pool."""
+        return db.query(*cols).select_from(ResumePoolEntry).filter(*preds)
+
+    total = int(agg(func.count(ResumePoolEntry.id)).scalar() or 0)
+    pool_total = int(db.query(func.count(ResumePoolEntry.id))
+                       .filter(ResumePoolEntry.company_id == cid).scalar() or 0)
+
+    stage_rows = dict(agg(ResumePoolEntry.stage, func.count(ResumePoolEntry.id))
+                      .group_by(ResumePoolEntry.stage).all())
     counts = {s: int(stage_rows.get(s, 0)) for s in POOL_STAGES}
     # Rows written before `stage` existed read as NULL; show them as New rather than
     # silently dropping them from a total HR is trying to reconcile.
@@ -1401,42 +1610,113 @@ async def talent_pool_metrics(
         "applied": "Applied", "manual": "Added by hand",
     }
     sources = []
-    for channel, n in (db.query(ResumePoolEntry.source_channel, func.count(ResumePoolEntry.id))
-                         .filter(ResumePoolEntry.company_id == cid,
-                                 ResumePoolEntry.source_channel.isnot(None))
-                         .group_by(ResumePoolEntry.source_channel).all()):
+    for channel, n in (agg(ResumePoolEntry.source_channel, func.count(ResumePoolEntry.id))
+                       .filter(ResumePoolEntry.source_channel.isnot(None))
+                       .group_by(ResumePoolEntry.source_channel).all()):
         sources.append(NamedCount(name=channel, count=int(n)))
     # Anyone without an explicit sourcing channel falls back to how they got here, so
     # the breakdown always accounts for every person.
-    for src, n in (db.query(ResumePoolEntry.source, func.count(ResumePoolEntry.id))
-                     .filter(ResumePoolEntry.company_id == cid,
-                             ResumePoolEntry.source_channel.is_(None))
-                     .group_by(ResumePoolEntry.source).all()):
+    for src, n in (agg(ResumePoolEntry.source, func.count(ResumePoolEntry.id))
+                   .filter(ResumePoolEntry.source_channel.is_(None))
+                   .group_by(ResumePoolEntry.source).all()):
         sources.append(NamedCount(name=source_labels.get(src, src or "Unknown"), count=int(n)))
     sources.sort(key=lambda s: s.count, reverse=True)
 
     avg_days = None
-    contacted = (db.query(func.avg(func.datediff(func.now(), ResumePoolEntry.last_contact_at)))
-                   .filter(ResumePoolEntry.company_id == cid,
-                           ResumePoolEntry.last_contact_at.isnot(None)).scalar())
+    # UTC_TIMESTAMP(), not NOW(): last_contact_at is written with datetime.utcnow() and
+    # no session time_zone is set, so NOW() would measure the gap between UTC data and
+    # the server's local clock - 5.5 hours of it on an IST host. The per-row
+    # `days_since_contact` in _entry_to_result already uses UTC; these two have to agree.
+    contacted = (agg(func.avg(func.datediff(func.utc_timestamp(),
+                                            ResumePoolEntry.last_contact_at)))
+                 .filter(ResumePoolEntry.last_contact_at.isnot(None)).scalar())
     if contacted is not None:
         avg_days = round(float(contacted), 1)
 
     cutoff = datetime.utcnow() - timedelta(days=30)
 
+    # One scan for all six buckets. Counting them one COUNT(*) at a time meant six
+    # scans, each re-running up to six correlated EXISTS per row - and every filter
+    # predicate multiplied that.
+    outcome_cols = outcome_sum_columns(db, cid)
     outcome_counts = []
-    for bucket in ("never_applied", "in_process", "offer", "hired", "declined", "rejected"):
-        predicate = outcome_filter(db, cid, bucket)
-        n = base.filter(predicate).count() if predicate is not None else 0
-        if n:
-            outcome_counts.append(NamedCount(name=bucket, count=n))
+    if total:
+        row = agg(*[col for _, col in outcome_cols]).one()
+        outcome_counts = [NamedCount(name=name, count=int(row[i] or 0))
+                          for i, (name, _) in enumerate(outcome_cols) if row[i]]
 
+    # Whole-pool on purpose - see the docstring.
     unscored, unscoreable = count_unscored(db, cid)
+
+    # ── Additions over time ───────────────────────────────────────────────────
+    start, end, granularity = _trend_window(filters)
+    window = [ResumePoolEntry.uploaded_at >= start, ResumePoolEntry.uploaded_at <= end]
+    if granularity == "week":
+        # YEARWEEK mode 3 is ISO: weeks start Monday and week 1 is the one with four
+        # days in the new year. Modes that read default_week_format make the chart
+        # depend on a server setting.
+        bucket = func.yearweek(ResumePoolEntry.uploaded_at, 3)
+        key_of = lambda d: int(d.strftime("%G%V"))
+    else:
+        # The format string is bound as a parameter, so its % escapes never reach the
+        # DBAPI's own interpolation.
+        bucket = func.date_format(ResumePoolEntry.uploaded_at, "%Y-%m")
+        key_of = lambda d: d.strftime("%Y-%m")
+
+    trend_rows = dict(agg(bucket, func.count(ResumePoolEntry.id))
+                      .filter(*window).group_by(bucket).all())
+    trend_rows = {(int(k) if granularity == "week" else str(k)): int(v)
+                  for k, v in trend_rows.items() if k is not None}
+    added_over_time = [
+        TrendPoint(
+            period=d.strftime("%Y-%m-%d"),
+            label=d.strftime("%d %b") if granularity == "week" else d.strftime("%b %Y"),
+            count=trend_rows.get(key_of(d), 0),
+        )
+        for d in _trend_periods(start, end, granularity)
+    ]
+
+    # ── Match-score distribution ──────────────────────────────────────────────
+    band_of = func.floor(ResumePoolEntry.best_score / 10)
+    band_rows = dict(agg(band_of, func.count(ResumePoolEntry.id))
+                     .filter(ResumePoolEntry.best_score.isnot(None))
+                     .group_by(band_of).all())
+    band_counts: Dict[int, int] = {}
+    for raw, n in band_rows.items():
+        if raw is None:
+            continue
+        # A perfect 100 floors to 10; it belongs in the top band, not an eleventh one.
+        band_counts[min(int(raw), 9)] = band_counts.get(min(int(raw), 9), 0) + int(n)
+    score_bands = [
+        BandCount(band=f"{i * 10}-{100 if i == 9 else i * 10 + 9}",
+                  floor=i * 10, count=band_counts.get(i, 0))
+        for i in range(10)
+    ]
+    # "Never ranked" is not "scored zero" - it must never land in the 0-9 bar.
+    unscored_in_view = int(agg(func.count(ResumePoolEntry.id))
+                           .filter(ResumePoolEntry.best_score.is_(None)).scalar() or 0)
+    avg_score_raw = agg(func.avg(ResumePoolEntry.best_score)).scalar()
+
+    def _top(column, limit: int = 10) -> List[NamedCount]:
+        """The most common values of one free-form column in the current view.
+
+        Grouped on TRIM() only. `college` and `job_role` are typed by hand and parsed
+        out of resumes, so "IIT Madras" and "I.I.T. Madras" stay two rows - the card
+        says so rather than presenting this grouping as authoritative.
+        """
+        key = func.trim(column)
+        rows = (agg(key, func.count(ResumePoolEntry.id))
+                .filter(column.isnot(None), key != "")
+                .group_by(key)
+                .order_by(desc(func.count(ResumePoolEntry.id)))
+                .limit(limit).all())
+        return [NamedCount(name=str(name), count=int(n)) for name, n in rows]
 
     return TalentPoolMetrics(
         unscored=unscored,
         unscoreable=unscoreable,
-        total=base.count(),
+        total=total,
+        pool_total=pool_total,
         new_count=counts["new"],
         ongoing_count=counts["ongoing"],
         archived_count=counts["archived"],
@@ -1444,10 +1724,47 @@ async def talent_pool_metrics(
         sources=sources,
         outcomes=outcome_counts,
         avg_days_since_contact=avg_days,
-        never_contacted=base.filter(ResumePoolEntry.last_contact_at.is_(None)).count(),
-        added_last_30_days=base.filter(ResumePoolEntry.uploaded_at >= cutoff).count(),
-        with_resume=base.filter(ResumePoolEntry.resume_path.isnot(None)).count(),
+        never_contacted=int(agg(func.count(ResumePoolEntry.id))
+                            .filter(ResumePoolEntry.last_contact_at.is_(None)).scalar() or 0),
+        added_last_30_days=int(agg(func.count(ResumePoolEntry.id))
+                               .filter(ResumePoolEntry.uploaded_at >= cutoff).scalar() or 0),
+        with_resume=int(agg(func.count(ResumePoolEntry.id))
+                        .filter(ResumePoolEntry.resume_path.isnot(None)).scalar() or 0),
+        added_over_time=added_over_time,
+        trend_granularity=granularity,
+        score_bands=score_bands,
+        unscored_in_view=unscored_in_view,
+        avg_score=round(float(avg_score_raw), 1) if avg_score_raw is not None else None,
+        top_colleges=_top(ResumePoolEntry.college),
+        top_roles=_top(ResumePoolEntry.job_role),
     )
+
+
+@router.get("/talent-pool/skills", response_model=TalentPoolSkills)
+async def talent_pool_skills(
+    filters: PoolFilters = Depends(),
+    current_user: User = Depends(AuthMiddleware.get_current_hr),
+    db: Session = Depends(get_db),
+):
+    """Skills supply against demand: can we staff the roles we have open?
+
+    Takes the same filters as `/resume-pool` and `/talent-pool/metrics`, through the
+    same dependency, so supply describes exactly the people the Candidates list would
+    show. Demand stays company-wide on purpose — narrowing the pool to 2024 graduates
+    does not change what the open roles need, and letting the gap shrink as you filter
+    would make the number worthless.
+
+    Kept off `/talent-pool/metrics` deliberately: this one parses JSON for the whole
+    filtered set, a different cost profile, and the Dashboard tab should not pay for it.
+    """
+    from src.services.talent_pool_skills import skill_report
+
+    preds = _pool_predicates(db, current_user.company_id, filters)
+    try:
+        return TalentPoolSkills(**skill_report(db, current_user.company_id, preds))
+    except Exception as e:
+        logger.error(f"Talent pool skills report failed: {e}")
+        raise HTTPException(status_code=500, detail="Could not build the skills report.")
 
 
 @router.post("/talent-pool/score-backlog", response_model=ScoreBacklogResponse)

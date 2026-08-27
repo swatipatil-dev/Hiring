@@ -1536,3 +1536,214 @@
   .rm-intake { padding: 34px 18px; }
   .rm-dropveil__frame { padding: 32px 26px; }
 }
+
+/* ─── Dashboard grid ───────────────────────────────────────
+   .tp-panel is a single column; these rows sit inside it and split. auto-fit with a
+   min track means a narrow window folds them back to one column without a query, and
+   a chart never gets squeezed below the width its axis labels need. */
+
+.rm-page .tp-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 18px;
+}
+
+.rm-page .tp-grid--3 {
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+}
+
+/* Recharts measures its parent, so the parent has to have a height of its own. */
+.rm-page .tp-figure {
+  margin-top: 16px;
+  width: 100%;
+}
+
+/* Recharts writes inline styles onto its SVG text; keep the type consistent with the
+   rest of the page rather than letting the library's defaults through. */
+.rm-page .tp-figure .recharts-text {
+  font-family: var(--rm-mono);
+  font-size: 0.68rem;
+  fill: var(--text-tertiary);
+}
+
+.rm-page .tp-figure .recharts-cartesian-grid line {
+  shape-rendering: crispEdges;
+}
+
+/* ─── View scope ───────────────────────────────────────────
+   How much of the pool is on screen. Reads as a plain line when nothing is filtered
+   and lights up when something is — the whole point is that a filtered dashboard
+   cannot be mistaken for the full one. */
+
+.rm-page .tp-scope {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  padding: 12px 16px;
+  border: 1px solid var(--rm-rule);
+  border-radius: 12px;
+  background: var(--surface-card);
+}
+
+.rm-page .tp-scope--on {
+  border-color: #b8cfe9;
+  background: #f4f8fd;
+}
+
+.rm-page .tp-scope__count {
+  font-size: 0.95rem;
+  color: var(--text-primary);
+}
+
+.rm-page .tp-scope__count strong {
+  font-family: var(--font-display);
+  font-size: 1.15rem;
+  font-weight: 700;
+  letter-spacing: -0.015em;
+}
+
+.rm-page .tp-scope__note {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+
+/* Pushed to the far end so it never reads as part of the sentence. */
+.rm-page .tp-scope__clear {
+  margin-left: auto;
+}
+
+/* A filter matching nobody is a normal answer, not an error — no alert styling. */
+.rm-page .tp-card--empty {
+  text-align: center;
+  padding: 34px 20px 30px;
+}
+
+.rm-page .tp-card--empty .tp-card__sub {
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.rm-page .tp-card--empty .tp-card__actions {
+  justify-content: center;
+}
+
+/* ─── Skills: supply vs demand ─────────────────────────────
+   One row per demanded skill. Bar length encodes people-in-pool only — demand rides
+   alongside as a badge, because roles (1–5) and candidates (0–hundreds) are nowhere
+   near the same scale and drawing both would make the smaller need look larger. */
+
+.rm-page .tp-skills {
+  list-style: none;
+  margin: 18px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.rm-page .tp-skill__row {
+  display: grid;
+  grid-template-columns: minmax(110px, 200px) 82px minmax(0, 1fr) 96px auto;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+}
+
+/* Only rows with someone behind them are clickable, so only those look it. */
+.rm-page .tp-skill--link .tp-skill__row {
+  cursor: pointer;
+}
+.rm-page .tp-skill--link .tp-skill__row:hover {
+  background: var(--bg-tertiary);
+}
+
+.rm-page .tp-skill__name {
+  font-weight: 550;
+  font-size: 0.88rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rm-page .tp-skill__roles {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--rm-mono);
+  font-size: 0.68rem;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+}
+
+.rm-page .tp-skill__track {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--bg-tertiary);
+  overflow: hidden;
+}
+
+.rm-page .tp-skill__fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+}
+
+/* The same warm status ramp the ATS score bands use, so "weak" means one thing across
+   the app. Never load-bearing — the count beside it says the number in words. */
+.rm-page .tp-skill__fill--weak { background: var(--rm-weak); }
+.rm-page .tp-skill__fill--fair { background: var(--rm-fair); }
+.rm-page .tp-skill__fill--good { background: var(--rm-good); }
+
+.rm-page .tp-skill__count {
+  font-family: var(--rm-mono);
+  font-size: 0.72rem;
+  text-align: right;
+  white-space: nowrap;
+}
+.rm-page .tp-skill__count--weak { color: var(--rm-weak); font-weight: 600; }
+.rm-page .tp-skill__count--fair { color: var(--text-secondary); }
+.rm-page .tp-skill__count--good { color: var(--text-secondary); }
+
+.rm-page .tp-skill__go {
+  color: var(--text-tertiary);
+  opacity: 0;
+}
+.rm-page .tp-skill--link .tp-skill__row:hover .tp-skill__go,
+.rm-page .tp-skill--link .tp-skill__row:focus-visible .tp-skill__go {
+  opacity: 1;
+}
+
+/* Secondary to the row above it, and indented under the skill it qualifies. */
+.rm-page .tp-skill__related {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: -2px 0 6px 10px;
+  font-size: 0.76rem;
+  color: var(--text-tertiary);
+}
+
+/* A filter with no control of its own — set by clicking a skill, so it needs somewhere
+   to be visible and removable. */
+.rm-page .rm-chip--filter {
+  align-self: center;
+  background: #f4f8fd;
+  border-color: #b8cfe9;
+}
+
+@media (max-width: 720px) {
+  /* The bar is the first thing to give up its width; name and count carry the meaning. */
+  .rm-page .tp-skill__row {
+    grid-template-columns: minmax(90px, 1fr) 72px 84px;
+  }
+  .rm-page .tp-skill__track,
+  .rm-page .tp-skill__go { display: none; }
+}

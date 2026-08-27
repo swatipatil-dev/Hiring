@@ -5,7 +5,7 @@ Handles user management, department creation, system configuration, and analytic
 
 from fastapi import APIRouter, HTTPException, status, Depends, UploadFile, File
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import func, desc, case, extract
+from sqlalchemy import func, desc, case, extract, or_
 from datetime import date
 from typing import List, Optional
 import json
@@ -101,6 +101,24 @@ class UserResponse(BaseModel):
     phone: Optional[str]
     is_active: bool
     created_at: datetime
+
+class UserListResponse(BaseModel):
+    """Paged envelope for the admin user list.
+
+    `total` is the count *before* skip/limit, so the UI can render "showing
+    X–Y of Z" and page without guessing whether another page exists.
+    """
+    users: List[UserResponse]
+    total: int
+
+
+class RoleCounts(BaseModel):
+    all: int
+    admin: int
+    hr: int
+    interviewer: int
+    candidate: int
+
 
 class DepartmentResponse(BaseModel):
     id: str
@@ -243,29 +261,107 @@ async def create_interviewer_user(
     
     return create_user_response(user)
 
-@router.get("/users", response_model=List[UserResponse])
+USER_ROLES = ["admin", "hr", "interviewer", "candidate"]
+
+
+def _visible_users_query(db: Session, company_id: Optional[str]):
+    """Base query for users this admin may see.
+
+    Everyone in their company, *plus* candidates who applied to it from another
+    portal: a bare HireFlow sign-up lands in the platform org (see
+    `src/auth.py` create_user and `routes/auth_routes.py` register), so their
+    `users.company_id` is Innomax even though the application row they later
+    created is ours. Matching on `candidates.company_id` as well is what makes
+    those applicants visible under the Candidate category.
+
+    Tenancy note: `src/tenancy/events.py` auto-injects `company_id == <current>`
+    into queries on TenantScoped models *unless the WHERE clause already names
+    `<table>.company_id`. Both arms of the or_ name `users.company_id` and the
+    subquery names `candidates.company_id`, so the auto-filter stands down and
+    the union survives. Do not drop those explicit comparisons — the auto-filter
+    would re-add `AND users.company_id = me` and silently undo the union.
+    """
+    query = db.query(User).filter(User.role != "superadmin")
+    if not company_id:
+        return query
+
+    applicant_ids = (
+        db.query(Candidate.user_id)
+          .filter(Candidate.company_id == company_id, Candidate.user_id.isnot(None))
+    )
+    return query.filter(
+        or_(User.company_id == company_id, User.id.in_(applicant_ids))
+    )
+
+
+@router.get("/users/counts", response_model=RoleCounts)
+async def get_user_counts(
+    current_user: User = Depends(AuthMiddleware.get_current_admin),
+    db: Session = Depends(get_db)
+):
+    """Per-role user counts for the admin Users tab bar.
+
+    Scoped identically to GET /users so a tab's badge always matches the number
+    of rows that tab actually lists.
+    """
+    base = _visible_users_query(db, current_user.company_id)
+    rows = base.with_entities(User.role, func.count(User.id)).group_by(User.role).all()
+
+    counts = {role: 0 for role in USER_ROLES}
+    for role, count in rows:
+        if role in counts:
+            counts[role] = count
+    counts["all"] = sum(counts[role] for role in USER_ROLES)
+    return RoleCounts(**counts)
+
+
+@router.get("/users", response_model=UserListResponse)
 async def get_users(
     skip: int = 0,
     limit: int = 50,
     role: Optional[str] = None,
     is_active: Optional[bool] = None,
+    search: Optional[str] = None,
     current_user: User = Depends(AuthMiddleware.get_current_admin),
     db: Session = Depends(get_db)
 ):
-    """Get all users with optional filtering"""
-    query = db.query(User).filter(User.role != "superadmin")
-    if current_user.company_id:
-        query = query.filter(User.company_id == current_user.company_id)
+    """Get users with optional role / status / text filtering, paged.
+
+    Search runs server-side so it spans every page, not just the rows the client
+    happens to have loaded.
+    """
+    query = _visible_users_query(db, current_user.company_id)
 
     if role:
         query = query.filter(User.role == role)
-    
+
     if is_active is not None:
         query = query.filter(User.is_active == is_active)
-    
-    users = query.order_by(User.created_at.desc()).offset(skip).limit(limit).all()
-    
-    return [create_user_response(user) for user in users]
+
+    if search and search.strip():
+        term = f"%{search.strip()}%"
+        query = query.filter(or_(
+            User.first_name.ilike(term),
+            User.last_name.ilike(term),
+            User.email.ilike(term),
+        ))
+
+    total = query.count()
+    # `id` is the tiebreaker, not decoration: created_at is a second-resolution
+    # DATETIME, so users created in the same second sort arbitrarily and
+    # skip/limit would drop or repeat rows between pages.
+    users = (
+        query.order_by(User.created_at.desc(), User.id.desc())
+             .offset(skip).limit(limit).all()
+    )
+
+    # Returned as a dict so FastAPI coerces each row against UserResponse.
+    # create_user_response() builds src.auth.UserResponse — a distinct class with
+    # the same fields — which pydantic would reject if constructed directly here.
+    return {
+        "users": [create_user_response(user) for user in users],
+        "total": total,
+    }
 
 @router.put("/users/{user_id}/status")
 async def update_user_status(

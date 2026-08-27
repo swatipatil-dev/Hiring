@@ -2,12 +2,13 @@ import React, { useCallback, useEffect, useRef, useState } from 'react'
 import {
   FileSearch, Upload, X, ChevronDown, ChevronRight, ChevronLeft, CheckCircle2,
   AlertCircle, Download, RefreshCw, Trash2, UserPlus, Search, SlidersHorizontal, Users,
-  Pencil, PhoneCall, Paperclip, Save, Check, GraduationCap,
+  Pencil, PhoneCall, Paperclip, Save, Check, GraduationCap, Sparkles,
 } from 'lucide-react'
 import api from '../../api/client'
 import MoveToATSModal from './MoveToATSModal'
 import CandidateForm from './CandidateForm'
-import { OverviewPanel, AnalyticsPanel, SettingsPanel } from './TalentPoolPanels'
+import { DashboardPanel, SettingsPanel } from './TalentPoolPanels'
+import { SkillsPanel } from './TalentPoolSkills'
 import { COLLEGE_GROUPS, ALL_COLLEGES, collegeKey } from '../../data/colleges'
 import './ResumeMatcher.css'
 
@@ -763,8 +764,20 @@ function Chip({ label, onRemove, free }) {
 
 const EMPTY_FILTERS = {
   search: '', college: '', year_of_passing: '', job_role: '', min_score: '',
-  outcome: '', stage: '', source: '', sort: '', uploaded_from: '', uploaded_to: '',
+  outcome: '', stage: '', source: '', sort: '', skill: '',
+  uploaded_from: '', uploaded_to: '',
 }
+
+/**
+ * Identity of a filter set, for "has the dashboard already seen this one?".
+ *
+ * `sort` is excluded on purpose: it reorders a list and cannot change an aggregate,
+ * so re-sorting must not cost a metrics round trip.
+ */
+const filterKey = (f) =>
+  JSON.stringify(Object.entries(f).filter(([k]) => k !== 'sort').sort())
+
+const NO_METRICS = '\u0000'   // a key no real filter set can produce
 
 const SORTS = [
   { value: '', label: 'Best match' },
@@ -773,10 +786,12 @@ const SORTS = [
   { value: 'name', label: 'Name A–Z' },
 ]
 
+// Overview and Analytics were one screen's worth of numbers split across two, so
+// the same count was reachable from two places and could be stale in one of them.
 const TABS = [
-  { value: 'overview', label: 'Overview' },
+  { value: 'dashboard', label: 'Dashboard' },
+  { value: 'skills', label: 'Skills' },
   { value: 'candidates', label: 'Candidates' },
-  { value: 'analytics', label: 'Analytics' },
   { value: 'settings', label: 'Settings' },
 ]
 
@@ -799,8 +814,10 @@ const PAGE_SIZE = 25
 const OUTCOME_TABS = [
   { value: '', label: 'Everyone' },
   { value: 'in_process', label: 'In process' },
-  { value: 'rejected', label: 'Rejected' },
+  { value: 'offer', label: 'Offer out' },
   { value: 'hired', label: 'Hired' },
+  { value: 'declined', label: 'Declined' },
+  { value: 'rejected', label: 'Rejected' },
   { value: 'never_applied', label: 'Never applied' },
 ]
 
@@ -864,7 +881,7 @@ export default function ResumeMatcher() {
   const attachRef = useRef()          // per-profile attachment picker
   const attachTarget = useRef(null)
   const dragDepth = useRef(0)
-  const [tab, setTab] = useState('overview')
+  const [tab, setTab] = useState('dashboard')
   const [metrics, setMetrics] = useState(null)
   const [metricsLoading, setMetricsLoading] = useState(true)
   const [editing, setEditing] = useState(null)   // entry being edited, or {} to add
@@ -890,8 +907,24 @@ export default function ResumeMatcher() {
   const [busyId, setBusyId] = useState(null)
   const [moveTarget, setMoveTarget] = useState(null)
   const [notice, setNotice] = useState('')
+  // Which filter set the currently-held metrics describe. Comparing it to the live
+  // filters is what lets the dashboard skip a refetch it does not need, and what makes
+  // a mutation able to say "these numbers are wrong now" without knowing which ones.
+  const [metricsKey, setMetricsKey] = useState(NO_METRICS)
+  const [skills, setSkills] = useState(null)
+  const [skillsLoading, setSkillsLoading] = useState(false)
+  const [skillsKey, setSkillsKey] = useState(NO_METRICS)
 
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE))
+
+  /** Mark every derived view stale. The effect below refetches whichever is on screen.
+   *  One call rather than one per view: a mutation that moves the charts moves the
+   *  skills too, and remembering to invalidate both at each call site is how one of
+   *  them ends up stale. */
+  const invalidateDerived = useCallback(() => {
+    setMetricsKey(NO_METRICS)
+    setSkillsKey(NO_METRICS)
+  }, [])
 
   const loadPool = useCallback(async (f = filters, p = page) => {
     setListLoading(true)
@@ -920,16 +953,72 @@ export default function ResumeMatcher() {
     }
   }, [filters, page])
 
-  // Re-query on filter or page change. Typing is debounced; paging is not, because a
-  // 300ms lag on a Next click reads as a broken button.
+  const loadMetrics = useCallback(async (f = filters) => {
+    setMetricsLoading(true)
+    try {
+      const params = {}
+      Object.entries(f).forEach(([k, v]) => {
+        // `sort` orders a list and means nothing to an aggregate; the server does not
+        // accept it here and sending it would 422 the whole dashboard.
+        if (k !== 'sort' && v !== '' && v != null) params[k] = v
+      })
+      const r = await api.get('/hr/talent-pool/metrics', { params })
+      setMetrics(r.data)
+      setMetricsKey(filterKey(f))
+    } catch (e) {
+      setError(errText(e, 'Could not load the dashboard metrics.'))
+    } finally {
+      setMetricsLoading(false)
+    }
+  }, [filters])
+
+  const loadSkills = useCallback(async (f = filters) => {
+    setSkillsLoading(true)
+    try {
+      const params = {}
+      Object.entries(f).forEach(([k, v]) => {
+        if (k !== 'sort' && v !== '' && v != null) params[k] = v
+      })
+      const r = await api.get('/hr/talent-pool/skills', { params })
+      setSkills(r.data)
+      setSkillsKey(filterKey(f))
+    } catch (e) {
+      setError(errText(e, 'Could not load the skills report.'))
+    } finally {
+      setSkillsLoading(false)
+    }
+  }, [filters])
+
+  // Re-query on filter, page or tab change. Typing is debounced; paging is not,
+  // because a 300ms lag on a Next click reads as a broken button.
+  //
+  // Only the visible view is fetched. The dashboard and the list take the same filters,
+  // so loading both on every keystroke would double every round trip to keep a hidden
+  // panel warm. The stale one catches up when you switch to it — `metricsKey` is what
+  // remembers whether it needs to.
   const prevFilters = useRef(filters)
   useEffect(() => {
     const filtersChanged = prevFilters.current !== filters
     prevFilters.current = filters
-    const t = setTimeout(() => loadPool(filters, page), filtersChanged ? 300 : 0)
+    const t = setTimeout(() => {
+      if (tab === 'candidates') { loadPool(filters, page); return }
+      // Everything else is a derived view. Settings shows the scoring backlog, so it
+      // needs metrics too. A table rather than a branch per tab, so the next view is a
+      // row here instead of another condition.
+      const want = tab === 'skills'
+        ? [[skillsKey, loadSkills]]
+        : [[metricsKey, loadMetrics]]
+      const key = filterKey(filters)
+      want.forEach(([held, load]) => { if (held !== key) load(filters) })
+    }, filtersChanged ? 300 : 0)
     return () => clearTimeout(t)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filters, page])
+  }, [filters, page, tab, metricsKey, skillsKey])
+
+  // The list backs the Candidates tab, but its response also carries the import
+  // backlog the Settings tab shows and the masthead counts. Fetch it once up front so
+  // those are right before anyone opens that tab.
+  useEffect(() => { loadPool(EMPTY_FILTERS, 0) }, [])   // eslint-disable-line react-hooks/exhaustive-deps
 
   // Any filter change invalidates the current page — page 4 of the old result set is
   // meaningless in the new one.
@@ -1003,6 +1092,7 @@ export default function ResumeMatcher() {
       setPage(0)
       if (hasFilters) setFilters(EMPTY_FILTERS)
       else await loadPool(EMPTY_FILTERS, 0)
+      invalidateDerived()
     } catch (e) {
       setError(errText(e, 'Could not match resumes. Please try again.'))
     } finally {
@@ -1020,6 +1110,7 @@ export default function ResumeMatcher() {
       const r = await api.post('/hr/resume-pool/import-registered', { limit: 50 })
       setNotice(r.data.message)
       await loadPool(filters, page)
+      invalidateDerived()
     } catch (e) {
       setError(errText(e, 'Could not import people into the pool.'))
     } finally {
@@ -1027,24 +1118,10 @@ export default function ResumeMatcher() {
     }
   }
 
-  const loadMetrics = useCallback(async () => {
-    setMetricsLoading(true)
-    try {
-      const r = await api.get('/hr/talent-pool/metrics')
-      setMetrics(r.data)
-    } catch (e) {
-      setError(errText(e, 'Could not load the dashboard metrics.'))
-    } finally {
-      setMetricsLoading(false)
-    }
-  }, [])
-
-  useEffect(() => { loadMetrics() }, [loadMetrics])
-
   /** Replace one row in place and refresh the counts the change affected. */
   const applyUpdate = (data) => {
     setEntries(prev => prev.map(e => (e.id === data.id ? data : e)))
-    loadMetrics()
+    invalidateDerived()
   }
 
   const handleStage = async (entry, stage) => {
@@ -1109,10 +1186,11 @@ export default function ResumeMatcher() {
       setNotice(stopScoring.current
         ? `Stopped after ranking ${done}. The rest keep their place.`
         : `Ranked ${done} ${done === 1 ? 'person' : 'people'}.`)
-      await Promise.all([loadPool(filters, page), loadMetrics()])
+      await loadPool(filters, page)
+      invalidateDerived()
     } catch (e) {
       setError(errText(e, 'Could not rank these candidates.'))
-      loadMetrics()
+      invalidateDerived()
     } finally {
       setScoring(false)
       setScoreProgress('')
@@ -1189,7 +1267,7 @@ export default function ResumeMatcher() {
     try {
       await api.delete(`/hr/resume-pool/${entry.id}/attachments/${file.id}`)
       await loadPool(filters, page)
-      loadMetrics()
+      invalidateDerived()
     } catch (e) {
       setError(errText(e, 'Could not remove that file.'))
     } finally {
@@ -1210,7 +1288,7 @@ export default function ResumeMatcher() {
     } else {
       applyUpdate(data)
     }
-    loadMetrics()
+    invalidateDerived()
   }
 
   const handleRematch = async (entry) => {
@@ -1218,7 +1296,7 @@ export default function ResumeMatcher() {
     setError('')
     try {
       const r = await api.post(`/hr/resume-pool/${entry.id}/rematch`)
-      setEntries(prev => prev.map(e => (e.id === entry.id ? r.data : e)))
+      applyUpdate(r.data)
       setNotice(`Re-matched against ${activeJobCount} open role${activeJobCount === 1 ? '' : 's'}.`)
     } catch (e) {
       setError(errText(e, 'Could not re-match this resume.'))
@@ -1245,6 +1323,7 @@ export default function ResumeMatcher() {
       setTotal(t => Math.max(0, t - 1))
       // Removing the only row on a page would otherwise strand HR on an empty one.
       if (entries.length === 1 && page > 0) setPage(p => p - 1)
+      invalidateDerived()
     } catch (e) {
       setError(errText(e, 'Could not remove this resume.'))
     } finally {
@@ -1258,10 +1337,16 @@ export default function ResumeMatcher() {
     // Reload rather than patching locally: the move created a new application, and
     // both the history list and the outcome bucket are derived server-side.
     await loadPool(filters, page)
+    invalidateDerived()
   }
 
   const pickFiles = () => inputRef.current?.click()
   const showIntakePanel = !listLoading && entries.length === 0 && !hasFilters
+  // Settings has nothing to filter, and an empty pool has nothing to narrow — the
+  // intake screen's job is to get the first resume in.
+  const showFilters = (tab === 'dashboard' || tab === 'skills' || tab === 'candidates')
+    && !(tab === 'candidates' && showIntakePanel)
+    && !(tab === 'dashboard' && !hasFilters && (metrics?.pool_total ?? 0) === 0)
 
   return (
     <div
@@ -1380,27 +1465,20 @@ export default function ResumeMatcher() {
         </div>
       )}
 
-      {tab === 'overview' && (
-        <OverviewPanel
-          metrics={metrics}
-          loading={metricsLoading}
-          onOpenStage={(stage) => { setTab('candidates'); setFilter('stage', stage) }}
-          scoring={scoring} progress={scoreProgress}
-          onScore={runScoring} onStop={() => { stopScoring.current = true }}
-        />
-      )}
-      {tab === 'analytics' && <AnalyticsPanel metrics={metrics} loading={metricsLoading} />}
       {tab === 'settings' && (
         <SettingsPanel
           metrics={metrics} pending={pending} importing={importing}
-          onImport={runImport} onRefresh={loadMetrics} busy={metricsLoading}
+          onImport={runImport} onRefresh={() => loadMetrics(filters)} busy={metricsLoading}
           scoring={scoring} progress={scoreProgress}
           onScore={runScoring} onStop={() => { stopScoring.current = true }}
         />
       )}
 
-      {/* ── Filters ────────────────────────────────────────────── */}
-      {tab === 'candidates' && !showIntakePanel && (
+      {/* ── Filters ────────────────────────────────────────────────
+          Shared by the Dashboard and the Candidates list, and rendered above both,
+          because they narrow both. One filter state, one set of controls: a chart
+          that disagrees with the list underneath it is worse than no chart. */}
+      {showFilters && (
         <div className="rm-filters" style={{ marginTop: 20 }}>
           {/* Outcome is the primary axis of this screen, so it gets a rail rather than
               being buried in a select alongside the incidental filters. */}
@@ -1435,12 +1513,28 @@ export default function ResumeMatcher() {
               <option value="registered">Registered on portal</option>
               <option value="applied">Added by HR</option>
             </select>
-            <select className="select" style={{ flex: '0 1 150px' }} aria-label="Sort by"
-                    value={filters.sort} onChange={e => setFilter('sort', e.target.value)}>
-              {SORTS.map(s => (
-                <option key={s.value || 'best'} value={s.value}>Sort: {s.label}</option>
-              ))}
-            </select>
+            {/* Ordering a list cannot change an aggregate, so this one stays on the
+                tab that has a list. */}
+            {tab === 'candidates' && (
+              <select className="select" style={{ flex: '0 1 150px' }} aria-label="Sort by"
+                      value={filters.sort} onChange={e => setFilter('sort', e.target.value)}>
+                {SORTS.map(s => (
+                  <option key={s.value || 'best'} value={s.value}>Sort: {s.label}</option>
+                ))}
+              </select>
+            )}
+            {/* Arrived by clicking a skill on the Skills tab, so it has no control of
+                its own — without a chip the list would look inexplicably short. */}
+            {filters.skill && (
+              <span className="rm-chip rm-chip--filter">
+                <Sparkles size={12} />
+                <span className="rm-chip__name">{filters.skill}</span>
+                <button onClick={() => setFilter('skill', '')}
+                        aria-label={`Remove the ${filters.skill} filter`}>
+                  <X size={12} />
+                </button>
+              </span>
+            )}
             <button className="rm-act" onClick={() => setShowMoreFilters(s => !s)}
                     aria-expanded={showMoreFilters}>
               <SlidersHorizontal size={14} /> More filters
@@ -1471,6 +1565,28 @@ export default function ResumeMatcher() {
             </div>
           )}
         </div>
+      )}
+
+      {tab === 'dashboard' && (
+        <DashboardPanel
+          metrics={metrics}
+          loading={metricsLoading}
+          filtered={hasFilters}
+          onClear={clearFilters}
+          onOpenStage={(stage) => { setTab('candidates'); setFilter('stage', stage) }}
+          scoring={scoring} progress={scoreProgress}
+          onScore={runScoring} onStop={() => { stopScoring.current = true }}
+        />
+      )}
+
+      {tab === 'skills' && (
+        <SkillsPanel
+          skills={skills}
+          loading={skillsLoading}
+          filtered={hasFilters}
+          onClear={clearFilters}
+          onPickSkill={(skill) => { setTab('candidates'); setFilter('skill', skill) }}
+        />
       )}
 
       {/* ── Records ────────────────────────────────────────────── */}

@@ -1193,3 +1193,475 @@ def test_hard_delete_does_not_duplicate_a_candidate_moved_from_the_pool(
     assert len(rows) == 1, f"the person was split into {len(rows)} pool rows"
     assert rows[0].id == entry_id, "a second entry was created instead of reusing theirs"
     assert json.loads(rows[0].archived_applications)[0]["job_title"] == "Backend Engineer"
+
+
+# ── Dashboard: the same filters, over aggregates ─────────────────────────────
+#
+# The dashboard sits above the Candidates list and describes it. If the two ever
+# disagree about who is in view, the charts are lying — so the load-bearing test here
+# is not any single number, it is that `metrics.total` and the list's `total` are
+# equal for every filter.
+
+def _metrics(client, hr_headers, **params):
+    r = client.get("/api/v1/hr/talent-pool/metrics", headers=hr_headers, params=params)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def _list_total(client, hr_headers, **params):
+    r = client.get("/api/v1/hr/resume-pool", headers=hr_headers, params=params)
+    assert r.status_code == 200, r.text
+    return r.json()["total"]
+
+
+def _dashboard_fixture(db, company):
+    """Six people spread across college, year, stage and score."""
+    _pool_row(db, company, email="a@x.com", college="IIT Madras",
+              year_of_passing=2024, job_role="Backend Engineer", best_score=91.0)
+    _pool_row(db, company, email="b@x.com", college="IIT Madras",
+              year_of_passing=2024, job_role="Backend Engineer", best_score=72.5)
+    _pool_row(db, company, email="c@x.com", college="IIT Madras",
+              year_of_passing=2023, job_role="Data Analyst", best_score=55.0)
+    _pool_row(db, company, email="d@x.com", college="NIT Trichy",
+              year_of_passing=2024, job_role="Backend Engineer", best_score=40.0)
+    _pool_row(db, company, email="e@x.com", college="NIT Trichy",
+              year_of_passing=2022, job_role="Data Analyst")
+    _pool_row(db, company, email="f@x.com", college="  BITS Pilani  ",
+              year_of_passing=2024, job_role="Designer", best_score=100.0)
+
+
+@pytest.mark.parametrize("params", [
+    {},
+    {"college": "IIT Madras"},
+    {"year_of_passing": 2024},
+    {"college": "IIT Madras,NIT Trichy", "year_of_passing": 2024},
+    {"job_role": "Backend"},
+    {"min_score": 70},
+    {"stage": "new"},
+    {"search": "Data"},
+    {"college": "Nobody Went Here"},
+])
+def test_dashboard_total_always_matches_the_list_it_describes(
+        client, db, hr_headers, hr_company, params):
+    """The invariant the whole feature rests on.
+
+    Both endpoints take the same PoolFilters dependency and the same predicate list, so
+    this holds by construction — which is precisely why it is worth pinning down. The
+    moment someone re-declares a filter on one side, this fails.
+    """
+    _dashboard_fixture(db, hr_company)
+    assert _metrics(client, hr_headers, **params)["total"] == \
+        _list_total(client, hr_headers, **params)
+
+
+def test_pool_total_stays_whole_pool_under_a_filter(client, db, hr_headers, hr_company):
+    """`total` narrows, `pool_total` does not — that pair is how the UI says
+    "312 of 4,180" instead of leaving the reader to guess a filter is on."""
+    _dashboard_fixture(db, hr_company)
+    m = _metrics(client, hr_headers, college="IIT Madras")
+    assert m["total"] == 3
+    assert m["pool_total"] == 6
+
+
+def test_the_scoring_backlog_ignores_the_filter(client, db, hr_headers, hr_company):
+    """`unscored`/`unscoreable` drive "Rank all N", and score_backlog() ranks the whole
+    backlog rather than the current view. A filtered count would promise something the
+    button does not do."""
+    _make_job(db, hr_company)
+    _pool_row(db, hr_company, email="scored@x.com", college="IIT Madras",
+              resume_text="text", best_score=70.0)
+    _pool_row(db, hr_company, email="waiting@x.com", college="NIT Trichy",
+              resume_text="text")
+    _pool_row(db, hr_company, email="cannot@x.com", college="NIT Trichy")
+
+    m = _metrics(client, hr_headers, college="IIT Madras")
+    assert m["total"] == 1, "the filter should still narrow everything else"
+    assert m["unscored"] == 1
+    assert m["unscoreable"] == 1
+
+
+def test_score_bands_are_filtered_and_never_absorb_the_unscored(
+        client, db, hr_headers, hr_company):
+    """A NULL score is "never ranked", not "scored zero" — putting it in the 0-9 bar
+    would invent a cohort of terrible candidates out of people nobody has ranked."""
+    _dashboard_fixture(db, hr_company)
+    m = _metrics(client, hr_headers, college="IIT Madras")
+
+    bands = {b["floor"]: b["count"] for b in m["score_bands"]}
+    assert len(m["score_bands"]) == 10, "all ten bands present, zero-filled"
+    assert bands[90] == 1        # 91.0
+    assert bands[70] == 1        # 72.5
+    assert bands[50] == 1        # 55.0
+    assert bands[0] == 0, "nobody scored 0-9"
+    assert sum(bands.values()) == 3
+
+    unfiltered = _metrics(client, hr_headers)
+    assert unfiltered["unscored_in_view"] == 1, "e@x.com has no score"
+    assert {b["floor"]: b["count"] for b in unfiltered["score_bands"]}[0] == 0
+
+
+def test_a_perfect_score_lands_in_the_top_band(client, db, hr_headers, hr_company):
+    """FLOOR(100/10) is 10, which is an eleventh band that must not exist."""
+    _pool_row(db, hr_company, email="perfect@x.com", best_score=100.0)
+    bands = {b["floor"]: b["count"] for b in _metrics(client, hr_headers)["score_bands"]}
+    assert bands[90] == 1
+    assert max(bands) == 90
+
+
+def test_band_boundaries_split_at_the_ten(client, db, hr_headers, hr_company):
+    _pool_row(db, hr_company, email="just_under@x.com", best_score=79.99)
+    _pool_row(db, hr_company, email="just_over@x.com", best_score=80.00)
+    bands = {b["floor"]: b["count"] for b in _metrics(client, hr_headers)["score_bands"]}
+    assert bands[70] == 1
+    assert bands[80] == 1
+
+
+def test_avg_score_follows_the_filter(client, db, hr_headers, hr_company):
+    _dashboard_fixture(db, hr_company)
+    assert _metrics(client, hr_headers, college="NIT Trichy")["avg_score"] == 40.0
+    assert _metrics(client, hr_headers, college="Nobody Went Here")["avg_score"] is None
+
+
+def test_top_colleges_and_roles_rank_within_the_filter(client, db, hr_headers, hr_company):
+    _dashboard_fixture(db, hr_company)
+
+    everyone = _metrics(client, hr_headers)
+    colleges = [c["name"] for c in everyone["top_colleges"]]
+    assert colleges[0] == "IIT Madras", "most common first"
+    assert "BITS Pilani" in colleges, "grouped on TRIM(), so the padded row joins in"
+
+    narrowed = _metrics(client, hr_headers, year_of_passing=2024)
+    assert {c["name"]: c["count"] for c in narrowed["top_colleges"]} == {
+        "IIT Madras": 2, "NIT Trichy": 1, "BITS Pilani": 1,
+    }
+    assert [r["name"] for r in narrowed["top_roles"]][0] == "Backend Engineer"
+
+
+def test_the_trend_is_zero_filled(client, db, hr_headers, hr_company):
+    """MySQL returns no row for a week nobody joined. Charting only what came back
+    closes the gap and draws a flat line over a hiring freeze."""
+    from datetime import datetime, timedelta
+
+    now = datetime.utcnow()
+    _pool_row(db, hr_company, email="old@x.com", uploaded_at=now - timedelta(days=60))
+    _pool_row(db, hr_company, email="new@x.com", uploaded_at=now)
+
+    # "to: today" in a date picker, not this exact instant: uploaded_at is a
+    # 0-precision DATETIME and MySQL rounds the fractional seconds up on insert.
+    m = _metrics(client, hr_headers,
+                 uploaded_from=(now - timedelta(days=70)).isoformat(),
+                 uploaded_to=(now + timedelta(days=1)).isoformat())
+
+    assert m["trend_granularity"] == "week", "a 71-day window is too short for months"
+    counts = [p["count"] for p in m["added_over_time"]]
+    assert sum(counts) == 2
+    assert len(counts) > 2, "the empty weeks between them are present"
+    assert 0 in counts
+
+
+def test_the_trend_switches_to_months_over_a_long_window(client, db, hr_headers, hr_company):
+    from datetime import datetime, timedelta
+
+    now = datetime.utcnow()
+    _pool_row(db, hr_company, email="a@x.com", uploaded_at=now)
+    m = _metrics(client, hr_headers,
+                 uploaded_from=(now - timedelta(days=300)).isoformat(),
+                 uploaded_to=(now + timedelta(days=1)).isoformat())
+    assert m["trend_granularity"] == "month"
+    assert sum(p["count"] for p in m["added_over_time"]) == 1
+
+
+def test_the_dashboard_is_scoped_to_the_company(client, db, hr_headers, hr_company):
+    """Every new aggregate, not just `total` — one leak is enough."""
+    other = Company(id=_uid(), name="Rival Ltd", slug=f"rival-{_uid()[:8]}")
+    db.add(other)
+    db.flush()
+    _pool_row(db, other, email="theirs@x.com", college="Rival College",
+              job_role="Their Role", best_score=88.0)
+    _pool_row(db, hr_company, email="ours@x.com", college="Our College",
+              job_role="Our Role", best_score=61.0)
+
+    m = _metrics(client, hr_headers)
+    assert m["total"] == 1
+    assert m["pool_total"] == 1
+    assert [c["name"] for c in m["top_colleges"]] == ["Our College"]
+    assert [r["name"] for r in m["top_roles"]] == ["Our Role"]
+    assert m["avg_score"] == 61.0
+    assert sum(p["count"] for p in m["added_over_time"]) == 1
+    assert sum(b["count"] for b in m["score_bands"]) == 1
+
+
+def test_an_empty_slice_returns_a_renderable_shape(client, db, hr_headers, hr_company):
+    """A filter matching nobody must still return every series, so the UI shows an
+    empty state instead of crashing on a missing key."""
+    _dashboard_fixture(db, hr_company)
+    m = _metrics(client, hr_headers, college="Nobody Went Here")
+
+    assert m["total"] == 0
+    assert m["outcomes"] == []
+    assert m["sources"] == []
+    assert m["top_colleges"] == []
+    assert m["top_roles"] == []
+    assert len(m["score_bands"]) == 10 and all(b["count"] == 0 for b in m["score_bands"])
+    assert all(p["count"] == 0 for p in m["added_over_time"])
+    assert m["avg_score"] is None
+
+
+def test_outcome_counts_survive_a_filter(client, db, hr_headers, hr_company):
+    """The single-pass SUM(CASE) rewrite has to stay filterable, and the buckets have
+    to stay exclusive within the filtered set."""
+    job = _make_job(db, hr_company)
+    user = _make_registered_user(db, hr_company, "applicant@x.com")
+    db.add(Candidate(id=_uid(), company_id=hr_company.id, user_id=user.id,
+                     email="applicant@x.com", first_name="Anjali", last_name="Rao",
+                     job_id=job.id, current_stage="hr_review"))
+    db.flush()
+    _pool_row(db, hr_company, email="applicant@x.com", source_user_id=user.id,
+              college="IIT Madras")
+    _pool_row(db, hr_company, email="quiet@x.com", college="NIT Trichy")
+
+    inside = _metrics(client, hr_headers, college="IIT Madras")
+    assert {o["name"]: o["count"] for o in inside["outcomes"]} == {"in_process": 1}
+
+    outside = _metrics(client, hr_headers, college="NIT Trichy")
+    assert {o["name"]: o["count"] for o in outside["outcomes"]} == {"never_applied": 1}
+
+    everyone = _metrics(client, hr_headers)
+    assert sum(o["count"] for o in everyone["outcomes"]) == everyone["total"]
+
+
+def test_the_list_rejects_nonsense_paging(client, db, hr_headers, hr_company):
+    """`limit=-1` used to reach MySQL as `LIMIT -1`. The dashboard re-queries on every
+    keystroke, so the list's parameters are worth bounding."""
+    assert client.get("/api/v1/hr/resume-pool", headers=hr_headers,
+                      params={"limit": -1}).status_code == 422
+    assert client.get("/api/v1/hr/resume-pool", headers=hr_headers,
+                      params={"skip": -5}).status_code == 422
+    assert client.get("/api/v1/hr/resume-pool", headers=hr_headers,
+                      params={"limit": 5000}).status_code == 422
+
+
+# ── Skills: supply vs demand ─────────────────────────────────────────────────
+#
+# The load-bearing property is not any single count: it is that this tab agrees with
+# the Has/Gaps chips on the candidate card underneath it. Four different skill-matching
+# rules are live in this repo, and the tab mirrors exactly one of them.
+
+def _skills(client, hr_headers, **params):
+    r = client.get("/api/v1/hr/talent-pool/skills", headers=hr_headers, params=params)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def _row(report, skill):
+    """One row of the gap table, by canonical skill name."""
+    return next((r for r in report["demand"] if r["skill"].lower() == skill.lower()), None)
+
+
+def _job_wanting(db, company, skills, title="Platform Engineer", status="active"):
+    job = _make_job(db, company, title=title)
+    job.required_skills = json.dumps(skills)
+    job.status = status
+    db.flush()
+    return job
+
+
+def test_skill_aliases_resolve_supply_against_demand(client, db, hr_headers, hr_company):
+    """A resume saying "k8s" covers a role asking for "Kubernetes".
+
+    Both sides go through the ATS's own alias map, so the tab cannot disagree with the
+    score about whether this person has the skill.
+    """
+    _job_wanting(db, hr_company, ["Kubernetes", "Docker"])
+    _pool_row(db, hr_company, email="a@x.com", extracted_skills=json.dumps(["k8s"]))
+
+    k8s = _row(_skills(client, hr_headers), "Kubernetes")
+    assert k8s is not None, "a demanded skill must appear even when nobody has it"
+    assert k8s["candidates"] == 1, "k8s should have resolved to Kubernetes"
+    assert k8s["roles"] == 1
+
+
+def test_a_cluster_sibling_is_its_own_state_not_a_match(client, db, hr_headers, hr_company):
+    """Docker for Kubernetes is neither "has it" nor "nothing there".
+
+    The ATS computes this third state and then drops it at persist time, so it is
+    invisible everywhere else in the app. It must not be silently folded into either
+    bucket here.
+    """
+    _job_wanting(db, hr_company, ["Kubernetes"])
+    _pool_row(db, hr_company, email="a@x.com", extracted_skills=json.dumps(["Docker"]))
+
+    k8s = _row(_skills(client, hr_headers), "Kubernetes")
+    assert k8s["candidates"] == 0, "Docker is not Kubernetes"
+    assert k8s["related"] == 1
+    assert "Docker" in k8s["related_examples"]
+    # The grouping is named so a recruiter can judge it rather than trust it.
+    assert k8s["related_cluster"]
+
+
+def test_the_headline_counts_only_the_truly_unheld(client, db, hr_headers, hr_company):
+    """`fully_unmet` is the number to act on, so a cluster near-miss must not inflate it."""
+    _job_wanting(db, hr_company, ["Kubernetes", "Rust"])
+    _pool_row(db, hr_company, email="a@x.com", extracted_skills=json.dumps(["Docker"]))
+
+    r = _skills(client, hr_headers)
+    assert r["demanded_skills"] == 2
+    assert r["fully_unmet"] == 1, "Kubernetes has a related holder; only Rust is unmet"
+
+
+def test_the_gap_table_reads_worst_first(client, db, hr_headers, hr_company):
+    """The working order. Ties break on demand: a skill three roles need and nobody has
+    outranks one role needs and nobody has."""
+    _job_wanting(db, hr_company, ["Python", "Rust"], title="A")
+    _job_wanting(db, hr_company, ["Rust"], title="B")
+    _pool_row(db, hr_company, email="a@x.com", extracted_skills=json.dumps(["Python"]))
+
+    demand = _skills(client, hr_headers)["demand"]
+    assert [d["skill"] for d in demand] == ["Rust", "Python"]
+    assert demand[0]["roles"] == 2
+
+
+def test_one_person_counts_once_however_they_spell_it(client, db, hr_headers, hr_company):
+    """A verbose resume must not outvote real people."""
+    _job_wanting(db, hr_company, ["React"])
+    _pool_row(db, hr_company, email="a@x.com",
+              extracted_skills=json.dumps(["React", "react", "ReactJS", "React.js"]))
+
+    assert _row(_skills(client, hr_headers), "React")["candidates"] == 1
+
+
+def test_demand_ignores_roles_that_are_not_open(client, db, hr_headers, hr_company):
+    """A draft or closed posting is not a staffing need."""
+    _job_wanting(db, hr_company, ["Rust"], title="Draft role", status="draft")
+    _job_wanting(db, hr_company, ["Python"], title="Live role")
+
+    r = _skills(client, hr_headers)
+    assert r["active_roles"] == 1
+    assert _row(r, "Rust") is None
+    assert _row(r, "Python") is not None
+
+
+def test_malformed_skill_columns_degrade_rather_than_500(client, db, hr_headers, hr_company):
+    """`admin_routes.py:751` writes the raw Pydantic value with no json.dumps, so a
+    Python repr() can reach these columns. One bad row must not take out the tab — and
+    where the real names are recoverable, they should be recovered."""
+    _job_wanting(db, hr_company, ["Python"])
+    _pool_row(db, hr_company, email="repr@x.com", extracted_skills="['Python', 'React']")
+    _pool_row(db, hr_company, email="junk@x.com", extracted_skills="not json at all")
+    _pool_row(db, hr_company, email="empty@x.com", extracted_skills=None)
+
+    r = _skills(client, hr_headers)
+    assert _row(r, "Python")["candidates"] == 1, "the repr() row should still be readable"
+    assert r["no_skills_on_record"] == 1, "only the NULL row has nothing on record"
+
+
+def test_people_with_no_skills_recorded_are_not_evidence_of_a_gap(
+        client, db, hr_headers, hr_company):
+    """An unparsed resume is not a person who lacks every skill."""
+    _job_wanting(db, hr_company, ["Python"])
+    _pool_row(db, hr_company, email="known@x.com", extracted_skills=json.dumps(["Python"]))
+    _pool_row(db, hr_company, email="unread@x.com", extracted_skills=None)
+
+    r = _skills(client, hr_headers)
+    assert r["people"] == 2
+    assert r["people_with_skills"] == 1
+    assert r["no_skills_on_record"] == 1
+    # Coverage is a share of the people we actually know something about.
+    assert _row(r, "Python")["coverage"] == 100.0
+
+
+def test_the_filter_narrows_supply_but_never_demand(client, db, hr_headers, hr_company):
+    """Filtering to 2024 graduates does not change what the open roles need. If demand
+    shrank with the filter, the gap would vanish as you searched."""
+    _job_wanting(db, hr_company, ["Python", "Rust"])
+    _pool_row(db, hr_company, email="a@x.com", college="IIT Madras",
+              extracted_skills=json.dumps(["Python"]))
+    _pool_row(db, hr_company, email="b@x.com", college="NIT Trichy",
+              extracted_skills=json.dumps(["Python"]))
+
+    everyone = _skills(client, hr_headers)
+    narrowed = _skills(client, hr_headers, college="IIT Madras")
+
+    assert _row(everyone, "Python")["candidates"] == 2
+    assert _row(narrowed, "Python")["candidates"] == 1
+    assert narrowed["active_roles"] == everyone["active_roles"] == 1
+    assert narrowed["demanded_skills"] == everyone["demanded_skills"] == 2
+
+
+def test_skills_are_scoped_to_the_company(client, db, hr_headers, hr_company):
+    """Supply and demand both — another company's roles must not appear as our need."""
+    other = Company(id=_uid(), name="Rival Ltd", slug=f"rival-{_uid()[:8]}")
+    db.add(other)
+    db.flush()
+    _job_wanting(db, other, ["Their Skill"], title="Their role")
+    _job_wanting(db, hr_company, ["Python"], title="Our role")
+    _pool_row(db, other, email="theirs@x.com", extracted_skills=json.dumps(["Their Skill"]))
+    _pool_row(db, hr_company, email="ours@x.com", extracted_skills=json.dumps(["Python"]))
+
+    r = _skills(client, hr_headers)
+    assert r["active_roles"] == 1
+    assert r["people"] == 1
+    assert _row(r, "Their Skill") is None
+    assert [t["skill"] for t in r["top_skills"]] == ["Python"]
+
+
+def test_top_skills_show_what_no_role_asks_for(client, db, hr_headers, hr_company):
+    """The gap table structurally cannot show a strength nobody is hiring for."""
+    _job_wanting(db, hr_company, ["Python"])
+    _pool_row(db, hr_company, email="a@x.com",
+              extracted_skills=json.dumps(["Python", "Figma"]))
+
+    r = _skills(client, hr_headers)
+    assert _row(r, "Figma") is None, "no role asks for it, so it is not a gap"
+    assert "Figma" in [t["skill"] for t in r["top_skills"]]
+
+
+# ── The `skill` filter behind the drill-down ─────────────────────────────────
+
+def test_the_skill_filter_matches_whole_entries_not_substrings(
+        client, db, hr_headers, hr_company):
+    """`search=java` matches "javascript" inside the JSON text, which is fine for a
+    search box and useless for a drill-down claiming to list the people who have Java."""
+    _pool_row(db, hr_company, email="js@x.com", extracted_skills=json.dumps(["JavaScript"]))
+    _pool_row(db, hr_company, email="java@x.com", extracted_skills=json.dumps(["Java"]))
+
+    by_skill = client.get("/api/v1/hr/resume-pool", headers=hr_headers,
+                          params={"skill": "Java"}).json()
+    assert [e["email"] for e in by_skill["results"]] == ["java@x.com"]
+    assert by_skill["total"] == 1
+
+    by_search = client.get("/api/v1/hr/resume-pool", headers=hr_headers,
+                           params={"search": "Java"}).json()
+    assert by_search["total"] == 2, "search is deliberately the blunt one"
+
+
+def test_the_skill_filter_reaches_the_dashboard_too(client, db, hr_headers, hr_company):
+    """It lives in the shared predicate list, so every chart narrows with it and the
+    two views cannot disagree about who is in scope."""
+    _pool_row(db, hr_company, email="a@x.com", extracted_skills=json.dumps(["Python"]))
+    _pool_row(db, hr_company, email="b@x.com", extracted_skills=json.dumps(["Rust"]))
+
+    m = client.get("/api/v1/hr/talent-pool/metrics", headers=hr_headers,
+                   params={"skill": "Python"}).json()
+    lst = client.get("/api/v1/hr/resume-pool", headers=hr_headers,
+                     params={"skill": "Python"}).json()
+    assert m["total"] == lst["total"] == 1
+    assert m["pool_total"] == 2
+
+
+def test_the_skill_filter_survives_hostile_input(client, db, hr_headers, hr_company):
+    """The term is interpolated into a LIKE pattern, so wildcards and quotes must not
+    turn a filter into a match-everything."""
+    _pool_row(db, hr_company, email="a@x.com", extracted_skills=json.dumps(["Python"]))
+
+    # `_` is a single-character LIKE wildcard too, so an unescaped "Pytho_" would match
+    # Python — and a term stripped to nothing would drop the predicate entirely, which
+    # is a filter that silently matches everyone.
+    for term in ('%', '"', '\\', '%%', 'Py%hon', 'Pytho_', '_ython', '%thon', '___%'):
+        r = client.get("/api/v1/hr/resume-pool", headers=hr_headers, params={"skill": term})
+        assert r.status_code == 200, f"{term!r} -> {r.text}"
+        assert r.json()["total"] == 0, f"{term!r} matched somebody"
+
+    # ...and the real name still works, so the escaping did not break the filter itself.
+    assert client.get("/api/v1/hr/resume-pool", headers=hr_headers,
+                      params={"skill": "Python"}).json()["total"] == 1
