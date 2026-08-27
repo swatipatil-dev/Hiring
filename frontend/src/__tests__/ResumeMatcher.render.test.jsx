@@ -8,11 +8,24 @@
  */
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 
 vi.mock('../api/client', () => ({
   default: { get: vi.fn(), post: vi.fn(), put: vi.fn(), patch: vi.fn(), delete: vi.fn() },
 }))
+
+// Recharts sizes itself from its parent, and every element in jsdom measures 0x0 —
+// the charts would render nothing and the assertions below would prove nothing. Hand
+// the figure a fixed box instead of waiting on a measurement that never arrives.
+// (The ResizeObserver stub itself lives in src/__tests__/setup.js.)
+vi.mock('recharts', async () => {
+  const actual = await vi.importActual('recharts')
+  const { cloneElement } = await vi.importActual('react')
+  return {
+    ...actual,
+    ResponsiveContainer: ({ children }) => cloneElement(children, { width: 600, height: 240 }),
+  }
+})
 
 import api from '../api/client'
 import ResumeMatcher from '../pages/hr/ResumeMatcher'
@@ -54,7 +67,7 @@ const RECORD = {
 }
 
 const METRICS = {
-  total: 12, new_count: 7, ongoing_count: 4, archived_count: 1,
+  total: 12, pool_total: 12, new_count: 7, ongoing_count: 4, archived_count: 1,
   pipeline: [
     { stage: 'new', label: 'New prospects', count: 7 },
     { stage: 'ongoing', label: 'Ongoing', count: 4 },
@@ -65,6 +78,44 @@ const METRICS = {
   avg_days_since_contact: 9.5, never_contacted: 4,
   added_last_30_days: 6, with_resume: 8,
   unscored: 0, unscoreable: 0,
+  added_over_time: [
+    { period: '2026-06-01', label: 'Jun 2026', count: 4 },
+    { period: '2026-07-01', label: 'Jul 2026', count: 0 },
+    { period: '2026-08-01', label: 'Aug 2026', count: 8 },
+  ],
+  trend_granularity: 'month',
+  score_bands: Array.from({ length: 10 }, (_, i) => ({
+    band: `${i * 10}-${i === 9 ? 100 : i * 10 + 9}`, floor: i * 10,
+    count: i === 7 ? 5 : i === 5 ? 3 : 0,
+  })),
+  unscored_in_view: 4,
+  avg_score: 68.2,
+  top_colleges: [{ name: 'NIT Trichy', count: 6 }, { name: 'IIT Madras', count: 3 }],
+  top_roles: [{ name: 'Backend Engineer', count: 7 }],
+}
+
+/** The params the component sent on its most recent metrics request. */
+const lastMetricsParams = () => {
+  const calls = api.get.mock.calls.filter(c => String(c[0]).includes('metrics'))
+  return calls.length ? (calls[calls.length - 1][1]?.params ?? {}) : null
+}
+
+const SKILLS = {
+  people: 12, people_with_skills: 10, no_skills_on_record: 2,
+  distinct_skills: 18, active_roles: 3, demanded_skills: 4, fully_unmet: 1,
+  scanned: 12, truncated: false,
+  demand: [
+    { skill: 'Rust', roles: 2, role_titles: ['Platform Engineer'], candidates: 0,
+      related: 0, related_examples: [], related_cluster: '', coverage: 0 },
+    { skill: 'Kubernetes', roles: 1, role_titles: ['SRE'], candidates: 0,
+      related: 4, related_examples: ['Docker'], related_cluster: 'container orchestration',
+      coverage: 0 },
+    { skill: 'React', roles: 1, role_titles: ['Frontend Engineer'], candidates: 3,
+      related: 0, related_examples: [], related_cluster: '', coverage: 30 },
+    { skill: 'Python', roles: 3, role_titles: ['Backend Engineer'], candidates: 9,
+      related: 0, related_examples: [], related_cluster: '', coverage: 90 },
+  ],
+  top_skills: [{ skill: 'Python', count: 9 }, { skill: 'Figma', count: 5 }],
 }
 
 const listResponse = (results, extra = {}) => ({
@@ -79,9 +130,21 @@ const listResponse = (results, extra = {}) => ({
 // The page loads the list and the metrics from different endpoints, so route the mock
 // by URL rather than returning one shape for everything.
 const routeGet = (results = [RECORD], extra = {}) => (url) =>
-  Promise.resolve(url.includes('metrics')
-    ? { data: METRICS }
-    : listResponse(results, extra))
+  Promise.resolve(
+    url.includes('talent-pool/skills') ? { data: SKILLS }
+      : url.includes('metrics') ? { data: METRICS }
+        : listResponse(results, extra))
+
+/** The params the component sent on its most recent skills request. */
+const lastSkillsParams = () => {
+  const calls = api.get.mock.calls.filter(c => String(c[0]).includes('talent-pool/skills'))
+  return calls.length ? (calls[calls.length - 1][1]?.params ?? {}) : null
+}
+
+const goToSkills = async () => {
+  const user = (await import('@testing-library/user-event')).default
+  await user.click(screen.getByRole('tab', { name: /Skills/ }))
+}
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -94,30 +157,51 @@ const goToCandidates = async () => {
 }
 
 describe('Talent Pool dashboard', () => {
-  it('opens on Overview with the metric tiles and pipeline', async () => {
+  it('opens on the Dashboard with the tiles and the pipeline', async () => {
     render(<ResumeMatcher />)
     expect(await screen.findByText('Total in pool')).toBeInTheDocument()
     expect(screen.getByText('Pipeline')).toBeInTheDocument()
     expect(screen.getByText('New prospects')).toBeInTheDocument()
-    // Every bar is direct-labelled, so nothing depends on colour alone.
-    expect(screen.getByText('Ongoing')).toBeInTheDocument()
+    // Every bar is direct-labelled, so nothing depends on colour alone. Scoped to the
+    // card, because "Ongoing" is also an option in the stage filter now that the filter
+    // bar is shared with this tab.
+    const pipeline = screen.getByText('Pipeline').closest('section')
+    expect(within(pipeline).getByText('Ongoing')).toBeInTheDocument()
   })
 
-  it('shows the source and outcome breakdowns on Analytics', async () => {
-    const user = (await import('@testing-library/user-event')).default
+  it('carries the old Analytics breakdowns on the same tab', async () => {
+    // These used to be one click away on their own tab, which meant the same counts
+    // lived in two places and could disagree.
     render(<ResumeMatcher />)
-    await screen.findByText('Total in pool')
-    await user.click(screen.getByRole('tab', { name: 'Analytics' }))
     expect(await screen.findByText('Where they came from')).toBeInTheDocument()
     expect(screen.getByText('LinkedIn')).toBeInTheDocument()
     expect(screen.getByText('What happened in the ATS')).toBeInTheDocument()
+    expect(screen.queryByRole('tab', { name: 'Analytics' })).not.toBeInTheDocument()
+  })
+
+  it('renders the trend, the histogram and the top-N lists', async () => {
+    render(<ResumeMatcher />)
+    expect(await screen.findByText('Additions over time')).toBeInTheDocument()
+    expect(screen.getByText('Match score distribution')).toBeInTheDocument()
+    expect(screen.getByText('Top colleges')).toBeInTheDocument()
+    expect(screen.getByText('Top roles')).toBeInTheDocument()
+    expect(screen.getByText('IIT Madras')).toBeInTheDocument()
+    expect(screen.getByText('Backend Engineer')).toBeInTheDocument()
+  })
+
+  it('keeps the unranked out of the score bands and says so', async () => {
+    // "Never ranked" is not "scored zero" — folding them into the 0-9 bar would invent
+    // a cohort of terrible candidates out of people nobody has ranked.
+    render(<ResumeMatcher />)
+    expect(await screen.findByText(/4 people are not ranked at all and appear in no band/))
+      .toBeInTheDocument()
   })
 
   it('explains stage vs outcome on Settings', async () => {
     const user = (await import('@testing-library/user-event')).default
     render(<ResumeMatcher />)
     await screen.findByText('Total in pool')
-    await user.click(screen.getByRole('tab', { name: 'Settings' }))
+    await user.click(screen.getByRole('tab', { name: /Settings/ }))
     expect(await screen.findByText('How stages work')).toBeInTheDocument()
   })
 
@@ -141,7 +225,8 @@ describe('Talent Pool dashboard', () => {
   it('does not prompt when everyone is ranked', async () => {
     render(<ResumeMatcher />)   // METRICS has unscored: 0
     await screen.findByText('Total in pool')
-    expect(screen.queryByText(/not ranked yet/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/people are not ranked yet$/)).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^Rank all/ })).not.toBeInTheDocument()
   })
 
   it('stops looping when a batch ranks nobody', async () => {
@@ -163,6 +248,204 @@ describe('Talent Pool dashboard', () => {
     await waitFor(() => expect(api.post).toHaveBeenCalled())
     expect(api.post.mock.calls.filter(c => String(c[0]).includes('score-backlog')))
       .toHaveLength(1)
+  })
+})
+
+describe('Talent Pool dashboard filtering', () => {
+  const userEvent = async () => (await import('@testing-library/user-event')).default
+
+  it('says how much of the pool is in view, and does not cry filter when none is on', async () => {
+    render(<ResumeMatcher />)
+    await screen.findByText('Total in pool')
+    // The count is emphasised, so the sentence spans elements — read the whole line.
+    expect(screen.getByRole('status')).toHaveTextContent('All 12 people')
+    expect(screen.queryByText('Clear filters')).not.toBeInTheDocument()
+  })
+
+  it('sends the filter to the metrics endpoint, not just the list', async () => {
+    const user = await userEvent()
+    render(<ResumeMatcher />)
+    await screen.findByText('Total in pool')
+
+    await user.click(screen.getByRole('button', { name: /In process/ }))
+
+    // Debounced by 300ms, same as the list.
+    await waitFor(() => expect(lastMetricsParams()).toMatchObject({ outcome: 'in_process' }),
+                  { timeout: 2000 })
+  })
+
+  it('never sends sort to the metrics endpoint', async () => {
+    // Ordering a list cannot change an aggregate, and the server rejects the param —
+    // sending it would 422 the whole dashboard on a harmless click.
+    const user = await userEvent()
+    render(<ResumeMatcher />)
+    await screen.findByText('Total in pool')
+    await user.click(screen.getByRole('button', { name: /Never applied/ }))
+    await waitFor(() => expect(lastMetricsParams()).toMatchObject({ outcome: 'never_applied' }),
+                  { timeout: 2000 })
+    expect(lastMetricsParams()).not.toHaveProperty('sort')
+  })
+
+  it('reports the slice against the whole pool once a filter is on', async () => {
+    api.get.mockImplementation((url) => Promise.resolve(
+      url.includes('metrics') ? { data: { ...METRICS, total: 3, pool_total: 12 } }
+                              : listResponse([RECORD])))
+    const user = await userEvent()
+    render(<ResumeMatcher />)
+    await screen.findByText('Total in pool')
+    await user.click(screen.getByRole('button', { name: /Hired/ }))
+
+    expect(await screen.findByText(/of 12 people/, {}, { timeout: 2000 })).toBeInTheDocument()
+    expect(screen.getByText('People in view')).toBeInTheDocument()
+  })
+
+  it('shows one empty state, not nine, when nothing matches', async () => {
+    const user = await userEvent()
+    render(<ResumeMatcher />)
+    await screen.findByText('Total in pool')
+
+    // Filter INTO the empty slice — starting there would never show the transition.
+    api.get.mockImplementation((url) => Promise.resolve(
+      url.includes('metrics')
+        ? { data: { ...METRICS, total: 0, pool_total: 12, outcomes: [], sources: [],
+                    top_colleges: [], top_roles: [],
+                    score_bands: METRICS.score_bands.map(b => ({ ...b, count: 0 })),
+                    added_over_time: METRICS.added_over_time.map(p => ({ ...p, count: 0 })) } }
+        : listResponse([])))
+    await user.click(screen.getByRole('button', { name: /Hired/ }))
+
+    expect(await screen.findByText('Nobody matches these filters', {}, { timeout: 2000 }))
+      .toBeInTheDocument()
+    // The charts are unmounted rather than each drawing its own empty axis.
+    expect(screen.queryByText('Additions over time')).not.toBeInTheDocument()
+  })
+
+  it('clears back to the whole pool', async () => {
+    const user = await userEvent()
+    render(<ResumeMatcher />)
+    await screen.findByText('Total in pool')
+    await user.click(screen.getByRole('button', { name: /Hired/ }))
+    await waitFor(() => expect(lastMetricsParams()).toMatchObject({ outcome: 'hired' }),
+                  { timeout: 2000 })
+
+    await user.click(screen.getAllByRole('button', { name: /Clear filters/ })[0])
+    await waitFor(() => expect(lastMetricsParams()).toEqual({}), { timeout: 2000 })
+  })
+
+  it('carries the filter across to the Candidates list', async () => {
+    const user = await userEvent()
+    render(<ResumeMatcher />)
+    await screen.findByText('Total in pool')
+    await user.click(screen.getByRole('button', { name: /In process/ }))
+    await waitFor(() => expect(lastMetricsParams()).toMatchObject({ outcome: 'in_process' }),
+                  { timeout: 2000 })
+
+    await user.click(screen.getByRole('tab', { name: /Candidates/ }))
+    await waitFor(() => {
+      const listCalls = api.get.mock.calls.filter(c => !String(c[0]).includes('metrics'))
+      expect(listCalls[listCalls.length - 1][1].params).toMatchObject({ outcome: 'in_process' })
+    }, { timeout: 2000 })
+  })
+})
+
+describe('Talent Pool skills tab', () => {
+  it('leads with what nobody can cover, worst first', async () => {
+    render(<ResumeMatcher />)
+    await screen.findByText('Total in pool')
+    await goToSkills()
+
+    expect(await screen.findByText('Skill by skill')).toBeInTheDocument()
+    expect(screen.getByText('Demanded, held by nobody')).toBeInTheDocument()
+
+    // Server order is preserved — worst-covered first is the working order, and
+    // re-sorting client-side would silently disagree with it. Scoped to the gap table:
+    // Python is also in the top-skills list below it.
+    const table = screen.getByRole('list', { name: 'Skills your open roles need' })
+    const names = within(table).getAllByTitle(/^(Rust|Kubernetes|React|Python)$/)
+      .map(n => n.textContent)
+    expect(names).toEqual(['Rust', 'Kubernetes', 'React', 'Python'])
+  })
+
+  it('says "nobody" in words, never colour alone', async () => {
+    render(<ResumeMatcher />)
+    await screen.findByText('Total in pool')
+    await goToSkills()
+    // Two rows have nobody; the bar colour is decoration on top of the words.
+    expect((await screen.findAllByText('nobody')).length).toBe(2)
+    expect(screen.getByText('3 people')).toBeInTheDocument()
+  })
+
+  it('names the grouping behind a related match rather than asserting equivalence', async () => {
+    // The clusters are hand-curated and some are loose, so the reader has to be able
+    // to judge "related" for themselves.
+    render(<ResumeMatcher />)
+    await screen.findByText('Total in pool')
+    await goToSkills()
+    expect(await screen.findByText(/4 people know Docker — same container orchestration group/))
+      .toBeInTheDocument()
+  })
+
+  it('does not blame people whose resume was never read', async () => {
+    render(<ResumeMatcher />)
+    await screen.findByText('Total in pool')
+    await goToSkills()
+    expect(await screen.findByText(/counted in none of these rows/)).toBeInTheDocument()
+  })
+
+  it('shows strengths no open role asks for', async () => {
+    render(<ResumeMatcher />)
+    await screen.findByText('Total in pool')
+    await goToSkills()
+    expect(await screen.findByText('What this group actually knows')).toBeInTheDocument()
+    expect(screen.getByText('Figma')).toBeInTheDocument()
+  })
+
+  it('drills a skill through to the people who have it', async () => {
+    const user = (await import('@testing-library/user-event')).default
+    render(<ResumeMatcher />)
+    await screen.findByText('Total in pool')
+    await goToSkills()
+
+    await user.click(await screen.findByTitle(/Show the 3 in the pool with React/))
+
+    await waitFor(() => {
+      const listCalls = api.get.mock.calls.filter(
+        c => !String(c[0]).includes('metrics') && !String(c[0]).includes('skills'))
+      expect(listCalls[listCalls.length - 1][1].params).toMatchObject({ skill: 'React' })
+    }, { timeout: 2000 })
+    // The filter has no control of its own, so it needs a chip or the short list is
+    // inexplicable.
+    expect(screen.getByLabelText('Remove the React filter')).toBeInTheDocument()
+  })
+
+  it('will not offer a drill-down that would land on nobody', async () => {
+    render(<ResumeMatcher />)
+    await screen.findByText('Total in pool')
+    await goToSkills()
+    expect(screen.queryByTitle(/Show the 0 in the pool/)).not.toBeInTheDocument()
+  })
+
+  it('passes the shared filter to the skills endpoint', async () => {
+    const user = (await import('@testing-library/user-event')).default
+    render(<ResumeMatcher />)
+    await screen.findByText('Total in pool')
+    await user.click(screen.getByRole('button', { name: /In process/ }))
+    await goToSkills()
+
+    await waitFor(() => expect(lastSkillsParams()).toMatchObject({ outcome: 'in_process' }),
+                  { timeout: 2000 })
+    expect(lastSkillsParams()).not.toHaveProperty('sort')
+  })
+
+  it('explains itself when there is nothing to measure against', async () => {
+    api.get.mockImplementation((url) => Promise.resolve(
+      url.includes('talent-pool/skills')
+        ? { data: { ...SKILLS, active_roles: 0, demand: [], demanded_skills: 0 } }
+        : url.includes('metrics') ? { data: METRICS } : listResponse([RECORD])))
+    render(<ResumeMatcher />)
+    await screen.findByText('Total in pool')
+    await goToSkills()
+    expect(await screen.findByText('No open roles to measure against')).toBeInTheDocument()
   })
 })
 

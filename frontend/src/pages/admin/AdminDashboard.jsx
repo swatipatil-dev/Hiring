@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { useLocation, useNavigate } from 'react-router-dom'
+import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Legend, AreaChart, Area, CartesianGrid } from 'recharts'
 import { Users, Building2, Briefcase, TrendingUp, Plus, Edit3, Trash2, Search, Camera, Upload, X, Mail, CheckCircle2, AlertCircle, Send } from 'lucide-react'
 import api from '../../api/client'
@@ -24,6 +24,18 @@ const CustomTooltip = ({ active, payload, label }) => {
 }
 
 const TAB_MAP = { users: 'users', departments: 'departments', analytics: 'analytics', email: 'email', support: 'support' }
+
+// Role categories for the Users tab bar. 'all' is a UI-only key — the API takes
+// no `role` param for it. The rest match the `users.role` strings exactly.
+const ROLE_TABS = [
+  { key: 'all',         label: 'All' },
+  { key: 'admin',       label: 'Admin' },
+  { key: 'hr',          label: 'HR' },
+  { key: 'interviewer', label: 'Interviewer' },
+  { key: 'candidate',   label: 'Candidate' },
+]
+const ROLE_KEYS = ROLE_TABS.map(t => t.key)
+const PAGE_SIZE = 25
 
 function DepartmentCard({ dept, stat, accent, logo, initials, onUploadLogo, onRemoveLogo, onEdit, onDelete }) {
   const fileRef = useRef(null)
@@ -201,9 +213,15 @@ const EMPTY_DEPT = { name: '', description: '' }
 export default function AdminDashboard() {
   const location = useLocation()
   const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
   const [users, setUsers] = useState([])
   const [departments, setDepartments] = useState([])
   const [search, setSearch] = useState('')
+  // Role filtering, paging and per-role counts all run server-side — the table
+  // renders exactly the page the API returned.
+  const [userTotal, setUserTotal] = useState(0)
+  const [userPage, setUserPage] = useState(0)
+  const [roleCounts, setRoleCounts] = useState(null)
   const [analytics, setAnalytics] = useState(null)
   const [showUserModal, setShowUserModal] = useState(false)
   const [showDeptModal, setShowDeptModal] = useState(false)
@@ -328,8 +346,29 @@ export default function AdminDashboard() {
 
   const setTab = (t) => navigate(t === 'overview' ? '/admin' : `/admin/${t}`)
 
+  // The selected role category lives in the URL (?role=hr) rather than in state,
+  // matching how the top-level tabs work above — so it survives a reload and can
+  // be bookmarked or shared.
+  const roleFilter = ROLE_KEYS.includes(searchParams.get('role')) ? searchParams.get('role') : 'all'
+  const setRoleFilter = (r) => {
+    const next = new URLSearchParams(searchParams)
+    if (r === 'all') next.delete('role')
+    else next.set('role', r)
+    setSearchParams(next, { replace: true })
+  }
+
+  // Debounce the search box so typing doesn't fire a request per keystroke.
+  const [debouncedSearch, setDebouncedSearch] = useState('')
   useEffect(() => {
-    api.get('/admin/users').then(r => setUsers((r.data || []).filter(u => u.role !== 'superadmin'))).catch(() => {})
+    const t = setTimeout(() => setDebouncedSearch(search), 300)
+    return () => clearTimeout(t)
+  }, [search])
+
+  // Changing the category or the search term invalidates the current page —
+  // without this, switching to a 3-user category while on page 4 shows nothing.
+  useEffect(() => { setUserPage(0) }, [roleFilter, debouncedSearch])
+
+  useEffect(() => {
     api.get('/admin/departments').then(r => setDepartments(r.data)).catch(() => {})
     api.get('/admin/department-stats').then(r => setDeptStats(r.data)).catch(() => {})
     api.get('/admin/analytics/overview').then(r => setAnalytics(r.data)).catch(() => {})
@@ -339,9 +378,28 @@ export default function AdminDashboard() {
     loadEmailConfig()
   }, [loadEmailConfig])
 
-  const fetchUsers = () => {
-    api.get('/admin/users').then(r => setUsers((r.data || []).filter(u => u.role !== 'superadmin'))).catch(() => {})
-  }
+  // Role, text search and paging are all query params — the server already
+  // excludes superadmin, so there is nothing left to filter client-side.
+  const fetchUsers = useCallback(() => {
+    api.get('/admin/users', {
+      params: {
+        role: roleFilter === 'all' ? undefined : roleFilter,
+        search: debouncedSearch || undefined,
+        skip: userPage * PAGE_SIZE,
+        limit: PAGE_SIZE,
+      },
+    }).then(r => {
+      setUsers(r.data?.users || [])
+      setUserTotal(r.data?.total || 0)
+    }).catch(() => {})
+  }, [roleFilter, debouncedSearch, userPage])
+
+  const fetchCounts = useCallback(() => {
+    api.get('/admin/users/counts').then(r => setRoleCounts(r.data)).catch(() => {})
+  }, [])
+
+  useEffect(() => { fetchUsers() }, [fetchUsers])
+  useEffect(() => { fetchCounts() }, [fetchCounts])
   const fetchDepartments = () => {
     api.get('/admin/departments').then(r => setDepartments(r.data)).catch(() => {})
     api.get('/admin/department-stats').then(r => setDeptStats(r.data)).catch(() => {})
@@ -414,6 +472,7 @@ export default function AdminDashboard() {
         await api.post(endpoint, payload)
       }
       fetchUsers()
+      fetchCounts()
       closeUserModal()
     } catch (err) {
       alert(err.response?.data?.detail || 'Failed to save user')
@@ -444,6 +503,7 @@ export default function AdminDashboard() {
         await api.put(`/admin/users/${userId}/status?is_active=true`)
       }
       fetchUsers()
+      fetchCounts()
     } catch (err) {
       alert(err.response?.data?.detail || 'Failed to update user')
     }
@@ -471,12 +531,19 @@ export default function AdminDashboard() {
     }
   }
 
-  const filtered = users.filter(u =>
-    u.role !== 'superadmin' && (
-      (u.name || `${u.first_name || ''} ${u.last_name || ''}`).toLowerCase().includes(search.toLowerCase()) ||
-      u.email?.toLowerCase().includes(search.toLowerCase())
-    )
-  )
+  // Paging maths for the Users footer. `userTotal` is the server's count for the
+  // active role + search, so these stay right no matter which category is open.
+  const userRangeStart = userTotal === 0 ? 0 : userPage * PAGE_SIZE + 1
+  const userRangeEnd = Math.min((userPage + 1) * PAGE_SIZE, userTotal)
+  const hasNextUserPage = (userPage + 1) * PAGE_SIZE < userTotal
+
+  // Overview's "Users by Role" chart reads the counts endpoint, not `users` —
+  // `users` now holds one filtered page, which would make the chart show only
+  // whichever category was last opened.
+  const roleChartData = ROLE_TABS
+    .filter(t => t.key !== 'all')
+    .map(t => ({ name: t.label, value: roleCounts?.[t.key] ?? 0 }))
+    .filter(d => d.value > 0)
 
   return (
     <>
@@ -486,7 +553,7 @@ export default function AdminDashboard() {
         <>
           <div className="stats-grid">
             {[
-              { label: 'Total Users', value: analytics?.total_users ?? users.length, icon: Users, cls: 'amber' },
+              { label: 'Total Users', value: analytics?.total_users ?? roleCounts?.all ?? 0, icon: Users, cls: 'amber' },
               { label: 'Departments', value: departments.length, icon: Building2, cls: 'blue' },
               { label: 'Active Jobs', value: analytics?.active_jobs ?? 0, icon: Briefcase, cls: 'green' },
               { label: 'Total Candidates', value: analytics?.total_candidates ?? 0, icon: TrendingUp, cls: 'purple' },
@@ -521,15 +588,15 @@ export default function AdminDashboard() {
 
             <div className="card">
               <h3 style={{ marginBottom: 20 }}>Users by Role</h3>
-              {users.length > 0 ? (
+              {roleChartData.length > 0 ? (
                 <>
                   <ResponsiveContainer width="100%" height={240}>
                     <PieChart>
                       <Pie
-                        data={Object.entries(users.reduce((acc, u) => { acc[u.role] = (acc[u.role] || 0) + 1; return acc }, {})).map(([name, value]) => ({ name, value }))}
+                        data={roleChartData}
                         cx="50%" cy="50%" innerRadius={55} outerRadius={90}
                         dataKey="value" stroke="var(--bg-primary)" strokeWidth={3} paddingAngle={3}>
-                        {Object.keys(users.reduce((acc, u) => { acc[u.role] = 1; return acc }, {})).map((_, i) => (
+                        {roleChartData.map((_, i) => (
                           <Cell key={i} fill={CHART_COLORS[i % CHART_COLORS.length]} />
                         ))}
                       </Pie>
@@ -537,10 +604,10 @@ export default function AdminDashboard() {
                     </PieChart>
                   </ResponsiveContainer>
                   <div className="flex gap-12" style={{ justifyContent: 'center', flexWrap: 'wrap', marginTop: 8 }}>
-                    {Object.entries(users.reduce((acc, u) => { acc[u.role] = (acc[u.role] || 0) + 1; return acc }, {})).map(([role, count], i) => (
-                      <div key={role} className="flex-center gap-8" style={{ fontSize: '0.75rem', color: 'var(--text-tertiary)' }}>
+                    {roleChartData.map((d, i) => (
+                      <div key={d.name} className="flex-center gap-8" style={{ fontSize: '0.75rem', color: 'var(--text-tertiary)' }}>
                         <div style={{ width: 8, height: 8, borderRadius: 2, background: CHART_COLORS[i % CHART_COLORS.length] }} />
-                        {role} ({count})
+                        {d.name} ({d.value})
                       </div>
                     ))}
                   </div>
@@ -1160,6 +1227,16 @@ export default function AdminDashboard() {
 
       {tab === 'users' && (
         <div className="card">
+          <div className="tabs">
+            {ROLE_TABS.map(t => (
+              <button key={t.key}
+                className={`tab ${roleFilter === t.key ? 'active' : ''}`}
+                aria-pressed={roleFilter === t.key}
+                onClick={() => setRoleFilter(t.key)}>
+                {t.label}{roleCounts ? ` (${roleCounts[t.key] ?? 0})` : ''}
+              </button>
+            ))}
+          </div>
           <div className="flex-between mb-16">
             <div className="flex-center gap-8" style={{ background: 'var(--surface-input)', border: '1px solid var(--border-subtle)', borderRadius: 8, padding: '0 12px', width: 260 }}>
               <Search size={16} style={{ color: 'var(--text-tertiary)' }} />
@@ -1174,7 +1251,7 @@ export default function AdminDashboard() {
                 <tr><th>Name</th><th>Email</th><th>Role</th><th>Status</th><th>Actions</th></tr>
               </thead>
               <tbody>
-                {filtered.map(u => (
+                {users.map(u => (
                   <tr key={u.id}>
                     <td style={{ fontWeight: 500 }}>{u.name || `${u.first_name || ''} ${u.last_name || ''}`.trim()}</td>
                     <td className="mono" style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>{u.email}</td>
@@ -1202,6 +1279,28 @@ export default function AdminDashboard() {
               </tbody>
             </table>
           </div>
+
+          {users.length === 0 && (
+            <div style={{ padding: '32px 0', textAlign: 'center', color: 'var(--text-tertiary)', fontSize: '0.85rem' }}>
+              {debouncedSearch
+                ? `No ${roleFilter === 'all' ? 'users' : roleFilter + 's'} match "${debouncedSearch}".`
+                : roleFilter === 'all' ? 'No users yet.' : `No ${roleFilter} accounts yet.`}
+            </div>
+          )}
+
+          {userTotal > 0 && (
+            <div className="flex-between" style={{ marginTop: 16 }}>
+              <div style={{ color: 'var(--text-tertiary)', fontSize: '0.8rem' }}>
+                Showing {userRangeStart}–{userRangeEnd} of {userTotal}
+              </div>
+              <div className="flex gap-8">
+                <button className="btn btn-ghost btn-sm" disabled={userPage === 0}
+                  onClick={() => setUserPage(p => Math.max(0, p - 1))}>Previous</button>
+                <button className="btn btn-ghost btn-sm" disabled={!hasNextUserPage}
+                  onClick={() => setUserPage(p => p + 1)}>Next</button>
+              </div>
+            </div>
+          )}
         </div>
       )}
 

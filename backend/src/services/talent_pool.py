@@ -20,14 +20,19 @@ match what the application actually writes** — they omit `ats_screening`, `hr_
 derived from the values the live code really assigns.
 
 Two implementations of the same precedence live here: `derive_outcome` for display and
-`person_applied_exists` for SQL filtering. Filtering has to happen in SQL or pagination
-silently breaks (you cannot filter a page and still report a correct total). They are
-kept structurally parallel on purpose — that is what stops them drifting apart.
+`_bucket_predicates` for SQL. Filtering has to happen in SQL or pagination silently
+breaks (you cannot filter a page and still report a correct total). They are kept
+structurally parallel on purpose — that is what stops them drifting apart.
+
+Everything SQL-side goes through `_bucket_predicates`: `outcome_filter` takes one bucket
+for a WHERE clause, `outcome_sum_columns` takes all six as SUM(CASE) columns for the
+dashboard. One definition, two shapes — so a change to what "declined" means cannot
+reach one caller and miss the other.
 """
 
-from typing import Iterable, Optional, Set
+from typing import Iterable, List, Optional, Set, Tuple
 
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, case, func, or_
 
 # Terminal outcomes.
 HIRED_STAGES: Set[str] = {"hired"}
@@ -39,6 +44,11 @@ TERMINAL_STAGES: Set[str] = HIRED_STAGES | OFFER_STAGES | DECLINED_STAGES | REJE
 
 # The bucket a person falls into, best-first. Also the order the UI rail shows.
 OUTCOMES = ("hired", "offer", "in_process", "declined", "rejected", "never_applied")
+
+# The order the dashboard counts them in: worst-known to best, so the breakdown reads
+# as a funnel rather than as `OUTCOMES`' precedence order, which exists for a different
+# reason (resolving one person to one bucket).
+COUNTED_OUTCOMES = ("never_applied", "in_process", "offer", "hired", "declined", "rejected")
 
 
 def derive_outcome(stages: Iterable[str]) -> str:
@@ -123,6 +133,20 @@ def outcome_filter(db, company_id: str, outcome: str):
     Returns None for an unknown bucket so the caller can ignore it rather than
     silently returning an empty list.
     """
+    return _bucket_predicates(db, company_id).get(outcome)
+
+
+def _bucket_predicates(db, company_id: str) -> dict:
+    """Every outcome bucket as a SQL predicate, keyed by name.
+
+    The negations are what make the buckets mutually exclusive and exhaustive, and they
+    mirror `derive_outcome`'s precedence exactly — that parallel is the only thing
+    stopping the displayed outcome and the filterable one from drifting apart.
+
+    Both `outcome_filter` (one bucket, for the WHERE clause) and `outcome_sum_columns`
+    (all six, for the dashboard) are built from this, so there is one definition of
+    "who counts as declined" rather than two.
+    """
     has_any = person_applied_exists(db, company_id)
     has_hired = person_applied_exists(db, company_id, stages=HIRED_STAGES)
     has_offer = person_applied_exists(db, company_id, stages=OFFER_STAGES)
@@ -130,18 +154,27 @@ def outcome_filter(db, company_id: str, outcome: str):
     has_declined = person_applied_exists(db, company_id, stages=DECLINED_STAGES)
     has_rejected = person_applied_exists(db, company_id, stages=REJECTED_STAGES)
 
-    if outcome == "never_applied":
-        return ~has_any
-    if outcome == "applied":                      # any application at all
-        return has_any
-    if outcome == "hired":
-        return has_hired
-    if outcome == "offer":
-        return and_(has_offer, ~has_hired)
-    if outcome == "in_process":
-        return and_(has_live, ~has_hired, ~has_offer)
-    if outcome == "declined":
-        return and_(has_declined, ~has_hired, ~has_offer, ~has_live)
-    if outcome == "rejected":
-        return and_(has_rejected, ~has_hired, ~has_offer, ~has_live, ~has_declined)
-    return None
+    return {
+        "never_applied": ~has_any,
+        "applied": has_any,                       # synthetic: any application at all
+        "hired": has_hired,
+        "offer": and_(has_offer, ~has_hired),
+        "in_process": and_(has_live, ~has_hired, ~has_offer),
+        "declined": and_(has_declined, ~has_hired, ~has_offer, ~has_live),
+        "rejected": and_(has_rejected, ~has_hired, ~has_offer, ~has_live, ~has_declined),
+    }
+
+
+def outcome_sum_columns(db, company_id: str) -> List[Tuple[str, object]]:
+    """All six outcome counts as `SUM(CASE …)` columns, in `COUNTED_OUTCOMES` order.
+
+    Counting the buckets one COUNT(*) at a time means six scans of `resume_pool`, each
+    re-evaluating up to six correlated EXISTS per row. Selected as columns instead, the
+    same predicates are evaluated once per row and folded into six sums — one scan.
+
+    Returns `[(bucket_name, column), …]` so the caller can zip the result row back onto
+    the names without depending on column order.
+    """
+    buckets = _bucket_predicates(db, company_id)
+    return [(name, func.sum(case((buckets[name], 1), else_=0)).label(f"n_{name}"))
+            for name in COUNTED_OUTCOMES]
