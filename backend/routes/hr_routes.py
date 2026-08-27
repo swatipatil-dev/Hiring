@@ -822,8 +822,8 @@ class TalentPoolMetrics(BaseModel):
     added_over_time: List[TrendPoint] = []
     trend_granularity: str = "month"      # "week" | "month" — what one point covers
     score_bands: List[BandCount] = []
-    unscored_in_view: int = 0             # filtered rows with no score. NOT a 0-9 band:
-                                          # "never ranked" is not "scored zero".
+    # Filtered rows with no score. NOT a 0-9 band: "never ranked" is not "scored zero".
+    unscored_in_view: int = 0
     avg_score: Optional[float] = None
     top_colleges: List[NamedCount] = []
     top_roles: List[NamedCount] = []
@@ -840,11 +840,13 @@ class SkillDemandRow(BaseModel):
     roles: int                       # active postings asking for it
     role_titles: List[str] = []      # a few, for the tooltip
     candidates: int                  # people who have it outright
-    related: int = 0                 # people with a cluster sibling instead (Docker for
-                                     # Kubernetes). Only computed when candidates == 0.
+    # People with a cluster sibling instead (Docker for Kubernetes). Only computed
+    # when `candidates` is 0 — a well-covered skill needs no consolation prize.
+    related: int = 0
     related_examples: List[str] = []
-    related_cluster: str = ""        # the grouping that called them related, so the
-                                     # reader can judge it rather than trust it
+    # The grouping that called them related, so the reader can judge it rather than
+    # trust it — some of the curated clusters are loose.
+    related_cluster: str = ""
     coverage: float = 0.0            # candidates as a % of people with skills on record
 
 
@@ -1656,12 +1658,18 @@ async def talent_pool_metrics(
         # days in the new year. Modes that read default_week_format make the chart
         # depend on a server setting.
         bucket = func.yearweek(ResumePoolEntry.uploaded_at, 3)
-        key_of = lambda d: int(d.strftime("%G%V"))
+
+        def key_of(d):
+            """The Python inverse of the bucket expression above, for zero-filling."""
+            return int(d.strftime("%G%V"))
     else:
         # The format string is bound as a parameter, so its % escapes never reach the
         # DBAPI's own interpolation.
         bucket = func.date_format(ResumePoolEntry.uploaded_at, "%Y-%m")
-        key_of = lambda d: d.strftime("%Y-%m")
+
+        def key_of(d):
+            """The Python inverse of the bucket expression above, for zero-filling."""
+            return d.strftime("%Y-%m")
 
     trend_rows = dict(agg(bucket, func.count(ResumePoolEntry.id))
                       .filter(*window).group_by(bucket).all())
