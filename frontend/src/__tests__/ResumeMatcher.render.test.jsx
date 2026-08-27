@@ -348,6 +348,44 @@ describe('Talent Pool dashboard filtering', () => {
   })
 })
 
+describe('Talent Pool page width', () => {
+  const page = () => document.querySelector('.rm-page')
+
+  it('gives the charts the whole screen', async () => {
+    // A page-level cap here left ~400px dead on a 1920 screen while the header above
+    // ran edge to edge.
+    render(<ResumeMatcher />)
+    await screen.findByText('Total in pool')
+    expect(page().className).not.toMatch(/rm-page--reading/)
+  })
+
+  it('keeps a reading measure on the candidate records', async () => {
+    render(<ResumeMatcher />)
+    await screen.findByText('Total in pool')
+    await goToCandidates()
+    await screen.findByText('Anjali Rao')
+    expect(page().className).toMatch(/rm-page--reading/)
+  })
+
+  it('drops the measure again on Skills, and on the way back', async () => {
+    // The modifier lives on .rm-page, which also wraps the masthead rule, the tab bar
+    // and the ledgerline — so it has to come off cleanly or that chrome shifts width
+    // every time you change tab.
+    const user = (await import('@testing-library/user-event')).default
+    render(<ResumeMatcher />)
+    await screen.findByText('Total in pool')
+
+    await goToCandidates()
+    expect(page().className).toMatch(/rm-page--reading/)
+
+    await goToSkills()
+    expect(page().className).not.toMatch(/rm-page--reading/)
+
+    await user.click(screen.getByRole('tab', { name: /Dashboard/ }))
+    expect(page().className).not.toMatch(/rm-page--reading/)
+  })
+})
+
 describe('Talent Pool skills tab', () => {
   it('leads with what nobody can cover, worst first', async () => {
     render(<ResumeMatcher />)

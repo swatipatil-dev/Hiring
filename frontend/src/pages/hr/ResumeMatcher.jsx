@@ -1350,7 +1350,10 @@ export default function ResumeMatcher() {
 
   return (
     <div
-      className="rm-page"
+      // Charts and the skills table take the whole screen; candidate records are text
+      // and keep a reading measure. The modifier goes here rather than on the content
+      // so the masthead, tabs and ledgerline stay put when you switch tabs.
+      className={`rm-page${tab === 'candidates' ? ' rm-page--reading' : ''}`}
       onDragEnter={onDragEnter}
       onDragLeave={onDragLeave}
       onDragOver={(e) => { if (isFileDrag(e)) e.preventDefault() }}

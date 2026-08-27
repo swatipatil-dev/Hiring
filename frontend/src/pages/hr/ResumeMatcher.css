@@ -6,8 +6,17 @@
    from the global tokens in index.css; only the score bands are local.
    ═══════════════════════════════════════════════════════════ */
 
+/* Deliberately uncapped. .main-content already provides the gutters, and this page
+   carries a chart dashboard and a skills table that want every pixel — a page-level
+   max-width here left ~400px of dead space on a 1920 screen while the header above
+   ran edge to edge. The reading cap that used to live here now applies only to the
+   Candidates blocks, via .rm-page--reading below: capping .rm-page itself per tab
+   would drag the masthead rule, the tab bar and the ledgerline in and out on every
+   tab switch. */
 .rm-page {
-  max-width: 1180px;
+  /* The one reading measure, kept with its sibling tokens rather than buried in a
+     rule. Records are text; charts are not. */
+  --rm-reading-max: 1400px;
 
   /* Score bands — same thresholds the ATS sheet uses, moved onto the
      app's warm status palette so they sit in the ivory workspace. */
@@ -18,6 +27,16 @@
 
   --rm-rule: var(--border-subtle);
   --rm-mono: var(--font-mono);
+}
+
+/* Candidates only. The record is a 78px | 1fr | 148px grid, so unbounded the middle
+   column runs past 1600px and a name sits marooned from its own metadata.
+   The filter bar is capped with them on purpose: a full-width toolbar sitting above
+   a narrower list reads as a bug rather than as a decision. */
+.rm-page--reading .rm-filters,
+.rm-page--reading .rm-records,
+.rm-page--reading .rm-pagefoot {
+  max-width: var(--rm-reading-max);
 }
 
 .rm-page :focus-visible {
@@ -1644,7 +1663,12 @@
 
 .rm-page .tp-skill__row {
   display: grid;
-  grid-template-columns: minmax(110px, 200px) 82px minmax(0, 1fr) 96px auto;
+  /* The bar grows to 720px and then stops, and the trailing 1fr absorbs whatever is
+     left. Longer bars are genuinely better here — they give a two-person difference
+     more pixels to show itself in — but an uncapped track on a 1900px screen strands
+     the count a screen-width away from the bar it belongs to. The spare width goes
+     to the right of the whole group instead of inside it. */
+  grid-template-columns: minmax(110px, 200px) 82px minmax(0, 720px) 96px auto 1fr;
   align-items: center;
   gap: 12px;
   width: 100%;
