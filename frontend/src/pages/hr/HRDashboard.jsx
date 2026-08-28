@@ -886,12 +886,13 @@ export default function HRDashboard() {
   const [inviteMailboxId, setInviteMailboxId] = useState(undefined)
   const [rejectMailboxId, setRejectMailboxId] = useState(undefined)
 
-  // The three proctoring flags, in display order. `copy_paste_allowed` is stored inverted
+  // The proctoring flags, in display order. `copy_paste_allowed` is stored inverted
   // relative to the other two (true = candidate MAY copy/paste); the label says so, and we
   // pass the value through unchanged so this screen agrees with the Create Test wizard.
   const PROCTOR_FIELDS = [
     { key: 'enable_webcam_monitoring', label: 'Webcam Monitoring' },
     { key: 'enable_tab_switch_detection', label: 'Tab Switch Detection' },
+    { key: 'require_fullscreen', label: 'Require Fullscreen' },
     { key: 'copy_paste_allowed', label: 'Allow Copy / Paste' },
   ]
 

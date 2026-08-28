@@ -1049,16 +1049,19 @@ async def get_my_interviews(
         # the client applied tab-switch detection and copy/paste blocking unconditionally.
         enable_webcam_monitoring = False
         enable_tab_switch_detection = True
+        require_fullscreen = True
         copy_paste_allowed = False
         if iv.security_settings_data:
             try:
                 _sec = json.loads(iv.security_settings_data)
                 enable_webcam_monitoring = bool(_sec.get("enable_webcam_monitoring", False))
                 enable_tab_switch_detection = bool(_sec.get("enable_tab_switch_detection", True))
+                require_fullscreen = bool(_sec.get("require_fullscreen", True))
                 copy_paste_allowed = bool(_sec.get("copy_paste_allowed", False))
             except (json.JSONDecodeError, TypeError, AttributeError):
                 enable_webcam_monitoring = False
                 enable_tab_switch_detection = True
+                require_fullscreen = True
                 copy_paste_allowed = False
         # Detect mode + location from notes (same convention as the HR/interviewer
         # lists). Offline interviews store "Location: <x>" in notes; fall back to the
@@ -1089,6 +1092,7 @@ async def get_my_interviews(
             "panel_members": (json.loads(iv.panel_members) if iv.panel_members else []),
             "enable_webcam_monitoring": enable_webcam_monitoring,
             "enable_tab_switch_detection": enable_tab_switch_detection,
+            "require_fullscreen": require_fullscreen,
             "copy_paste_allowed": copy_paste_allowed,
             "is_scheduled_interview": bool(iv.notes and "Mode:" in iv.notes),
         })
