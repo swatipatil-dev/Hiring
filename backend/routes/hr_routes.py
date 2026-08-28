@@ -56,7 +56,20 @@ PROCTORING_FLAGS = (
     "enable_webcam_monitoring",
     "enable_tab_switch_detection",
     "copy_paste_allowed",
+    "require_fullscreen",
 )
+
+# Per-flag defaults for a test whose security_settings_data is NULL or malformed - drafts,
+# and every test created before a flag existed. These must match what the candidate client
+# actually applies (routes/candidate_routes.py), or HR's summary describes a stricter or
+# looser exam than the one that ran. A blanket False did not: tab-switch detection has
+# always defaulted ON for the candidate.
+PROCTORING_FLAG_DEFAULTS = {
+    "enable_webcam_monitoring": False,
+    "enable_tab_switch_detection": True,
+    "copy_paste_allowed": False,
+    "require_fullscreen": True,
+}
 
 def _parse_security_settings(raw):
     """Parse a security_settings_data blob into a dict. Returns {} when the column is
@@ -70,10 +83,11 @@ def _parse_security_settings(raw):
         return {}
 
 def _proctoring_flags(raw):
-    """The three HR-visible proctoring flags from a security_settings_data blob,
-    each coerced to a bool and defaulting to False."""
+    """The HR-visible proctoring flags from a security_settings_data blob, each coerced
+    to a bool and falling back to the default the candidate client actually applies."""
     sec = _parse_security_settings(raw)
-    return {flag: bool(sec.get(flag, False)) for flag in PROCTORING_FLAGS}
+    return {flag: bool(sec.get(flag, PROCTORING_FLAG_DEFAULTS[flag]))
+            for flag in PROCTORING_FLAGS}
 
 
 def _safe_targets(raw):
@@ -2981,6 +2995,7 @@ class ProctoringOverride(BaseModel):
     """
     enable_webcam_monitoring: Optional[bool] = None
     enable_tab_switch_detection: Optional[bool] = None
+    require_fullscreen: Optional[bool] = None
     copy_paste_allowed: Optional[bool] = None
 
 

@@ -192,7 +192,7 @@ export default function InterviewerDashboard() {
     conceptual_vs_practical_ratio: '60:40', real_world_scenarios: true,
     bloom_taxonomy_level: 'Apply', coding_focus_areas: '', avoid_topics: '',
     // Tab-switch detection defaults ON — the interviewer opts out deliberately.
-    enable_webcam_monitoring: false, enable_tab_switch_detection: true, copy_paste_allowed: false,
+    enable_webcam_monitoring: false, enable_tab_switch_detection: true, require_fullscreen: true, copy_paste_allowed: false,
     interviewer_name: '', interviewer_email: '', meeting_link: '',
     notes: ''
   })
@@ -391,6 +391,7 @@ export default function InterviewerDashboard() {
       time_per_question_type: { ...TYPE_TIME_DEFAULTS, ...(t.interview_configuration?.time_per_question_type || {}) },
       enable_webcam_monitoring: !!sec.enable_webcam_monitoring,
       enable_tab_switch_detection: sec.enable_tab_switch_detection !== false,
+      require_fullscreen: sec.require_fullscreen !== false,
       copy_paste_allowed: !!sec.copy_paste_allowed,
     })
   }
@@ -897,6 +898,7 @@ export default function InterviewerDashboard() {
       avoid_topics: Array.isArray(ag.avoid_topics) ? ag.avoid_topics.join(', ') : (ag.avoid_topics || ''),
       enable_webcam_monitoring: sec.enable_webcam_monitoring || false,
       enable_tab_switch_detection: sec.enable_tab_switch_detection !== false,
+      require_fullscreen: sec.require_fullscreen !== false,
       copy_paste_allowed: sec.copy_paste_allowed || false,
       interviewer_name: intd.name || f.interviewer_name,
       interviewer_email: intd.email || f.interviewer_email,
@@ -1346,6 +1348,7 @@ export default function InterviewerDashboard() {
           security_settings: {
             enable_webcam_monitoring: ctForm.enable_webcam_monitoring,
             enable_tab_switch_detection: ctForm.enable_tab_switch_detection,
+            require_fullscreen: ctForm.require_fullscreen,
             copy_paste_allowed: ctForm.copy_paste_allowed,
           },
           interviewer_details: {
@@ -1382,7 +1385,7 @@ export default function InterviewerDashboard() {
           question_format: { total_questions: ctForm.skills.filter(s => s.name.trim()).reduce((sum, s) => sum + s.question_types.reduce((ts, qt) => ts + qt.count_per_set, 0), 0), include_explanations: false, shuffle_questions: false, shuffle_options: false },
           evaluation_rules: { total_marks: ctForm.total_marks, negative_marking: ctForm.negative_marking, negative_mark_percent: ctForm.negative_mark_percent, section_cutoff: ctForm.section_cutoff, overall_cutoff: ctForm.overall_cutoff },
           ai_generation_rules: { conceptual_vs_practical_ratio: ctForm.conceptual_vs_practical_ratio, real_world_scenarios: ctForm.real_world_scenarios, bloom_taxonomy_level: ctForm.bloom_taxonomy_level, coding_focus_areas: ctForm.coding_focus_areas ? ctForm.coding_focus_areas.split(',').map(s => s.trim()) : [], avoid_topics: ctForm.avoid_topics ? ctForm.avoid_topics.split(',').map(s => s.trim()) : [] },
-          security_settings: { enable_webcam_monitoring: ctForm.enable_webcam_monitoring, enable_tab_switch_detection: ctForm.enable_tab_switch_detection, copy_paste_allowed: ctForm.copy_paste_allowed },
+          security_settings: { enable_webcam_monitoring: ctForm.enable_webcam_monitoring, enable_tab_switch_detection: ctForm.enable_tab_switch_detection, require_fullscreen: ctForm.require_fullscreen, copy_paste_allowed: ctForm.copy_paste_allowed },
           interviewer_details: { name: ctForm.interviewer_name, email: ctForm.interviewer_email, meeting_link: ctForm.meeting_link || 'N/A' },
           notes: ctForm.notes,
         }
@@ -2510,7 +2513,12 @@ export default function InterviewerDashboard() {
                       Tab Switch Detection
                     </label>
                     <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <input type="checkbox" checked={ctForm.copy_paste_allowed}
+                      <input type="checkbox" checked={ctForm.require_fullscreen}
+                        onChange={e => setCtForm({ ...ctForm, require_fullscreen: e.target.checked })} />
+                      Require Fullscreen
+                    </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <input type="checkbox" checked={ctForm.copy_paste_allowed}
                         onChange={e => setCtForm({ ...ctForm, copy_paste_allowed: e.target.checked })} />
                       Allow Copy/Paste
                     </label>

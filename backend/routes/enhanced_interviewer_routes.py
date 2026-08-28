@@ -211,6 +211,8 @@ class SecuritySettings(BaseModel):
     enable_webcam_monitoring: bool = False
     # Tab-switch detection is ON by default; an interviewer must opt out deliberately.
     enable_tab_switch_detection: bool = True
+    # Same reasoning: the exam runs fullscreen unless someone deliberately turns it off.
+    require_fullscreen: bool = True
     copy_paste_allowed: bool = False
 
 class InterviewerDetails(BaseModel):
@@ -854,7 +856,8 @@ def _build_interview_response(interview) -> "InterviewResponse":
         **json.loads(interview.security_settings_data)
     ) if interview.security_settings_data else SecuritySettings(
         time_per_question=5, enable_webcam_monitoring=False,
-        enable_tab_switch_detection=True, copy_paste_allowed=False
+        enable_tab_switch_detection=True, require_fullscreen=True,
+        copy_paste_allowed=False
     )
 
     interviewer_details = InterviewerDetails(
@@ -1296,7 +1299,7 @@ async def get_interviews(
                     "question_format": {"total_questions": 10, "mcq": 3, "coding": 2, "descriptive": 3, "case_study": 2, "aptitude": 0},
                     "evaluation_rules": {"total_marks": 100, "negative_marking": False, "section_cutoff": 30, "overall_cutoff": 50},
                     "ai_generation_rules": {"conceptual_vs_practical_ratio": "60:40", "real_world_scenarios": True, "bloom_taxonomy_level": "Apply", "coding_focus_areas": [], "avoid_topics": []},
-                    "security_settings": {"time_per_question": 5, "enable_webcam_monitoring": False, "enable_tab_switch_detection": True, "copy_paste_allowed": False},
+                    "security_settings": {"time_per_question": 5, "enable_webcam_monitoring": False, "enable_tab_switch_detection": True, "require_fullscreen": True, "copy_paste_allowed": False},
                     "interviewer_details": {"name": interview.interviewer_name or "", "email": interview.interviewer_email or "", "meeting_link": ""},
                     "notes": interview.notes,
                     "status": interview.status or "DRAFT",
@@ -2215,6 +2218,7 @@ from src.models.question_models import (
 _PROCTOR_DEFAULTS = {
     "enable_webcam_monitoring": False,
     "enable_tab_switch_detection": True,
+    "require_fullscreen": True,
     "copy_paste_allowed": False,
 }
 
@@ -2428,6 +2432,7 @@ class TestSettingsUpdate(BaseModel):
     time_per_question_type: Optional[Dict[str, int]] = None
     enable_webcam_monitoring: Optional[bool] = None
     enable_tab_switch_detection: Optional[bool] = None
+    require_fullscreen: Optional[bool] = None
     copy_paste_allowed: Optional[bool] = None
     apply_to_pending_invites: bool = True
 

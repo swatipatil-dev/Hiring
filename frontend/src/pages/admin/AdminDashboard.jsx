@@ -25,17 +25,68 @@ const CustomTooltip = ({ active, payload, label }) => {
 
 const TAB_MAP = { users: 'users', departments: 'departments', analytics: 'analytics', email: 'email', support: 'support' }
 
-// Role categories for the Users tab bar. 'all' is a UI-only key — the API takes
+// Role categories for the Users cards. 'all' is a UI-only key — the API takes
 // no `role` param for it. The rest match the `users.role` strings exactly.
+//
+// `tone`/`tint`/`line` are the same colours the role badges use in the table below
+// (.badge-red / -amber / -blue / -green in index.css), so a role reads the same
+// wherever it appears on this page rather than picking up a second identity here.
 const ROLE_TABS = [
-  { key: 'all',         label: 'All' },
-  { key: 'admin',       label: 'Admin' },
-  { key: 'hr',          label: 'HR' },
-  { key: 'interviewer', label: 'Interviewer' },
-  { key: 'candidate',   label: 'Candidate' },
+  { key: 'all',         label: 'All Users',    tone: '#2b7cba', tint: '#eef4fb', line: '#c0d8ed' },
+  { key: 'admin',       label: 'Admin',        tone: '#c44536', tint: '#fef2f0', line: '#f5c6c0' },
+  { key: 'hr',          label: 'HR',           tone: '#92610a', tint: '#fef7ec', line: '#fde4b1' },
+  { key: 'interviewer', label: 'Interviewer',  tone: '#2d5f8a', tint: '#eef4fb', line: '#c0d8ed' },
+  { key: 'candidate',   label: 'Candidate',    tone: '#1a6b5a', tint: '#eef6f3', line: '#c8e6dc' },
 ]
 const ROLE_KEYS = ROLE_TABS.map(t => t.key)
 const PAGE_SIZE = 25
+
+/**
+ * One role card in the Users filter row.
+ *
+ * A button, not a div: this filters the table below it, so it has to be reachable and
+ * operable from the keyboard like the tab bar it replaced. `aria-pressed` carries the
+ * selected state, because the tinted background and heavier border are decoration that
+ * a screen reader never sees.
+ */
+function RoleCard({ role, count, selected, onSelect }) {
+  return (
+    <button
+      type="button"
+      aria-pressed={selected}
+      // Without this the accessible name is the raw text content — "8HR" — because the
+      // numeral is rendered first. Spelling it out gives a screen reader the same two
+      // facts a sighted reader gets from the layout, in a sensible order.
+      aria-label={count == null
+        ? `${role.label}, loading count`
+        : `${role.label}, ${count} ${count === 1 ? 'user' : 'users'}`}
+      onClick={() => onSelect(role.key)}
+      style={{
+        flex: '1 1 150px', minWidth: 140, textAlign: 'left', cursor: 'pointer',
+        padding: '14px 16px', borderRadius: 12,
+        background: selected ? role.tint : 'var(--surface-card)',
+        border: `1px solid ${selected ? role.line : 'var(--border-subtle)'}`,
+        // The selected card is lifted by a ring rather than a colour swap alone, so the
+        // choice survives greyscale and colour-blindness.
+        boxShadow: selected ? `inset 0 0 0 1px ${role.line}` : 'none',
+        transition: 'background 0.15s, border-color 0.15s',
+      }}
+    >
+      <div style={{
+        fontSize: '1.6rem', fontWeight: 800, lineHeight: 1.1,
+        fontFamily: 'var(--font-mono)', color: role.tone,
+      }}>
+        {count == null ? '—' : count}
+      </div>
+      <div style={{
+        fontSize: '0.8rem', fontWeight: 700, marginTop: 4,
+        color: selected ? role.tone : 'var(--text-primary)',
+      }}>
+        {role.label}
+      </div>
+    </button>
+  )
+}
 
 function DepartmentCard({ dept, stat, accent, logo, initials, onUploadLogo, onRemoveLogo, onEdit, onDelete }) {
   const fileRef = useRef(null)
@@ -1227,14 +1278,21 @@ export default function AdminDashboard() {
 
       {tab === 'users' && (
         <div className="card">
-          <div className="tabs">
+          {/* Pick a role to filter the table below. Counts come from
+              GET /admin/users/counts, so they describe the whole company rather than
+              the current page. */}
+          <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 18 }}
+               role="group" aria-label="Filter users by role">
             {ROLE_TABS.map(t => (
-              <button key={t.key}
-                className={`tab ${roleFilter === t.key ? 'active' : ''}`}
-                aria-pressed={roleFilter === t.key}
-                onClick={() => setRoleFilter(t.key)}>
-                {t.label}{roleCounts ? ` (${roleCounts[t.key] ?? 0})` : ''}
-              </button>
+              <RoleCard
+                key={t.key}
+                role={t}
+                // null, not 0, until the counts land: a flash of zero reads as an empty
+                // system rather than as "still loading".
+                count={roleCounts ? (roleCounts[t.key] ?? 0) : null}
+                selected={roleFilter === t.key}
+                onSelect={setRoleFilter}
+              />
             ))}
           </div>
           <div className="flex-between mb-16">

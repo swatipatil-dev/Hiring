@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import api from '../../api/client'
+import { isSupported as fullscreenSupported, requestFullscreen } from '../../utils/fullscreen'
 
 export default function TestInstructions() {
   const { interviewId } = useParams()
@@ -144,11 +145,24 @@ export default function TestInstructions() {
   }, [interviewId])
 
   const webcamEnabled = !!interview?.enable_webcam_monitoring
+  // Defaults ON, matching the server: a test predating this flag still runs fullscreen.
+  const requireFullscreen = interview?.require_fullscreen !== false
   const devicesReady = camStatus === 'granted' && micStatus === 'granted'
   const canStart = agreed && (!webcamEnabled || devicesReady)
 
-  const handleStart = () => {
+  const handleStart = async () => {
     if (!canStart) return
+    // Enter fullscreen HERE, not on the exam screen. The browser only grants it from a
+    // user gesture, and this click is the last one before the test begins — an effect
+    // in OnlineTest would run with no gesture in hand and be refused every time.
+    //
+    // Best effort on purpose. If it is refused or unsupported (iOS Safari has no
+    // element fullscreen), the exam still starts: OnlineTest re-checks on mount, prompts
+    // if it can, and reports the gap to the proctor so HR sees an unmonitored run for
+    // what it is. Nobody loses a job application because of their phone.
+    if (requireFullscreen && fullscreenSupported()) {
+      await requestFullscreen()
+    }
     navigate(`/test/${interviewId}/exam`)
   }
 

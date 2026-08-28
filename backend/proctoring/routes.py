@@ -298,6 +298,12 @@ FLAG_SEVERITY = {
     "LEANING_SIDEWAYS": "LOW",
     "BEHAVIORAL_ANOMALY": "MEDIUM",
     "TAB_SWITCH": "HIGH",
+    # Leaving fullscreen is the same act as switching tabs, reached by a different key,
+    # so it carries the same weight. FULLSCREEN_UNAVAILABLE is not a violation at all -
+    # it records that the browser had no fullscreen API (iOS Safari has none), so HR can
+    # tell an unmonitored run from a clean one rather than reading silence as a pass.
+    "FULLSCREEN_EXIT": "HIGH",
+    "FULLSCREEN_UNAVAILABLE": "LOW",
     # Objects YOLO can see besides a phone. MEDIUM, not HIGH: they are worth showing HR
     # with the annotated frame, but they are single-model calls with no second
     # confirmation, so they must not feed the warn-and-terminate policy.
@@ -317,6 +323,8 @@ FLAG_MODULE = {
     "LEANING_SIDEWAYS": "pose",
     "BEHAVIORAL_ANOMALY": "behavioral",
     "TAB_SWITCH": "behavioral",
+    "FULLSCREEN_EXIT": "behavioral",
+    "FULLSCREEN_UNAVAILABLE": "behavioral",
     "PERSON_DETECTED": "object", "BOOK_DETECTED": "object",
     "TABLET_DETECTED": "object", "REMOTE_DETECTED": "object",
 }
@@ -379,6 +387,7 @@ _TERMINATE_MESSAGES = {
     "PHONE_GESTURE": "Phone-use gestures were detected repeatedly.",
     "CANDIDATE_LEFT": "You left the camera view repeatedly.",
     "TAB_SWITCH": "You switched away from the test tab too many times.",
+    "FULLSCREEN_EXIT": "You left fullscreen too many times.",
 }
 
 
@@ -1125,6 +1134,83 @@ async def record_tab_switch(session_id: str, req: TabSwitchRequest):
         "reason": "TAB_SWITCH" if terminate else None,
         "message": _TERMINATE_MESSAGES["TAB_SWITCH"] if terminate else None,
     }
+
+
+class FullscreenExitRequest(BaseModel):
+    count: int
+    timestamp: Optional[float] = None
+
+
+class FullscreenUnavailableRequest(BaseModel):
+    reason: Optional[str] = None      # what the browser said, or "unsupported"
+
+
+@router.post("/sessions/{session_id}/fullscreen-exit")
+async def record_fullscreen_exit(session_id: str, req: FullscreenExitRequest):
+    """Record a fullscreen exit and apply the same strike policy as a tab switch.
+
+    Deliberately its own flag rather than reusing TAB_SWITCH: HR's report should be able
+    to distinguish "pressed Escape" from "switched tab", and the two fire from different
+    browser events, so sharing a strike counter would double-count a single act on the
+    browsers where leaving fullscreen also backgrounds the tab.
+    """
+    entry = _sessions.get(session_id)
+    if not entry:
+        raise HTTPException(404, "Session not found")
+
+    cfg = entry["pipeline"].cfg
+    n = entry["strikes"].get("FULLSCREEN_EXIT", 0) + 1
+    entry["strikes"]["FULLSCREEN_EXIT"] = n
+    terminate = n > cfg.TERMINATE_STRIKES
+
+    db_session_id = entry.get("db_session_id")
+    if db_session_id:
+        severity = "HIGH" if n >= cfg.TERMINATE_STRIKES else "MEDIUM"
+        _persist_violation(
+            db_session_id, "FULLSCREEN_EXIT", severity, "behavioral",
+            score_impact=15 if n >= cfg.TERMINATE_STRIKES else 10,
+            details={"exit_count": req.count, "strike": n, "timestamp": req.timestamp},
+        )
+
+    if terminate:
+        _mark_session_terminated(entry, "FULLSCREEN_EXIT")
+
+    logger.warning("Fullscreen exit strike %d/%d for session %s (terminate=%s)",
+                   n, cfg.TERMINATE_STRIKES, session_id, terminate)
+    return {
+        "session_id": session_id,
+        "exit_count": req.count,
+        "strike": n,
+        "max": cfg.TERMINATE_STRIKES,
+        "warning": not terminate,
+        "terminate": terminate,
+        "reason": "FULLSCREEN_EXIT" if terminate else None,
+        "message": _TERMINATE_MESSAGES["FULLSCREEN_EXIT"] if terminate else None,
+    }
+
+
+@router.post("/sessions/{session_id}/fullscreen-unavailable")
+async def record_fullscreen_unavailable(session_id: str, req: FullscreenUnavailableRequest):
+    """Note that this browser could not go fullscreen. Never a strike.
+
+    iOS Safari has no Element.requestFullscreen at all, and a candidate should not lose a
+    job application over their phone. Recorded with zero score impact purely so the
+    report says "this run was not fullscreen-monitored" instead of looking identical to
+    one that was.
+    """
+    entry = _sessions.get(session_id)
+    if not entry:
+        raise HTTPException(404, "Session not found")
+
+    db_session_id = entry.get("db_session_id")
+    if db_session_id:
+        _persist_violation(
+            db_session_id, "FULLSCREEN_UNAVAILABLE", "LOW", "behavioral",
+            score_impact=0,
+            details={"reason": req.reason or "unsupported"},
+        )
+    logger.info("Fullscreen unavailable for session %s: %s", session_id, req.reason)
+    return {"session_id": session_id, "recorded": True}
 
 
 @router.get("/health")

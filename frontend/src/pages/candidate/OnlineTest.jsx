@@ -2,6 +2,10 @@ import { useState, useEffect, useRef, useCallback, useMemo, lazy, Suspense } fro
 import { useParams, useNavigate } from 'react-router-dom'
 import { motion, AnimatePresence } from 'framer-motion'
 import api from '../../api/client'
+import {
+  isSupported as fullscreenSupported, isFullscreen,
+  requestFullscreen, exitFullscreen, onFullscreenChange,
+} from '../../utils/fullscreen'
 import VoiceAnswer from './VoiceAnswer'
 import ErrorBoundary from '../../components/ErrorBoundary'
 
@@ -213,6 +217,16 @@ export default function OnlineTest() {
   // Both default to the stricter setting until the interview record says otherwise.
   const [enableTabSwitchDetection, setEnableTabSwitchDetection] = useState(true)
   const [copyPasteAllowed, setCopyPasteAllowed] = useState(false)
+  // Defaults ON to match the server: a test created before this flag existed still runs
+  // fullscreen rather than silently losing the protection.
+  const [requireFullscreen, setRequireFullscreen] = useState(true)
+  const [fullscreenLost, setFullscreenLost] = useState(false)
+  const [fullscreenUnavailable, setFullscreenUnavailable] = useState(false)
+  const [fullscreenExits, setFullscreenExits] = useState(0)
+  // Was the page fullscreen a moment ago? Only a true -> false transition is a
+  // violation. Arriving without fullscreen means the request was refused on the
+  // instructions page, which is not the candidate's doing and must not cost a strike.
+  const wasFullscreenRef = useRef(false)
 
   // Pre-test connectivity check (skipped — device check screen removed)
   const [connectivityChecked, setConnectivityChecked] = useState(true)
@@ -326,11 +340,13 @@ export default function OnlineTest() {
         setEnableWebcamMonitoring(!!m?.enable_webcam_monitoring)
         setEnableTabSwitchDetection(m?.enable_tab_switch_detection !== false)
         setCopyPasteAllowed(!!m?.copy_paste_allowed)
+        setRequireFullscreen(m?.require_fullscreen !== false)
       } catch {
         if (!cancelled) {
           setEnableWebcamMonitoring(false)
           setEnableTabSwitchDetection(true)
           setCopyPasteAllowed(false)
+          setRequireFullscreen(true)
         }
       }
     })()
@@ -791,6 +807,63 @@ export default function OnlineTest() {
     document.addEventListener('visibilitychange', handleVisibility)
     return () => document.removeEventListener('visibilitychange', handleVisibility)
   }, [proctorSession, enableTabSwitchDetection])
+
+  // Fullscreen enforcement.
+  //
+  // This cannot stop anyone reaching another tab — Escape and F11 always work and no
+  // page may suppress them. What it does is make leaving conspicuous and costly: the
+  // questions go behind an overlay, and each exit is a strike under the same policy
+  // that governs tab switches, so the fourth one ends the test.
+  //
+  // Entering fullscreen needs a user gesture, so it happens on the Start button in
+  // TestInstructions. Here we only observe, and offer a button to get back.
+  useEffect(() => {
+    if (!requireFullscreen || done || terminated) return
+
+    // No fullscreen API at all (iOS Safari). Tell the proctor once so HR can see this
+    // run was not fullscreen-monitored, then leave the candidate alone — blocking here
+    // would mean nobody on an iPhone can take an assessment.
+    if (!fullscreenSupported()) {
+      setFullscreenUnavailable(true)
+      if (proctorSession?.session_id) {
+        api.post(`/proctor/sessions/${proctorSession.session_id}/fullscreen-unavailable`,
+                 { reason: 'unsupported' }).catch(() => {})
+      }
+      return
+    }
+
+    wasFullscreenRef.current = isFullscreen()
+    // Refused on the way in rather than exited: prompt, but do not penalise.
+    setFullscreenLost(!wasFullscreenRef.current)
+
+    const unsubscribe = onFullscreenChange((active) => {
+      const left = wasFullscreenRef.current && !active
+      wasFullscreenRef.current = active
+      setFullscreenLost(!active)
+      if (!left) return
+
+      setFullscreenExits((prev) => {
+        const n = prev + 1
+        if (proctorSession?.session_id) {
+          api.post(`/proctor/sessions/${proctorSession.session_id}/fullscreen-exit`, {
+            count: n,
+            timestamp: Date.now(),
+          }).then(r => {
+            if (r.data?.terminate) {
+              terminateTest(r.data.reason || 'FULLSCREEN_EXIT', r.data.message)
+            } else if (r.data?.warning) {
+              setProctorWarning({ severity: 'serious', flag: 'FULLSCREEN_EXIT', strike: r.data.strike, max: r.data.max })
+              clearTimeout(warningTimerRef.current)
+              warningTimerRef.current = setTimeout(() => setProctorWarning(null), 6000)
+            }
+          }).catch(() => {})
+        }
+        return n
+      })
+    })
+    return unsubscribe
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [requireFullscreen, proctorSession, done, terminated])
 
   // Copy-paste blocking, right-click prevention, DevTools detection.
   // Copy/paste and right-click are suppressed only when the test forbids copy/paste;
@@ -1264,6 +1337,9 @@ export default function OnlineTest() {
   const terminateTest = (reason, message) => {
     if (terminatedRef.current) return
     terminatedRef.current = true
+    // Hand the screen back. The test is over; trapping them in fullscreen to read a
+    // result they cannot act on is just rude.
+    exitFullscreen()
     setTerminated({ reason, message: message || 'Your test has been ended due to repeated proctoring violations.' })
     submitTest()
   }
@@ -1271,6 +1347,10 @@ export default function OnlineTest() {
   const submitTest = async () => {
     clearInterval(timer.current)
     stopCamera()
+    // Release the screen on the way out, whichever branch below completes. Holding a
+    // finished candidate in fullscreen to read their score is pointless, and it also
+    // stops the exit firing as a violation after the test is already over.
+    exitFullscreen()
     try {
       const res = await api.post(`/candidate/interviews/${interviewId}/submit`, { answers: questions.map((q, i) => q.question_type === 'coding'
         ? { question_id: q.id, selected_option: (typeof answers[i] === 'string' ? answers[i] : ''), language: (q.language || langByQ[q.id] || 'python') }
@@ -1570,6 +1650,61 @@ export default function OnlineTest() {
               ? `Warning ${proctorWarning.strike}/${proctorWarning.max} — ${PROCTOR_FLAG_LABELS[proctorWarning.flag] || proctorWarning.flag}. The test will end if this continues.`
               : `${(proctorWarning.flags || []).map(f => PROCTOR_FLAG_LABELS[f] || f).join(', ')} — please face the screen and stay still.`}
           </div>
+        </div>
+      )}
+
+      {/* ═══ FULLSCREEN LOST — questions hidden until they return ═══ */}
+      {/* Below the terminated overlay in z-order on purpose: once the test is over,
+          "return to fullscreen" is the wrong thing to be asking for. */}
+      {requireFullscreen && fullscreenLost && !terminated && !done && (
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 10000, background: 'rgba(15,23,42,0.92)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20,
+        }}>
+          <div style={{ maxWidth: 460, background: '#fff', borderRadius: 14, padding: '28px 30px', textAlign: 'center', boxShadow: '0 20px 60px rgba(0,0,0,0.4)' }}>
+            <div style={{ width: 52, height: 52, borderRadius: '50%', background: '#fef3c7', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 14px' }}>
+              <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#b45309" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>
+              </svg>
+            </div>
+            <h2 style={{ margin: '0 0 8px', fontSize: 19, color: '#0f172a' }}>Return to fullscreen to continue</h2>
+            <p style={{ margin: 0, fontSize: 13.5, color: '#475569', lineHeight: 1.5 }}>
+              This assessment runs in fullscreen. Your questions are hidden until you go
+              back.
+            </p>
+            {/* The timer does not stop for this, and saying so is fairer than letting
+                them discover it. */}
+            <p style={{ margin: '10px 0 0', fontSize: 12.5, color: '#b45309', fontWeight: 600 }}>
+              The timer is still running.
+            </p>
+            {fullscreenExits > 0 && (
+              <p style={{ margin: '10px 0 0', fontSize: 12.5, color: '#991b1b', fontWeight: 700 }}>
+                Leaving fullscreen is recorded. This is exit {fullscreenExits}; repeated
+                exits will end the test.
+              </p>
+            )}
+            <button
+              onClick={() => requestFullscreen()}
+              style={{ marginTop: 20, padding: '11px 28px', borderRadius: 999, border: 'none', background: '#0f766e', color: '#fff', fontSize: 14, fontWeight: 700, cursor: 'pointer' }}
+            >
+              Return to fullscreen
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ═══ FULLSCREEN UNAVAILABLE — this browser cannot do it ═══ */}
+      {/* Not a blocker. iOS Safari has no element fullscreen, and a candidate should not
+          lose an application over their phone. The proctor has been told. */}
+      {requireFullscreen && fullscreenUnavailable && !terminated && !done && (
+        <div style={{
+          position: 'fixed', top: 14, left: '50%', transform: 'translateX(-50%)', zIndex: 9999,
+          maxWidth: 560, padding: '10px 16px', borderRadius: 10, background: '#fffbeb',
+          border: '1.5px solid #f59e0b', boxShadow: '0 6px 20px rgba(0,0,0,0.15)',
+          fontSize: 12.5, color: '#92400e', fontWeight: 600,
+        }}>
+          This browser cannot run the test in fullscreen. You may continue — please stay
+          on this tab, which is still monitored.
         </div>
       )}
 
