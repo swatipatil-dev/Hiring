@@ -18,7 +18,18 @@ from types import SimpleNamespace
 
 import pytest
 
-from proctoring.routes import (
+# proctoring/routes.py imports cv2 at module scope, and the CI image installs
+# requirements-ci.txt, which deliberately carries no ML extras — so importing this module
+# there raises ModuleNotFoundError and takes the whole collection down with it. Skip
+# rather than fail, the same guard test_proctor_model_sharing.py uses.
+#
+# The cost is real and worth naming: these tests do not run in CI. Every cv2 use in
+# routes.py is inside a function, so a lazy import there would make the whole proctoring
+# HTTP layer CI-testable — but that is a change to a live service, not something to do
+# in passing to turn one check green.
+pytest.importorskip("cv2", reason="proctoring extras not installed")
+
+from proctoring.routes import (   # noqa: E402  (must follow the guard above)
     FLAG_MODULE,
     FLAG_SEVERITY,
     FullscreenExitRequest,
