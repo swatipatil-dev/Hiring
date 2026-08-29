@@ -17,9 +17,12 @@ land there — which means naming the *finished* states and treating everything 
 still open. Get that backwards and a typo in HR's payload silently switches the guard off.
 """
 
+from contextlib import contextmanager
 from typing import Optional
 
+from fastapi import HTTPException
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 
 # JobPosting.status is draft | pending_approval | active | closed (models.py:334).
 # Everything but closed is a role someone is still working.
@@ -119,3 +122,47 @@ def duplicate_job_detail(existing) -> str:
         f"(created {when}, currently {existing.status}). Edit or close that one instead "
         f"of posting a second copy."
     )
+
+
+# ── The database as the last word ────────────────────────────────────────────
+#
+# Every path that creates a Candidate checks `(job_id, email)` first, and those checks
+# are the ones that produce a good error message. They cannot be the whole story though:
+# two concurrent applications both read "not present" before either writes, and the
+# second one then meets `uq_candidates_company_job_email`.
+#
+# Without this, that race surfaces to the candidate as a 500 on the apply button.
+
+# MySQL's duplicate-key errno. Matching on it specifically matters: a foreign-key
+# violation is also an IntegrityError, and reporting one of those as "already exists"
+# would send whoever is debugging it in exactly the wrong direction.
+_MYSQL_DUPLICATE_ENTRY = 1062
+
+
+def is_duplicate_key(exc: IntegrityError) -> bool:
+    """Is this IntegrityError a unique-constraint violation, rather than some other one?"""
+    orig = getattr(exc, "orig", None)
+    args = getattr(orig, "args", None) or ()
+    if args and args[0] == _MYSQL_DUPLICATE_ENTRY:
+        return True
+    # Fallback for drivers that do not expose the errno the same way.
+    return "duplicate entry" in str(orig).lower()
+
+
+@contextmanager
+def duplicate_as_conflict(db, message: str):
+    """Turn a unique-constraint violation into a 409 with `message`.
+
+    Rolls back first: after an IntegrityError the session is unusable, and leaving it
+    dirty makes the *next* query in the request fail with something unrelated.
+
+    Anything that is not a duplicate key is re-raised untouched — this is a translator,
+    not a catch-all.
+    """
+    try:
+        yield
+    except IntegrityError as exc:
+        db.rollback()
+        if not is_duplicate_key(exc):
+            raise
+        raise HTTPException(status_code=409, detail=message)
