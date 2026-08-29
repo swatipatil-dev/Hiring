@@ -9,6 +9,9 @@ from typing import List, Optional, Dict, Any, Union
 from src.config.database_config_mysql import get_db
 from src.auth import get_current_user, AuthMiddleware
 from src.models.models import Interview, User, Candidate, InterviewerProfile, JobPosting, Department, CandidateRequest, JDTemplate, HRProfile
+from src.services.job_dedup import (
+    find_open_duplicate_job, find_open_duplicate_request, duplicate_request_detail,
+)
 from src.models.question_schemas import (
     QuestionGenerationRequest, QuestionGenerationResponse, 
     QuestionListResponse as QuestionListResponseBase, Question, QuestionUpdate, QuestionCreate,
@@ -344,15 +347,25 @@ async def auto_create_job_from_request(
     """Auto-create a job posting when interviewer selects a candidate request to create a test"""
     from src.models.models import HRProfile, InterviewerProfile
 
-    # Check if job with same title already exists — return it instead of creating duplicate
-    existing = db.query(JobPosting).filter(
-        JobPosting.title.ilike(data.title.strip())
-    ).first()
+    # Reuse an existing OPEN job for this role rather than creating a second one. This
+    # endpoint is a get-or-create by design — the test wizard calls it to obtain a
+    # job_id to hang a test on — so a match returns 200 with that job rather than 409.
+    #
+    # The previous query matched `title.ilike(...)` with no company and no status filter,
+    # which meant it could hand back another TENANT's job, and that a role closed a year
+    # ago permanently blocked reopening it. find_open_duplicate_job fixes both.
+    #
+    # Department is not part of the match here: the caller supplies a department name,
+    # not an id, and the id is only resolved further down. Matching on title within the
+    # company is what this endpoint has always done, minus the two defects.
+    existing = find_open_duplicate_job(db, current_user.company_id, data.title)
     if existing:
         return {
             "job_id": str(existing.id),
             "job_title": existing.title,
-            "message": f"Job '{existing.title}' already exists"
+            "reused": True,
+            "message": f"Using the existing open job '{existing.title}' ({existing.status}) "
+                       f"instead of creating a second one."
         }
 
     # Find interviewer's department
@@ -1860,6 +1873,22 @@ async def create_candidate_request(
     db: Session = Depends(get_db)
 ):
     """Interviewer submits a request for candidates with role/skill requirements"""
+    # An interviewer could previously raise the same role over and over, and each request
+    # could become another job posting. Refuse a second one while the first is still
+    # unfinished, and say which one is in the way — the role they want is usually already
+    # in flight, so pointing at it is more use than a bare rejection.
+    duplicate = find_open_duplicate_request(
+        db, current_user.company_id, request.job_title, request.department)
+    if duplicate:
+        # A plain string: the interviewer UI puts response.data.detail straight into React
+        # state, so a list-of-objects detail would crash the page rather than show.
+        raise HTTPException(
+            status_code=409,
+            detail=duplicate_request_detail(
+                duplicate,
+                db.query(User).filter(User.id == duplicate.requested_by).first()),
+        )
+
     cr = CandidateRequest(
         company_id=current_user.company_id,
         requested_by=current_user.id,

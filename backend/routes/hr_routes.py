@@ -21,6 +21,7 @@ from src.services.resume_pool_import import (
     count_importable_users, count_orphan_candidates,
     score_backlog, count_unscored,
 )
+from src.services.job_dedup import find_open_duplicate_job, duplicate_job_detail
 from src.services.talent_pool import (
     derive_outcome, outcome_filter, outcome_sum_columns,
 )
@@ -519,6 +520,17 @@ async def create_job(
     # back to the resolved department's company_id so a job is never created
     # with NULL company_id (which would break multi-tenant isolation downstream).
     job_company_id = current_user.company_id or department.company_id
+
+    # Refuse a second posting for a role this department is already hiring for. This is
+    # the path that closes the loop: an interviewer's draft for the role now blocks HR
+    # posting the same title again, which is how the same opening used to appear twice —
+    # once from the request and once from the posting.
+    #
+    # Resolved company_id, not current_user's, so the check covers the same tenant the
+    # row is about to be written into.
+    duplicate = find_open_duplicate_job(db, job_company_id, job_data.title, dept_id)
+    if duplicate:
+        raise HTTPException(status_code=409, detail=duplicate_job_detail(duplicate))
 
     # Create job posting
     db_job = JobPosting(
