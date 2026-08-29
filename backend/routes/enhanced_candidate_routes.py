@@ -25,6 +25,7 @@ import uuid
 import os
 import json
 import logging
+from src.services.job_dedup import duplicate_as_conflict
 
 logger = logging.getLogger(__name__)
 
@@ -507,7 +508,12 @@ async def apply_for_job_enhanced(
     )
     
     db.add(candidate)
-    db.commit()
+    # The `(job_id, email)` check above is what produces a good message, but it cannot
+    # be the whole story: two concurrent applications both read "not present" before
+    # either writes, and the loser then meets uq_candidates_company_job_email. Without
+    # this that race reaches the candidate as a 500 on the apply button.
+    with duplicate_as_conflict(db, "You have already applied for this job. If you meant to update your application, contact the recruiter rather than applying again."):
+        db.commit()
     db.refresh(candidate)
     
     # Create enhanced ATS result record

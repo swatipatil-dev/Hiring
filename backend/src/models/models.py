@@ -352,6 +352,19 @@ class JobPosting(Base, TenantScoped):
 
 class Candidate(Base, TenantScoped):
     __tablename__ = "candidates"
+    __table_args__ = (
+        # One row per person per opening. Five code paths create a Candidate and only
+        # some checked first, so whichever lacked a check could enter someone twice —
+        # and an app-level check cannot stop two concurrent requests both reading
+        # "not present" before either writes.
+        #
+        # Does NOT cover the signup placeholders: registration writes one row per user
+        # with job_id = NULL (src/auth.py), and MySQL treats NULLs as distinct in a
+        # unique index. That is deliberate — one placeholder per person is already
+        # guaranteed upstream by uq_users_company_email.
+        UniqueConstraint("company_id", "job_id", "email",
+                         name="uq_candidates_company_job_email"),
+    )
 
     id               = Column(String(36), primary_key=True, default=_uuid)
     company_id       = Column(String(36), ForeignKey("companies.id"), nullable=True, index=True)

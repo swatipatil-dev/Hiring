@@ -48,6 +48,7 @@ from src.utils import (
     validate_pagination_params, validate_sort_params, validate_order_params,
     create_error_response, create_success_response
 )
+from src.services.job_dedup import duplicate_as_conflict
 
 router = APIRouter(prefix="/api/v1/candidate", tags=["Candidates"])
 
@@ -543,7 +544,12 @@ async def apply_for_job_enhanced(
     )
     
     db.add(candidate)
-    db.commit()
+    # The `(job_id, email)` check above is what produces a good message, but it cannot
+    # be the whole story: two concurrent applications both read "not present" before
+    # either writes, and the loser then meets uq_candidates_company_job_email. Without
+    # this that race reaches the candidate as a 500 on the apply button.
+    with duplicate_as_conflict(db, "You have already applied for this job. If you meant to update your application, contact the recruiter rather than applying again."):
+        db.commit()
     db.refresh(candidate)
     
     # Create ATS result record
@@ -777,7 +783,12 @@ async def quick_apply_for_job(
     )
 
     db.add(candidate)
-    db.commit()
+    # The `(job_id, email)` check above is what produces a good message, but it cannot
+    # be the whole story: two concurrent applications both read "not present" before
+    # either writes, and the loser then meets uq_candidates_company_job_email. Without
+    # this that race reaches the candidate as a 500 on the apply button.
+    with duplicate_as_conflict(db, "You have already applied for this job. If you meant to update your application, contact the recruiter rather than applying again."):
+        db.commit()
     db.refresh(candidate)
 
     # Create ATS result record
