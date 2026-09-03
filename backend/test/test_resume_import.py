@@ -31,9 +31,11 @@ from routes.candidate_profile_routes import (
 def test_projects_primary_uses_tech_anchor():
     """Title is the non-bullet line directly above a 'Tech:' line."""
     section = "Smart Resume Parser\nTech: Python, spaCy\n- Built an NER pipeline\n"
-    assert _projects_from_section(section) == [
-        {"name": "Smart Resume Parser", "confidence": CONF_INFERRED}
-    ]
+    out = _projects_from_section(section)
+    assert len(out) == 1
+    assert out[0]["name"] == "Smart Resume Parser"
+    assert out[0]["technologies_used"] == "Python, spaCy"
+    assert out[0]["confidence"] == CONF_INFERRED
 
 
 def test_projects_ignores_wrapped_bullet_fragments():

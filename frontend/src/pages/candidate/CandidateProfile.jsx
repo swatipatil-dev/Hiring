@@ -1659,16 +1659,24 @@ function DocumentsSection({ profile, reload, flash }) {
   const [parsing, setParsing] = useState(false)
   const [reviewData, setReviewData] = useState(null)
 
-  const handleAutoFill = async () => {
-    const file = autoFillRef.current?.files[0]
-    if (!file) return
+  const handleAutoFill = async (fileOverride) => {
+    const file = (fileOverride && fileOverride.target ? null : fileOverride) || autoFillRef.current?.files[0]
+    if (!file && !profile.resume_path) {
+      autoFillRef.current?.click()
+      return
+    }
     setParsing(true)
-    const fd = new FormData()
-    fd.append('resume', file)
     try {
-      const r = await api.post('/candidate/profile/import/parse', fd, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-      })
+      let r
+      if (file) {
+        const fd = new FormData()
+        fd.append('resume', file)
+        r = await api.post('/candidate/profile/import/parse', fd, {
+          headers: { 'Content-Type': 'multipart/form-data' },
+        })
+      } else {
+        r = await api.post('/candidate/profile/import/parse')
+      }
       setReviewData(r.data)
     } catch (e) {
       flash(e.response?.data?.detail || 'Could not read that resume. Try a different file.', 'error')
@@ -1783,7 +1791,13 @@ function DocumentsSection({ profile, reload, flash }) {
                 </div>
               </div>
               <button className="btn btn-sm" style={{ background: TEAL, color: '#fff', border: `1px solid ${TEAL}` }}
-                onClick={() => autoFillRef.current?.click()} disabled={parsing}>
+                onClick={() => {
+                  if (profile.resume_path) {
+                    handleAutoFill()
+                  } else {
+                    autoFillRef.current?.click()
+                  }
+                }} disabled={parsing}>
                 {parsing ? <><Loader2 size={13} style={{ animation: 'spin 1s linear infinite' }} /> Reading…</> : <><Sparkles size={13} /> Auto-fill</>}
               </button>
             </div>

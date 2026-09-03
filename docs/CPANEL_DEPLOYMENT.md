@@ -40,6 +40,7 @@ moving on — later steps assume the earlier ones worked.
 - [Tuning after real load](#tuning-after-real-load)
 - [If something breaks](#if-something-breaks)
 - [After deployment](#after-deployment)
+- [Deploying a code update](#deploying-a-code-update) — or go straight to [DEPLOY_UPDATE.md](DEPLOY_UPDATE.md)
 
 ---
 
@@ -1155,15 +1156,18 @@ journalctl -u hireflow-api -f
 # Restart after a config change
 systemctl restart hireflow-api hireflow-proctor
 
-# Deploy updated code
-cd /opt/hireflow && sudo -u hireflow git pull
-sudo -u hireflow /opt/hireflow/venv/bin/pip install -r backend/requirements-cpanel.txt
-cd backend && sudo -u hireflow /opt/hireflow/venv/bin/alembic upgrade head
-systemctl restart hireflow-api hireflow-proctor hireflow-judge-worker hireflow-email-worker
-
-# Rebuild the website after a code update
-cd /opt/hireflow/frontend && npm ci && npm run build
-rsync -a --delete dist/ /home/innomaxskills/public_html/career/
-cp /opt/hireflow/deploy/cpanel/htaccess-spa /home/innomaxskills/public_html/career/.htaccess
-chown -R innomaxskills:innomaxskills /home/innomaxskills/public_html/career
+# Deploy updated code -> follow DEPLOY_UPDATE.md, not a snippet from here
 ```
+
+### Deploying a code update
+
+**→ [DEPLOY_UPDATE.md](DEPLOY_UPDATE.md)**
+
+There used to be a four-line recipe here. It was wrong in three ways — `npm ci`
+fails on this repo's lockfile, and it never re-copied the systemd units or the
+Apache config, both of which `git pull` leaves stale. Worse, it ended at
+`alembic upgrade head` with nothing to confirm the schema actually matched the
+code, which is precisely the gap that took out the HR dashboard after one release.
+
+The separate document is ordered, says which steps are conditional on what
+changed, and ends in a verification you can fail.

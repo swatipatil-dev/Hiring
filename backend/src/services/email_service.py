@@ -407,7 +407,7 @@ def _send(to: str, subject: str, body: str, reply_to: Optional[str] = None,
                 cc_list.append(a)
 
     logger.info(f"[EMAIL] To: {to} | Cc: {', '.join(cc_list) or '-'} | From: {from_header} | Subject: {subject}")
-    logger.info(f"[EMAIL BODY]\n{body}\n{'='*60}")
+    logger.info(f"[EMAIL BODY]\n{body}\n{'=' * 60}")
     if not EMAIL_ENABLED or not user:
         return {"sent": False, "error": "EMAIL_ENABLED is false or SMTP user not set", "error_type": "disabled"}
     try:

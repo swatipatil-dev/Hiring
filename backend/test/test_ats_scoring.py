@@ -62,8 +62,9 @@ def _make_fake_rapidfuzz():
     fuzz_mod.partial_ratio = partial_ratio
     fuzz_mod.token_set_ratio = token_set_ratio
     rf.fuzz = fuzz_mod
-    sys.modules["rapidfuzz"] = rf
-    sys.modules["rapidfuzz.fuzz"] = fuzz_mod
+    # Deliberately NOT installed into sys.modules: the only caller patches
+    # enhanced_ats_service._fuzz directly, and a session-wide fake leaks into
+    # every later test that imports the real rapidfuzz.
     return rf
 
 

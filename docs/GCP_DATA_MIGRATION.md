@@ -218,6 +218,29 @@ This becomes the permanent production database after the flip. The name is
 cosmetic: every query uses MySQL's `DATABASE()` rather than a hardcoded name, and
 `/health` reports whatever it is actually connected to.
 
+**Then fix its charset, before importing anything:**
+
+```bash
+mysql -u innomaxskills_hf -p -e   "ALTER DATABASE innomaxskills_hfmig CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;"
+```
+
+cPanel creates databases as **`utf8mb3`**. A `mysqldump` restores its tables as
+`utf8mb4`, because `mysqldump` writes the charset onto each `CREATE TABLE` — and
+you have just deleted the dump's `CREATE DATABASE` line, which is what would
+otherwise have carried it. So the tables end up `utf8mb4` inside a `utf8mb3`
+database, and the mismatch is invisible: every imported table works fine.
+
+It surfaces the first time a *later* migration creates a table with a foreign key.
+The new table inherits the database default, and MySQL refuses the constraint:
+
+```
+(3780, "Referencing column 'company_id' and referenced column 'id' ... are incompatible")
+```
+
+That happened here ten days after the migration, and cost an afternoon. Existing
+tables are not rewritten by the `ALTER`, so it is free to run at any time — but
+running it now means never meeting the error.
+
 ## Step 5 — Import
 
 ```bash
