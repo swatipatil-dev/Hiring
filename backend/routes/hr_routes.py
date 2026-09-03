@@ -22,11 +22,16 @@ from src.services.resume_pool_import import (
     score_backlog, count_unscored,
 )
 from src.services.job_dedup import find_open_duplicate_job, duplicate_job_detail
+from src.services.llm_resume_extractor import (
+    PROFILE_FIELDS, missing_fields, extract_gaps, profile_source_map as _profile_source,
+    LLM_RESUME_CONCURRENCY,
+)
 from src.services.talent_pool import (
     derive_outcome, outcome_filter, outcome_sum_columns,
 )
 from pydantic import BaseModel, EmailStr, Field
 from datetime import datetime, timedelta
+import asyncio
 import hashlib
 import logging
 import uuid
@@ -655,6 +660,10 @@ class ResumeMatchResult(BaseModel):
     year_of_passing: Optional[int] = None
     job_role: Optional[str] = None
     highest_degree: Optional[str] = None
+    # Origin of each field above: "regex" (parsed) or "llm" (inferred by Gemini from
+    # the resume). Drives the "verify this" badge. Absent for rows parsed before
+    # gap-filling existed, which the UI reads as "regex".
+    profile_source: Dict[str, str] = {}
     extracted_skills: List[str] = []
     extracted_experience: Optional[float] = None
     best_match: Optional[JobMatch] = None
@@ -1008,6 +1017,7 @@ def _entry_to_result(entry: ResumePoolEntry,
         year_of_passing=entry.year_of_passing,
         job_role=entry.job_role,
         highest_degree=entry.highest_degree,
+        profile_source=_profile_source(entry),
         extracted_skills=_json_list(entry.extracted_skills),
         extracted_experience=float(entry.experience_years) if entry.experience_years is not None else None,
         best_match=job_matches[0] if job_matches else None,
@@ -1133,6 +1143,18 @@ def _score_against_jobs(resume_text: str, prepared_jobs: List[Dict[str, Any]], l
     extracted_skills: List[str] = []
     extracted_experience = None
 
+    # Prepare once. The sanitize/clean/normalise/section-detect/parse chain depends only
+    # on the resume, and the parse runs a spaCy transformer pass — doing it inside the
+    # loop cost one pass per active job to produce an identical result.
+    #
+    # Unlike a single job failing below, a failed prepare affects every job, so it
+    # returns the same empty triple the callers already handle.
+    try:
+        prepared_resume = enhanced_ats_service.prepare_resume(resume_text)
+    except Exception as e:
+        logger.error(f"Resume match: preparing {label} failed: {e}")
+        return [], [], None
+
     for pj in prepared_jobs:
         try:
             r = enhanced_ats_service.enhanced_score_candidate(
@@ -1140,6 +1162,7 @@ def _score_against_jobs(resume_text: str, prepared_jobs: List[Dict[str, Any]], l
                 job_description=pj["jd_text"],
                 required_skills=pj["skills"],
                 required_experience=pj["experience"],
+                prepared=prepared_resume,
             )
         except Exception as e:
             logger.error(f"Resume match: scoring {label} vs {pj['job'].id} failed: {e}")
@@ -1209,6 +1232,8 @@ async def match_resumes_to_jobs(
         files = files[:RESUME_MATCH_MAX_FILES]
 
     results: List[ResumeMatchResult] = []
+    # (index into `results`, entry) for rows the regex parser left gaps on.
+    llm_pending: List[tuple] = []
     for upload in files:
         filename = upload.filename or "resume"
 
@@ -1315,6 +1340,21 @@ async def match_resumes_to_jobs(
         entry.best_score = ranked[0]["ats_score"]
         entry.match_results = json.dumps(ranked)
 
+        # Attribute each profile field. Read off the entry rather than `profile` so the
+        # `keep` guard above is respected — on a registered-candidate row the surviving
+        # value is their own, not this parser's. A field the parser found this time is
+        # re-marked "regex"; one it still cannot find keeps whatever it had, so an
+        # earlier "llm" attribution is not silently laundered into "regex".
+        src_map = _profile_source(entry)
+        for _f in PROFILE_FIELDS:
+            if not getattr(entry, _f, None):
+                src_map.pop(_f, None)
+            elif profile.get(_f):
+                src_map[_f] = "regex"
+            else:
+                src_map.setdefault(_f, "regex")
+        entry.profile_source = json.dumps(src_map) if src_map else None
+
         try:
             db.commit()
             db.refresh(entry)
@@ -1329,7 +1369,60 @@ async def match_resumes_to_jobs(
 
         results.append(_entry_to_result(entry))
 
-    # 3. Sort the batch so the strongest best-matches float to the top
+        # Queue for the gap-fill pass below if the parser left anything blank. Snapshot
+        # the values now, while this entry is freshly refreshed: a later file's commit
+        # expires it, and re-reading inside the async pass would issue a blocking
+        # lazy-load per row from the event loop.
+        current = {f: getattr(entry, f, None) for f in PROFILE_FIELDS}
+        if missing_fields(current):
+            llm_pending.append((len(results) - 1, entry, resume_text, current))
+
+    # 3. Fill the blanks the regex parser left, using Gemini.
+    #
+    # Deliberately a second pass rather than a call inside the loop: at
+    # RESUME_MATCH_MAX_FILES=20 these run concurrently here — roughly one call's
+    # latency — where inline they would run serially and add ~20x that to a request
+    # that is already scoring every resume against every active job. It also means
+    # every pool row is committed before the first call, so a failure here can delay
+    # a value but never lose an upload.
+    if llm_pending:
+        try:
+            sem = asyncio.Semaphore(LLM_RESUME_CONCURRENCY)
+
+            async def _fill(text, current):
+                async with sem:
+                    return await extract_gaps(text, current)
+
+            filled_all = await asyncio.gather(
+                *[_fill(t, c) for _, _, t, c in llm_pending], return_exceptions=True
+            )
+
+            touched = []
+            for (idx, entry, _text, _current), filled in zip(llm_pending, filled_all):
+                if isinstance(filled, BaseException):
+                    logger.warning(f"Resume match: gap-fill failed for {entry.id}: {filled}")
+                    continue
+                if not filled:
+                    continue
+                src_map = _profile_source(entry)
+                for field, value in filled.items():
+                    setattr(entry, field, value)
+                    src_map[field] = "llm"
+                entry.profile_source = json.dumps(src_map)
+                touched.append((idx, entry))
+
+            if touched:
+                db.commit()
+                # Re-render only the rows that changed — the versions already in
+                # `results` were built before the fill and would understate the row.
+                for idx, entry in touched:
+                    db.refresh(entry)
+                    results[idx] = _entry_to_result(entry)
+        except Exception as e:
+            db.rollback()
+            logger.warning(f"Resume match: LLM gap-fill pass failed: {e}")
+
+    # 4. Sort the batch so the strongest best-matches float to the top
     #    (rows with an error / no best_match sink to the bottom).
     results.sort(key=lambda x: x.best_match.ats_score if x.best_match else -1, reverse=True)
 
@@ -4302,6 +4395,8 @@ async def hr_schedule_interview(
 
     # Send email to candidate
     email_sent = False
+    email_status = "skipped"   # sent | queued | failed | skipped
+    email_error = None
     if body.send_email:
         try:
             meeting_link_or_location = (
@@ -4330,11 +4425,11 @@ async def hr_schedule_interview(
                 for k, v in placeholders.items():
                     subj = subj.replace(k, v)
                     html = html.replace(k, v)
-                _send(candidate.email, subj, html.replace("\n", "<br>"),
-                      smtp_config=smtp_config, cc=disp["cc"])
+                send_result = _send(candidate.email, subj, html.replace("\n", "<br>"),
+                                    smtp_config=smtp_config, cc=disp["cc"])
             else:
                 from src.services.email_service import send_interview_scheduled
-                send_interview_scheduled(
+                send_result = send_interview_scheduled(
                     candidate.email,
                     candidate_name_str,
                     job.title,
@@ -4344,9 +4439,23 @@ async def hr_schedule_interview(
                     smtp_config=smtp_config,
                     cc=disp["cc"]
                 )
-            email_sent = True
+            # These senders report failure by return value rather than by raising,
+            # so the result has to be read — reaching this line is not proof the
+            # candidate got anything.
+            from src.services.email_service import delivery_outcome
+            outcome = delivery_outcome(send_result)
+            email_status = outcome["status"]
+            email_sent = outcome["ok"]          # true for sent OR queued
+            email_error = outcome["error"]
+            if not outcome["ok"]:
+                logger.warning(
+                    f"interview-scheduled email to {candidate.email} not delivered: "
+                    f"{outcome['error_type']} — {outcome['error']}"
+                )
         except Exception as e:
             email_sent = False
+            email_status = "failed"
+            email_error = str(e)
             logger.warning(f"interview-scheduled email to {candidate.email} failed: {e}")
 
     # Invite each panel member by email (independent of the candidate email toggle —
@@ -4382,14 +4491,22 @@ async def hr_schedule_interview(
         except Exception as e:
             logger.warning(f"panel-invite dispatch failed: {e}")
 
+    email_note = {
+        "sent": " — email sent to candidate",
+        "queued": " — email queued for delivery",
+        "failed": " — WARNING: candidate email could not be sent",
+    }.get(email_status, "")
+
     return {
-        "message": f"Panel interview scheduled with {panel_names}" + (" — email sent to candidate" if email_sent else ""),
+        "message": f"Panel interview scheduled with {panel_names}" + email_note,
         "interview_id": interview.id,
         "interviewer": lead["email"] if lead else None,
         "panel": [p["email"] for p in panel],
         "mode": body.mode,
         "scheduled_at": body.scheduled_datetime,
-        "email_sent": email_sent
+        "email_sent": email_sent,
+        "email_status": email_status,
+        "email_error": email_error,
     }
 
 

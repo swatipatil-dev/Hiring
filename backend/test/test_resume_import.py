@@ -16,6 +16,9 @@ here directly rather than through a binary fixture.
 import pytest
 
 from routes.candidate_profile_routes import (
+    CONF_SECTION,
+    CONF_SCAN,
+    CONF_INFERRED,
     _projects_from_section,
     _work_experience_from_section,
     _education_from_section,
@@ -28,7 +31,9 @@ from routes.candidate_profile_routes import (
 def test_projects_primary_uses_tech_anchor():
     """Title is the non-bullet line directly above a 'Tech:' line."""
     section = "Smart Resume Parser\nTech: Python, spaCy\n- Built an NER pipeline\n"
-    assert _projects_from_section(section) == [{"name": "Smart Resume Parser"}]
+    assert _projects_from_section(section) == [
+        {"name": "Smart Resume Parser", "confidence": CONF_INFERRED}
+    ]
 
 
 def test_projects_ignores_wrapped_bullet_fragments():
@@ -93,6 +98,61 @@ def test_certifications_keeps_full_name():
 
 def test_certifications_empty_returns_empty():
     assert _certifications_from_section("") == []
+
+
+# ── confidence calibration ───────────────────────────────────────────────────
+# The number decides whether a row arrives pre-ticked in the review screen. It was
+# miscalibrated: section-anchored rows carried 0.6 (below the 0.7 threshold) while
+# whole-document scan rows inherited up to 0.85 from extract_education_info, so the
+# BETTER extraction arrived unticked and the worse one pre-ticked. In practice
+# nothing was ever pre-ticked. These pin the ordering, not the literals.
+
+# Mirrors HIGH_CONF in frontend/src/pages/hr/../candidate/ResumeImportReview.jsx.
+REVIEW_THRESHOLD = 0.7
+
+
+def test_section_extraction_outranks_whole_document_scan():
+    """The ordering that was inverted. This is the whole point of the calibration."""
+    assert CONF_SECTION > CONF_SCAN
+    assert CONF_SECTION > CONF_INFERRED
+
+
+def test_section_rows_are_pre_ticked():
+    assert CONF_SECTION >= REVIEW_THRESHOLD
+
+
+def test_scan_and_inferred_rows_are_opt_in():
+    """An unanchored guess must never arrive already accepted."""
+    assert CONF_SCAN < REVIEW_THRESHOLD
+    assert CONF_INFERRED < REVIEW_THRESHOLD
+
+
+def test_work_from_section_is_confident_enough_to_pre_tick():
+    section = "Acme Corp  Jan 2021 - Present\nSenior Backend Engineer\n- Built APIs\n"
+    rows = _work_experience_from_section(section)
+    assert rows, "the fixture should yield a row"
+    assert all(r["confidence"] >= REVIEW_THRESHOLD for r in rows)
+
+
+def test_education_from_section_is_confident_enough_to_pre_tick():
+    section = "B.Tech Computer Science 2019\nAnna University, Chennai\n"
+    rows = _education_from_section(section)
+    assert rows, "the fixture should yield a row"
+    assert all(r["confidence"] >= REVIEW_THRESHOLD for r in rows)
+
+
+def test_projects_stay_opt_in():
+    """A title-shape guess, not a heading-anchored read — it must not pre-tick."""
+    section = "Smart Resume Parser\nTech: Python, spaCy\n- Built an NER pipeline\n"
+    rows = _projects_from_section(section)
+    assert rows
+    assert all(r["confidence"] < REVIEW_THRESHOLD for r in rows)
+
+
+def test_llm_filled_rows_stay_opt_in():
+    """AI suggestions are offered, never pre-accepted."""
+    from src.services.llm_profile_extractor import _LLM_CONFIDENCE
+    assert _LLM_CONFIDENCE < REVIEW_THRESHOLD
 
 
 # ── contract: POST /import/apply ─────────────────────────────────────────────

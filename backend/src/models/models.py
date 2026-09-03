@@ -468,6 +468,12 @@ class ResumePoolEntry(Base, TenantScoped):
     year_of_passing    = Column(Integer, index=True)
     job_role           = Column(String(255), index=True)  # most recent / target role
     highest_degree     = Column(String(100))
+    # Where each profile field above came from: {"full_name": "regex", "college": "llm"}.
+    # The regex parser and Gemini's gap-filler are not equally trustworthy, and once both
+    # land in the same VARCHAR they are indistinguishable — this keeps them apart so HR
+    # can be shown which values are inferred. NULL on rows predating gap-filling; readers
+    # treat absent as "regex".
+    profile_source     = Column(Text)                     # JSON
     extracted_skills   = Column(Text)                     # JSON
     experience_years   = Column(DECIMAL(4, 2))
 

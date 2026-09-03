@@ -7,6 +7,12 @@ const TEAL_LIGHT = '#e9f9f4'
 const TEAL_MID = '#c3ede6'
 
 // A low-confidence extraction starts unchecked so the candidate opts in deliberately.
+//
+// The API rates a row by how well anchored the extraction was, not by how tidy the
+// string looks (see CONF_SECTION / CONF_SCAN / CONF_INFERRED in
+// candidate_profile_routes.py). This threshold sits between them: rows read under a
+// real section heading are pre-ticked; whole-document scans and anything the model
+// inferred are not.
 const HIGH_CONF = 0.7
 
 /**
@@ -14,28 +20,43 @@ const HIGH_CONF = 0.7
  * each extracted item; nothing is written until they click "Add to profile".
  */
 export default function ResumeImportReview({ data, onClose, onApplied }) {
+  // Sections the resume's own layout didn't yield, recovered by AI from the text.
+  // Section-level because the fill is all-or-nothing: a section either parsed or it
+  // didn't. Every item in one of these is a suggestion, so none of them start ticked.
+  const aiSections = useMemo(() => new Set(data.ai_sections || []), [data.ai_sections])
+  const isAI = (section) => aiSections.has(section)
+
   const [skills, setSkills] = useState(
     () => (data.skills || []).map(s => ({ value: s, include: true }))
   )
   const [work, setWork] = useState(
     () => (data.work_experience || []).map(w => ({
       title: w.title || '', company: w.company || '',
-      include: (w.confidence ?? 0) >= HIGH_CONF,
+      include: !isAI('work_experience') && (w.confidence ?? 0) >= HIGH_CONF,
     }))
   )
   const [education, setEducation] = useState(
+    // The institution the API sends was previously discarded here, which made the
+    // candidate retype every college name.
     () => (data.education || []).map(e => ({
-      degree: e.degree || '', institution: '',
-      include: (e.confidence ?? 0) >= HIGH_CONF,
+      degree: e.degree || '', institution: e.institution || '',
+      include: !isAI('education') && (e.confidence ?? 0) >= HIGH_CONF,
     }))
   )
   const [certs, setCerts] = useState(
-    () => (data.certifications || []).map(c => ({ value: c, include: true }))
+    () => (data.certifications || []).map(c => ({
+      value: c, include: !isAI('certifications'),
+    }))
   )
-  // Projects are the least reliable extraction, so they default to OFF —
-  // the candidate opts in deliberately after checking each title.
+  // Projects are the least reliable extraction — a title-shape guess rather than a
+  // heading-anchored read — so the API rates them below the threshold and they
+  // default to OFF. Same rule as every other section now, rather than a hardcoded
+  // false, so improving the extraction is enough to change the default.
   const [projects, setProjects] = useState(
-    () => (data.projects || []).map(p => ({ value: p.name || '', include: false }))
+    () => (data.projects || []).map(p => ({
+      value: p.name || '',
+      include: !isAI('projects') && (p.confidence ?? 0) >= HIGH_CONF,
+    }))
   )
   const expYears = data.total_experience_years
   const [includeExp, setIncludeExp] = useState(!!expYears)
@@ -136,7 +157,8 @@ export default function ResumeImportReview({ data, onClose, onApplied }) {
 
               {/* Work experience */}
               {work.length > 0 && (
-                <Group title="Work experience" count={work.filter(w => w.include).length}>
+                <Group title="Work experience" count={work.filter(w => w.include).length}
+                       ai={isAI('work_experience')}>
                   {work.map((w, i) => (
                     <div key={i} className="rir-row">
                       <input type="checkbox" checked={w.include}
@@ -152,7 +174,8 @@ export default function ResumeImportReview({ data, onClose, onApplied }) {
 
               {/* Education */}
               {education.length > 0 && (
-                <Group title="Education" count={education.filter(e => e.include).length}>
+                <Group title="Education" count={education.filter(e => e.include).length}
+                       ai={isAI('education')}>
                   {education.map((e, i) => (
                     <div key={i} className="rir-row">
                       <input type="checkbox" checked={e.include}
@@ -168,7 +191,8 @@ export default function ResumeImportReview({ data, onClose, onApplied }) {
 
               {/* Certifications */}
               {certs.length > 0 && (
-                <Group title="Certifications" count={certs.filter(c => c.include).length}>
+                <Group title="Certifications" count={certs.filter(c => c.include).length}
+                       ai={isAI('certifications')}>
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
                     {certs.map((c, i) => (
                       <button key={i} type="button"
@@ -183,7 +207,8 @@ export default function ResumeImportReview({ data, onClose, onApplied }) {
 
               {/* Projects */}
               {projects.length > 0 && (
-                <Group title="Projects" count={projects.filter(p => p.include).length}>
+                <Group title="Projects" count={projects.filter(p => p.include).length}
+                       ai={isAI('projects')}>
                   {projects.map((p, i) => (
                     <div key={i} className="rir-row">
                       <input type="checkbox" checked={p.include}
@@ -250,15 +275,34 @@ export default function ResumeImportReview({ data, onClose, onApplied }) {
   )
 }
 
-function Group({ title, count, children }) {
+function Group({ title, count, ai, children }) {
   return (
     <div>
       <div style={{
         fontSize: '0.7rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em',
         color: 'var(--text-tertiary)', marginBottom: 8,
+        display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap',
       }}>
-        {title}{typeof count === 'number' ? ` · ${count} selected` : ''}
+        <span>{title}{typeof count === 'number' ? ` · ${count} selected` : ''}</span>
+        {/* Amber, not the teal accent: this says "check me", not "look here". */}
+        {ai && (
+          <span style={{
+            padding: '1px 5px', borderRadius: 4, background: '#fef3eb', color: '#b45309',
+            border: '1px solid #b4530933', fontSize: '0.6rem', letterSpacing: '0.04em',
+          }}>
+            AI
+          </span>
+        )}
       </div>
+      {ai && (
+        <div style={{
+          fontSize: '0.75rem', color: '#b45309', marginTop: -4, marginBottom: 8,
+          textTransform: 'none', letterSpacing: 0, fontWeight: 400,
+        }}>
+          We couldn't read this section from your resume's layout, so these were suggested
+          by AI. Check each one before adding it.
+        </div>
+      )}
       {children}
     </div>
   )

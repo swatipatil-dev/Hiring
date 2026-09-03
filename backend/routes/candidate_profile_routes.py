@@ -9,9 +9,11 @@ from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
 from sqlalchemy.orm import Session
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
-import uuid, os, json, re
+import uuid, os, json, re, logging
 from pathlib import Path
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 from src.config.database_config_mysql import get_db
 from src.auth import AuthMiddleware
@@ -77,6 +79,30 @@ _DEGREE_KW = re.compile(
 )
 _INSTITUTION_KW = re.compile(r'\b(university|college|institute|school|academy)\b', re.IGNORECASE)
 
+# ── Extraction confidence ──────────────────────────────────────────────────────
+# This number decides whether a row arrives pre-ticked in the review screen (see
+# HIGH_CONF in ResumeImportReview.jsx). It expresses ONE thing: how well anchored
+# the extraction was — not how tidy the resulting string looks.
+#
+#   SECTION  — found under a real section heading, so the resume's own layout
+#              confirms what the text is. The strongest signal available, and the
+#              path these helpers exist to prefer.
+#   SCAN     — the whole-document ATS fallback, used only when no heading matched.
+#              Noisy by construction: it leaks skills and institution names in as
+#              "companies", which is why the filtering below has to exist.
+#   INFERRED — read out of prose by the model, or a title-shape guess. Plausible,
+#              unverified: always an opt-in.
+#
+# These were miscalibrated: section rows carried 0.6 (below the 0.7 threshold) while
+# scan rows inherited up to 0.85 from extract_education_info. The better extraction
+# arrived unticked and the worse one pre-ticked, so in practice nothing was ever
+# pre-ticked and the candidate re-confirmed every row by hand. extract_education_info
+# scores the degree STRING and cannot know its row came from an unanchored scan, so
+# the route overrides it rather than trusting the value through.
+CONF_SECTION = 0.8
+CONF_SCAN = 0.5
+CONF_INFERRED = 0.5
+
 
 def _work_experience_from_section(section_text: str) -> List[Dict[str, Any]]:
     """Extract (company, title) pairs from the detected Experience section only.
@@ -106,7 +132,7 @@ def _work_experience_from_section(section_text: str) -> List[Dict[str, Any]]:
                 title = lines[j].strip(" .,-–—|")
                 i = j
             if company or title:
-                out.append({"title": title, "company": company, "confidence": 0.6})
+                out.append({"title": title, "company": company, "confidence": CONF_SECTION})
         i += 1
     return out[:15]
 
@@ -150,7 +176,7 @@ def _education_from_section(section_text: str) -> List[Dict[str, Any]]:
         deg = degrees[k] if k < len(degrees) else ""
         inst = institutions[k] if k < len(institutions) else ""
         if deg or inst:
-            out.append({"degree": deg, "institution": inst, "confidence": 0.6})
+            out.append({"degree": deg, "institution": inst, "confidence": CONF_SECTION})
     return out[:10]
 
 
@@ -211,7 +237,7 @@ def _projects_from_section(section_text: str) -> List[Dict[str, Any]]:
         if key in seen:
             return
         seen.add(key)
-        out.append({"name": title})
+        out.append({"name": title, "confidence": CONF_INFERRED})
 
     # Primary (high precision): a project title is the non-bullet line directly
     # above a "Tech:"/"Technologies:" line — the common
@@ -1312,7 +1338,9 @@ async def parse_resume_for_import(
                     "title": title,
                     "company": company,
                     "duration_months": w.get("duration_months"),
-                    "confidence": round(float(w.get("confidence", 0.5)), 2),
+                    # Not w["confidence"]: the extractor rates the string, not the
+                    # fact that this row came from an unanchored scan.
+                    "confidence": CONF_SCAN,
                 })
 
         section_edu = _education_from_section(sections.get("education", ""))
@@ -1330,15 +1358,44 @@ async def parse_resume_for_import(
                 {
                     "degree": (e.get("degree") or "").strip(),
                     "institution": "",
-                    "confidence": round(float(e.get("confidence", 0.5)), 2),
+                    # extract_education_info returns up to 0.85 for a clean degree
+                    # string; that says nothing about this unanchored row.
+                    "confidence": CONF_SCAN,
                 }
                 for e in (parsed.education or [])
                 if e.get("degree")
             ]
 
-        # Calculate total experience excluding internships <= 8 months
+        # Hoisted out of the response dict so the gap check below can see it.
+        certifications = (_certifications_from_section(sections.get("certifications", ""))
+                          or [c for c in (parsed.certifications or []) if c])
+
+        # Ask Gemini for the sections the regex extractors could not read AT ALL.
+        # A section with even one row is left alone: topping it up would leave the
+        # candidate unable to tell which rows came off their own resume. Nothing is
+        # written here — they review, edit and tick each item before /import/apply
+        # inserts anything.
+        draft = {
+            "work_experience": work_experience,
+            "education": education,
+            "certifications": certifications,
+            "projects": section_projects,
+        }
+        ai_sections = []
+        try:
+            from src.services.llm_profile_extractor import extract_sections
+            filled = await extract_sections(parsed.text, draft)
+            for key, items in filled.items():
+                draft[key] = items
+                ai_sections.append(key)
+        except Exception as e:
+            # An import or scheduling failure must not cost the candidate their parse.
+            logger.warning(f"Resume import: AI section fill failed: {e}")
+
+        # Experience is derived AFTER the fill, so AI-recovered roles still count.
         from src.services.enhanced_ats_service import enhanced_ats_service
-        total_exp = enhanced_ats_service.calculate_work_experience_years_from_entries(work_experience)
+        total_exp = enhanced_ats_service.calculate_work_experience_years_from_entries(
+            draft["work_experience"])
         if total_exp == 0.0 and parsed.experience_years:
             total_exp = parsed.experience_years
 
@@ -1346,13 +1403,16 @@ async def parse_resume_for_import(
             "skills": [s for s in parsed.skills if s],
             "total_experience_years": total_exp,
             "contact": parsed.contact_info or {},
-            "work_experience": work_experience,
-            "education": education,
-            "certifications": (_certifications_from_section(sections.get("certifications", ""))
-                               or [c for c in (parsed.certifications or []) if c]),
-            "projects": section_projects,
+            "work_experience": draft["work_experience"],
+            "education": draft["education"],
+            "certifications": draft["certifications"],
+            "projects": draft["projects"],
             "languages": [l for l in (parsed.languages or []) if l],
             "confidence_score": round(float(parsed.confidence_score), 2),
+            # Which sections came from the model rather than the resume's own layout.
+            # Section-level because the fill is all-or-nothing, and because
+            # certifications are plain strings with nowhere to hang a per-item flag.
+            "ai_sections": ai_sections,
         }
     finally:
         if tmp_path and os.path.exists(tmp_path):

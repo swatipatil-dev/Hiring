@@ -812,6 +812,22 @@
   color: var(--border-medium);
 }
 
+/* Marks a value Gemini inferred because the resume parser could not find it. Amber
+   rather than the accent colour: this is "check me", not "look here". */
+.rm-ai {
+  display: inline-block;
+  margin-left: 5px;
+  padding: 0 4px;
+  border: 1px solid #b4530933;
+  border-radius: 4px;
+  background: #fef3eb;
+  color: #b45309;
+  font-size: 0.6rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  vertical-align: 1px;
+}
+
 /* The verdict — the one thing this page exists to say. */
 .rm-verdict {
   border-left: 3px solid var(--accent-primary);

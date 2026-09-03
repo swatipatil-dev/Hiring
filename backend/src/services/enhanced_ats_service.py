@@ -11,6 +11,8 @@ import pathlib
 import unicodedata
 import hashlib
 import functools
+from collections import OrderedDict
+from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 from datetime import datetime
@@ -75,9 +77,13 @@ except Exception as _st_err:  # noqa: BLE001 — intentional broad fallback
         _st_err,
     )
 
-# FIXED: No embedding cache — LRU cache for JD embeddings
-_EMBEDDING_CACHE: Dict[str, Any] = {}
-_EMBEDDING_CACHE_MAXSIZE = 128
+# Embedding cache, keyed on SHA-256 of the text. Genuinely LRU: an earlier version
+# evicted by insertion order (FIFO), which is the wrong policy here. Scoring one resume
+# against N jobs re-reads the same job-description embeddings while inserting a fresh
+# batch of resume-section embeddings, so FIFO evicted exactly the entries being reused —
+# a 20-resume batch (~8 sections each) overflowed 128 mid-batch and re-encoded the JDs.
+_EMBEDDING_CACHE: "OrderedDict[str, Any]" = OrderedDict()
+_EMBEDDING_CACHE_MAXSIZE = max(16, int(os.getenv("ATS_EMBEDDING_CACHE_SIZE", "512")))
 
 
 def _get_text_embedding(text: str) -> Any:
@@ -85,7 +91,9 @@ def _get_text_embedding(text: str) -> Any:
     Get embedding for a text string with SHA-256 based LRU caching.
 
     Caches up to _EMBEDDING_CACHE_MAXSIZE embeddings keyed on the SHA-256
-    hash of the input text. Cache hits avoid the 200-800ms encode() call.
+    hash of the input text. Cache hits avoid the 200-800ms encode() call, and
+    move the entry to the most-recently-used end so a burst of one-off inserts
+    cannot evict a hot entry.
 
     Args:
         text: Input text to embed.
@@ -98,12 +106,12 @@ def _get_text_embedding(text: str) -> Any:
     text_hash = hashlib.sha256(text.encode()).hexdigest()
     if text_hash in _EMBEDDING_CACHE:
         logger.debug("JD embedding cache hit: %s", text_hash[:8])
+        _EMBEDDING_CACHE.move_to_end(text_hash)
         return _EMBEDDING_CACHE[text_hash]
     embedding = _SEMANTIC_MODEL.encode(text, convert_to_tensor=True)
-    # Evict oldest if at capacity (simple FIFO eviction)
+    # Evict least-recently-used if at capacity.
     if len(_EMBEDDING_CACHE) >= _EMBEDDING_CACHE_MAXSIZE:
-        oldest_key = next(iter(_EMBEDDING_CACHE))
-        del _EMBEDDING_CACHE[oldest_key]
+        _EMBEDDING_CACHE.popitem(last=False)
     _EMBEDDING_CACHE[text_hash] = embedding
     return embedding
 
@@ -290,6 +298,25 @@ class EnhancedResumeParseResult(BaseModel):
     confidence_score: float
     file_type: str
     processing_method: str
+
+@dataclass
+class PreparedResume:
+    """Everything derivable from a resume alone, computed once.
+
+    The first five steps of ``enhanced_score_candidate`` never read the job
+    description, yet scoring one resume against N jobs repeated all of them N times —
+    including the spaCy transformer pass inside ``enhanced_parse_resume_from_text``.
+    A caller with many jobs builds this once and passes it in, so that work happens
+    once per resume instead of once per (resume, job) pair.
+
+    ``text`` is the PROCESSED resume (sanitised, cleaned, normalised), because the
+    scorer keeps using it after parsing — for keyword match, education, experience and
+    JD-overlap. Handing back the caller's raw text here would change scores.
+    """
+    text: str
+    sections: Dict[str, str]
+    parsed: "EnhancedResumeParseResult"
+
 
 class EnhancedATSScoreResult(BaseModel):
     """Enhanced ATS scoring result with detailed breakdown"""
@@ -1775,6 +1802,25 @@ class EnhancedATSScoringService:
             processing_method=processing_method
         )
 
+    def prepare_resume(self, resume_text: str) -> PreparedResume:
+        """Run the resume-only half of scoring once.
+
+        Holds the same calls, in the same order, with the same arguments that
+        ``enhanced_score_candidate`` used inline, so a prepared result scores
+        identically to an unprepared one. See ``PreparedResume``.
+        """
+        # Sanitize before any processing, then repair the raw text (ligatures,
+        # line breaks, bullets), then apply the token budget.
+        text = sanitize_resume_text(resume_text)
+        text = clean_resume_text(text)
+        text = normalize_resume_text(text)
+        return PreparedResume(
+            text=text,
+            # C4.6 — sections drive section-aware semantic scoring.
+            sections=detect_sections(text),
+            parsed=self.enhanced_parse_resume_from_text(text),
+        )
+
     def enhanced_score_candidate(
         self,
         resume_text: str,
@@ -1788,7 +1834,8 @@ class EnhancedATSScoringService:
         educations: Optional[List[Dict[str, Any]]] = None,
         work_experiences: Optional[List[Dict[str, Any]]] = None,
         links_text: Optional[str] = None,
-        preferred_skills: Optional[List[str]] = None
+        preferred_skills: Optional[List[str]] = None,
+        prepared: Optional[PreparedResume] = None
     ) -> EnhancedATSScoreResult:
         """
         Recruiter-rubric ATS scoring.
@@ -1806,20 +1853,13 @@ class EnhancedATSScoringService:
         """
         weights = custom_weights if custom_weights else self.weights
 
-        # FIXED: No input sanitization — sanitize before any processing
-        resume_text = sanitize_resume_text(resume_text)
-
-        # Clean raw text before any processing (ligatures, line-break repair, bullets)
-        resume_text = clean_resume_text(resume_text)
-
-        # FIXED: No resume length normalization — apply token-budget truncation
-        resume_text = normalize_resume_text(resume_text)
-
-        # C4.6 — Detect sections for section-aware scoring
-        sections = detect_sections(resume_text)
-
-        # Parse resume
-        resume_result = self.enhanced_parse_resume_from_text(resume_text)
+        # Resume-only preprocessing: sanitise, clean, normalise, detect sections, parse.
+        # None of it reads the job description, so a caller scoring one resume against
+        # many jobs passes `prepared` and pays for it once instead of once per job.
+        prep = prepared if prepared is not None else self.prepare_resume(resume_text)
+        resume_text = prep.text
+        sections = prep.sections
+        resume_result = prep.parsed
 
         # ── Secondary factors (semantic / keyword / certification / project) ──
         if len(sections) > 1:

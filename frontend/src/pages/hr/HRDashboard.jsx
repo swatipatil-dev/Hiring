@@ -222,16 +222,25 @@ export default function HRDashboard() {
   const [schedMailboxId, setSchedMailboxId] = useState(undefined)
   const [schedSubmitting, setSchedSubmitting] = useState(false)
 
+  // Job + candidate picker — used when the modal is opened from the Interviews
+  // tab, where there is no pre-seeded candidate to schedule.
+  const [pickerJobId, setPickerJobId] = useState('')
+  const [pickerCandidates, setPickerCandidates] = useState([])
+  const [pickerLoading, setPickerLoading] = useState(false)
+
   // When the schedule modal opens, clear the manual-add inputs and (re)load the
   // selectable people. NOTE: we do NOT reset schedForm here — the opener already
   // sets it (and pre-selects the job's interviewer); resetting would race that.
+  // Keyed on open/closed rather than the scheduleModal object: the picker rewrites
+  // that object on every dropdown change, which would otherwise refetch both lists
+  // and wipe a half-typed manual panelist.
+  const schedOpen = !!scheduleModal
   useEffect(() => {
-    if (scheduleModal) {
-      setManualName(''); setManualEmail('')
-      api.get('/hr/interviewers').then(r => setInterviewers(r.data || [])).catch(() => {})
-      api.get('/hr/panel-staff').then(r => setPanelStaff(r.data || [])).catch(() => {})
-    }
-  }, [scheduleModal])
+    if (!schedOpen) return
+    setManualName(''); setManualEmail('')
+    api.get('/hr/interviewers').then(r => setInterviewers(r.data || [])).catch(() => {})
+    api.get('/hr/panel-staff').then(r => setPanelStaff(r.data || [])).catch(() => {})
+  }, [schedOpen])
 
   // Add a typed panelist (name + email) to the panel, deduped by email.
   const addManualPanelist = () => {
@@ -245,6 +254,73 @@ export default function HRDashboard() {
     ))
     setManualName(''); setManualEmail('')
   }
+
+  // Default schedule-form state. Shared by both openers — the Test Results table
+  // and the Interviews-tab picker — so the candidate email reads identically
+  // either way. The {{...}} placeholders are substituted server-side.
+  const buildSchedDefaults = (candidateName, jobTitle) => ({
+    interview_type: 'TECHNICAL', mode: 'online', scheduled_datetime: '', duration_minutes: 60,
+    meeting_link: '', location: '', notes: '', send_email: true,
+    email_subject: `Interview Scheduled — ${jobTitle}`,
+    email_body: `Dear ${candidateName},
+
+Congratulations! You have been shortlisted for the ${jobTitle} position.
+
+Your interview has been scheduled. Details:
+- Interview Type: {{interview_type}}
+- Date & Time: {{datetime}}
+- Mode: {{mode}}
+- {{meeting_details}}
+- Panel: {{interviewer_name}}
+
+Please be on time and prepared.
+
+Best regards,
+HR Team`,
+    interviewer_ids: [], manual_panelists: [],
+  })
+
+  // Open the schedule modal with nothing chosen — the modal then renders a job +
+  // candidate picker instead of a pre-seeded header.
+  const openBlankSchedule = () => {
+    setPickerJobId(''); setPickerCandidates([]); setPickerLoading(false)
+    setSchedMailboxId(undefined)
+    setScheduleModal({ pick: true, candidate_id: '', candidate_name: '', candidate_email: '', job_id: '', job_title: '' })
+    setSchedForm(buildSchedDefaults('', ''))
+  }
+
+  // Job dropdown → load that job's applicants (any stage) and clear the candidate.
+  const loadPickerCandidates = async (jobId) => {
+    setPickerJobId(jobId)
+    setPickerCandidates([])
+    setScheduleModal(m => ({ ...m, job_id: jobId, job_title: jobs.find(j => j.id === jobId)?.title || '', candidate_id: '', candidate_name: '', candidate_email: '' }))
+    if (!jobId) return
+    setPickerLoading(true)
+    try {
+      const r = await api.get(`/hr/jobs/${jobId}/candidates?per_page=100`)
+      setPickerCandidates(r.data?.candidates || [])
+    } catch { setPickerCandidates([]) }
+    setPickerLoading(false)
+  }
+
+  // Candidate dropdown → re-seed only the email copy, so any panel members the
+  // user already ticked survive a change of mind about the candidate.
+  const pickCandidate = (candidateId) => {
+    const c = pickerCandidates.find(x => x.candidate_id === candidateId)
+    const jobTitle = jobs.find(j => j.id === pickerJobId)?.title || ''
+    setScheduleModal(m => ({ ...m, candidate_id: candidateId, candidate_name: c?.name || '', candidate_email: c?.email || '' }))
+    const d = buildSchedDefaults(c?.name || '', jobTitle)
+    setSchedForm(f => ({ ...f, email_subject: d.email_subject, email_body: d.email_body }))
+  }
+
+  // An existing, non-cancelled interview for the candidate+job currently in the
+  // modal. GET /hr/interviews returns no job_id, so this matches on job_title.
+  // The backend does not dedupe, so this only warns — second rounds stay possible.
+  const dupIv = scheduleModal?.candidate_id
+    ? interviews.find(iv => iv.candidate_id === scheduleModal.candidate_id
+        && iv.job_title === scheduleModal.job_title
+        && iv.status !== 'CANCELLED')
+    : null
 
   // Round 2 (Coding) selection + invite email, from the test-results sheet
   const [round2Sel, setRound2Sel] = useState(() => new Set())  // candidate_ids selected for Round 2
@@ -450,15 +526,23 @@ export default function HRDashboard() {
 
   const handleScheduleInterview = async (e) => {
     e.preventDefault()
+    if (!scheduleModal.candidate_id || !scheduleModal.job_id) return alert('Select a job and a candidate')
     if (!schedForm.scheduled_datetime) return alert('Select date & time')
     if ((schedForm.interviewer_ids?.length || 0) + (schedForm.manual_panelists?.length || 0) === 0)
       return alert('Add at least one panel member (pick a staff member or add one manually)')
     if (schedForm.mode === 'online' && !schedForm.meeting_link) return alert('Enter meeting link for online interview')
     if (schedForm.mode === 'offline' && !schedForm.location) return alert('Enter location for offline interview')
+    if (dupIv && !window.confirm(`${scheduleModal.candidate_name} already has a ${dupIv.status} interview for ${scheduleModal.job_title}. Schedule another one?`)) return
     setSchedSubmitting(true)
     try {
       const res = await api.post('/hr/schedule-interview', { ...schedForm, candidate_id: scheduleModal.candidate_id, job_id: scheduleModal.job_id, mailbox_id: schedMailboxId ?? null })
-      alert(res.data.message + '\nCandidate moved to Scheduled Interviews.')
+      // The interview is committed before any mail is attempted, so a failed
+      // email is a warning, not a failed scheduling.
+      const d = res.data
+      alert(d.message + '\nCandidate moved to Scheduled Interviews.'
+        + (d.email_status === 'failed'
+            ? `\n\n⚠ The interview was saved, but the candidate email did not send${d.email_error ? `: ${d.email_error}` : ''}.\nCheck Email Settings, or notify them another way.`
+            : ''))
       setScheduleModal(null)
       setTestResultJob(null)
       setTestResultCandidates([])
@@ -1749,9 +1833,10 @@ export default function HRDashboard() {
         }
         return (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 28 }}>
-            {/* Only interviews scheduled via the explicit "Schedule Interview" action
-                in Test Results are shown here. Auto-cloned candidate tests are tracked
-                in the Test Results tab, not surfaced as "scheduled". */}
+            {/* Only explicitly scheduled interviews are shown here — either from the
+                "Schedule Interview" action in Test Results or from the button below,
+                which opens the same modal with a job + candidate picker. Auto-cloned
+                candidate tests are tracked in the Test Results tab, not as "scheduled". */}
 
             {/* ── Scheduled Interviews ── */}
             <div>
@@ -1763,9 +1848,20 @@ export default function HRDashboard() {
                   </h3>
                   <span className="text-sm text-muted">{scheduledInterviews.length} interview{scheduledInterviews.length !== 1 ? 's' : ''} scheduled</span>
                 </div>
+                <button
+                  className="btn btn-primary btn-sm"
+                  onClick={openBlankSchedule}
+                  style={{ display: 'flex', alignItems: 'center', gap: 7 }}
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18M12 14v4M10 16h4"/></svg>
+                  Schedule Interview
+                </button>
               </div>
               {scheduledInterviews.length === 0 ? (
-                <div className="card" style={{ padding: 40, textAlign: 'center', color: 'var(--text-tertiary)' }}>No interviews scheduled yet. Select candidates from Test Results to schedule.</div>
+                <div className="card" style={{ padding: 40, textAlign: 'center', color: 'var(--text-tertiary)' }}>
+                  <div style={{ marginBottom: 16 }}>No interviews scheduled yet. Click <strong>Schedule Interview</strong> to set one up, or select candidates from Test Results.</div>
+                  <button className="btn btn-primary" onClick={openBlankSchedule}>Schedule Interview</button>
+                </div>
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
                   {scheduledInterviews.map((iv, i) => renderInterviewCard(iv, i))}
@@ -2558,7 +2654,7 @@ export default function HRDashboard() {
                             <button onClick={() => {
                               const _preId = interviewers.find(x => x.email === r.interviewer_email)?.id
                               setScheduleModal({ candidate_id: r.candidate_id, candidate_name: r.candidate_name, candidate_email: r.candidate_email, job_id: r.job_id, job_title: r.job_title, interviewer_name: r.interviewer_name, interviewer_email: r.interviewer_email })
-                              setSchedForm({ interview_type: 'TECHNICAL', mode: 'online', scheduled_datetime: '', duration_minutes: 60, meeting_link: '', location: '', notes: '', send_email: true, email_subject: `Interview Scheduled — ${r.job_title}`, email_body: `Dear ${r.candidate_name},\n\nCongratulations! You have been shortlisted for the ${r.job_title} position.\n\nYour interview has been scheduled. Details:\n- Interview Type: {{interview_type}}\n- Date & Time: {{datetime}}\n- Mode: {{mode}}\n- {{meeting_details}}\n- Panel: {{interviewer_name}}\n\nPlease be on time and prepared.\n\nBest regards,\nHR Team`, interviewer_ids: _preId ? [_preId] : [], manual_panelists: [] })
+                              setSchedForm({ ...buildSchedDefaults(r.candidate_name, r.job_title), interviewer_ids: _preId ? [_preId] : [] })
                             }} style={{ padding: '4px 10px', borderRadius: 6, border: 'none', background: '#2b7cba', color: '#fff', fontSize: '0.75rem', fontWeight: 600, cursor: 'pointer' }}>Schedule Interview</button>
                           )
                           const txt = (s, c) => <span style={{ fontSize: '0.75rem', color: c, fontWeight: 600 }}>{s}</span>
@@ -2891,10 +2987,51 @@ export default function HRDashboard() {
             <div className="flex-between" style={{ marginBottom: 20 }}>
               <div>
                 <h2 style={{ margin: 0, fontSize: '1.2rem' }}>Schedule Panel Interview</h2>
-                <div className="text-sm text-muted" style={{ marginTop: 4 }}>{scheduleModal.candidate_name} — {scheduleModal.job_title}</div>
+                <div className="text-sm text-muted" style={{ marginTop: 4 }}>
+                  {scheduleModal.candidate_id ? `${scheduleModal.candidate_name} — ${scheduleModal.job_title}` : 'Select a job and candidate'}
+                </div>
               </div>
               <button className="btn btn-ghost btn-sm" onClick={() => setScheduleModal(null)} style={{ fontSize: '1.2rem', padding: '4px 10px' }}>x</button>
             </div>
+
+            {/* Job + candidate picker — only when opened from the Interviews tab,
+                where nothing was pre-seeded. Any applicant for the job is eligible,
+                regardless of stage, so a candidate who never sat a test can be booked. */}
+            {scheduleModal.pick && (
+              <div style={{ padding: '14px 16px', background: '#f8fafc', borderRadius: 10, marginBottom: 16, border: '1px solid #e5e7eb' }}>
+                <div className="input-group" style={{ marginBottom: 12 }}>
+                  <label>Job *</label>
+                  <select className="select" value={pickerJobId} onChange={e => loadPickerCandidates(e.target.value)}>
+                    <option value="">Select a job...</option>
+                    {jobs.map(j => (
+                      <option key={j.id} value={j.id}>{j.title}{j.department && j.department !== '—' ? ` · ${j.department}` : ''}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="input-group" style={{ marginBottom: 0 }}>
+                  <label>Candidate *</label>
+                  <select className="select" value={scheduleModal.candidate_id} disabled={!pickerJobId || pickerLoading}
+                          onChange={e => pickCandidate(e.target.value)}>
+                    <option value="">
+                      {!pickerJobId ? 'Select a job first'
+                        : pickerLoading ? 'Loading...'
+                        : pickerCandidates.length === 0 ? 'No applicants for this job'
+                        : 'Select a candidate...'}
+                    </option>
+                    {pickerCandidates.map(c => (
+                      <option key={c.candidate_id} value={c.candidate_id}>
+                        {c.name} · {c.email}{c.current_stage ? ` · ${c.current_stage}` : ''}{c.ats_score != null ? ` · ATS ${Math.round(c.ats_score)}%` : ''}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                {dupIv && (
+                  <div style={{ marginTop: 12, padding: '8px 12px', borderRadius: 8, background: '#fef3eb', color: '#b45309', border: '1px solid #b4530925', fontSize: '0.8rem', fontWeight: 600 }}>
+                    ⚠ Already has a {dupIv.status} interview on {dupIv.scheduled_datetime ? new Date(dupIv.scheduled_datetime).toLocaleString() : '—'} — scheduling another will create a second one.
+                  </div>
+                )}
+              </div>
+            )}
 
             <div style={{ padding: '12px 16px', background: '#f0f7ff', borderRadius: 10, marginBottom: 16, fontSize: '0.85rem' }}>
               <div style={{ fontWeight: 700, marginBottom: 8 }}>Interview Panel <span style={{ fontWeight: 400, color: '#6b7280' }}>— pick staff and/or add people manually</span></div>

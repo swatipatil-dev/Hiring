@@ -188,6 +188,41 @@ def _apply_profile_fields(entry: ResumePoolEntry, user: User, profile, candidate
         entry.highest_degree = entry.highest_degree or parsed.get("highest_degree")
         entry.job_role = entry.job_role or parsed.get("job_role")
         entry.phone = entry.phone or parsed.get("phone")
+        _llm_fill_gaps(entry, scoring_text, label=user.email)
+
+
+def _llm_fill_gaps(entry, resume_text: Optional[str], label: str = "") -> None:
+    """Fill profile fields still blank after parsing, using Gemini, and record it.
+
+    A no-op when the feature is off, credentials are absent, or nothing is missing —
+    so the common case costs nothing. Synchronous because this module is: it runs from
+    scripts and background jobs, not a request coroutine.
+
+    Never raises. An import that has already done real work must not fail because the
+    model was unreachable.
+    """
+    if not resume_text:
+        return
+    try:
+        from src.services.llm_resume_extractor import (
+            PROFILE_FIELDS, missing_fields, extract_gaps_sync, profile_source_map,
+        )
+        current = {f: getattr(entry, f, None) for f in PROFILE_FIELDS}
+        if not missing_fields(current):
+            return
+        filled = extract_gaps_sync(resume_text, current)
+        if not filled:
+            return
+        # Drop attributions for fields that are now empty; the parser never overwrites a
+        # populated field, so a surviving "llm" label still describes its value.
+        src_map = {k: v for k, v in profile_source_map(entry).items()
+                   if getattr(entry, k, None)}
+        for field, value in filled.items():
+            setattr(entry, field, value)
+            src_map[field] = "llm"
+        entry.profile_source = json.dumps(src_map)
+    except Exception as e:
+        logger.warning(f"Resume pool import: LLM gap-fill failed for {label}: {e}")
 
 
 def import_registered_users(
@@ -760,6 +795,7 @@ def import_orphan_candidates(
                 entry.year_of_passing = entry.year_of_passing or parsed.get("year_of_passing")
                 entry.highest_degree = entry.highest_degree or parsed.get("highest_degree")
                 entry.job_role = entry.job_role or parsed.get("job_role")
+                _llm_fill_gaps(entry, resume_text, label=seed.email)
 
             if ranked:
                 entry.best_job_id = ranked[0]["job_id"]

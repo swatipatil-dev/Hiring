@@ -52,6 +52,12 @@ export default function MoveToATSModal({ entry, activeJobs = [], onClose, onMove
     }
   }, [jobId, jobOptions])
 
+  // Fields Gemini inferred because the resume parser could not read them. This is the
+  // last screen before an inferred value becomes a real candidate record, so it is the
+  // one place the distinction genuinely has to be visible.
+  const ai = entry.profile_source || {}
+  const aiHere = ['full_name', 'email', 'phone'].filter(f => ai[f] === 'llm')
+
   const emailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
   const canSubmit = firstName.trim() && lastName.trim() && emailValid && jobId && !saving
 
@@ -85,6 +91,22 @@ export default function MoveToATSModal({ entry, activeJobs = [], onClose, onMove
           applicant. Check the details below — they were read from{' '}
           {entry.source === 'registered' ? 'their portal profile' : 'the resume'}.
         </p>
+
+        {aiHere.length > 0 && (
+          <div style={{
+            margin: '0 0 16px', padding: '10px 12px', borderRadius: 8,
+            background: '#fef3eb', border: '1px solid #b4530933', color: '#b45309',
+            display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: '0.85rem',
+          }}>
+            <AlertCircle size={15} style={{ flexShrink: 0, marginTop: 1 }} />
+            <span>
+              The resume parser could not read{' '}
+              <strong>{aiHere.map(f => f.replace('_', ' ')).join(', ')}</strong> —
+              {aiHere.length === 1 ? ' it was' : ' they were'} filled in by AI.
+              Please confirm {aiHere.length === 1 ? 'it is' : 'they are'} right before moving.
+            </span>
+          </div>
+        )}
 
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
           <div className="input-group">

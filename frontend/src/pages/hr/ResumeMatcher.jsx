@@ -14,6 +14,47 @@ import './ResumeMatcher.css'
 
 const ACCEPT = '.pdf,.doc,.docx'
 const ALLOWED = ['pdf', 'doc', 'docx']
+
+// ── Upload chunking ────────────────────────────────────────────────────────────
+// Any number of resumes can be queued; they upload a few at a time. Two limits make
+// one big request the wrong shape, and a chunk has to respect both:
+//
+//   * Apache's LimitRequestBody caps the whole body and returns 413 before FastAPI
+//     runs, so a batch of large PDFs used to fail with no usable explanation.
+//   * The API processes at most RESUME_MATCH_MAX_FILES (20) per request and silently
+//     discards the rest — files 21+ were dropped with only a one-line warning.
+//
+// Chunking also means the user sees progress instead of a frozen button, and one
+// worker is not held for the length of the whole batch.
+const MATCH_CHUNK_FILES = 8                        // well under the API's 20
+const MATCH_CHUNK_BYTES = 16 * 1024 * 1024         // well under LimitRequestBody
+// Mirrors validate_file_upload's per-file rule, checked here so an oversized file is
+// named before upload rather than failing anonymously part-way through a batch.
+const MAX_FILE_BYTES = 5 * 1024 * 1024
+
+const fmtMB = (bytes) => `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+
+/** Pack files into upload chunks bounded by BOTH file count and total bytes.
+ *  Exported for tests — the byte bound is what stops the 413, so it is worth pinning. */
+export const chunkFiles = (list) => {
+  const chunks = []
+  let current = []
+  let bytes = 0
+  for (const f of list) {
+    // Never emit an empty chunk: an outsized single file still goes on its own, and
+    // is caught by the MAX_FILE_BYTES check before it gets here.
+    if (current.length && (current.length >= MATCH_CHUNK_FILES ||
+                           bytes + f.size > MATCH_CHUNK_BYTES)) {
+      chunks.push(current)
+      current = []
+      bytes = 0
+    }
+    current.push(f)
+    bytes += f.size
+  }
+  if (current.length) chunks.push(current)
+  return chunks
+}
 // Profiles also take images — they display but cannot be ATS-scored, since matching
 // reads text and no OCR runs on this path.
 const ATTACH_ACCEPT = '.pdf,.doc,.docx,.png,.jpg,.jpeg,.webp'
@@ -93,10 +134,19 @@ function SkillSet({ label, skills, tone }) {
   )
 }
 
-/** A record field in the mono meta line (college, year, role, contact). */
-function Fact({ children, title }) {
+/** A record field in the mono meta line (college, year, role, contact).
+ *
+ * `ai` marks a value the resume parser could not find and Gemini inferred from the
+ * resume text. Worth showing: an inferred value reads exactly like a parsed one, and
+ * this is the field HR promotes into a real candidate record. */
+function Fact({ children, title, ai }) {
   if (!children) return null
-  return <span title={title}>{children}</span>
+  return (
+    <span title={ai ? `${title} — filled by AI from the resume, please verify` : title}>
+      {children}
+      {ai && <span className="rm-ai" aria-label="filled by AI, verify">AI</span>}
+    </span>
+  )
 }
 
 /** Every role this person has been put forward for, and how far each one got. */
@@ -329,6 +379,11 @@ function Record({ result, index, activeJobCount, onMove, onRematch, onDelete, bu
   // A rejected or declined person is the whole reason this screen exists — they read
   // as available, never as a failure.
   const available = result.outcome === 'rejected' || result.outcome === 'declined'
+  // Which profile fields Gemini inferred rather than the parser reading them. Absent
+  // for rows stored before gap-filling existed, which is correctly read as "parsed".
+  const aiField = Object.fromEntries(
+    Object.entries(result.profile_source || {}).map(([k, v]) => [k, v === 'llm'])
+  )
 
   return (
     <article className="rm-record" style={{ animationDelay: `${Math.min(index, 12) * 45}ms` }}>
@@ -354,16 +409,16 @@ function Record({ result, index, activeJobCount, onMove, onRematch, onDelete, bu
         </div>
 
         <div className="rm-facts">
-          <Fact title="College">{result.college}</Fact>
-          <Fact title="Year of passing">{result.year_of_passing}</Fact>
-          <Fact title="Job role">{result.job_role}</Fact>
+          <Fact title="College" ai={aiField.college}>{result.college}</Fact>
+          <Fact title="Year of passing" ai={aiField.year_of_passing}>{result.year_of_passing}</Fact>
+          <Fact title="Job role" ai={aiField.job_role}>{result.job_role}</Fact>
           {typeof result.extracted_experience === 'number' && (
             <Fact title="Experience">
               {result.extracted_experience} yr{result.extracted_experience === 1 ? '' : 's'}
             </Fact>
           )}
-          <Fact title="Email">{result.email}</Fact>
-          <Fact title="Phone">{result.phone}</Fact>
+          <Fact title="Email" ai={aiField.email}>{result.email}</Fact>
+          <Fact title="Phone" ai={aiField.phone}>{result.phone}</Fact>
           <Fact title="Sourcing channel">{result.source_channel}</Fact>
           {uploaded && (
             <Fact title={registered ? 'Registered' : 'Uploaded'}>
@@ -863,6 +918,12 @@ const errText = (e, fallback) => {
   if (status >= 500) return `${fallback} The server hit an error (${status}) — the cause is in the backend log.`
   if (status === 401 || status === 403) return 'Your session has expired. Sign in again.'
   if (status === 404) return `${fallback} That endpoint is missing (404) — the API may be running older code.`
+  // 413 is rejected by the web server before the API sees it, so there is no `detail`
+  // to quote — say what it means, or this reads as a generic failure.
+  if (status === 413) {
+    return `${fallback} The upload was too large for the server to accept. ` +
+           'Try fewer or smaller files, or ask an admin to raise LimitRequestBody.'
+  }
   return msg || `${fallback} (HTTP ${status})`
 }
 
@@ -889,6 +950,8 @@ export default function ResumeMatcher() {
   const [scoreProgress, setScoreProgress] = useState('')
   const stopScoring = useRef(false)
   const [files, setFiles] = useState([])       // File[] queued for matching
+  const [matchProgress, setMatchProgress] = useState('')
+  const stopMatching = useRef(false)
   const [loading, setLoading] = useState(false)
   const [dragging, setDragging] = useState(false)
   const [error, setError] = useState('')
@@ -1065,28 +1128,88 @@ export default function ResumeMatcher() {
 
   const removeFile = (idx) => setFiles(prev => prev.filter((_, i) => i !== idx))
 
+  /**
+   * Upload the queue in size-bounded chunks. Any number of resumes can be queued.
+   *
+   * A chunk failing does not discard the chunks that already landed — those rows are
+   * in the pool. The files from failed chunks stay queued so they can be retried
+   * without re-selecting the whole batch.
+   */
   const runMatch = async () => {
     if (files.length === 0) return
+
+    // Name oversized files up front. The server applies the same per-file rule, but it
+    // would reject them mid-batch with the filename buried in a list of row errors.
+    const oversized = files.filter(f => f.size > MAX_FILE_BYTES)
+    if (oversized.length) {
+      setError(
+        `Too large to upload (max ${fmtMB(MAX_FILE_BYTES)} each): ` +
+        oversized.map(f => `${f.name} — ${fmtMB(f.size)}`).join(', ') +
+        '. Remove them, or split the PDF, and try again.'
+      )
+      return
+    }
+
+    const chunks = chunkFiles(files)
     setLoading(true)
     setError('')
     setWarning('')
     setNotice('')
+    stopMatching.current = false
+
+    const rowFailures = []   // per-resume errors the API reported
+    const chunkErrors = []   // whole-chunk failures (network, 413, 500)
+    const retry = []         // files worth queueing again
+    let stored = 0
+    let processed = 0
+
     try {
-      const fd = new FormData()
-      for (const f of files) fd.append('resumes', f)
-      const r = await api.post('/hr/resume-match', fd, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-      })
-      const failed = (r.data.results || []).filter(x => x.error)
-      if (r.data.message) setWarning(r.data.message)
-      if (r.data.warning) setWarning(r.data.warning)
-      if (failed.length) {
-        setError(`${failed.length} resume${failed.length > 1 ? 's' : ''} could not be read: ` +
-                 failed.map(f => `${f.filename} (${f.error})`).join('; '))
+      for (let i = 0; i < chunks.length; i++) {
+        if (stopMatching.current) {
+          retry.push(...chunks.slice(i).flat())
+          break
+        }
+        const chunk = chunks[i]
+        if (chunks.length > 1) {
+          setMatchProgress(`Matching ${processed + 1}–${processed + chunk.length} of ${files.length}…`)
+        }
+        try {
+          const fd = new FormData()
+          for (const f of chunk) fd.append('resumes', f)
+          const r = await api.post('/hr/resume-match', fd, {
+            headers: { 'Content-Type': 'multipart/form-data' },
+          })
+          const results = r.data.results || []
+          rowFailures.push(...results.filter(x => x.error))
+          stored += results.filter(x => x.id).length
+          // Chunks are sized under the API's own cap, so this should not fire — if it
+          // does, the caps have drifted apart and we want to hear about it.
+          if (r.data.warning) setWarning(r.data.warning)
+        } catch (e) {
+          chunkErrors.push(errText(e, `Batch ${i + 1} of ${chunks.length} failed.`))
+          retry.push(...chunk)
+        }
+        processed += chunk.length
       }
-      const stored = (r.data.results || []).filter(x => x.id).length
+
       if (stored) setNotice(`${stored} resume${stored > 1 ? 's' : ''} saved to the pool.`)
-      setFiles([])
+
+      const problems = []
+      if (rowFailures.length) {
+        problems.push(
+          `${rowFailures.length} resume${rowFailures.length > 1 ? 's' : ''} could not be read: ` +
+          rowFailures.map(f => `${f.filename} (${f.error})`).join('; ')
+        )
+      }
+      // De-duped: every chunk usually fails the same way, and repeating one sentence
+      // five times buries the part that differs.
+      if (chunkErrors.length) problems.push(...new Set(chunkErrors))
+      if (retry.length) {
+        problems.push(`${retry.length} file${retry.length > 1 ? 's are' : ' is'} still queued — press Match to retry.`)
+      }
+      if (problems.length) setError(problems.join(' '))
+
+      setFiles(retry)
       if (inputRef.current) inputRef.current.value = ''
       // Clear filters and return to page one so fresh uploads are guaranteed visible.
       setPage(0)
@@ -1097,6 +1220,7 @@ export default function ResumeMatcher() {
       setError(errText(e, 'Could not match resumes. Please try again.'))
     } finally {
       setLoading(false)
+      setMatchProgress('')
     }
   }
 
@@ -1431,11 +1555,21 @@ export default function ResumeMatcher() {
         <div className="rm-queue" style={{ marginTop: 16 }}>
           <div className="rm-queue__head">
             <span className="rm-queue__count">
-              {files.length} resume{files.length > 1 ? 's' : ''} ready
+              {matchProgress || `${files.length} resume${files.length > 1 ? 's' : ''} ready`}
             </span>
-            <button className="btn btn-primary btn-sm" onClick={runMatch} disabled={loading}>
-              {loading ? 'Matching…' : 'Match to jobs'}
-            </button>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              {/* Cancelling stops before the next chunk; whatever already uploaded is
+                  saved, and the rest stay queued. */}
+              {loading && chunkFiles(files).length > 1 && (
+                <button className="btn btn-secondary btn-sm"
+                        onClick={() => { stopMatching.current = true }}>
+                  Stop
+                </button>
+              )}
+              <button className="btn btn-primary btn-sm" onClick={runMatch} disabled={loading}>
+                {loading ? 'Matching…' : 'Match to jobs'}
+              </button>
+            </div>
           </div>
           <div className="rm-chips">
             {files.map((f, i) => (

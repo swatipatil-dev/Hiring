@@ -516,6 +516,41 @@ def dispatch(to: str, subject: str, body: str, reply_to: Optional[str] = None,
                      branding=branding, is_otp=is_otp, cc=cc)
 
 
+def delivery_outcome(result: Any) -> Dict[str, Any]:
+    """Classify what ``_send`` / ``dispatch`` / ``enqueue_email`` reported.
+
+    Delivery is three-state, not boolean: mail can be sent inline, accepted onto
+    the queue for a worker to send later, or fail outright. These paths return
+    different shapes — ``_send`` gives ``{"sent": bool, ...}`` while a queued
+    ``dispatch`` gives ``{"mode": "async", "job_id": ...}`` with no ``sent`` key
+    at all. Reading ``.get("sent")`` directly would therefore mis-report every
+    healthy async send as a failure.
+
+    Returns:
+        {"status": "sent" | "queued" | "failed", "error": str | None,
+         "error_type": str | None, "ok": bool} — ``ok`` is sent-or-queued.
+    """
+    # Legacy senders that return None: absence of a result is not evidence of
+    # failure, so don't manufacture one.
+    if not isinstance(result, dict):
+        return {"status": "sent", "error": None, "error_type": None, "ok": True}
+
+    if result.get("sent") is True:
+        return {"status": "sent", "error": None, "error_type": None, "ok": True}
+
+    if "sent" in result:  # present and falsy — an actual, reported failure
+        return {
+            "status": "failed",
+            "error": result.get("error"),
+            "error_type": result.get("error_type"),
+            "ok": False,
+        }
+
+    # Queued: "async" from RQ, or the worker deferring/retrying. Outcome is not
+    # known yet, but the message was accepted for delivery.
+    return {"status": "queued", "error": None, "error_type": None, "ok": True}
+
+
 # ==================== OTP / AUTH EMAILS ====================
 
 def send_password_reset_otp(to: str, name: str, otp: str, branding: Optional[Dict[str, Any]] = None,
