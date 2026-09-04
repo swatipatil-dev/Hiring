@@ -1,0 +1,64 @@
+name: Production dependencies
+
+# CI installs requirements-ci.txt; the server runs requirements-cpanel.txt. The
+# two disagree on the torch pin (>=2.0.0 vs ==2.1.1) and on sentence-transformers,
+# and CI omits the entire proctoring stack, transformers and dnspython. So a green
+# CI run is not evidence that a deploy's `pip install` will even succeed.
+#
+# This closes that gap without slowing every push: weekly, plus whenever the
+# requirements files themselves change.
+on:
+  schedule:
+    - cron: '0 3 * * 1'          # Mondays 03:00 UTC
+  push:
+    paths:
+      - 'backend/requirements-cpanel.txt'
+      - 'backend/requirements.txt'
+      - '.github/workflows/prod-deps.yml'
+  workflow_dispatch:
+
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install the production requirements
+        run: pip install -r requirements-cpanel.txt
+
+      # --extra-index-url is ADDITIVE, not a replacement: pip may still resolve
+      # the CUDA build from PyPI even though the CPU index is listed first. On a
+      # box with no GPU that is ~2 GB of unusable nvidia-* wheels.
+      #
+      # The correct test is torch's own build flag. Grepping for `nvidia`
+      # packages gives a false positive — nvidia-ml-py is a legitimate 50 KB
+      # ultralytics dependency. See docs/DEPLOYMENT_NOTES.md:443-445.
+      - name: torch must be the CPU build
+        run: |
+          python - <<'PY'
+          import sys, torch
+          print("torch", torch.__version__, "| cuda:", torch.version.cuda)
+          if torch.version.cuda is not None:
+              sys.exit("FAIL: CUDA build of torch resolved — the CPU index was not honoured")
+          print("OK: CPU build")
+          PY
+
+      # Every import the server does at boot, so a missing dependency surfaces
+      # here rather than as a crash-looping service after a deploy. dnspython is
+      # named explicitly because it is required by superadmin_routes and is
+      # absent from requirements.txt.
+      - name: The app imports cleanly
+        env:
+          SECRET_KEY: ci-test-secret-key-32chars-minimum!!
+        run: |
+          python -c "import dns.resolver; print('dnspython ok')"
+          python -c "import main; print('main imports ok')"

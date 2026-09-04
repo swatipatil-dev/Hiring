@@ -1,16 +1,82 @@
 name: HireFlow CI
 
+# Label the run with the branch's role, so the Actions list says what a run means
+# without opening it — "CI · main (PRODUCTION)" reads differently from
+# "CI · develop (integration)".
+run-name: >-
+  CI · ${{ github.ref_name }} ${{
+    github.ref_name == 'main' && '(PRODUCTION — deploys on approval)'
+    || github.ref_name == 'testing' && '(pre-release)'
+    || github.ref_name == 'develop' && '(integration)'
+    || '(feature)' }}
+
+# Branch flow:  feature -> develop -> testing -> main
+#
+#   feature/*  day-to-day work        CI only
+#   develop    integration            CI only
+#   testing    pre-release / QA       CI only
+#   main       production             CI, then deploy.yml on approval
+#
+# `testing` deliberately does NOT deploy: there is one server
+# (career.innomaxskills.com), so deploying it would replace the live site with
+# unreviewed code. See docs/CICD_SETUP.md.
+#
+# Push is every branch, not a fixed list. The previous trigger named `staging`
+# and `develop` — neither of which existed — while missing every branch actually
+# in use, so pushes to real work branches ran no CI at all.
 on:
   push:
-    branches: [main, staging, develop]
+    branches: ['**']
   pull_request:
-    branches: [main, staging, develop]
+    branches: [main, testing, develop]
+  workflow_dispatch:
+
+# A new push to the same branch makes the previous run irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  NODE_VERSION: "20"
 
 jobs:
-  test:
+  # ── Lint ────────────────────────────────────────────────────────────────────
+  # Its own job so it reports independently. Previously it ran AFTER pytest in
+  # the same job, which meant a test failure hid lint entirely, and a lint
+  # failure was only ever visible on an otherwise-green run.
+  lint:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-    # All backend code now lives under backend/. Run every shell step there.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements-ci.txt
+
+      - run: pip install flake8
+
+      # Ignore pre-existing cosmetic style issues across the codebase
+      # (whitespace, blank-line counts, comparison style, etc.) while keeping
+      # checks for the things that matter: undefined names (F821), syntax
+      # errors, unused imports of *names* (F-class), etc.
+      - name: flake8
+        run: |
+          flake8 routes/ src/ \
+            --max-line-length=120 \
+            --ignore=E501,W503,E402,F401,W291,W293,W391,E302,E303,E305,E401,E127,E128,E123,E221,E225,E241,E711,E712,E722,E741,F811,F841,W504 \
+            --exclude=src/services/ollama_service.py
+
+  # ── Backend tests ───────────────────────────────────────────────────────────
+  backend:
+    runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: backend
@@ -36,33 +102,48 @@ jobs:
       DATABASE_URL: mysql+pymysql://root:1234@localhost:3306/recruitment_test_db
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
         with:
-          python-version: "3.11"
+          fetch-depth: 1
 
-      - name: Cache pip dependencies
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements-ci.txt
+
+      - run: pip install -r requirements-ci.txt
+
+      # The judge integration tests run real code inside hardened Docker
+      # containers. ubuntu-latest HAS a Docker daemon, so docker_available() is
+      # True and the skipif guards do NOT fire — meaning if an image is missing,
+      # every sandboxed test fails as RE/CE rather than skipping.
+      #
+      # Cached on the Dockerfiles: four uncached `docker build`s on every push
+      # was the dominant cost of this workflow.
+      - name: Cache judge sandbox images
+        id: judge-cache
         uses: actions/cache@v4
         with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('backend/requirements-ci.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          path: /tmp/judge-images
+          key: judge-images-${{ hashFiles('backend/judge/images/Dockerfile.*') }}
 
-      - name: Install dependencies
-        run: pip install -r requirements-ci.txt
+      - name: Load cached judge images
+        if: steps.judge-cache.outputs.cache-hit == 'true'
+        run: for f in /tmp/judge-images/*.tar; do docker load -i "$f"; done
 
       - name: Build judge sandbox images
-        # The judge integration tests run real code inside hardened Docker
-        # containers. ubuntu-latest has a Docker daemon (so docker_available()
-        # is True and the skipif guard does NOT skip), but the per-language
-        # images must be built first or every sandboxed run fails as RE/CE.
-        run: bash scripts/build_judge_images.sh
+        if: steps.judge-cache.outputs.cache-hit != 'true'
+        run: |
+          bash scripts/build_judge_images.sh
+          mkdir -p /tmp/judge-images
+          # Named explicitly rather than `docker images | grep judge`, so an
+          # unrelated image on the runner can never end up in the cache.
+          for lang in python cpp node java; do
+            docker save "hireflow-judge-$lang:latest" -o "/tmp/judge-images/$lang.tar"
+          done
 
-      - name: Wait for MySQL and verify DB exists
+      - name: Wait for MySQL
         run: |
           for i in {1..15}; do
             mysql -h 127.0.0.1 -u root -p1234 -e "SELECT 1;" 2>/dev/null && break
@@ -71,24 +152,128 @@ jobs:
           done
           mysql -h 127.0.0.1 -u root -p1234 -e "CREATE DATABASE IF NOT EXISTS recruitment_test_db;"
 
-      - name: Run tests
+      - name: pytest
         run: pytest test/ -v --tb=short -m "not slow" --junit-xml=test-results.xml
 
       - name: Upload test results on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-results
+          name: backend-test-results
           path: backend/test-results.xml
 
-      - name: Lint with flake8
+  # ── Migrations ──────────────────────────────────────────────────────────────
+  # conftest.py builds the schema with Base.metadata.create_all, so the test job
+  # never runs a single migration — a green suite says nothing about whether
+  # `alembic upgrade head` works. That gap shipped a missing column that only
+  # surfaced as "Unknown column" against a real database.
+  #
+  # This job runs the migrations for real, then uses the same schema_diff.py
+  # gate the deploy runbook uses, so a missing migration fails the PR instead of
+  # the deployment.
+  migrations:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: "1234"
+          MYSQL_DATABASE: hireflow_migrations
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost -u root -p1234"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      SECRET_KEY: ci-test-secret-key-32chars-minimum!!
+      DATABASE_URL: mysql+pymysql://root:1234@localhost:3306/hireflow_migrations
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements-ci.txt
+
+      - run: pip install -r requirements-ci.txt
+
+      - name: Wait for MySQL
         run: |
-          pip install flake8
-          # Ignore pre-existing cosmetic style issues across the codebase
-          # (whitespace, blank-line counts, comparison style, etc.) while
-          # keeping checks for the things that matter: undefined names
-          # (F821), syntax errors, unused imports of *names* (F-class), etc.
-          flake8 routes/ src/ \
-            --max-line-length=120 \
-            --ignore=E501,W503,E402,F401,W291,W293,W391,E302,E303,E305,E401,E127,E128,E123,E221,E225,E241,E711,E712,E722,E741,F811,F841,W504 \
-            --exclude=src/services/ollama_service.py
+          for i in {1..15}; do
+            mysql -h 127.0.0.1 -u root -p1234 -e "SELECT 1;" 2>/dev/null && break
+            sleep 3
+          done
+
+      # Two branches each adding a migration produce two heads, which only fails
+      # at merge time. Catch it on the PR instead.
+      - name: Exactly one Alembic head
+        run: |
+          heads=$(alembic heads | grep -c "(head)" || true)
+          echo "heads found: $heads"
+          alembic heads
+          if [ "$heads" -ne 1 ]; then
+            echo "::error::Expected exactly 1 Alembic head, found $heads — two branches added migrations in parallel."
+            exit 1
+          fi
+
+      - name: alembic upgrade head (on an empty database)
+        run: alembic upgrade head
+
+      - name: alembic current
+        run: alembic current
+
+      # The real check: does the migrated schema match what the models declare?
+      # `alembic current` alone is not evidence — a database can be stamped at
+      # head while missing a column, silently, until a request 500s.
+      - name: Schema matches the models
+        run: python scripts/schema_diff.py
+
+      # No downgrade round-trip here on purpose. 6 of 34 revisions have a stub
+      # downgrade (mostly merge revisions, legitimately), so `downgrade -1` can
+      # be a no-op and the re-upgrade then fails on "Duplicate column" — a false
+      # alarm, not a finding. And DEPLOY_UPDATE.md:185-188 is explicit that a
+      # failed deploy rolls the CODE back and leaves the schema alone, so
+      # downgrade correctness is not a property this project relies on.
+
+  # ── Frontend ────────────────────────────────────────────────────────────────
+  # New. Node was never set up in CI, so 109 vitest tests and the production
+  # build were entirely unverified.
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # `npm install`, not `npm ci`: the lockfile drifts from package.json and
+      # `npm ci` fails with EUSAGE (see docs/DEPLOY_UPDATE.md:139). It rewrites
+      # the lockfile, which is why this must never run on the server — there it
+      # dirties the tree and wedges the next `git pull`. On a disposable runner
+      # checkout the rewrite is harmless.
+      - run: npm install
+
+      - name: vitest
+        run: npm test
+
+      - name: Production build
+        run: npm run build

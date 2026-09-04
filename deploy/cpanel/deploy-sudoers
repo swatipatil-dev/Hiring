@@ -1,0 +1,66 @@
+# Sudoers fragment for the CI/CD deploy user.
+#
+# Install as root:
+#   visudo -c -f deploy/cpanel/deploy-sudoers     # validate FIRST
+#   install -m 0440 -o root -g root deploy/cpanel/deploy-sudoers /etc/sudoers.d/hireflow-deploy
+#
+# A syntax error in /etc/sudoers.d/ can lock everyone out of sudo. Always
+# validate with `visudo -c -f` before installing, and keep a second root shell
+# open while you do it.
+#
+# Why this exists: the deploy pipeline needs root for six specific things, and
+# nothing else. csf and firewalld are both inactive on this box
+# (docs/DEPLOYMENT_NOTES.md:507), port 22 is open to the internet, and the
+# machine hosts other cPanel accounts. A leaked GitHub Actions secret must not
+# be a root shell — it should be able to deploy HireFlow and nothing more.
+#
+# Deliberately NOT granted:
+#   * any shell, su, or sudo -i
+#   * read or write access to /opt/hireflow/backend/.env (0600, hireflow-owned;
+#     it holds the only copy of SECRET_KEY and EMAIL_ENCRYPTION_KEY)
+#   * unrestricted cp, rm, systemctl, or mysql
+#   * anything as the hfjudge user, which has docker-group membership and is
+#     therefore root-equivalent
+
+Cmnd_Alias HF_SERVICES = \
+    /usr/bin/systemctl restart hireflow-api hireflow-proctor hireflow-judge-worker hireflow-email-worker, \
+    /usr/bin/systemctl daemon-reload, \
+    /usr/bin/systemctl is-active *, \
+    /usr/bin/systemctl status *
+
+# The app runs as `hireflow`; pip/alembic/python go through its venv. Bare
+# `sudo -u hireflow /bin/sh` is not granted — only these three binaries.
+Cmnd_Alias HF_APP = \
+    /usr/bin/sudo -u hireflow /opt/hireflow/venv/bin/pip *, \
+    /usr/bin/sudo -u hireflow /opt/hireflow/venv/bin/alembic *, \
+    /usr/bin/sudo -u hireflow /opt/hireflow/venv/bin/python *, \
+    /usr/bin/sudo -u hireflow HF_HOME=/opt/hireflow/hf-cache /opt/hireflow/venv/bin/python *
+
+# Config that `git pull` does not update. Sources are pinned to the repo tree so
+# this cannot be used to write arbitrary files into /etc.
+Cmnd_Alias HF_CONFIG = \
+    /usr/bin/cp -f /opt/hireflow/deploy/cpanel/*.service /etc/systemd/system/, \
+    /usr/bin/cp -f /opt/hireflow/deploy/cpanel/*.timer /etc/systemd/system/, \
+    /usr/bin/cp -f /opt/hireflow/deploy/cpanel/hireflow.conf /etc/apache2/conf.d/userdata/*/2_4/innomaxskills/career.innomaxskills.com/
+
+# cPanel's own vhost rebuild and httpd restart.
+Cmnd_Alias HF_APACHE = \
+    /scripts/ensure_vhost_includes --user=innomaxskills, \
+    /scripts/restartsrv_httpd
+
+# Publishing the built frontend. Confined to the career/ docroot.
+Cmnd_Alias HF_WEB = \
+    /usr/bin/rsync -a --delete /tmp/hireflow-dist/ /home/innomaxskills/public_html/career/, \
+    /usr/bin/cp -f /opt/hireflow/deploy/cpanel/htaccess-spa /home/innomaxskills/public_html/career/.htaccess, \
+    /usr/bin/chown -R innomaxskills\:innomaxskills /home/innomaxskills/public_html/career
+
+# Pre-migration dump only. Read-only against the database; the destination is
+# fixed so this cannot be used to write elsewhere.
+Cmnd_Alias HF_BACKUP = \
+    /usr/bin/mysqldump *
+
+deploy ALL=(root) NOPASSWD: HF_SERVICES, HF_APP, HF_CONFIG, HF_APACHE, HF_WEB, HF_BACKUP
+
+# Refuse to run any of the above through a shell or an editor escape.
+Defaults:deploy !authenticate
+Defaults:deploy noexec

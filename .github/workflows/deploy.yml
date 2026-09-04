@@ -1,0 +1,218 @@
+name: Deploy to cPanel
+
+# Merging to main PREPARES a release; a human releases it. The `production`
+# environment carries a required reviewer, so the deploy job waits for approval.
+#
+# This automates docs/DEPLOY_UPDATE.md step for step, including its conditionals
+# — git pull leaves four things stale (database, systemd units, Apache config,
+# built frontend) and each of those has an incident behind it.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Print the commands without changing anything'
+        type: boolean
+        default: false
+
+# Never let two deploys overlap. Not cancel-in-progress: interrupting a deploy
+# halfway is worse than queueing behind one.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  APP_DIR: /opt/hireflow
+  WEB_ROOT: /home/innomaxskills/public_html/career
+  SERVICES: hireflow-api hireflow-proctor hireflow-judge-worker hireflow-email-worker
+
+jobs:
+  # ── Build the release ───────────────────────────────────────────────────────
+  # The frontend is built HERE, never on the server. docs/DEPLOY_UPDATE.md:139
+  # requires `npm install` over `npm ci` because the lockfile drifts — but
+  # `npm install` rewrites the tracked package-lock.json, so on the server it
+  # dirties the tree and the NEXT `git pull` conflicts mid-deploy.
+  #
+  # Safe to build here because dist/ is environment-independent: client.js uses a
+  # relative baseURL and there are no VITE_ build variables.
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build the frontend
+        working-directory: frontend
+        run: |
+          npm install
+          npm test
+          npm run build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+          retention-days: 30
+
+  # ── Deploy ──────────────────────────────────────────────────────────────────
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://career.innomaxskills.com
+    steps:
+      # The push trigger is main-only, but workflow_dispatch ignores that: the
+      # Actions "Run workflow" dropdown lets you pick ANY branch, and without
+      # this the job would happily ship develop to the live site. The approving
+      # reviewer sees a deploy request, not a branch name, so this has to be
+      # checked here rather than left to a human.
+      #
+      # develop and testing are CI-only by design — there is one server, so
+      # deploying them would replace production. See docs/CICD_SETUP.md.
+      - name: Only main reaches production
+        run: |
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "::error::Refusing to deploy from '${{ github.ref_name }}'. Production deploys only from main."
+            exit 1
+          fi
+          echo "Deploying ${{ github.sha }} from main."
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: dist/
+
+      - name: Open an SSH session
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
+          cat >> ~/.ssh/config <<CFG
+          Host target
+            HostName ${{ secrets.DEPLOY_HOST }}
+            User ${{ secrets.DEPLOY_USER }}
+            IdentityFile ~/.ssh/id_ed25519
+            ControlMaster auto
+            ControlPath ~/.ssh/cm-%r@%h:%p
+            ControlPersist 10m
+          CFG
+
+      # Step 1 — pull, and let the diff decide what else has to happen.
+      - name: Pull and compute the change set
+        id: pull
+        run: |
+          BEFORE=$(ssh target "cd $APP_DIR && git rev-parse HEAD")
+          echo "before=$BEFORE" >> "$GITHUB_OUTPUT"
+          echo "Rolling back to $BEFORE if anything fails."
+
+          ${{ inputs.dry_run && 'echo DRY-RUN would:' || '' }} \
+            ssh target "cd $APP_DIR && git pull --ff-only"
+
+          CHANGED=$(ssh target "cd $APP_DIR && git diff --name-only $BEFORE HEAD")
+          echo "$CHANGED"
+          grep -q '^backend/alembic/versions/'   <<<"$CHANGED" && echo "migrations=true" >> "$GITHUB_OUTPUT" || true
+          grep -q '^backend/requirements-cpanel' <<<"$CHANGED" && echo "deps=true"       >> "$GITHUB_OUTPUT" || true
+          grep -qE '^deploy/cpanel/.*\.(service|timer)$' <<<"$CHANGED" && echo "units=true" >> "$GITHUB_OUTPUT" || true
+          grep -q '^deploy/cpanel/hireflow.conf' <<<"$CHANGED" && echo "apache=true"     >> "$GITHUB_OUTPUT" || true
+          grep -q '^frontend/'                   <<<"$CHANGED" && echo "frontend=true"   >> "$GITHUB_OUTPUT" || true
+
+      # Step 2 — back up before any migration. A dump with zero CREATE TABLE
+      # lines is not a backup; the runbook says stop if the count is 0.
+      - name: Back up the database
+        if: steps.pull.outputs.migrations == 'true' && !inputs.dry_run
+        run: |
+          ssh target "sudo mysqldump -u '${{ secrets.DB_USER }}' -p'${{ secrets.DB_PASSWORD }}' \
+            --single-transaction --no-tablespaces '${{ secrets.DB_NAME }}' \
+            > /root/predeploy-\$(date +%F-%H%M).sql"
+          TABLES=$(ssh target "grep -c '^CREATE TABLE' \$(ls -t /root/predeploy-*.sql | head -1)")
+          echo "tables in dump: $TABLES"
+          [ "$TABLES" -gt 0 ] || { echo "::error::Backup contains no tables — refusing to migrate."; exit 1; }
+
+      - name: Install Python dependencies
+        if: steps.pull.outputs.deps == 'true' && !inputs.dry_run
+        run: |
+          ssh target "sudo -u hireflow $APP_DIR/venv/bin/pip install -r $APP_DIR/backend/requirements-cpanel.txt"
+
+      # Fail fast, before services are touched: exits non-zero if a required
+      # model cannot be fetched. Missing from DEPLOY_UPDATE.md but present in the
+      # install runbook, and it belongs here.
+      - name: Prefetch ML models
+        if: steps.pull.outputs.deps == 'true' && !inputs.dry_run
+        run: |
+          ssh target "cd $APP_DIR/backend && sudo -u hireflow HF_HOME=$APP_DIR/hf-cache \
+            $APP_DIR/venv/bin/python scripts/prefetch_models.py"
+
+      # Step 4 — THE GATE. Runs on every deploy, migrations changed or not,
+      # because a database can be stamped at head while missing a column. Nothing
+      # below this line runs if it fails, and no service has been restarted yet.
+      - name: Migrate and verify the schema
+        if: ${{ !inputs.dry_run }}
+        run: |
+          ssh target "cd $APP_DIR/backend && sudo -u hireflow $APP_DIR/venv/bin/alembic upgrade head"
+          ssh target "cd $APP_DIR/backend && sudo -u hireflow $APP_DIR/venv/bin/alembic current"
+          ssh target "cd $APP_DIR/backend && sudo -u hireflow $APP_DIR/venv/bin/python scripts/schema_diff.py"
+
+      - name: Update systemd units
+        if: steps.pull.outputs.units == 'true' && !inputs.dry_run
+        run: |
+          ssh target "sudo cp -f $APP_DIR/deploy/cpanel/*.service /etc/systemd/system/"
+          ssh target "sudo cp -f $APP_DIR/deploy/cpanel/*.timer /etc/systemd/system/ 2>/dev/null || true"
+          ssh target "sudo systemctl daemon-reload"
+
+      # Both std and ssl — cPanel rebuilds its own configuration and needs both.
+      - name: Update the Apache vhost include
+        if: steps.pull.outputs.apache == 'true' && !inputs.dry_run
+        run: |
+          ssh target "for m in std ssl; do sudo cp -f $APP_DIR/deploy/cpanel/hireflow.conf \
+            /etc/apache2/conf.d/userdata/\$m/2_4/innomaxskills/career.innomaxskills.com/; done"
+          ssh target "sudo /scripts/ensure_vhost_includes --user=innomaxskills"
+          ssh target "sudo /scripts/restartsrv_httpd"
+
+      # .htaccess is copied AFTER the rsync: --delete would otherwise remove it
+      # and every deep link would 404. Order matters here.
+      - name: Publish the frontend
+        if: steps.pull.outputs.frontend == 'true' && !inputs.dry_run
+        run: |
+          rsync -az --delete -e "ssh -F ~/.ssh/config" dist/ target:/tmp/hireflow-dist/
+          ssh target "sudo rsync -a --delete /tmp/hireflow-dist/ $WEB_ROOT/"
+          ssh target "sudo cp -f $APP_DIR/deploy/cpanel/htaccess-spa $WEB_ROOT/.htaccess"
+          ssh target "sudo chown -R innomaxskills:innomaxskills $WEB_ROOT"
+
+      - name: Restart services and verify
+        if: ${{ !inputs.dry_run }}
+        run: |
+          ssh target "sudo systemctl restart $SERVICES"
+          sleep 25
+          ssh target "systemctl is-active $SERVICES"
+          HEALTH=$(ssh target "curl -sf localhost:8000/health")
+          echo "$HEALTH"
+          grep -q '"status":"healthy"' <<<"$HEALTH" \
+            || { echo "::error::Health check failed after restart."; exit 1; }
+
+      # Roll the CODE back, not the schema. DEPLOY_UPDATE.md:185-188 is explicit:
+      # a half-applied migration is worse than a newer schema under older code,
+      # which is usually harmless because migrations here are additive.
+      - name: Roll back on failure
+        if: failure() && !inputs.dry_run
+        run: |
+          echo "::warning::Deploy failed — rolling code back to ${{ steps.pull.outputs.before }}"
+          ssh target "cd $APP_DIR && git reset --hard ${{ steps.pull.outputs.before }}"
+          ssh target "sudo systemctl restart $SERVICES" || true
+          sleep 20
+          ssh target "curl -sf localhost:8000/health" || echo "::error::Still unhealthy after rollback — needs a human."
+          echo "::warning::Schema was NOT rolled back. Dumps are in /root/predeploy-*.sql"
+
+      - name: Smoke checks a pipeline cannot do
+        if: success() && !inputs.dry_run
+        run: |
+          echo "::notice::Deployed. Proctoring and the coding judge have NO CI coverage —"
+          echo "::notice::verify by hand (DEPLOY_UPDATE.md:165-171): HR login, one real email,"
+          echo "::notice::a proctoring WebSocket reaching 101, Run Code, and opening a CV."
