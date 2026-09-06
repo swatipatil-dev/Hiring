@@ -1,4 +1,4 @@
-﻿import React, { useState, useEffect, useRef } from 'react'
+﻿import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { Briefcase, Users, Calendar, Gift, Plus, Eye, Edit3, Trash2, Archive, RotateCcw, GripVertical, ChevronRight, FileText, ClipboardList, Mic, UserCheck, Award, Search, X } from 'lucide-react'
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, LabelList } from 'recharts'
@@ -56,11 +56,49 @@ const PIPELINE_STAGES = [
   { key: 'shortlisted',   label: 'Shortlisted',color: '#f59e0b', icon: 'clipboard' },
   { key: 'interview',     label: 'Interview',  color: '#06b6d4', icon: 'mic'       },
   { key: 'interview_completed', label: 'Interviewed', color: '#3b82f6', icon: 'usercheck' },
+  // Added so candidates at 'offer_sent' are counted. Without a bucket they hit the
+  // same silent-drop path that hid 'interview_scheduled' — see normalizeStage below.
+  { key: 'offer',         label: 'Offer',      color: '#ec4899', icon: 'award'     },
   { key: 'hired',         label: 'Hired',      color: '#22c55e', icon: 'award'     },
 ]
 
-// Normalize legacy/transient 'applied' stage → 'ats_screening'
-const normalizeStage = (stage) => stage === 'applied' ? 'ats_screening' : (stage || 'ats_screening')
+// Map every stage the backend can write onto one of the PIPELINE_STAGES buckets above.
+//
+// WHY THIS IS A MAP AND NOT A ONE-LINER: current_stage is NOT a closed vocabulary.
+// Most writes use a literal ('shortlisted', 'hired', ...) but three paths assign a
+// caller-supplied value — hr_routes.py:412 (move-stage), hr_routes.py:4799 and
+// advanced_features_routes.py:599 (bulk selection) — so values like
+// 'interview_scheduled' and 'offer_sent' reach this chart without ever appearing as
+// a literal in the backend.
+//
+// Anything not listed here used to fall through to rawStages[<unknown>], which no
+// bucket reads, so the candidate silently VANISHED from the pipeline. That is how a
+// job with a real applicant rendered "No candidate data yet": their stage was
+// 'interview_scheduled', which had no bucket. Unmapped stages now warn in dev
+// instead of disappearing.
+const STAGE_ALIASES = {
+  applied: 'ats_screening',          // history-log only; current_stage is set past it on apply
+  interview_scheduled: 'interview',  // an interview exists but has not happened yet
+  test_submitted: 'interview',       // assessment sits in the interview phase
+  test_completed: 'interview',
+  offer_sent: 'offer',
+}
+
+// Stages that are deliberately NOT counted in the funnel. 'rejected' and
+// 'registered' are excluded on purpose — a rejection is terminal, and a registered
+// talent-pool entry has not applied to this job — but they are listed explicitly so
+// the exclusion is a decision rather than an accident of the lookup missing.
+const STAGE_EXCLUDED = new Set(['rejected', 'registered'])
+
+const normalizeStage = (stage) => {
+  const s = stage || 'ats_screening'
+  if (STAGE_EXCLUDED.has(s)) return null
+  const mapped = STAGE_ALIASES[s] || s
+  if (import.meta.env?.DEV && !PIPELINE_STAGES.some(p => p.key === mapped)) {
+    console.warn(`[pipeline] unmapped candidate stage "${s}" — add it to STAGE_ALIASES or it will not be counted`)
+  }
+  return mapped
+}
 
 // A candidate is still "unsent" (no ATS-stage email yet) while they rest at one of these
 // stages. Any other stage (shortlisted/rejected/interview/...) means they were already
@@ -704,6 +742,7 @@ HR Team`,
           const stages = {}
           candidates.forEach(c => {
             const s = normalizeStage(c.current_stage)
+            if (!s) return                       // rejected / registered: not in the funnel
             stages[s] = (stages[s] || 0) + 1
           })
           setJobPipelines(prev => ({ ...prev, [j.id]: { total: cr.data?.total_candidates || candidates.length, stages } }))
@@ -711,6 +750,7 @@ HR Team`,
             const next = { ...prev }
             candidates.forEach(c => {
               const stage = normalizeStage(c.current_stage)
+              if (!stage) return                 // rejected / registered: not in the funnel
               const existing = next[stage] || []
               // Skip if this candidate_id is already in the bucket
               if (!existing.some(x => x.candidate_id === c.candidate_id)) {
@@ -730,18 +770,47 @@ HR Team`,
     fetchJobs()
   }, [jobFilters.status])
 
-  useEffect(() => {
-    fetchRequirements()
-    fetchNotifications()
+  // The counts behind the overview cards. Previously these ran once on mount and
+  // never again, so after creating a job / scheduling an interview / sending an
+  // offer the dashboard kept showing the old numbers until a full page reload —
+  // which reads to a user as "my action didn't save".
+  const refreshOverview = useCallback(() => {
     api.get('/hr/departments').then(r => setDepartments(r.data || [])).catch(() => {})
     api.get('/hr/interviews').then(r => setInterviews(r.data || [])).catch(() => {})
     api.get('/hr/offers').then(r => setOffers(r.data || [])).catch(() => {})
     api.get('/hr/test-results').then(r => setTestResults(r.data || [])).catch(() => {})
     api.get('/hr/feedback').then(r => setFeedbackData(r.data || [])).catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    fetchRequirements()
+    fetchNotifications()
+    refreshOverview()
     // Poll notifications every 30s
     const notifInterval = setInterval(fetchNotifications, 30000)
     return () => clearInterval(notifInterval)
-  }, [])
+  }, [refreshOverview])
+
+  // Re-pull the overview whenever the user lands back on it, and when the window
+  // regains focus (work done in another tab, or by a colleague, shows up).
+  // fetchJobs() guards its own staleness via fetchJobsId, so re-calling is safe.
+  //
+  // The first run is skipped: the mount effect above and the jobFilters effect
+  // have already issued exactly these requests, and firing again here would
+  // double every call on initial load.
+  const overviewMounted = useRef(false)
+  useEffect(() => {
+    if (tab !== 'overview') return
+    if (overviewMounted.current) {
+      refreshOverview()
+      fetchJobs()
+    }
+    overviewMounted.current = true
+    const onFocus = () => { refreshOverview(); fetchJobs() }
+    window.addEventListener('focus', onFocus)
+    return () => window.removeEventListener('focus', onFocus)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, refreshOverview])
 
   // Refresh test results every time the test-results tab is opened
   useEffect(() => {
@@ -1202,7 +1271,8 @@ HR Team`,
 
         const rawStages = Object.values(jobPipelines).reduce((acc, p) => {
           Object.entries(p.stages || {}).forEach(([stage, count]) => {
-            const s = normalizeStage(stage)
+            const s = normalizeStage(stage)   // already normalized upstream; idempotent
+            if (!s) return
             acc[s] = (acc[s] || 0) + count
           })
           return acc
@@ -1221,18 +1291,45 @@ HR Team`,
 
         return (
           <>
-            {/* Stats Cards */}
+            {/* Stats Cards — each one is a drill-down into the tab it summarises.
+                These used to be plain <div>s that lifted on hover, so they read as
+                buttons and did nothing when clicked. */}
             <div className="stats-grid">
               {[
-                { label: 'Job Postings', value: jobs.length, cls: 'amber' },
-                { label: 'Active Jobs', value: jobs.filter(j => j.status === 'active' || j.status === 'open').length, cls: 'blue' },
-                { label: 'Interviews', value: interviews.length, cls: 'green' },
-                { label: 'Offers', value: offers.length, cls: 'purple' },
-              ].map((s, i) => (
-                <div key={i} className={`stat-card ${s.cls}`}>
+                {
+                  label: 'Job Postings', value: jobs.length, cls: 'amber',
+                  hint: 'View all job postings',
+                  onSelect: () => { setJobFilters({ ...jobFilters, status: '' }); setTab('jobs') },
+                },
+                {
+                  label: 'Active Jobs',
+                  value: jobs.filter(j => j.status === 'active' || j.status === 'open').length,
+                  cls: 'blue',
+                  hint: 'View active job postings',
+                  onSelect: () => { setJobFilters({ ...jobFilters, status: 'active' }); setTab('jobs') },
+                },
+                {
+                  label: 'Interviews', value: interviews.length, cls: 'green',
+                  hint: 'View all interviews',
+                  onSelect: () => setTab('interviews'),
+                },
+                {
+                  label: 'Offers', value: offers.length, cls: 'purple',
+                  hint: 'View all offers',
+                  onSelect: () => setTab('offers'),
+                },
+              ].map((s) => (
+                <button
+                  key={s.label}
+                  type="button"
+                  className={`stat-card ${s.cls}`}
+                  onClick={s.onSelect}
+                  aria-label={`${s.label}: ${s.value}. ${s.hint}`}
+                >
                   <div className="stat-label">{s.label}</div>
                   <div className="stat-value">{s.value}</div>
-                </div>
+                  <ChevronRight size={16} className="stat-affordance" aria-hidden="true" />
+                </button>
               ))}
             </div>
 
@@ -1310,15 +1407,28 @@ HR Team`,
               ) : (
                 <div className="table-wrapper">
                   <table>
-                    <thead><tr><th>Title</th><th>Department</th><th>Location</th><th>Status</th><th>Posted</th></tr></thead>
+                    <thead><tr><th>Title</th><th>Department</th><th>Location</th><th>Status</th><th>Posted</th><th aria-label="Open" /></tr></thead>
                     <tbody>
                       {jobs.slice(0, 5).map(j => (
-                        <tr key={j.id}>
+                        <tr
+                          key={j.id}
+                          className="row-clickable"
+                          role="button"
+                          tabIndex={0}
+                          title={`Open ${j.title} in Job Postings`}
+                          onClick={() => setTab('jobs')}
+                          onKeyDown={e => {
+                            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setTab('jobs') }
+                          }}
+                        >
                           <td style={{ fontWeight: 600 }}>{j.title}</td>
                           <td>{j.department}</td>
                           <td>{j.location}</td>
                           <td><span className={`badge ${j.status === 'active' ? 'badge-green' : 'badge-neutral'}`}>{j.status}</span></td>
                           <td className="mono text-sm text-muted">{j.created_at ? new Date(j.created_at).toLocaleDateString() : '—'}</td>
+                          <td style={{ width: 28 }}>
+                            <ChevronRight size={15} className="row-affordance" aria-hidden="true" />
+                          </td>
                         </tr>
                       ))}
                     </tbody>
