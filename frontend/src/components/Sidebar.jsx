@@ -77,6 +77,14 @@ export default function Sidebar() {
     }
   }
 
+  // The API returns first_name / last_name — never a `name` field. Reading user.name
+  // left every user in every role showing a "?" avatar and the label "User".
+  // Fall back to the email local-part so there is always something human on screen.
+  const displayName = [user?.first_name, user?.last_name].filter(Boolean).join(' ')
+    || user?.email?.split('@')[0]
+    || 'User'
+  const avatarInitial = (user?.first_name?.[0] || user?.email?.[0] || '?').toUpperCase()
+
   const isCandidate = role === 'candidate'
   // Platform org (Innomax) → navy + innomax.ai logo. Detect by slug so it works for
   // superadmin/admin/candidates who belong to the innomax company (which has a color),
@@ -84,7 +92,10 @@ export default function Sidebar() {
   const isInnomax = !user?.company_id
     || user?.company_slug === 'innomax'
     || user?.company_id === INNOMAX_COMPANY_ID
-  const sidebarBg = isInnomax ? '#1a1f2e' : user.company_color
+  // Optional-chained: `user` is read from localStorage and can be null while a token
+  // still exists (cleared site data, half-finished logout) — a bare user.company_color
+  // threw and blanked the whole shell.
+  const sidebarBg = isInnomax ? '#1a1f2e' : user?.company_color
   const navActive = isInnomax ? '#3d8ed6' : 'rgba(255,255,255,0.95)'
   const navActiveBg = isInnomax ? 'rgba(61,142,214,0.14)' : 'rgba(255,255,255,0.15)'
   const avatarBg = isInnomax ? 'rgba(61,142,214,0.16)' : 'rgba(255,255,255,0.15)'
@@ -167,10 +178,10 @@ export default function Sidebar() {
       {/* User + Logout */}
       <div className="sidebar-footer">
         <div className="sidebar-user">
-          <div className="user-avatar">{user?.name?.[0] || '?'}</div>
+          <div className="user-avatar">{avatarInitial}</div>
           <div className="user-info">
-            <div className="user-name">{user?.name || 'User'}</div>
-            <div className="user-email">{user?.email || ''}</div>
+            <div className="user-name" title={displayName}>{displayName}</div>
+            <div className="user-email" title={user?.email || ''}>{user?.email || ''}</div>
           </div>
         </div>
         <button className="nav-item logout-btn" onClick={handleLogout}>
@@ -308,6 +319,7 @@ export default function Sidebar() {
         .user-avatar {
           width: 34px;
           height: 34px;
+          flex-shrink: 0;
           border-radius: 10px;
           background: var(--avatar-bg, rgba(78,205,181,0.12));
           color: var(--avatar-color, #4ecdb5);
@@ -317,16 +329,28 @@ export default function Sidebar() {
           font-size: 0.85rem;
           font-family: var(--font-display);
         }
+        /* min-width:0 lets the flex child shrink so the ellipsis below can engage —
+           without it a long email pushes past the 260px rail instead of truncating. */
+        .user-info {
+          min-width: 0;
+          flex: 1;
+        }
         .user-name {
           font-size: 0.85rem;
           font-weight: 600;
           color: #d4dae6;
           line-height: 1.2;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
         }
         .user-email {
           font-size: 0.66rem;
           color: #6b7589;
           font-family: var(--font-mono);
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
         }
         .logout-btn {
           color: #e87c6c !important;
