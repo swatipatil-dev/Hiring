@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Legend, AreaChart, Area, CartesianGrid } from 'recharts'
-import { Users, Building2, Briefcase, TrendingUp, Plus, Edit3, Trash2, Search, Camera, Upload, X, Mail, CheckCircle2, AlertCircle, Send } from 'lucide-react'
+import { Users, Building2, Briefcase, TrendingUp, Plus, Edit3, Trash2, Search, Camera, Upload, X, Mail, CheckCircle2, AlertCircle, Send, ChevronRight } from 'lucide-react'
 import api from '../../api/client'
 import Header from '../../components/Header'
 import SupportPanel from './SupportPanel'
@@ -602,17 +602,30 @@ export default function AdminDashboard() {
 
 {tab === 'overview' && (
         <>
+          {/* Each card drills into the tab that owns its data. The `icon` field was
+              already declared here but never rendered — it is shown now. */}
           <div className="stats-grid">
             {[
-              { label: 'Total Users', value: analytics?.total_users ?? roleCounts?.all ?? 0, icon: Users, cls: 'amber' },
-              { label: 'Departments', value: departments.length, icon: Building2, cls: 'blue' },
-              { label: 'Active Jobs', value: analytics?.active_jobs ?? 0, icon: Briefcase, cls: 'green' },
-              { label: 'Total Candidates', value: analytics?.total_candidates ?? 0, icon: TrendingUp, cls: 'purple' },
+              { label: 'Total Users', value: analytics?.total_users ?? roleCounts?.all ?? 0, icon: Users, cls: 'amber', to: 'users', hint: 'Manage users' },
+              { label: 'Departments', value: departments.length, icon: Building2, cls: 'blue', to: 'departments', hint: 'Manage departments' },
+              { label: 'Active Jobs', value: analytics?.active_jobs ?? 0, icon: Briefcase, cls: 'green', to: 'analytics', hint: 'View hiring analytics' },
+              { label: 'Total Candidates', value: analytics?.total_candidates ?? 0, icon: TrendingUp, cls: 'purple', to: 'analytics', hint: 'View hiring analytics' },
             ].map((s, i) => (
-              <div key={i} className={`stat-card ${s.cls}`} style={{ animationDelay: `${i * 80}ms` }}>
-                <div className="stat-label">{s.label}</div>
+              <button
+                key={s.label}
+                type="button"
+                className={`stat-card ${s.cls}`}
+                style={{ animationDelay: `${i * 80}ms` }}
+                onClick={() => setTab(s.to)}
+                aria-label={`${s.label}: ${s.value.toLocaleString()}. ${s.hint}`}
+              >
+                <div className="stat-label" style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                  <s.icon size={13} aria-hidden="true" />
+                  <span>{s.label}</span>
+                </div>
                 <div className="stat-value">{s.value.toLocaleString()}</div>
-              </div>
+                <ChevronRight size={16} className="stat-affordance" aria-hidden="true" />
+              </button>
             ))}
           </div>
 

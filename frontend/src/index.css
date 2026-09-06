@@ -365,6 +365,36 @@ tbody tr:last-child td {
   border-bottom: none;
 }
 
+/* Rows that actually open something. Every row already gets a hover background,
+   which reads as "clickable" — this makes the promise real and adds the pointer,
+   a keyboard focus ring, and a chevron that appears on hover. */
+tbody tr.row-clickable {
+  cursor: pointer;
+}
+
+tbody tr.row-clickable:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: -2px;
+}
+
+.row-affordance {
+  color: var(--text-tertiary);
+  opacity: 0;
+  transform: translateX(-4px);
+  transition: opacity 0.2s, transform 0.2s var(--ease-out-expo);
+  vertical-align: middle;
+}
+
+tbody tr.row-clickable:hover .row-affordance,
+tbody tr.row-clickable:focus-visible .row-affordance {
+  opacity: 1;
+  transform: translateX(0);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .row-affordance { transition: none; }
+}
+
 /* ─── Stats Grid ──────────────────────────────── */
 
 .stats-grid {
@@ -374,6 +404,10 @@ tbody tr:last-child td {
   margin-bottom: 24px;
 }
 
+/* A stat card lifts on hover ONLY when it is actually clickable.
+   Previously every card lifted, which is the universal affordance for "button" —
+   so users clicked all four and nothing happened. Rule: if it moves, it must
+   navigate. A plain (non-interactive) .stat-card now reads correctly as a label. */
 .stat-card {
   background: var(--surface-card);
   border: 1px solid var(--border-subtle);
@@ -382,12 +416,66 @@ tbody tr:last-child td {
   position: relative;
   overflow: hidden;
   box-shadow: var(--shadow-sm);
-  transition: transform 0.3s var(--ease-out-expo), box-shadow 0.3s;
+  transition: transform 0.3s var(--ease-out-expo), box-shadow 0.3s, border-color 0.2s;
 }
 
-.stat-card:hover {
+/* Button reset — stat cards rendered as <button> must not inherit UA styling. */
+button.stat-card {
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  display: block;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+button.stat-card:hover,
+.stat-card.is-clickable:hover {
   transform: translateY(-3px);
   box-shadow: var(--shadow-md);
+  border-color: var(--border-accent);
+}
+
+button.stat-card:active,
+.stat-card.is-clickable:active {
+  transform: translateY(-1px);
+}
+
+button.stat-card:focus-visible,
+.stat-card.is-clickable:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
+/* Chevron affordance — the visual promise that the card goes somewhere. */
+.stat-affordance {
+  position: absolute;
+  top: 20px;
+  right: 18px;
+  color: var(--text-tertiary);
+  opacity: 0;
+  transform: translateX(-4px);
+  transition: opacity 0.25s, transform 0.25s var(--ease-out-expo);
+}
+
+button.stat-card:hover .stat-affordance,
+button.stat-card:focus-visible .stat-affordance,
+.stat-card.is-clickable:hover .stat-affordance {
+  opacity: 1;
+  transform: translateX(0);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .stat-card,
+  .stat-affordance {
+    transition: none;
+  }
+  button.stat-card:hover,
+  .stat-card.is-clickable:hover {
+    transform: none;
+  }
 }
 
 .stat-card::before {

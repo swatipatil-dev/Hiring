@@ -1,0 +1,231 @@
+Group,Permission,Slug,Description,Display_Order,superadmin,admin,hr,interviewer,candidate,Endpoints,Current_Gate,Conflict,Notes
+Jobs,Approve jobs,jobs.approve,1 endpoint under /api/v1/hr,10,,Y,Y,,,PUT /api/v1/hr/jobs/{job_id}/approve,"admin,hr",,
+Jobs,Assign hr jobs,jobs.assign_hr,1 endpoint under /api/v1/hr,20,,Y,Y,,,PUT /api/v1/hr/jobs/{job_id}/assign-hr,"admin,hr",,
+Jobs,Assign interviewer jobs,jobs.assign_interviewer,1 endpoint under /api/v1/hr,30,,Y,Y,,,PUT /api/v1/hr/jobs/{job_id}/assign-interviewer,"admin,hr",,
+Jobs,Auto reject jobs,jobs.auto_reject,1 endpoint under /api/v1/advanced,40,,Y,Y,,,POST /api/v1/advanced/jobs/{job_id}/auto-reject,"admin,hr",,
+Jobs,Clone jobs,jobs.clone,1 endpoint under /api/v1/advanced,50,,Y,Y,,,POST /api/v1/advanced/jobs/{job_id}/clone,"admin,hr",,
+Jobs,Create jobs,jobs.create,"2 endpoints under /api/v1/admin, /api/v1/hr",60,,Y,Y,,,POST /api/v1/admin/jobs | POST /api/v1/hr/jobs,"admin / admin,hr",Y,
+Jobs,Delete jobs,jobs.delete,1 endpoint under /api/v1/hr,70,,Y,Y,,,DELETE /api/v1/hr/jobs/{job_id},"admin,hr",,
+Jobs,Move to screening jobs,jobs.move_to_screening,1 endpoint under /api/v1/hr,80,,Y,Y,,,POST /api/v1/hr/jobs/{job_id}/move-to-screening,"admin,hr",,
+Jobs,Permanent jobs,jobs.permanent,1 endpoint under /api/v1/hr,90,,Y,Y,,,DELETE /api/v1/hr/jobs/{job_id}/permanent,"admin,hr",,
+Jobs,Quick apply jobs,jobs.quick_apply,1 endpoint under /api/v1/candidate,100,,,,,Y,POST /api/v1/candidate/jobs/{job_id}/quick-apply,candidate,,
+Jobs,Reopen jobs,jobs.reopen,1 endpoint under /api/v1/hr,110,,Y,Y,,,PUT /api/v1/hr/jobs/{job_id}/reopen,"admin,hr",,
+Jobs,Send round2 invite jobs,jobs.send_round2_invite,1 endpoint under /api/v1/hr,120,,Y,Y,,,POST /api/v1/hr/jobs/{job_id}/send-round2-invite,"admin,hr",,
+Jobs,Send test invite jobs,jobs.send_test_invite,1 endpoint under /api/v1/hr,130,,Y,Y,,,POST /api/v1/hr/jobs/{job_id}/send-test-invite,"admin,hr",,
+Jobs,Edit jobs,jobs.update,1 endpoint under /api/v1/hr,140,,Y,Y,,,PUT /api/v1/hr/jobs/{job_id},"admin,hr",,
+Jobs,View jobs,jobs.view,2 endpoints under /api/v1/candidate,150,,,,,Y,GET /api/v1/candidate/jobs | GET /api/v1/candidate/jobs/{job_id},candidate,,
+Jobs,View all jobs,jobs.view_all,"9 endpoints under /api/v1/admin, /api/v1/advanced, /api/v1/hr",160,,Y,Y,,,GET /api/v1/admin/jobs | GET /api/v1/advanced/jobs/{job_id}/export | GET /api/v1/advanced/jobs/{job_id}/funnel | GET /api/v1/advanced/jobs/{job_id}/skill-gap | GET /api/v1/advanced/jobs/{job_id}/timeline | GET /api/v1/hr/jobs | GET /api/v1/hr/jobs/{job_id} | GET /api/v1/hr/jobs/{job_id}/candidates | GET /api/v1/hr/jobs/{job_id}/tests,"admin / admin,hr",Y,
+Candidates,Edit candidate requests,candidate_requests.update,1 endpoint under /api/v1/hr,170,,Y,Y,,,PUT /api/v1/hr/candidate-requests/{request_id},"admin,hr",,
+Candidates,View candidate requests,candidate_requests.view,1 endpoint under /api/v1/hr,180,,Y,Y,,,GET /api/v1/hr/candidate-requests,"admin,hr",,
+Candidates,Bulk action candidates,candidates.bulk_action,1 endpoint under /api/v1/advanced,190,,Y,Y,,,POST /api/v1/advanced/candidates/bulk-action,"admin,hr",,
+Candidates,Compare candidates,candidates.compare,1 endpoint under /api/v1/advanced,200,,Y,Y,Y,,POST /api/v1/advanced/candidates/compare,"admin,hr,interviewer",,
+Candidates,Notes candidates,candidates.notes,1 endpoint under /api/v1/advanced,210,,Y,Y,Y,,POST /api/v1/advanced/candidates/{candidate_id}/notes,"admin,hr,interviewer",,
+Candidates,View candidates,candidates.view,4 endpoints under /api/v1/advanced,220,,Y,Y,Y,,GET /api/v1/advanced/candidates/search | GET /api/v1/advanced/candidates/{candidate_id}/notes | GET /api/v1/advanced/candidates/{candidate_id}/profile | GET /api/v1/advanced/candidates/{candidate_id}/scorecard,"admin,hr,interviewer",,
+Candidates,View all candidates,candidates.view_all,1 endpoint under /api/v1/hr,230,,Y,Y,,,GET /api/v1/hr/candidates/{candidate_id}/stage-history,"admin,hr",,
+Candidates,Generate cover letter,cover_letter.generate,1 endpoint under /api/v1/candidate,240,,,,,Y,POST /api/v1/candidate/cover-letter/generate,candidate,,
+Candidates,View my candidate requirements,my_candidate_requirements.view,1 endpoint under /api/v1/hr,250,,Y,Y,,,GET /api/v1/hr/my-candidate-requirements,"admin,hr",,
+Candidates,Apply profile,profile.apply,1 endpoint under /api/v1/candidate,260,,,,,Y,POST /api/v1/candidate/profile/import/apply,candidate,,
+Candidates,Create profile,profile.create,8 endpoints under /api/v1/candidate,270,,,,,Y,POST /api/v1/candidate/profile/certifications | POST /api/v1/candidate/profile/documents/cover-letter | POST /api/v1/candidate/profile/documents/resume | POST /api/v1/candidate/profile/education | POST /api/v1/candidate/profile/photo | POST /api/v1/candidate/profile/projects | POST /api/v1/candidate/profile/skills | POST /api/v1/candidate/profile/work-experience,candidate,,
+Candidates,Delete profile,profile.delete,5 endpoints under /api/v1/candidate,280,,,,,Y,DELETE /api/v1/candidate/profile/certifications/{entry_id} | DELETE /api/v1/candidate/profile/education/{entry_id} | DELETE /api/v1/candidate/profile/projects/{entry_id} | DELETE /api/v1/candidate/profile/skills/{skill_id} | DELETE /api/v1/candidate/profile/work-experience/{entry_id},candidate,,
+Candidates,Parse profile,profile.parse,1 endpoint under /api/v1/candidate,290,,,,,Y,POST /api/v1/candidate/profile/import/parse,candidate,,
+Candidates,Edit profile,profile.update,10 endpoints under /api/v1/candidate,300,,,,,Y,PUT /api/v1/candidate/profile | PUT /api/v1/candidate/profile/certifications/{entry_id} | PUT /api/v1/candidate/profile/education/{entry_id} | PUT /api/v1/candidate/profile/links | PUT /api/v1/candidate/profile/location | PUT /api/v1/candidate/profile/personal | PUT /api/v1/candidate/profile/preferences | PUT /api/v1/candidate/profile/projects/{entry_id} | PUT /api/v1/candidate/profile/summary | PUT /api/v1/candidate/profile/work-experience/{entry_id},candidate,,
+Candidates,View profile,profile.view,"3 endpoints under /api/v1/candidate, /api/v1/interviewer",310,,,,Y,Y,GET /api/v1/candidate/profile | GET /api/v1/candidate/profile/completion | GET /api/v1/interviewer/profile,candidate / interviewer,Y,
+Applications,View applications,applications.view,2 endpoints under /api/v1/candidate,320,,,,,Y,GET /api/v1/candidate/applications | GET /api/v1/candidate/applications/{application_id},candidate,,
+Talent Pool,Create resume match,resume_match.create,1 endpoint under /api/v1/hr,330,,Y,Y,,,POST /api/v1/hr/resume-match,"admin,hr",,
+Talent Pool,Attachments talent pool,resume_pool.attachments,1 endpoint under /api/v1/hr,340,,Y,Y,,,POST /api/v1/hr/resume-pool/{entry_id}/attachments,"admin,hr",,
+Talent Pool,Create talent pool,resume_pool.create,1 endpoint under /api/v1/hr,350,,Y,Y,,,POST /api/v1/hr/resume-pool,"admin,hr",,
+Talent Pool,Delete talent pool,resume_pool.delete,2 endpoints under /api/v1/hr,360,,Y,Y,,,DELETE /api/v1/hr/resume-pool/{entry_id} | DELETE /api/v1/hr/resume-pool/{entry_id}/attachments/{attachment_id},"admin,hr",,
+Talent Pool,Import registered talent pool,resume_pool.import_registered,1 endpoint under /api/v1/hr,370,,Y,Y,,,POST /api/v1/hr/resume-pool/import-registered,"admin,hr",,
+Talent Pool,Move to ats talent pool,resume_pool.move_to_ats,1 endpoint under /api/v1/hr,380,,Y,Y,,,POST /api/v1/hr/resume-pool/{entry_id}/move-to-ats,"admin,hr",,
+Talent Pool,Rematch talent pool,resume_pool.rematch,1 endpoint under /api/v1/hr,390,,Y,Y,,,POST /api/v1/hr/resume-pool/{entry_id}/rematch,"admin,hr",,
+Talent Pool,Stage talent pool,resume_pool.stage,1 endpoint under /api/v1/hr,400,,Y,Y,,,PATCH /api/v1/hr/resume-pool/{entry_id}/stage,"admin,hr",,
+Talent Pool,Edit talent pool,resume_pool.update,2 endpoints under /api/v1/hr,410,,Y,Y,,,PATCH /api/v1/hr/resume-pool/{entry_id} | PUT /api/v1/hr/resume-pool/{entry_id}/attachments/{attachment_id},"admin,hr",,
+Talent Pool,View talent pool,resume_pool.view,4 endpoints under /api/v1/hr,420,,Y,Y,,,GET /api/v1/hr/resume-pool | GET /api/v1/hr/resume-pool/{entry_id} | GET /api/v1/hr/resume-pool/{entry_id}/attachments/{attachment_id} | GET /api/v1/hr/resume-pool/{entry_id}/resume,"admin,hr",,
+Talent Pool,Score backlog talent pool,talent_pool.score_backlog,1 endpoint under /api/v1/hr,430,,Y,Y,,,POST /api/v1/hr/talent-pool/score-backlog,"admin,hr",,
+Talent Pool,View talent pool,talent_pool.view,2 endpoints under /api/v1/hr,440,,Y,Y,,,GET /api/v1/hr/talent-pool/metrics | GET /api/v1/hr/talent-pool/skills,"admin,hr",,
+Interviews,View calendar,calendar.view,1 endpoint under /api/v1/advanced,450,,Y,Y,Y,,GET /api/v1/advanced/calendar,"admin,hr,interviewer",,
+Interviews,Create interviews,interviews.create,1 endpoint under /api/v1/hr,460,,Y,Y,,,POST /api/v1/hr/interviews,"admin,hr",,
+Interviews,Feedback interviews,interviews.feedback,"2 endpoints under /api/v1/hr, /api/v1/interviewer",470,,Y,Y,Y,,POST /api/v1/hr/interviews/{interview_id}/feedback | POST /api/v1/interviewer/interviews/{interview_id}/feedback,"admin,hr / interviewer",Y,
+Interviews,Reschedule interviews,interviews.reschedule,1 endpoint under /api/v1/advanced,480,,Y,Y,Y,,POST /api/v1/advanced/interviews/{interview_id}/reschedule,"admin,hr,interviewer",,
+Interviews,Submit interviews,interviews.submit,1 endpoint under /api/v1/candidate,490,,,,,Y,POST /api/v1/candidate/interviews/{interview_id}/submit,candidate,,
+Interviews,View interviews,interviews.view,2 endpoints under /api/v1/candidate,500,,,,,Y,GET /api/v1/candidate/interviews | GET /api/v1/candidate/interviews/{interview_id}/questions,candidate,,
+Interviews,View all interviews,interviews.view_all,"6 endpoints under /api/v1/hr, /api/v1/interviewer",510,,Y,Y,Y,,GET /api/v1/hr/interviews | GET /api/v1/interviewer/interviews | GET /api/v1/interviewer/interviews/history | GET /api/v1/interviewer/interviews/{interview_id} | GET /api/v1/interviewer/interviews/{interview_id}/candidate | GET /api/v1/interviewer/interviews/{interview_id}/feedback,"admin,hr / interviewer",Y,
+Interviews,Voice answer interviews,interviews.voice_answer,1 endpoint under /api/v1/candidate,520,,,,,Y,POST /api/v1/candidate/interviews/{interview_id}/voice-answer,candidate,,
+Interviews,View my assignments,my_assignments.view,2 endpoints under /api/v1/interviewer,530,,,,Y,,GET /api/v1/interviewer/my-assignments | GET /api/v1/interviewer/my-assignments/{job_id}/candidates,interviewer,,
+Interviews,Create schedule interview,schedule_interview.create,"2 endpoints under /api/v1/hr, /api/v1/interviewer",540,,Y,Y,Y,,POST /api/v1/hr/schedule-interview | POST /api/v1/interviewer/schedule-interview,"admin,hr / interviewer",Y,
+Tests & Assessments,Action test results,test_results.action,1 endpoint under /api/v1/hr,550,,Y,Y,,,POST /api/v1/hr/test-results/action,"admin,hr",,
+Tests & Assessments,View test results,test_results.view,2 endpoints under /api/v1/hr,560,,Y,Y,,,GET /api/v1/hr/test-results | GET /api/v1/hr/test-results/{interview_id}/answers,"admin,hr",,
+Tests & Assessments,Settings tests,tests.settings,1 endpoint under /api/v1/interviewer,570,,Y,Y,Y,,PATCH /api/v1/interviewer/tests/{interview_id}/settings,"admin,hr,interviewer",,
+Tests & Assessments,View tests,tests.view,2 endpoints under /api/v1/interviewer,580,,Y,Y,Y,,GET /api/v1/interviewer/tests | GET /api/v1/interviewer/tests/drafts,"admin,hr,interviewer",,
+Questions,Create question bank,question_bank.create,2 endpoints under /api/v1/advanced,590,,Y,Y,Y,,POST /api/v1/advanced/question-bank | POST /api/v1/advanced/question-bank/{question_id}/add-to-interview/{interview_id},"admin,hr,interviewer",,
+Questions,Delete question bank,question_bank.delete,1 endpoint under /api/v1/advanced,600,,Y,Y,,,DELETE /api/v1/advanced/question-bank/{question_id},"admin,hr",,
+Questions,Edit question bank,question_bank.update,1 endpoint under /api/v1/advanced,610,,Y,Y,Y,,PUT /api/v1/advanced/question-bank/{question_id},"admin,hr,interviewer",,
+Questions,View question bank,question_bank.view,1 endpoint under /api/v1/advanced,620,,Y,Y,Y,,GET /api/v1/advanced/question-bank,"admin,hr,interviewer",,
+Questions,Delete questions,questions.delete,1 endpoint under /api/v1/interviewer,630,,Y,Y,Y,,DELETE /api/v1/interviewer/questions/{question_id},"admin,hr,interviewer",,
+Questions,Edit questions,questions.update,1 endpoint under /api/v1/interviewer,640,,Y,Y,Y,,PUT /api/v1/interviewer/questions/{question_id},"admin,hr,interviewer",,
+Questions,View questions,questions.view,1 endpoint under /api/v1/interviewer,650,,Y,Y,Y,,GET /api/v1/interviewer/questions/{question_id}/usage,"admin,hr,interviewer",,
+Questions,View skills,skills.view,2 endpoints under /api/v1/interviewer,660,,Y,Y,Y,,GET /api/v1/interviewer/skills | GET /api/v1/interviewer/skills/{skill_name}/questions,"admin,hr,interviewer",,
+Coding Judge,Create judge,judge.create,1 endpoint under /api/v1/judge,670,Y,Y,Y,,,POST /api/v1/judge/problems,"admin,hr,superadmin",,
+Coding Judge,Testcases judge,judge.testcases,1 endpoint under /api/v1/judge,680,Y,Y,Y,,,POST /api/v1/judge/problems/{problem_id}/testcases,"admin,hr,superadmin",,
+Coding Judge,Edit judge,judge.update,1 endpoint under /api/v1/judge,690,Y,Y,Y,,,PUT /api/v1/judge/problems/{problem_id},"admin,hr,superadmin",,
+Coding Judge,View judge,judge.view,1 endpoint under /api/v1/judge,700,Y,Y,Y,,,GET /api/v1/judge/problems/{problem_id}/testcases,"admin,hr,superadmin",,
+Offers,Create offers,offers.create,1 endpoint under /api/v1/hr,710,,Y,Y,,,POST /api/v1/hr/offers,"admin,hr",,
+Offers,View offers,offers.view,"2 endpoints under /api/v1/candidate, /api/v1/hr",720,,Y,Y,,Y,GET /api/v1/candidate/offers | GET /api/v1/hr/offers,"admin,hr / candidate",Y,
+Feedback & Evaluation,View feedback,feedback.view,1 endpoint under /api/v1/hr,730,,Y,Y,,,GET /api/v1/hr/feedback,"admin,hr",,
+Users,View HR profiles,hr_profiles.view,1 endpoint under /api/v1/hr,740,,Y,Y,,,GET /api/v1/hr/hr-profiles,"admin,hr",,
+Users,View interviewers,interviewers.view,1 endpoint under /api/v1/hr,750,,Y,Y,,,GET /api/v1/hr/interviewers,"admin,hr",,
+Users,View panel staff,panel_staff.view,1 endpoint under /api/v1/hr,760,,Y,Y,,,GET /api/v1/hr/panel-staff,"admin,hr",,
+Users,Create users,users.create,2 endpoints under /api/v1/admin,770,,Y,,,,POST /api/v1/admin/users/hr | POST /api/v1/admin/users/interviewer,admin,,
+Users,Delete users,users.delete,1 endpoint under /api/v1/admin,780,,Y,,,,DELETE /api/v1/admin/users/{user_id},admin,,
+Users,Status users,users.status,1 endpoint under /api/v1/admin,790,,Y,,,,PUT /api/v1/admin/users/{user_id}/status,admin,,
+Users,Edit users,users.update,1 endpoint under /api/v1/admin,800,,Y,,,,PUT /api/v1/admin/users/{user_id},admin,,
+Users,View users,users.view,2 endpoints under /api/v1/admin,810,,Y,,,,GET /api/v1/admin/users | GET /api/v1/admin/users/counts,admin,,
+Departments,Create department chat,department_chat.create,1 endpoint under /api/v1/admin,820,,Y,,,,POST /api/v1/admin/department-chat,admin,,
+Departments,Create departments,departments.create,1 endpoint under /api/v1/admin,830,,Y,,,,POST /api/v1/admin/departments,admin,,
+Departments,Delete departments,departments.delete,1 endpoint under /api/v1/admin,840,,Y,,,,DELETE /api/v1/admin/departments/{department_id},admin,,
+Departments,Logo departments,departments.logo,2 endpoints under /api/v1/admin,850,,Y,,,,DELETE /api/v1/admin/departments/{department_id}/logo | POST /api/v1/admin/departments/{department_id}/logo,admin,,
+Departments,Edit departments,departments.update,1 endpoint under /api/v1/admin,860,,Y,,,,PUT /api/v1/admin/departments/{department_id},admin,,
+Departments,View departments,departments.view,"2 endpoints under /api/v1/admin, /api/v1/hr",870,,Y,Y,,,GET /api/v1/admin/departments | GET /api/v1/hr/departments,"admin / admin,hr",Y,
+Email & Mailboxes,Test email,email.test,1 endpoint under /api/v1/admin,880,,Y,Y,,,POST /api/v1/admin/email/test,"admin,hr",,
+Email & Mailboxes,View email,email.view,1 endpoint under /api/v1/admin,890,,Y,,,,GET /api/v1/admin/email/routing,admin,,
+Email & Mailboxes,Delete email config,email_config.delete,1 endpoint under /api/v1/admin,900,,Y,,,,DELETE /api/v1/admin/email-config,admin,,
+Email & Mailboxes,Edit email config,email_config.update,1 endpoint under /api/v1/admin,910,,Y,,,,PUT /api/v1/admin/email-config,admin,,
+Email & Mailboxes,View email config,email_config.view,1 endpoint under /api/v1/admin,920,,Y,,,,GET /api/v1/admin/email-config,admin,,
+Email & Mailboxes,View mail preview,mail_preview.view,1 endpoint under /api/v1/hr,930,,Y,Y,,,GET /api/v1/hr/mail-preview,"admin,hr",,
+Email & Mailboxes,Create mailboxes,mailboxes.create,1 endpoint under /api/v1/admin,940,,Y,,,,POST /api/v1/admin/mailboxes,admin,,
+Email & Mailboxes,Delete mailboxes,mailboxes.delete,1 endpoint under /api/v1/admin,950,,Y,,,,DELETE /api/v1/admin/mailboxes/{mailbox_id},admin,,
+Email & Mailboxes,Edit mailboxes,mailboxes.update,1 endpoint under /api/v1/admin,960,,Y,,,,PUT /api/v1/admin/mailboxes/{mailbox_id},admin,,
+Email & Mailboxes,View mailboxes,mailboxes.view,"2 endpoints under /api/v1/admin, /api/v1/hr",970,,Y,Y,,,GET /api/v1/admin/mailboxes | GET /api/v1/hr/mailboxes,"admin / admin,hr",Y,
+Email & Mailboxes,Read notifications,notifications.read,"2 endpoints under /api/v1/candidate, /api/v1/hr",980,,Y,Y,,Y,PUT /api/v1/candidate/notifications/{notification_id}/read | PUT /api/v1/hr/notifications/{notification_id}/read,"admin,hr / candidate",Y,
+Email & Mailboxes,Read all notifications,notifications.read_all,"2 endpoints under /api/v1/candidate, /api/v1/hr",990,,Y,Y,,Y,PUT /api/v1/candidate/notifications/read-all | PUT /api/v1/hr/notifications/read-all,"admin,hr / candidate",Y,
+Email & Mailboxes,View notifications,notifications.view,"2 endpoints under /api/v1/candidate, /api/v1/hr",1000,,Y,Y,,Y,GET /api/v1/candidate/notifications | GET /api/v1/hr/notifications,"admin,hr / candidate",Y,
+Email & Mailboxes,Test pipeline notifications,pipeline_notifications.test,1 endpoint under /api/v1/hr,1010,,Y,Y,,,POST /api/v1/hr/pipeline-notifications/test,"admin,hr",,
+Email & Mailboxes,Edit pipeline notifications,pipeline_notifications.update,1 endpoint under /api/v1/hr,1020,,Y,Y,,,PUT /api/v1/hr/pipeline-notifications,"admin,hr",,
+Email & Mailboxes,View pipeline notifications,pipeline_notifications.view,1 endpoint under /api/v1/hr,1030,,Y,Y,,,GET /api/v1/hr/pipeline-notifications,"admin,hr",,
+Email & Mailboxes,Create send mail,send_mail.create,1 endpoint under /api/v1/hr,1040,,Y,Y,,,POST /api/v1/hr/send-mail,"admin,hr",,
+Templates,Create mail templates,mail_templates.create,1 endpoint under /api/v1/hr,1050,,Y,Y,,,POST /api/v1/hr/mail-templates,"admin,hr",,
+Templates,Delete mail templates,mail_templates.delete,1 endpoint under /api/v1/hr,1060,,Y,Y,,,DELETE /api/v1/hr/mail-templates/{template_id},"admin,hr",,
+Templates,Edit mail templates,mail_templates.update,1 endpoint under /api/v1/hr,1070,,Y,Y,,,PUT /api/v1/hr/mail-templates/{template_id},"admin,hr",,
+Templates,View mail templates,mail_templates.view,1 endpoint under /api/v1/hr,1080,,Y,Y,,,GET /api/v1/hr/mail-templates,"admin,hr",,
+Support,Create support,support.create,1 endpoint under /api/v1/support,1090,,Y,,,,POST /api/v1/support/requests,admin,,
+Support,Messages support,support.messages,2 endpoints under /api/v1/support,1100,Y,Y,,,,POST /api/v1/support/admin/requests/{ticket_id}/messages | POST /api/v1/support/requests/{ticket_id}/messages,admin / superadmin,Y,
+Support,Status support,support.status,1 endpoint under /api/v1/support,1110,Y,,,,,PUT /api/v1/support/admin/requests/{ticket_id}/status,superadmin,,
+Support,View support,support.view,4 endpoints under /api/v1/support,1120,Y,Y,,,,GET /api/v1/support/admin/requests | GET /api/v1/support/admin/requests/{ticket_id} | GET /api/v1/support/requests | GET /api/v1/support/requests/{ticket_id},admin / superadmin,Y,
+Analytics,View analytics,analytics.view,"9 endpoints under /api/v1/admin, /api/v1/advanced",1130,,Y,Y,,,GET /api/v1/admin/analytics/age-distribution | GET /api/v1/admin/analytics/gender-distribution | GET /api/v1/admin/analytics/hr-comparison | GET /api/v1/admin/analytics/hr/{hr_id} | GET /api/v1/admin/analytics/jobs/{job_id} | GET /api/v1/admin/analytics/overview | GET /api/v1/advanced/analytics/department | GET /api/v1/advanced/analytics/hiring-velocity | GET /api/v1/advanced/analytics/overview,"admin / admin,hr",Y,
+Analytics,View department stats,department_stats.view,1 endpoint under /api/v1/admin,1140,,Y,,,,GET /api/v1/admin/department-stats,admin,,
+Analytics,View gender stats,gender_stats.view,1 endpoint under /api/v1/candidate,1150,,,,,Y,GET /api/v1/candidate/gender-stats,candidate,,
+Companies,Admin companies,companies.admin,1 endpoint under /api/v1/superadmin,1160,Y,,,,,POST /api/v1/superadmin/companies/{company_id}/admin,superadmin,,
+Companies,Create companies,companies.create,1 endpoint under /api/v1/superadmin,1170,Y,,,,,POST /api/v1/superadmin/companies,superadmin,,
+Companies,Custom domain companies,companies.custom_domain,2 endpoints under /api/v1/superadmin,1180,Y,,,,,DELETE /api/v1/superadmin/companies/{company_id}/custom-domain | POST /api/v1/superadmin/companies/{company_id}/custom-domain,superadmin,,
+Companies,Delete companies,companies.delete,1 endpoint under /api/v1/superadmin,1190,Y,,,,,DELETE /api/v1/superadmin/companies/{company_id}/departments/{dept_id},superadmin,,
+Companies,Departments companies,companies.departments,1 endpoint under /api/v1/superadmin,1200,Y,,,,,POST /api/v1/superadmin/companies/{company_id}/departments,superadmin,,
+Companies,Regenerate key companies,companies.regenerate_key,1 endpoint under /api/v1/superadmin,1210,Y,,,,,POST /api/v1/superadmin/companies/{company_id}/regenerate-key,superadmin,,
+Companies,Toggle companies,companies.toggle,1 endpoint under /api/v1/superadmin,1220,Y,,,,,PUT /api/v1/superadmin/companies/{company_id}/toggle,superadmin,,
+Companies,Edit companies,companies.update,1 endpoint under /api/v1/superadmin,1230,Y,,,,,PUT /api/v1/superadmin/companies/{company_id},superadmin,,
+Companies,Verify companies,companies.verify,1 endpoint under /api/v1/superadmin,1240,Y,,,,,POST /api/v1/superadmin/companies/{company_id}/custom-domain/verify,superadmin,,
+Companies,View companies,companies.view,3 endpoints under /api/v1/superadmin,1250,Y,,,,,GET /api/v1/superadmin/companies | GET /api/v1/superadmin/companies/{company_id} | GET /api/v1/superadmin/companies/{company_id}/departments,superadmin,,
+Companies,View own company,own_company.view,1 endpoint under /api/v1/superadmin,1260,Y,,,,,GET /api/v1/superadmin/own-company,superadmin,,
+Companies,Create upload logo,upload_logo.create,1 endpoint under /api/v1/superadmin,1270,Y,,,,,POST /api/v1/superadmin/upload-logo,superadmin,,
+System & Database,Edit config,config.update,1 endpoint under /api/v1/admin,1280,,Y,,,,PUT /api/v1/admin/config/{config_key},admin,,
+System & Database,View config,config.view,1 endpoint under /api/v1/admin,1290,,Y,,,,GET /api/v1/admin/config,admin,,
+System & Database,Backup database,database.backup,1 endpoint under /api/v1/database,1300,Y,,,,,POST /api/v1/database/backup,superadmin,,
+System & Database,Clear connections database,database.clear_connections,1 endpoint under /api/v1/database,1310,Y,,,,,POST /api/v1/database/maintenance/clear-connections,superadmin,,
+System & Database,Optimize database,database.optimize,1 endpoint under /api/v1/database,1320,Y,,,,,POST /api/v1/database/optimize,superadmin,,
+System & Database,Query database,database.query,1 endpoint under /api/v1/database,1330,Y,,,,,POST /api/v1/database/query,superadmin,,
+System & Database,Reconnect database,database.reconnect,1 endpoint under /api/v1/database,1340,Y,,,,,POST /api/v1/database/maintenance/reconnect,superadmin,,
+System & Database,View database,database.view,8 endpoints under /api/v1/database,1350,Y,,,,,GET /api/v1/database/backups | GET /api/v1/database/health | GET /api/v1/database/health/simple | GET /api/v1/database/info | GET /api/v1/database/performance | GET /api/v1/database/stats | GET /api/v1/database/tables | GET /api/v1/database/tables/{table_name},superadmin,,
+System & Database,View system,system.view,1 endpoint under /api/v1/admin,1360,,Y,,,,GET /api/v1/admin/system/health,admin,,
+,,,,,,,,,,,,,
+UNGATED ENDPOINTS,"-- rows below are documentation only, no Slug, not seeded --",,,,,,,,,,,,
+UNGATED ENDPOINTS,GET /api/v1/ats/demo,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/ats/diagnostics,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/ats/interpretation,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/ats/metrics,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/ats/score,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/ats/score/hybrid,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/ats/system/status,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/auth/logout,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/auth/me,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/auth/refresh,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/auth/verify-token,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/candidate/jobs/{job_id}/apply,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/evaluation/coding/submit,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/evaluation/marksheet/{interview_id},,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/evaluation/mcq/submit,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/evaluation/offers/{offer_id}/respond,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/hr/jobs/{job_id}/select-candidates,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/interviewer/all-jobs,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/interviewer/auto-create-job,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/interviewer/candidate-requests,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/interviewer/candidate-requests,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/interviewer/generate-jd,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/interviewer/hr-list,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/interviewer/interviews,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/interviewer/interviews,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/interviewer/interviews/draft,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,DELETE /api/v1/interviewer/interviews/{interview_id},,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/interviewer/interviews/{interview_id},,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,PUT /api/v1/interviewer/interviews/{interview_id},,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/interviewer/interviews/{interview_id}/generate-questions,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/interviewer/interviews/{interview_id}/publish,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,DELETE /api/v1/interviewer/interviews/{interview_id}/questions,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/interviewer/interviews/{interview_id}/questions,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,PUT /api/v1/interviewer/interviews/{interview_id}/questions/{question_id},,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/interviewer/interviews/{interview_id}/questions/{question_id}/regenerate,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/interviewer/my-meetings,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/interviewer/stats/questions,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/interviewer/templates,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/interviewer/templates,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/interviewer/templates/from-ai,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,DELETE /api/v1/interviewer/templates/{template_id},,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,PUT /api/v1/interviewer/templates/{template_id},,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/judge/grade-question,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/judge/health,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/judge/interview-submissions,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/judge/languages,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/judge/problems,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/judge/problems/{problem_id},,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/judge/run,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/judge/submissions,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/judge/submissions,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/judge/submissions/{submission_id},,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/judge/warmup,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/mcq/categories,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/mcq/interviews/{interview_id}/questions,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/mcq/questions,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,DELETE /api/v1/mcq/questions/{question_id},,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/mcq/questions/{question_id},,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/mcq/sample,,,,,,,,,,AUTHENTICATED,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/auth/forgot-password,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/auth/login,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/auth/register,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/auth/resend-otp,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/auth/reset-password,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/auth/verify-otp,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/info,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/interviewer/ai/health,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/interviewer/ai/test-connection,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/interviewer/interviews/test-ollama,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/judge/reap,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /api/v1/judge/regrade-pending,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/public/careers,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/public/careers/{job_id},,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/public/company-info,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /api/v1/public/jobs,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /health,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /interviews/health,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /interviews/questions/search,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /interviews/test-ollama,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /interviews/{interview_id}/assemble-sets,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /interviews/{interview_id}/generate-questions,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /interviews/{interview_id}/generate-skill-questions,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /interviews/{interview_id}/import-questions,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /interviews/{interview_id}/manual-questions,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /interviews/{interview_id}/manual-questions/csv,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,DELETE /interviews/{interview_id}/questions,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /interviews/{interview_id}/questions,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,PUT /interviews/{interview_id}/questions/{question_id},,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,POST /interviews/{interview_id}/questions/{question_id}/regenerate,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /interviews/{interview_id}/test-sets,,,,,,,,,,PUBLIC,,no permission -- triage separately
+UNGATED ENDPOINTS,GET /proctor,,,,,,,,,,PUBLIC,,no permission -- triage separately

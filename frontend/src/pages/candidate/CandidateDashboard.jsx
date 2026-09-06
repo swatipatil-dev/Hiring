@@ -337,6 +337,7 @@ export default function CandidateDashboard() {
           profile={profile}
           apps={apps}
           myInterviews={myInterviews}
+          myOffers={myOffers}
           jobs={jobs}
           navigate={navigate}
           onViewJob={(job) => setDetailsModal(job)}

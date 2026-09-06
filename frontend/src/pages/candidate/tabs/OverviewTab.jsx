@@ -8,7 +8,7 @@ import {
   rankJobsBySkillMatch,
 } from '../utils'
 
-export default function OverviewTab({ profile, apps, myInterviews, jobs, navigate, onViewJob }) {
+export default function OverviewTab({ profile, apps, myInterviews, myOffers, jobs, navigate, onViewJob }) {
   const firstName = profile?.first_name || 'there'
   const score = profile?.completion?.score ?? 0
   const missing = profile?.completion?.missing || []
@@ -17,7 +17,23 @@ export default function OverviewTab({ profile, apps, myInterviews, jobs, navigat
   const isInterviewing = s => /interview|shortlist/i.test(s || '') && !isOffer(s)
   const statApplied = apps.length
   const statInterviewing = apps.filter(a => isInterviewing(a.stage)).length
-  const statOffers = apps.filter(a => isOffer(a.stage)).length
+
+  // Offers come from the OFFERS endpoint, not from the application's stage string.
+  //
+  // This used to be `apps.filter(a => isOffer(a.stage)).length`, which is wrong in the
+  // one case that matters: an offer is a row in its own table with its own lifecycle,
+  // and sending one does not necessarily move the application's stage. A candidate with
+  // a live, sent offer therefore saw "Offers 0" — and, worse, the "You have an offer"
+  // prompt below never fired, so nothing on the dashboard told them an offer existed.
+  // `myOffers` was already being fetched and handed to InterviewsTab; it just was not
+  // used here.
+  const offers = myOffers || []
+  const respondedTo = o => ['accepted', 'rejected', 'declined'].includes(String(o.status || '').toLowerCase())
+  // The card counts offers still standing — a declined offer is not one you "have".
+  const statOffers = offers.filter(o => String(o.status || '').toLowerCase() !== 'rejected'
+                                     && String(o.status || '').toLowerCase() !== 'declined').length
+  // The prompt fires only for an offer still awaiting a decision.
+  const pendingOffers = offers.filter(o => !respondedTo(o) && !o.responded_at)
 
   const now = Date.now()
   const upcoming = [...(myInterviews || [])]
@@ -57,7 +73,9 @@ export default function OverviewTab({ profile, apps, myInterviews, jobs, navigat
   const lowAtsApp = [...apps].filter(a => a.atsScore != null).sort((a, b) => a.atsScore - b.atsScore)[0]
   const topRec = recs[0]
   const nba = (() => {
-    if (statOffers > 0) {
+    // Pending, not merely present: an offer already accepted should not keep nagging
+    // the candidate to "respond before it expires".
+    if (pendingOffers.length > 0) {
       return { tone: 'green', icon: CheckCircle2, title: 'You have an offer 🎉', sub: 'Review the details and respond before it expires.', cta: 'View offer', onClick: () => navigate('/candidate/interviews') }
     }
     if (upcoming) {

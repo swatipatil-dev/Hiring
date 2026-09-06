@@ -1,8 +1,10 @@
-import { Bell, Search, Moon } from 'lucide-react'
-import { useAuth } from '../context/AuthContext'
+import { Bell } from 'lucide-react'
 
 export default function Header({ title, subtitle, onBellClick, unreadCount = 0 }) {
-  const { user } = useAuth()
+  // NOTE: a non-functional "Search anything..." input used to sit here. It had no
+  // value, no onChange and no handler, so it read as a broken control on every
+  // dashboard. Removed rather than faked — restore it only alongside a real
+  // global-search endpoint.
   return (
     <header className="top-header">
       <div className="header-left">
@@ -10,12 +12,12 @@ export default function Header({ title, subtitle, onBellClick, unreadCount = 0 }
         {subtitle && <p className="subtitle">{subtitle}</p>}
       </div>
       <div className="header-right">
-        <div className="header-search">
-          <Search size={16} />
-          <input type="text" placeholder="Search anything..." className="input" />
-        </div>
-        <button className="header-icon-btn" onClick={onBellClick}>
-          <Bell size={18} color={unreadCount > 0 ? '#2b7cba' : undefined} />
+        <button
+          className="header-icon-btn"
+          onClick={onBellClick}
+          aria-label={unreadCount > 0 ? `Notifications, ${unreadCount} unread` : 'Notifications'}
+        >
+          <Bell size={18} color={unreadCount > 0 ? 'var(--accent-primary)' : undefined} />
           {unreadCount > 0 && <span className="notif-dot" />}
         </button>
       </div>
@@ -53,31 +55,6 @@ export default function Header({ title, subtitle, onBellClick, unreadCount = 0 }
           display: flex;
           align-items: center;
           gap: 10px;
-        }
-        .header-search {
-          display: flex;
-          align-items: center;
-          gap: 8px;
-          background: var(--surface-input);
-          border: 1px solid var(--border-subtle);
-          border-radius: 10px;
-          padding: 0 12px;
-          width: 220px;
-          color: var(--text-tertiary);
-          transition: border-color 0.2s;
-        }
-        .header-search:focus-within {
-          border-color: var(--accent-primary);
-        }
-        .header-search .input {
-          border: none;
-          background: none;
-          padding: 8px 0;
-          font-size: 0.83rem;
-          box-shadow: none;
-        }
-        .header-search .input:focus {
-          box-shadow: none;
         }
         .header-icon-btn {
           position: relative;
