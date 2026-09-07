@@ -163,19 +163,30 @@ jobs:
           path: backend/test-results.xml
 
   # ── Migrations ──────────────────────────────────────────────────────────────
-  # conftest.py builds the schema with Base.metadata.create_all, so the test job
-  # never runs a single migration — a green suite says nothing about whether
+  # conftest.py builds the schema with Base.metadata.create_all, so the backend
+  # job never runs a single migration — a green suite says nothing about whether
   # `alembic upgrade head` works. That gap shipped a missing column that only
-  # surfaced as "Unknown column" against a real database.
+  # surfaced as "Unknown column resume_pool.profile_source" against a real
+  # database.
   #
-  # This job runs the migrations for real, then uses the same schema_diff.py
-  # gate the deploy runbook uses, so a missing migration fails the PR instead of
-  # the deployment.
+  # DO NOT "simplify" this to `alembic upgrade head` on the empty service
+  # database. It cannot work, and the reason is documented at
+  # docs/CPANEL_DEPLOYMENT.md:702 — the first revision has no parent but its
+  # first statement is `CREATE INDEX ... ON interviews`. Alembic was adopted
+  # AFTER the schema already existed, so the chain only records changes since
+  # then; there is no create_table for the base schema anywhere in it. On an
+  # empty database it fails immediately with "Table 'interviews' doesn't exist".
+  #
+  # So this reproduces what a real deploy does instead:
+  #   1. build the schema as `main` has it   (create_all + stamp — the documented
+  #      bootstrap at CPANEL_DEPLOYMENT.md:715-745)
+  #   2. apply THIS branch's new revisions on top
+  #   3. check the result against the models with the same schema_diff.py gate
+  #      the deploy uses
+  #
+  # When a branch adds no migrations, step 2 is a no-op and step 3 still runs.
   migrations:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: backend
 
     services:
       mysql:
@@ -194,19 +205,29 @@ jobs:
     env:
       SECRET_KEY: ci-test-secret-key-32chars-minimum!!
       DATABASE_URL: mysql+pymysql://root:1234@localhost:3306/hireflow_migrations
+      # The service container already created the database. Left at its default
+      # of 1, init_db() would also attempt CREATE DATABASE / CREATE USER.
+      DB_BOOTSTRAP: "0"
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out this branch
+        uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          path: pr
+
+      - name: Check out main (the released schema)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: base
 
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-          cache-dependency-path: backend/requirements-ci.txt
+          cache-dependency-path: pr/backend/requirements-ci.txt
 
-      - run: pip install -r requirements-ci.txt
+      - run: pip install -r pr/backend/requirements-ci.txt
 
       - name: Wait for MySQL
         run: |
@@ -215,36 +236,50 @@ jobs:
             sleep 3
           done
 
-      # Two branches each adding a migration produce two heads, which only fails
-      # at merge time. Catch it on the PR instead.
+      # Two branches each adding a migration produce two heads, which otherwise
+      # only fails at merge time. Catch it on the PR instead.
       - name: Exactly one Alembic head
+        working-directory: pr/backend
         run: |
-          heads=$(alembic heads | grep -c "(head)" || true)
-          echo "heads found: $heads"
           alembic heads
+          heads=$(alembic heads | grep -c "(head)" || true)
           if [ "$heads" -ne 1 ]; then
             echo "::error::Expected exactly 1 Alembic head, found $heads — two branches added migrations in parallel."
             exit 1
           fi
 
-      - name: alembic upgrade head (on an empty database)
-        run: alembic upgrade head
+      # `import main` is load-bearing, not decorative: create_all only creates
+      # tables for models that have been IMPORTED, and the judge and question
+      # tables live in separate modules. Importing src.models.models alone
+      # silently skips them. See CPANEL_DEPLOYMENT.md:734-738.
+      - name: Build the schema as main has it
+        working-directory: base/backend
+        run: |
+          python -c "
+          import sys; sys.path.insert(0, '.')
+          import main
+          from src.config.database_config_mysql import init_db, db_manager
+          ok = init_db()
+          info = db_manager.get_database_info()
+          print('created:', ok, '| tables:', info.get('table_count'))
+          "
+          alembic stamp head
+          alembic current
 
-      - name: alembic current
-        run: alembic current
+      # The step that actually earns this job: only the revisions this branch
+      # adds run here, which is exactly what happens on the server.
+      - name: Apply this branch's new migrations
+        working-directory: pr/backend
+        run: |
+          alembic upgrade head
+          alembic current
 
-      # The real check: does the migrated schema match what the models declare?
-      # `alembic current` alone is not evidence — a database can be stamped at
-      # head while missing a column, silently, until a request 500s.
+      # `alembic current` is not evidence the schema is right — a database can be
+      # stamped at head while missing a column, silently, until a request 500s.
       - name: Schema matches the models
+        working-directory: pr/backend
         run: python scripts/schema_diff.py
 
-      # No downgrade round-trip here on purpose. 6 of 34 revisions have a stub
-      # downgrade (mostly merge revisions, legitimately), so `downgrade -1` can
-      # be a no-op and the re-upgrade then fails on "Duplicate column" — a false
-      # alarm, not a finding. And DEPLOY_UPDATE.md:185-188 is explicit that a
-      # failed deploy rolls the CODE back and leaves the schema alone, so
-      # downgrade correctness is not a property this project relies on.
 
   # ── Frontend ────────────────────────────────────────────────────────────────
   # New. Node was never set up in CI, so 109 vitest tests and the production
