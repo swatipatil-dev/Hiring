@@ -1,14 +1,25 @@
 name: Deploy to cPanel
 
-# Merging to main PREPARES a release; a human releases it. The `production`
-# environment carries a required reviewer, so the deploy job waits for approval.
+# Auto-deploy is PAUSED. `on: push` is deliberately absent.
+#
+# The six repository secrets in docs/CICD_SETUP.md section 4 were never created,
+# so the first run this workflow ever had — the merge to main on 2026-09-07 —
+# could only fail. It failed obscurely: DEPLOY_HOST expanded to nothing, ssh fell
+# back to resolving the literal alias `target`, and the visible error was a DNS
+# failure inside the ROLLBACK step, a hundred lines past the actual cause.
+#
+# Until those secrets exist, a deploy is a deliberate button press. To restore
+# automatic release-on-merge, add back:
+#
+#   push:
+#     branches: [main]
+#
+# and see docs/CICD_SETUP.md, "Auto-deploy is paused", for the full checklist.
 #
 # This automates docs/DEPLOY_UPDATE.md step for step, including its conditionals
 # — git pull leaves four things stale (database, systemd units, Apache config,
 # built frontend) and each of those has an incident behind it.
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       dry_run:
@@ -68,11 +79,15 @@ jobs:
       name: production
       url: https://career.innomaxskills.com
     steps:
-      # The push trigger is main-only, but workflow_dispatch ignores that: the
-      # Actions "Run workflow" dropdown lets you pick ANY branch, and without
-      # this the job would happily ship develop to the live site. The approving
-      # reviewer sees a deploy request, not a branch name, so this has to be
-      # checked here rather than left to a human.
+      # This is now the ONLY branch enforcement in the workflow. With `on: push`
+      # removed every run is a workflow_dispatch, and the Actions "Run workflow"
+      # dropdown lets you pick ANY branch — while the approving reviewer sees a
+      # deploy request, not a branch name. Without this, shipping develop to the
+      # live site is two clicks. It refuses tags too (github.ref is refs/tags/*).
+      #
+      # Belt and braces: the `production` environment should also carry a
+      # deployment branch rule limited to `main`, which refuses BEFORE a reviewer
+      # is prompted. See docs/CICD_SETUP.md section 5.
       #
       # develop and testing are CI-only by design — there is one server, so
       # deploying them would replace production. See docs/CICD_SETUP.md.
@@ -84,32 +99,118 @@ jobs:
           fi
           echo "Deploying ${{ github.sha }} from main."
 
+      # The obscure-failure fix. On the first run this workflow ever had, none of
+      # the six secrets below existed; the visible symptom was
+      # "ssh: Could not resolve hostname target" reported from the ROLLBACK step,
+      # a hundred lines past the cause. Name what is missing, here, before
+      # anything touches the server.
+      #
+      # This cannot be an `if:`. `secrets` is not among the contexts available to
+      # a step-level `if:` (nor a job-level one), so the values have to be mapped
+      # into `env` and tested by the shell. Only NAMES are ever printed.
+      - name: Every deploy secret is present
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [ -n "${DEPLOY_SSH_KEY:-}" ] || missing="$missing DEPLOY_SSH_KEY"
+          [ -n "${DEPLOY_HOST:-}"    ] || missing="$missing DEPLOY_HOST"
+          [ -n "${DEPLOY_USER:-}"    ] || missing="$missing DEPLOY_USER"
+          [ -n "${DB_NAME:-}"        ] || missing="$missing DB_NAME"
+          [ -n "${DB_USER:-}"        ] || missing="$missing DB_USER"
+          [ -n "${DB_PASSWORD:-}"    ] || missing="$missing DB_PASSWORD"
+
+          if [ -n "$missing" ]; then
+            echo "::error::Deploy secrets are not configured. Missing:$missing"
+            echo "::error::Add them at Settings -> Secrets and variables -> Actions."
+            echo "::error::The values, and how to generate the key pair, are in docs/CICD_SETUP.md section 4."
+            echo "::error::Nothing has been changed on the server."
+            exit 1
+          fi
+
+          # A public key pasted where the private one belongs passes the
+          # emptiness check and then fails at ssh — the most common way to get
+          # this wrong once the secrets do exist.
+          case "$DEPLOY_SSH_KEY" in
+            *"BEGIN OPENSSH PRIVATE KEY"*|*"BEGIN RSA PRIVATE KEY"*|*"BEGIN EC PRIVATE KEY"*) ;;
+            *)
+              echo "::error::DEPLOY_SSH_KEY is set but does not look like a private key."
+              echo "::error::Paste the whole private key file including its BEGIN/END lines — not the .pub half."
+              exit 1
+              ;;
+          esac
+
+          echo "All six deploy secrets are present."
+
       - uses: actions/download-artifact@v4
         with:
           name: frontend-dist
           path: dist/
 
+      # Defines the `target` alias every later step uses, so host, user and key
+      # are written once rather than repeated fifteen times.
       - name: Open an SSH session
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
+          set -euo pipefail
           mkdir -p ~/.ssh
-          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 700 ~/.ssh
+
+          # printf via env, not `echo "${{ secrets.* }}"`: the latter splices the
+          # key body into the generated script text, so a quote or backslash in
+          # the key corrupts the script rather than the key.
+          umask 077
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
-          cat >> ~/.ssh/config <<CFG
+
+          # ssh-keyscan's exit code on an unreachable host is not consistent
+          # across OpenSSH versions, and -H hashes the hostname so known_hosts
+          # cannot be grepped for it afterwards. Check the output instead: an
+          # empty keyscan silently yields a config that fails host-key
+          # verification several steps later.
+          KEYS=$(ssh-keyscan -H "$DEPLOY_HOST" 2>/dev/null || true)
+          if [ -z "$KEYS" ]; then
+            echo "::error::ssh-keyscan returned no host key for the deploy host."
+            echo "::error::Is it up, and is port 22 reachable from GitHub's runner ranges?"
+            exit 1
+          fi
+          printf '%s\n' "$KEYS" >> ~/.ssh/known_hosts
+
+          # `>` not `>>`: appending would stack duplicate `Host target` blocks if
+          # this step ever ran twice in one job.
+          cat > ~/.ssh/config <<CFG
           Host target
-            HostName ${{ secrets.DEPLOY_HOST }}
-            User ${{ secrets.DEPLOY_USER }}
+            HostName $DEPLOY_HOST
+            User $DEPLOY_USER
             IdentityFile ~/.ssh/id_ed25519
             ControlMaster auto
             ControlPath ~/.ssh/cm-%r@%h:%p
             ControlPersist 10m
           CFG
+          chmod 600 ~/.ssh/config
 
       # Step 1 — pull, and let the diff decide what else has to happen.
       - name: Pull and compute the change set
         id: pull
         run: |
+          # An empty BEFORE used to be written to $GITHUB_OUTPUT and the step
+          # carried on into `git pull` — leaving a deploy running with no
+          # rollback point. Stop here instead, while the server is untouched.
           BEFORE=$(ssh target "cd $APP_DIR && git rev-parse HEAD")
+          if [ -z "$BEFORE" ]; then
+            echo "::error::Could not read the current commit on the server."
+            echo "::error::Aborting before anything changes — there would be no rollback point."
+            exit 1
+          fi
           echo "before=$BEFORE" >> "$GITHUB_OUTPUT"
           echo "Rolling back to $BEFORE if anything fails."
 
@@ -200,15 +301,51 @@ jobs:
       # Roll the CODE back, not the schema. DEPLOY_UPDATE.md:185-188 is explicit:
       # a half-applied migration is worse than a newer schema under older code,
       # which is usually harmless because migrations here are additive.
+      #
+      # The `before != ''` guard is not optional. With an empty SHA the reset
+      # below expands to a bare `git reset --hard`, which resets to HEAD — it
+      # rolls nothing back and discards any uncommitted change in the production
+      # checkout. It would fire in exactly the case where the deploy died early
+      # and the server was never touched, i.e. where doing nothing is correct.
+      #
+      # `before` IS still set when the pull step itself failed: the runner reads
+      # $GITHUB_OUTPUT after a step exits regardless of its exit code. So a failed
+      # `git pull` still rolls back, which is the point. The guard suppresses only
+      # the case where `before` was never captured at all.
       - name: Roll back on failure
-        if: failure() && !inputs.dry_run
+        if: failure() && steps.pull.outputs.before != '' && !inputs.dry_run
+        env:
+          BEFORE: ${{ steps.pull.outputs.before }}
         run: |
-          echo "::warning::Deploy failed — rolling code back to ${{ steps.pull.outputs.before }}"
-          ssh target "cd $APP_DIR && git reset --hard ${{ steps.pull.outputs.before }}"
+          # Belt and braces behind the `if:`. GitHub casts both sides of a
+          # mixed-type comparison to number, so the expression guard alone has a
+          # vanishing but real hole for an all-decimal SHA. This one does not.
+          case "$BEFORE" in
+            *[!0-9a-f]*|"") ;;
+            *) [ "${#BEFORE}" -eq 40 ] && VALID=1 ;;
+          esac
+          if [ "${VALID:-0}" != "1" ]; then
+            echo "::error::Refusing to roll back: '$BEFORE' is not a commit SHA."
+            echo "::error::A bare 'git reset --hard' would discard server-side changes, not roll back."
+            exit 1
+          fi
+
+          echo "::warning::Deploy failed — rolling code back to $BEFORE"
+          ssh target "cd $APP_DIR && git reset --hard '$BEFORE'"
           ssh target "sudo systemctl restart $SERVICES" || true
           sleep 20
           ssh target "curl -sf localhost:8000/health" || echo "::error::Still unhealthy after rollback — needs a human."
           echo "::warning::Schema was NOT rolled back. Dumps are in /root/predeploy-*.sql"
+
+      # A skipped rollback on a failed deploy must not be silent — otherwise the
+      # only signal is the absence of a step, and "the rollback ran" is the
+      # natural assumption.
+      - name: Note that no rollback was needed
+        if: failure() && steps.pull.outputs.before == '' && !inputs.dry_run
+        run: |
+          echo "::warning::Deploy failed before a pre-deploy commit was recorded."
+          echo "::warning::Nothing was changed on the server, so there is nothing to roll back."
+          echo "::warning::Fix the error above and re-run; the live site is untouched."
 
       - name: Smoke checks a pipeline cannot do
         if: success() && !inputs.dry_run

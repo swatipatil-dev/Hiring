@@ -6,8 +6,67 @@ Deployment is otherwise nine hand-typed steps from [`DEPLOY_UPDATE.md`](DEPLOY_U
 each conditional on what changed. That runbook stays the source of truth — the pipeline
 automates it, it does not replace it. **Read it before changing the workflow.**
 
-The pipeline does **not** deploy on merge. Merging to `main` runs the tests and builds the
-frontend; the deploy job then waits for a human to approve it in the Actions tab.
+The pipeline does **not** deploy on merge. Merging to `main` runs the tests and nothing else.
+
+**Auto-deploy is currently paused** — `deploy.yml` no longer triggers on push at all. A
+deploy is started by hand from the Actions tab and then waits for a reviewer. Read the next
+section before you expect a merge to release anything.
+
+---
+
+## Auto-deploy is paused
+
+The first run this workflow ever had failed, and it failed for a boring reason with an
+unhelpful message.
+
+`deploy.yml` landed in `9188150` on `develop` and only reached `main` on 2026-09-07.
+Section 4 below — the six repository secrets — had never been done. With `DEPLOY_HOST`
+empty, the workflow wrote a bare `HostName` into `~/.ssh/config`, so every `ssh target`
+tried to resolve the literal alias `target`. What the run actually surfaced was:
+
+```
+Warning: Deploy failed — rolling code back to
+ssh: Could not resolve hostname target: Temporary failure in name resolution
+Error: Process completed with exit code 255
+```
+
+Two things are wrong with that message, and both are now fixed. The failure is reported from
+the **rollback** step, a hundred lines past its cause. And the commit it claims to roll back
+to is *empty* — which meant `git reset --hard` with no argument, a command that resets to
+`HEAD` and discards uncommitted server-side changes rather than rolling anything back. It
+could only ever have fired in the case where nothing had been changed yet.
+
+So three things changed:
+
+1. **A preflight names the missing secrets**, as the second step of the deploy job, before
+   anything touches the server. It prints names, never values.
+2. **The rollback refuses to run without a real 40-character SHA**, and says so explicitly
+   when it skips, so a silent skip is never mistaken for a rollback that happened.
+3. **`on: push` is gone.** Deploys are `workflow_dispatch` only.
+
+### Re-enabling automatic deploys
+
+In order. Steps 1 and 2 are the ones that were skipped.
+
+1. Complete **section 4** — all six secrets. The preflight will not accept a partial set.
+2. Complete **section 5** — the `production` environment, its required reviewer, **and** the
+   deployment branch rule limited to `main`.
+3. Dispatch once with **`dry_run` ticked**. This exercises the secrets, the host key and the
+   SSH config against the real server without changing it. Note it is not an offline
+   rehearsal — it does open a connection.
+4. Dispatch once for real, from `main`, and walk the smoke matrix at the end of this file.
+5. Only then, if you still want release-on-merge, restore the trigger in `deploy.yml`:
+
+   ```yaml
+   on:
+     push:
+       branches: [main]
+     workflow_dispatch:
+       ...
+   ```
+
+   The approval gate makes that safe, but it is not required. A deliberate button press is a
+   defensible end state, and it is the current one.
 
 ---
 
@@ -22,7 +81,7 @@ feature/*  →  develop  →  testing  →  main  →  production
 | feature branches | day-to-day work | ✅ full suite | ✗ |
 | `develop` | integration | ✅ full suite | ✗ |
 | `testing` | pre-release / QA | ✅ full suite | ✗ |
-| `main` | production | ✅ full suite | ✅ **after approval** |
+| `main` | production | ✅ full suite | ⏸ **paused** — manual dispatch, then approval |
 
 **`testing` does not deploy anywhere.** There is exactly one environment —
 `career.innomaxskills.com` on `66.116.207.71`. Deploying `testing` would replace the live
@@ -150,25 +209,48 @@ ssh -i hireflow-deploy deploy@66.116.207.71 "whoami"      # -> deploy
 
 `DB_NAME` is whatever `curl -s localhost:8000/health` reports as `database`.
 
+**None of these exist yet — that is what paused auto-deploy.** Confirm with:
+
+```bash
+gh secret list          # all six must appear
+```
+
+The deploy job's second step checks all six and fails naming the missing ones, so a partial
+set gets you a clear error rather than a half-finished deploy.
+
+Keep them at **repository** scope, matching the table above. Moving them to the `production`
+**environment** scope later is stricter and worth doing; nothing in `deploy.yml` needs to
+change if you do, because the check lives in the `deploy` job and that job declares
+`environment: production`. The same check in any *other* job would stop being able to see
+them.
+
 ## 5. The approval gate
 
 **Settings → Environments → New environment → `production`**
 
 - Tick **Required reviewers** and add yourself (and ideally one other person).
-- Optionally restrict deployment branches to `main`.
+- Restrict **deployment branches** to `main`. Not optional: `workflow_dispatch` is now the
+  only trigger, and its "Run workflow" dropdown offers every branch in the repo. The in-job
+  guard at `deploy.yml:94` catches this too, but only *after* a reviewer has already been
+  asked to approve; the branch rule refuses before anyone is prompted.
 
 Without this the deploy job runs unattended the moment anything merges. The gate is the
 point: proctoring and the coding judge have **no CI coverage at all**, so a human still has
 to look before a release goes out.
 
+**This step fails open, silently, if you skip it.** Referencing an environment that does not
+exist does not error — GitHub creates it on first use with *no* protection rules, and the
+deploy job runs unreviewed. An unattended deploy is therefore indistinguishable from a
+correctly gated one until you look at Settings → Environments. Check that `production` is
+listed and shows a reviewer.
+
 ---
 
 ## Running a deploy
 
-**Normal:** merge to `main` → CI and the build run → open **Actions**, find the run, click
-**Review deployments → Approve**.
-
-**Manual:** Actions → *Deploy to cPanel* → **Run workflow**.
+**Every deploy is manual.** Actions → *Deploy to cPanel* → **Run workflow** → pick `main` →
+then **Review deployments → Approve**. Merging to `main` no longer starts anything; see
+"Auto-deploy is paused" above.
 
 **Dry run first.** The manual trigger has a `dry_run` input that prints the exact command
 sequence for the current diff without changing anything. Use it the first time, and any time
@@ -201,6 +283,11 @@ half-reverted migration is worse than a newer schema under older code, which is 
 harmless because migrations here are additive.
 
 Pre-migration dumps are at `/root/predeploy-<date>-<time>.sql`.
+
+If the run failed **before** the pre-deploy commit was recorded — a missing secret, an
+unreachable host, the wrong branch — no rollback runs, and the workflow says so in a warning
+rather than leaving a step silently skipped. Nothing reached the server, so there is nothing
+to undo: fix the error and re-run.
 
 If the schema gate failed, nothing was restarted and the site is still serving the old code
 — that is the property the gate exists for. Fix the migration and redeploy.

@@ -5,7 +5,7 @@ name: HireFlow CI
 # "CI · develop (integration)".
 run-name: >-
   CI · ${{ github.ref_name }} ${{
-    github.ref_name == 'main' && '(PRODUCTION — deploys on approval)'
+    github.ref_name == 'main' && '(PRODUCTION — deploy is manual)'
     || github.ref_name == 'testing' && '(pre-release)'
     || github.ref_name == 'develop' && '(integration)'
     || '(feature)' }}
@@ -15,7 +15,7 @@ run-name: >-
 #   feature/*  day-to-day work        CI only
 #   develop    integration            CI only
 #   testing    pre-release / QA       CI only
-#   main       production             CI, then deploy.yml on approval
+#   main       production             CI only — deploy.yml is dispatched by hand
 #
 # `testing` deliberately does NOT deploy: there is one server
 # (career.innomaxskills.com), so deploying it would replace the live site with
