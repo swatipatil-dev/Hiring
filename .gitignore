@@ -55,3 +55,8 @@ backend/upload/photos/
 logos/
 # Local DB backups (created before backfills/migrations)
 backend/backups/
+
+# Rollback point for the deploy pipeline: the last frontend bundle that passed a
+# health check, kept on the server so a failed deploy can put the old UI back.
+# Written by .github/workflows/deploy.yml, never by a developer.
+.dist-prev/

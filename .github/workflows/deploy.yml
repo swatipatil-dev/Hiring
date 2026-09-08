@@ -280,6 +280,7 @@ jobs:
       # .htaccess is copied AFTER the rsync: --delete would otherwise remove it
       # and every deep link would 404. Order matters here.
       - name: Publish the frontend
+        id: publish
         if: steps.pull.outputs.frontend == 'true' && !inputs.dry_run
         run: |
           rsync -az --delete -e "ssh -F ~/.ssh/config" dist/ target:/tmp/hireflow-dist/
@@ -297,6 +298,26 @@ jobs:
           echo "$HEALTH"
           grep -q '"status":"healthy"' <<<"$HEALTH" \
             || { echo "::error::Health check failed after restart."; exit 1; }
+
+      # The rollback needs the bundle that WAS serving, and nothing on the server
+      # otherwise remembers it: the docroot is about to be overwritten, and the deploy
+      # user cannot read it back — it is innomaxskills-owned, and the single root rsync
+      # in deploy-sudoers only writes INTO the docroot, never out of it.
+      #
+      # So keep a copy, and write it only here: after the health check, so a bundle is
+      # promoted to "known good" only by a deploy that actually worked. During a failed
+      # deploy this therefore still holds the PREVIOUS good bundle, which is exactly
+      # what the rollback below needs.
+      #
+      # $APP_DIR rather than /tmp: the deploy user can write it without sudo (it is in
+      # the hireflow group and CICD_SETUP.md section 1 does `chmod -R g+rwX`), and it
+      # survives a reboot. It is untracked, so it blocks neither `git pull --ff-only`
+      # nor `git reset --hard` — neither of those touches untracked files.
+      - name: Record the published bundle as the rollback point
+        if: success() && steps.publish.outcome == 'success' && !inputs.dry_run
+        run: |
+          ssh target "rsync -a --delete /tmp/hireflow-dist/ $APP_DIR/.dist-prev/"
+          echo "Recorded this bundle as the rollback point for the next deploy."
 
       # Roll the CODE back, not the schema. DEPLOY_UPDATE.md:185-188 is explicit:
       # a half-applied migration is worse than a newer schema under older code,
@@ -316,6 +337,10 @@ jobs:
         if: failure() && steps.pull.outputs.before != '' && !inputs.dry_run
         env:
           BEFORE: ${{ steps.pull.outputs.before }}
+          # 'skipped' means the frontend was never touched. 'failure' means the publish
+          # died part-way, so the docroot is in a mixed state and MUST be restored —
+          # which is why this tests for "not skipped" rather than "succeeded".
+          PUBLISHED: ${{ steps.publish.outcome }}
         run: |
           # Belt and braces behind the `if:`. GitHub casts both sides of a
           # mixed-type comparison to number, so the expression guard alone has a
@@ -332,9 +357,43 @@ jobs:
 
           echo "::warning::Deploy failed — rolling code back to $BEFORE"
           ssh target "cd $APP_DIR && git reset --hard '$BEFORE'"
+
+          # Roll the frontend back too. Without this a deploy that published dist/ and
+          # then failed left the browser on the NEW UI against rolled-back code — the
+          # stale-copy failure DEPLOY_UPDATE.md is built around, re-created by the very
+          # thing meant to prevent it. The manual runbook (DEPLOY_UPDATE.md:181) rebuilds
+          # the frontend on rollback; this is the pipeline's equivalent.
+          #
+          # The three sudo commands are the same ones the publish step runs, so they are
+          # already covered by the HF_WEB alias in deploy-sudoers — no new grant needed.
+          # .htaccess is re-copied AFTER the rsync for the same reason it is there:
+          # --delete would take it out and every deep link would 404.
+          RESTORED="no"
+          if [ "$PUBLISHED" != "skipped" ]; then
+            if ssh target "[ -d $APP_DIR/.dist-prev ] && [ -n \"\$(ls -A $APP_DIR/.dist-prev 2>/dev/null)\" ]"; then
+              echo "::warning::Restoring the previously published frontend"
+              ssh target "rsync -a --delete $APP_DIR/.dist-prev/ /tmp/hireflow-dist/"
+              ssh target "sudo rsync -a --delete /tmp/hireflow-dist/ $WEB_ROOT/"
+              ssh target "sudo cp -f $APP_DIR/deploy/cpanel/htaccess-spa $WEB_ROOT/.htaccess"
+              ssh target "sudo chown -R innomaxskills:innomaxskills $WEB_ROOT"
+              RESTORED="yes"
+            else
+              # Only reachable on the first-ever deploy, or if .dist-prev was wiped.
+              # Loud, because this is the one case a human has to act on right now.
+              echo "::error::The new frontend is live and there is no recorded bundle to restore."
+              echo "::error::The site is serving new UI against rolled-back code."
+              echo "::error::Fix by hand — DEPLOY_UPDATE.md:181: build the frontend at $BEFORE"
+              echo "::error::and rsync it to $WEB_ROOT."
+            fi
+          fi
+
           ssh target "sudo systemctl restart $SERVICES" || true
           sleep 20
           ssh target "curl -sf localhost:8000/health" || echo "::error::Still unhealthy after rollback — needs a human."
+
+          # Say which of the four copies git pull does not update are now consistent,
+          # rather than leaving the reader to infer it from which steps ran.
+          echo "::warning::Rolled back: code -> $BEFORE; frontend restored: $RESTORED"
           echo "::warning::Schema was NOT rolled back. Dumps are in /root/predeploy-*.sql"
 
       # A skipped rollback on a failed deploy must not be silent — otherwise the

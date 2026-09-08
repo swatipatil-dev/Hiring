@@ -277,12 +277,37 @@ kept serving from the proctor process while proctoring was silently dead
 
 ## When a deploy fails
 
-The workflow rolls the **code** back to the pre-deploy commit and restarts the services. It
-does **not** roll back the schema — `DEPLOY_UPDATE.md:185-188` is explicit that a
-half-reverted migration is worse than a newer schema under older code, which is normally
-harmless because migrations here are additive.
+The workflow rolls the **code** back to the pre-deploy commit, restores the **frontend**
+bundle that was serving before the deploy, and restarts the services. It does **not** roll
+back the schema — `DEPLOY_UPDATE.md:185-188` is explicit that a half-reverted migration is
+worse than a newer schema under older code, which is normally harmless because migrations
+here are additive.
+
+The run's final warning states exactly which of those were rolled back, so you never have to
+infer it from which steps ran.
 
 Pre-migration dumps are at `/root/predeploy-<date>-<time>.sql`.
+
+### How the frontend gets rolled back
+
+`/opt/hireflow/.dist-prev/` holds the last frontend bundle that passed a health check. It is
+written at the end of a **successful** deploy and nowhere else, so during a failed one it
+still holds the previous good bundle — which is what the rollback restores.
+
+It lives under `$APP_DIR` rather than `/tmp` for two reasons: the deploy user can write it
+without sudo (it is in the `hireflow` group, and section 1 above does `chmod -R g+rwX`), and
+it survives a reboot. It is untracked and gitignored, so it interferes with neither
+`git pull --ff-only` nor `git reset --hard`.
+
+The restore reuses the same three commands the publish step runs, so it needs no addition to
+`deploy-sudoers`. If you ever change those three lines in the workflow, change them in the
+`HF_WEB` alias too — sudo matches the command string exactly, and a single differing space
+makes the restore fail at the worst possible moment.
+
+**The one case it cannot handle** is a first-ever deploy, or a wiped `.dist-prev`: there is
+no recorded bundle, so the site is left serving the new UI against rolled-back code. The run
+says so with an explicit error rather than skipping quietly, and the fix is the manual
+rebuild at `DEPLOY_UPDATE.md:181`.
 
 If the run failed **before** the pre-deploy commit was recorded — a missing secret, an
 unreachable host, the wrong branch — no rollback runs, and the workflow says so in a warning
