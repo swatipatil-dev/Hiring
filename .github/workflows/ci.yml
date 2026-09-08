@@ -5,7 +5,7 @@ name: HireFlow CI
 # "CI · develop (integration)".
 run-name: >-
   CI · ${{ github.ref_name }} ${{
-    github.ref_name == 'main' && '(PRODUCTION — deploy is manual)'
+    github.ref_name == 'main' && '(PRODUCTION — green means this DEPLOYS)'
     || github.ref_name == 'testing' && '(pre-release)'
     || github.ref_name == 'develop' && '(integration)'
     || '(feature)' }}
@@ -15,11 +15,15 @@ run-name: >-
 #   feature/*  day-to-day work        CI only
 #   develop    integration            CI only
 #   testing    pre-release / QA       CI only
-#   main       production             CI only — deploy.yml is dispatched by hand
+#   main       production             CI, then deploy.yml runs if CI is green
+#
+# A green run on main SHIPS. deploy.yml triggers on this workflow completing
+# (workflow_run) and checks the conclusion, so a red run deploys nothing — but a
+# green one needs no further approval.
 #
 # `testing` deliberately does NOT deploy: there is one server
 # (career.innomaxskills.com), so deploying it would replace the live site with
-# unreviewed code. See docs/CICD_SETUP.md.
+# unreviewed code. See docs/END_TO_END_RUNBOOK.md.
 #
 # Push is every branch, not a fixed list. The previous trigger named `staging`
 # and `develop` — neither of which existed — while missing every branch actually

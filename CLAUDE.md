@@ -101,7 +101,7 @@ Uploaded files resolve against `HIREFLOW_DATA_DIR` (default: the `backend/` dire
 
 Additional docs in `docs/`: API documentation, microservice architecture guide, MySQL setup, quickstart guide, and workflow docs.
 
-**Deployment**: `docs/CPANEL_DEPLOYMENT.md` is the first-install runbook, `docs/DEPLOY_UPDATE.md` is what to run when pushing an update to a live deployment (read it before deploying — `git pull` leaves the schema, systemd units, Apache config and built frontend stale, and each has caused an outage), `docs/GCP_DATA_MIGRATION.md` covers moving data between deployments, and `docs/DEPLOYMENT_NOTES.md` is the reference for *why* — non-obvious constraints, silent failure modes, and which config file wins. Read the latter before changing deployment behaviour. Service units and Apache config live in `deploy/cpanel/`.
+**Deployment**: `docs/END_TO_END_RUNBOOK.md` is the spine — local setup through to a production deploy, with every command labelled by which machine it runs on; start there and follow its links for depth. `docs/CPANEL_DEPLOYMENT.md` is the first-install runbook, `docs/DEPLOY_UPDATE.md` is what to run when pushing an update to a live deployment (read it before deploying — `git pull` leaves the schema, systemd units, Apache config and built frontend stale, and each has caused an outage), `docs/GCP_DATA_MIGRATION.md` covers moving data between deployments, and `docs/DEPLOYMENT_NOTES.md` is the reference for *why* — non-obvious constraints, silent failure modes, and which config file wins. Read the latter before changing deployment behaviour. Service units and Apache config live in `deploy/cpanel/`.
 
 Two constraints worth knowing before changing anything there:
 

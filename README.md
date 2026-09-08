@@ -34,10 +34,15 @@
 
 ## 🚀 Quick Start
 
+> **New to this project?** Start with **[`docs/END_TO_END_RUNBOOK.md`](docs/END_TO_END_RUNBOOK.md)**.
+> It walks from an empty laptop to code running in production — local setup, the branch flow,
+> GitHub secrets, the cPanel server, and deploying — with every command labelled by which
+> terminal to type it in.
+
 ### Prerequisites
-- Python 3.8+
-- PostgreSQL 12+
-- Node.js 14+ (for frontend)
+- Python 3.11
+- MySQL 8
+- Node.js 20 (for frontend)
 
 ### Installation
 
@@ -411,63 +416,20 @@ curl -X POST http://localhost:8000/api/v1/auth/login \
 
 ## 🚀 Deployment
 
-### Production Setup
+Production is **`career.innomaxskills.com`**, running on cPanel / AlmaLinux 9: MySQL 8,
+five systemd units, and Apache as the reverse proxy. A merge to `main` deploys it
+automatically once CI passes — nobody clicks anything.
 
-#### 1. Environment Preparation
-```bash
-# Production environment variables
-export DATABASE_URL="postgresql://user:password@prod-db:5432/recruitment_db"
-export SECRET_KEY="production-secret-key"
-export ENVIRONMENT="production"
-```
+| Doc | What it covers |
+|---|---|
+| **[`docs/END_TO_END_RUNBOOK.md`](docs/END_TO_END_RUNBOOK.md)** | **Start here.** Local → git → GitHub → cPanel, every command labelled by terminal |
+| [`docs/CPANEL_DEPLOYMENT.md`](docs/CPANEL_DEPLOYMENT.md) | Installing on a brand new server |
+| [`docs/DEPLOY_UPDATE.md`](docs/DEPLOY_UPDATE.md) | Deploying by hand, when the pipeline is unavailable |
+| [`docs/CICD_SETUP.md`](docs/CICD_SETUP.md) | Full detail on the pipeline |
+| [`docs/DEPLOYMENT_NOTES.md`](docs/DEPLOYMENT_NOTES.md) | Read **before** changing deployment behaviour |
 
-#### 2. Database Setup
-```bash
-# Create production database
-createdb recruitment_db_prod
-
-# Run migrations
-psql recruitment_db_prod < database_schema.sql
-```
-
-#### 3. Application Deployment
-```bash
-# Using Gunicorn
-pip install gunicorn
-gunicorn -w 4 -b 0.0.0.0:8000 main:app
-
-# Using Docker
-docker build -t hireflow .
-docker run -p 8000:8000 --env-file .env hireflow
-```
-
-#### 4. Reverse Proxy (Nginx)
-```nginx
-server {
-    listen 80;
-    server_name api.yourcompany.com;
-    
-    location / {
-        proxy_pass http://127.0.0.1:8000;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-    }
-}
-```
-
-### Docker Deployment
-```dockerfile
-FROM python:3.9-slim
-
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install -r requirements.txt
-
-COPY . .
-EXPOSE 8000
-
-CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:8000", "main:app"]
-```
+> An earlier version of this section described a PostgreSQL / Gunicorn / Docker / Nginx
+> setup. That deployment no longer exists; the docs above describe the real one.
 
 ---
 
