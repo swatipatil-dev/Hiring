@@ -150,9 +150,36 @@ h3 { font-size: 1.15rem; line-height: 1.4; }
   position: relative;
 }
 
-.card:hover {
+/* Same rule the stat cards follow (see the note above .stat-card): a card lifts only when
+   it is actually clickable. All 131 .card usages in the app were non-interactive and every
+   one of them lifted, so the whole UI advertised itself as clickable and then did nothing.
+   A card that gains a handler should be a <button>/<a>, or carry .is-clickable. */
+button.card:hover,
+a.card:hover,
+.card.is-clickable:hover {
   box-shadow: var(--shadow-md);
   transform: translateY(-1px);
+}
+
+button.card:focus-visible,
+a.card:focus-visible,
+.card.is-clickable:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
+/* A non-interactive card still responds to the pointer, just not with a movement that
+   promises navigation — the border warms, nothing shifts. */
+.card:hover {
+  border-color: var(--border-medium);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  button.card:hover,
+  a.card:hover,
+  .card.is-clickable:hover {
+    transform: none;
+  }
 }
 
 .card-accent {
@@ -675,4 +702,76 @@ button.stat-card:focus-visible .stat-affordance,
   .grid-2, .grid-3 { grid-template-columns: 1fr; }
   .stats-grid { grid-template-columns: 1fr; }
   .page-header { flex-direction: column; align-items: flex-start; gap: 12px; }
+}
+
+/* Admin HR scorecards — a <button> carrying its own gradient/border inline, so it needs
+   the UA reset and the focus ring but not the surface styling. */
+.hr-scorecard {
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+  transition: transform 0.2s var(--ease-out-expo), box-shadow 0.2s;
+}
+
+.hr-scorecard:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-md);
+}
+
+.hr-scorecard:active { transform: translateY(0); }
+
+.hr-scorecard:focus-visible {
+  outline: 2px solid var(--sc-accent, var(--accent-primary));
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hr-scorecard { transition: none; }
+  .hr-scorecard:hover { transform: none; }
+}
+
+/* Candidate Courses banner tiles that act as filters. */
+.course-stat {
+  text-align: center;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  padding: 4px 10px;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+  transition: background 0.2s, border-color 0.2s;
+}
+
+.course-stat:hover { background: rgba(255, 255, 255, 0.06); border-color: rgba(255, 255, 255, 0.18); }
+.course-stat[aria-pressed="true"] { border-color: currentColor; background: rgba(255, 255, 255, 0.08); }
+.course-stat:focus-visible { outline: 2px solid var(--accent-primary); outline-offset: 2px; }
+
+@media (prefers-reduced-motion: reduce) { .course-stat { transition: none; } }
+
+/* Multi-select question rows (interviewer question bank, create-test wizard).
+   The row is a <label> wrapping a clipped real checkbox — clipped, not display:none,
+   so it keeps focus and accessibility semantics. The ring goes on the row. */
+.q-select__input {
+  position: absolute;
+  width: 1px; height: 1px;
+  margin: -1px; padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+label:focus-within > .q-select__input ~ * { position: relative; }
+
+label:has(> .q-select__input:focus-visible) {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
 }

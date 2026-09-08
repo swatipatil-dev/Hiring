@@ -64,6 +64,7 @@ export default function CoursesTab({ profile, jobs, apps }) {
   const [sortBy, setSortBy] = useState('recommended')
   const [costFilter, setCostFilter] = useState('all')          // all | free | paid
   const [learningFilter, setLearningFilter] = useState('all')  // all | enrolled | completed
+  const [certifiedOnly, setCertifiedOnly] = useState(false)
   const [detailCourse, setDetailCourse] = useState(null)
 
   const learning = useMyLearning()
@@ -107,7 +108,8 @@ export default function CoursesTab({ profile, jobs, apps }) {
     const matchesCategory = activeCategory === 'All' || c.category === activeCategory
     const matchesCost = costFilter === 'all' || (costFilter === 'free' ? c.isFree : !c.isFree)
     const matchesLearning = learningFilter === 'all' || learning.statusOf(c.id) === learningFilter
-    return matchesSearch && matchesCategory && matchesCost && matchesLearning
+    const matchesCertified = !certifiedOnly || c.certified
+    return matchesSearch && matchesCategory && matchesCost && matchesLearning && matchesCertified
   })
 
   const displayed = [...filtered].sort((a, b) => {
@@ -130,7 +132,7 @@ export default function CoursesTab({ profile, jobs, apps }) {
   }, {})
   const countFor = cat => (cat === 'All' ? recommended.length : categoryCounts[cat] || 0)
 
-  const hasActiveFilters = q !== '' || activeCategory !== 'All' || costFilter !== 'all' || learningFilter !== 'all'
+  const hasActiveFilters = q !== '' || activeCategory !== 'All' || costFilter !== 'all' || learningFilter !== 'all' || certifiedOnly
   const clearFilters = () => { setSearch(''); setActiveCategory('All'); setCostFilter('all'); setLearningFilter('all') }
 
   return (
@@ -159,16 +161,35 @@ export default function CoursesTab({ profile, jobs, apps }) {
             Upskill with NASSCOM-certified courses
           </div>
           <div style={{ fontSize: 13, color: '#94a3b8', marginTop: 6, maxWidth: 480 }}>
-            Courses are matched to your profile, the jobs you're browsing, and your ATS screening results.
+            {/* The ORDER is personalised — useCourseRecommendations scores every course against
+                your skills, gaps and ATS results and sorts by it. The catalog is not filtered,
+                so the count below is the whole catalog and the copy no longer implies otherwise. */}
+            The whole catalog, ranked against your profile, the jobs you're browsing, and your
+            ATS screening results.
           </div>
         </div>
 
         <div style={{ position: 'relative', zIndex: 1, display: 'flex', alignItems: 'center', gap: 24, flexShrink: 0 }}>
           {[
-            { label: 'Courses', value: recommended.length },
+            // "In catalog" rather than "Courses": this is the size of the whole catalog, not a
+            // count of anything matched to this candidate.
+            { label: 'In catalog', value: recommended.length, hint: 'Show every course',
+              pressed: !hasActiveFilters,
+              act: () => { setSearch(''); setActiveCategory('All'); setCostFilter('all')
+                           setLearningFilter('all'); setCertifiedOnly(false) } },
+            // A count of the categories the filter row offers — a fact about the UI, not data,
+            // so it stays a label and does not move on hover.
             { label: 'Categories', value: CATEGORIES.length - 1 },
-            { label: 'Certified', value: recommended.filter(c => c.certified).length },
-          ].map(({ label, value }) => (
+            { label: 'Certified', value: recommended.filter(c => c.certified).length,
+              hint: 'Show only NASSCOM-certified courses', pressed: certifiedOnly,
+              act: () => setCertifiedOnly(v => !v) },
+          ].map(({ label, value, hint, act, pressed }) => act ? (
+            <button key={label} type="button" className="course-stat" onClick={act}
+                    aria-pressed={pressed} aria-label={`${label}: ${value}. ${hint}`}>
+              <div style={{ fontSize: 24, fontWeight: 700, color: TEAL }}>{value}</div>
+              <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 2 }}>{label}</div>
+            </button>
+          ) : (
             <div key={label} style={{ textAlign: 'center' }}>
               <div style={{ fontSize: 24, fontWeight: 700, color: TEAL }}>{value}</div>
               <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 2 }}>{label}</div>

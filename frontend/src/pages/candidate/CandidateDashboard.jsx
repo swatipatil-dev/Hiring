@@ -724,7 +724,7 @@ export default function CandidateDashboard() {
               </div>
               <div className="input-group">
                 <label>Resume (PDF/DOCX) *</label>
-                <div className="upload-zone" onClick={() => fileRef.current?.click()}>
+                <button type="button" className="upload-zone" onClick={() => fileRef.current?.click()}>
                   <input ref={fileRef} type="file" accept=".pdf,.docx,.doc" style={{ display: 'none' }}
                     onChange={e => setResumeFile(e.target.files[0])} />
                   {resumeFile ? (
@@ -743,7 +743,7 @@ export default function CandidateDashboard() {
                       <div className="text-sm" style={{ color: 'var(--text-tertiary)', fontSize: '0.75rem' }}>PDF or DOCX, max 10MB</div>
                     </div>
                   )}
-                </div>
+                </button>
               </div>
               <div className="input-group">
                 <label>Photo *</label>
@@ -785,21 +785,21 @@ export default function CandidateDashboard() {
                   </div>
                 ) : (
                   <div style={{ display: 'flex', gap: 10 }}>
-                    <div className="upload-zone" style={{ flex: 1, padding: 16 }} onClick={() => photoFileRef.current?.click()}>
+                    <button type="button" className="upload-zone" style={{ flex: 1, padding: 16 }} onClick={() => photoFileRef.current?.click()}>
                       <input ref={photoFileRef} type="file" accept="image/*" style={{ display: 'none' }} onChange={handlePhotoFile} />
                       <div style={{ textAlign: 'center' }}>
                         <Image size={24} style={{ color: 'var(--text-tertiary)', marginBottom: 4 }} />
                         <div className="text-sm text-muted">Upload Photo</div>
                         <div style={{ color: 'var(--text-tertiary)', fontSize: '0.7rem' }}>JPG, PNG</div>
                       </div>
-                    </div>
-                    <div className="upload-zone" style={{ flex: 1, padding: 16 }} onClick={openCamera}>
+                    </button>
+                    <button type="button" className="upload-zone" style={{ flex: 1, padding: 16 }} onClick={openCamera}>
                       <div style={{ textAlign: 'center' }}>
                         <Camera size={24} style={{ color: 'var(--text-tertiary)', marginBottom: 4 }} />
                         <div className="text-sm text-muted">Take Photo</div>
                         <div style={{ color: 'var(--text-tertiary)', fontSize: '0.7rem' }}>Use webcam</div>
                       </div>
-                    </div>
+                    </button>
                   </div>
                 )}
               </div>
@@ -844,7 +844,17 @@ export default function CandidateDashboard() {
             </form>
 
             <style>{`
+              /* These are <button> now — they were <div onClick>, i.e. unreachable by
+                 keyboard — so they need the UA reset and a visible focus ring. */
               .upload-zone {
+                display: block;
+                width: 100%;
+                font: inherit;
+                color: inherit;
+                text-align: center;
+                background: none;
+                -webkit-appearance: none;
+                appearance: none;
                 border: 2px dashed var(--border-medium);
                 border-radius: 10px;
                 padding: 24px;
@@ -855,6 +865,11 @@ export default function CandidateDashboard() {
                 border-color: var(--accent-primary);
                 background: var(--accent-glow);
               }
+              .upload-zone:focus-visible {
+                outline: 2px solid var(--accent-primary);
+                outline-offset: 2px;
+              }
+              @media (prefers-reduced-motion: reduce) { .upload-zone { transition: none; } }
             `}</style>
           </div>
         </div>
@@ -957,21 +972,21 @@ export default function CandidateDashboard() {
                     </div>
                   ) : (
                     <div style={{ display: 'flex', gap: 10 }}>
-                      <div className="upload-zone" style={{ flex: 1, padding: 16 }} onClick={() => photoFileRef.current?.click()}>
+                      <button type="button" className="upload-zone" style={{ flex: 1, padding: 16 }} onClick={() => photoFileRef.current?.click()}>
                         <input ref={photoFileRef} type="file" accept="image/*" style={{ display: 'none' }} onChange={handlePhotoFile} />
                         <div style={{ textAlign: 'center' }}>
                           <Image size={24} style={{ color: 'var(--text-tertiary)', marginBottom: 4 }} />
                           <div className="text-sm text-muted">Upload Photo</div>
                           <div style={{ color: 'var(--text-tertiary)', fontSize: '0.7rem' }}>JPG, PNG</div>
                         </div>
-                      </div>
-                      <div className="upload-zone" style={{ flex: 1, padding: 16 }} onClick={openCamera}>
+                      </button>
+                      <button type="button" className="upload-zone" style={{ flex: 1, padding: 16 }} onClick={openCamera}>
                         <div style={{ textAlign: 'center' }}>
                           <Camera size={24} style={{ color: 'var(--text-tertiary)', marginBottom: 4 }} />
                           <div className="text-sm text-muted">Take Photo</div>
                           <div style={{ color: 'var(--text-tertiary)', fontSize: '0.7rem' }}>Use webcam</div>
                         </div>
-                      </div>
+                      </button>
                     </div>
                   )}
                 </div>
@@ -996,7 +1011,16 @@ export default function CandidateDashboard() {
             )}
 
           <style>{`
+            /* Same reset as the block above — these zones are buttons now. */
             .upload-zone {
+              display: block;
+              width: 100%;
+              font: inherit;
+              color: inherit;
+              text-align: center;
+              background: none;
+              -webkit-appearance: none;
+              appearance: none;
               border: 2px dashed var(--border-medium);
               border-radius: 10px;
               padding: 24px;
@@ -1007,6 +1031,11 @@ export default function CandidateDashboard() {
               border-color: var(--accent-primary);
               background: var(--accent-glow);
             }
+            .upload-zone:focus-visible {
+              outline: 2px solid var(--accent-primary);
+              outline-offset: 2px;
+            }
+            @media (prefers-reduced-motion: reduce) { .upload-zone { transition: none; } }
           `}</style>
         </div>
         </div>

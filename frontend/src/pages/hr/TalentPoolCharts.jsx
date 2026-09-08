@@ -55,13 +55,30 @@ const tooltipStyle = {
   itemStyle: { color: '#475467' },
 }
 
-export function StatTile({ label, value, hint }) {
-  return (
-    <div className="tp-tile">
+/**
+ * A tile is a button only when it has somewhere to go.
+ *
+ * Without `onClick` it renders exactly as before — a plain div that reads as a label and
+ * does not move on hover. That is deliberate: index.css:408 sets the house rule that a card
+ * which lifts must navigate, and an average has no list to drill into, so `Avg match score`
+ * stays inert rather than being given a destination for the sake of consistency.
+ */
+export function StatTile({ label, value, hint, onClick, actionHint }) {
+  const body = (
+    <>
       <div className="tp-tile__label">{label}</div>
       <div className="tp-tile__value">{value}</div>
       {hint && <div className="tp-tile__hint">{hint}</div>}
-    </div>
+    </>
+  )
+
+  if (!onClick) return <div className="tp-tile">{body}</div>
+
+  return (
+    <button type="button" className="tp-tile tp-tile--action" onClick={onClick}
+            aria-label={`${label}: ${value}. ${actionHint || 'View these people'}`}>
+      {body}
+    </button>
   )
 }
 

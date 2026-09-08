@@ -113,6 +113,7 @@ export function ViewScope({ total, poolTotal, filtered, onClear }) {
  * who they are. Each row answers the question the row above it raises.
  */
 export function DashboardPanel({ metrics, loading, filtered, onClear, onOpenStage,
+                                 onOpenNeverContacted, onOpenRecent,
                                  scoring, progress, onScore, onStop }) {
   if (loading && !metrics) return <div className="tp-loading">Loading dashboard…</div>
   if (!metrics) return null
@@ -169,9 +170,13 @@ export function DashboardPanel({ metrics, loading, filtered, onClear, onOpenStag
                       value={contact == null ? '—' : contact}
                       hint={contact == null ? 'Nobody contacted yet' : 'Across everyone you have spoken to'} />
             <StatTile label="Never contacted" value={nf.format(metrics.never_contacted)}
-                      hint="No outreach recorded" />
+                      hint="No outreach recorded"
+                      onClick={metrics.never_contacted > 0 ? onOpenNeverContacted : undefined}
+                      actionHint="List them, least recently contacted first" />
             <StatTile label="Added in last 30 days"
-                      value={nf.format(metrics.added_last_30_days)} />
+                      value={nf.format(metrics.added_last_30_days)}
+                      onClick={metrics.added_last_30_days > 0 ? onOpenRecent : undefined}
+                      actionHint="List the people added in the last 30 days" />
           </div>
 
           <div className="tp-grid">

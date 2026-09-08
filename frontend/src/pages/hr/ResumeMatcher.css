@@ -1164,6 +1164,45 @@
   box-shadow: var(--shadow-sm);
 }
 
+/* Only a tile with a destination is a button, and only a button moves — the rule at
+   index.css:408. A plain .tp-tile keeps no hover state at all, so the two that drill
+   down are distinguishable from the three that are just labels. */
+.rm-page button.tp-tile {
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+  transition: transform 0.2s var(--ease-out-expo), box-shadow 0.2s, border-color 0.2s;
+}
+
+.rm-page button.tp-tile:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-md);
+  border-color: var(--rm-accent, var(--accent-primary));
+}
+
+.rm-page button.tp-tile:active { transform: translateY(0); }
+
+.rm-page button.tp-tile:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
+/* An underlined value is the second, non-colour signal that this tile leads somewhere. */
+.rm-page button.tp-tile:hover .tp-tile__value,
+.rm-page button.tp-tile:focus-visible .tp-tile__value {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rm-page button.tp-tile { transition: none; }
+  .rm-page button.tp-tile:hover { transform: none; }
+}
+
 .rm-page .tp-tile__label {
   font-family: var(--rm-mono);
   font-size: 0.65rem;

@@ -117,8 +117,12 @@ export function SkillsPanel({ skills, loading, filtered, onClear, onPickSkill })
             <StatTile label="Demanded, held by nobody" value={nf.format(unmet)}
                       hint={`of ${nf.format(demanded)} skills your open roles ask for`} />
             <StatTile label="Open roles" value={nf.format(roles)} />
-            <StatTile label="Skills in this group" value={nf.format(distinct)}
-                      hint={`across ${nf.format(withSkills)} ${withSkills === 1 ? 'person' : 'people'}`} />
+            {/* The note below the list already says these are lower bounds when the view was
+                truncated, but someone reading only the tile would never see it. Mark it here. */}
+            <StatTile label="Skills in this group" value={truncated ? `${nf.format(distinct)}+` : nf.format(distinct)}
+                      hint={truncated
+                        ? `at least — counted the first slice of ${nf.format(withSkills)} people`
+                        : `across ${nf.format(withSkills)} ${withSkills === 1 ? 'person' : 'people'}`} />
             <StatTile label="No skills on record" value={nf.format(noSkills)}
                       hint={noSkills > 0 ? 'Resume not parsed yet — not counted anywhere below'
                                          : 'Everyone here has skills recorded'} />

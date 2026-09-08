@@ -5,7 +5,7 @@ import {
   Calendar, Clock, MessageSquare, Brain, Star, Send, RefreshCw,
   ChevronDown, ChevronUp, Plus, CheckCircle2, XCircle, Eye, Loader2,
   Edit3, Trash2, BookOpen, Filter, Search, Square, CheckSquare,
-  Upload, FileText
+  Upload, FileText, ChevronRight, Briefcase, Users
 } from 'lucide-react'
 import api from '../../api/client'
 import './InterviewerDashboard.css'
@@ -615,7 +615,7 @@ export default function InterviewerDashboard() {
   }, [])
 
   const fetchInterviews = () => {
-    api.get('/interviewer/interviews', { params: { size: 50 } })
+    api.get('/interviewer/interviews', { params: { limit: 50 } })
       .then(r => setInterviews(r.data?.interviews || r.data || []))
       .catch(() => {})
   }
@@ -1485,16 +1485,27 @@ export default function InterviewerDashboard() {
         const qtypeLabels = { multiple_choice: 'MCQ', coding: 'Coding', short_answer: 'Descriptive', case_study: 'Case Study', aptitude: 'Aptitude', communication: 'Communication', mcq: 'MCQ', descriptive: 'Descriptive' }
         const qtColors = { multiple_choice: '#3b82f6', mcq: '#3b82f6', coding: '#f59e0b', short_answer: '#22c55e', descriptive: '#22c55e', case_study: '#8b5cf6', aptitude: '#ec4899', communication: '#06b6d4' }
 
-        const statCard = (label, value, sub, accent, icon) => (
-          <div key={label} style={{
+        // Each card drills into the tab that owns its data. A card that lifts on hover has to
+        // navigate somewhere — the rule, and the shared button/focus/affordance styles, are at
+        // index.css:408. `icon` was declared in the old signature and never rendered; it is now.
+        const statCard = (label, value, sub, accent, Icon, to, hint) => (
+          <button key={label} type="button" className="stat-card"
+            onClick={() => setTab(to)}
+            // Without this the accessible name is the raw text content, which reads the numeral
+            // before its label. Spell out both, in the order a sighted reader gets them.
+            aria-label={`${label}: ${value}. ${hint}`}
+            style={{
             background: 'var(--bg-secondary)', borderRadius: 14, padding: '20px 24px',
             border: `1px solid var(--border-subtle)`, display: 'flex', flexDirection: 'column', gap: 6,
             borderLeft: `4px solid ${accent}`
           }}>
-            <div style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 600 }}>{label}</div>
+            <div style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 7 }}>
+              {Icon && <Icon size={13} aria-hidden="true" />}<span>{label}</span>
+            </div>
             <div style={{ fontSize: '2rem', fontWeight: 700, color: accent, lineHeight: 1 }}>{value}</div>
             {sub && <div style={{ fontSize: '0.75rem', color: 'var(--text-tertiary)' }}>{sub}</div>}
-          </div>
+            <ChevronRight size={16} className="stat-affordance" aria-hidden="true" />
+          </button>
         )
 
         return (
@@ -1515,10 +1526,17 @@ export default function InterviewerDashboard() {
 
             {/* Stat Cards */}
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16 }}>
-              {statCard('Upcoming Meetings', upcomingMeetings.length, myMeetings.length > 0 ? `${myMeetings.length} total assigned` : 'None assigned yet', '#3b82f6')}
-              {statCard('Tests Ready', readyTests.length, `${draftTests.length} draft · ${scheduledTests.length} scheduled`, '#22c55e')}
-              {statCard('Assigned Jobs', assignments.length, assignments.length > 0 ? `${assignments.reduce((s, a) => s + (a.candidate_count || 0), 0)} candidates` : 'No jobs assigned', '#f59e0b')}
-              {statCard('Candidate Requests', crRequests.length, `${pendingRequests.length} pending review`, '#a855f7')}
+              {/* The card reports every meeting assigned, not `upcomingMeetings.length` — that is
+                  `myMeetings.slice(0, 5)`, so the old card read "5" whether there were 5 or 50.
+                  The sub-line says how many of them the list below actually shows. */}
+              {statCard('Upcoming Meetings', myMeetings.length,
+                myMeetings.length === 0 ? 'None assigned yet'
+                  : myMeetings.length > upcomingMeetings.length ? `next ${upcomingMeetings.length} shown below`
+                  : 'all shown below',
+                '#3b82f6', Calendar, 'interviews', 'View my interviews')}
+              {statCard('Tests Ready', readyTests.length, `${draftTests.length} draft · ${scheduledTests.length} scheduled`, '#22c55e', CheckCircle2, 'interviews', 'View my interviews')}
+              {statCard('Assigned Jobs', assignments.length, assignments.length > 0 ? `${assignments.reduce((s, a) => s + (a.candidate_count || 0), 0)} candidates` : 'No jobs assigned', '#f59e0b', Briefcase, 'request-candidates', 'Request candidates')}
+              {statCard('Candidate Requests', crRequests.length, `${pendingRequests.length} pending review`, '#a855f7', Users, 'request-candidates', 'Review candidate requests')}
             </div>
 
             {/* Row 2: Donut + Upcoming Meetings */}
@@ -3173,13 +3191,18 @@ export default function InterviewerDashboard() {
                       const isSelected = prevQSelected.has(q.id)
                       const opts = Array.isArray(q.options) ? q.options : (typeof q.options === 'string' ? (() => { try { return JSON.parse(q.options) } catch { return [] } })() : [])
                       return (
-                        <div key={q.id} onClick={() => toggleSelect(q.id)} style={{
+                        <label key={q.id} style={{
                           display: 'flex', gap: 12, padding: '14px 16px', marginBottom: 10,
                           border: `1px solid ${isSelected ? 'var(--accent-primary)' : 'var(--border-subtle)'}`,
                           borderRadius: 10, cursor: 'pointer', transition: 'all 0.15s',
                           background: isSelected ? 'var(--accent-primary-10, rgba(99,102,241,0.08))' : 'var(--bg-secondary)'
                         }}>
-                          <div style={{ flexShrink: 0, paddingTop: 2 }}>
+                          {/* A real checkbox, clipped rather than display:none so it stays
+                              focusable and in the accessibility tree. The row is a <label>, so
+                              clicking anywhere on it still toggles, exactly as before. */}
+                          <input type="checkbox" className="q-select__input"
+                                 checked={isSelected} onChange={() => toggleSelect(q.id)} />
+                          <div style={{ flexShrink: 0, paddingTop: 2 }} aria-hidden="true">
                             {isSelected
                               ? <CheckSquare size={18} style={{ color: 'var(--accent-primary)' }} />
                               : <Square size={18} style={{ color: 'var(--text-tertiary)' }} />}
@@ -3229,7 +3252,7 @@ export default function InterviewerDashboard() {
                               )}
                             </div>
                           </div>
-                        </div>
+                        </label>
                       )
                     })
                   )}

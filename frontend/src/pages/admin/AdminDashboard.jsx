@@ -1093,14 +1093,24 @@ export default function AdminDashboard() {
               {/* HR Scorecards */}
               <div style={{ display: 'grid', gridTemplateColumns: `repeat(${Math.min(hrComparison.length, 4)}, 1fr)`, gap: 12, marginTop: 24 }}>
                 {hrComparison.map((hr, i) => {
-                  const conversionRate = hr.candidates > 0 ? ((hr.offers / hr.candidates) * 100).toFixed(1) : 0
+                  // offers / candidates — the share of candidates who received an offer.
+                  // It was labelled "Hire Rate", which is a different number: this does not
+                  // know whether any offer was accepted.
+                  const offerRate = hr.candidates > 0 ? ((hr.offers / hr.candidates) * 100).toFixed(1) : 0
                   const accentColors = ['#2b7cba', '#3b82f6', '#8b5cf6', '#22c55e', '#06b6d4', '#ef4444']
                   const accent = accentColors[i % accentColors.length]
                   return (
-                    <div key={hr.name} style={{
+                    // The comparison endpoint returns a name and nothing else to key on, so the
+                    // drill-down is the Users tab filtered to HR and searched for that name —
+                    // both are already server-side params.
+                    <button key={hr.name} type="button" className="hr-scorecard"
+                      onClick={() => { setTab('users'); setRoleFilter('hr'); setSearch(hr.name) }}
+                      aria-label={`${hr.name}: ${hr.jobs} jobs, ${hr.candidates} candidates, ${hr.interviews} interviews, ${hr.offers} offers. Find this user`}
+                      style={{
                       padding: '18px 16px', borderRadius: 14, position: 'relative', overflow: 'hidden',
                       background: `linear-gradient(135deg, ${accent}06, ${accent}02)`,
                       border: `1px solid ${accent}18`,
+                      '--sc-accent': accent,
                     }}>
                       {/* Top accent bar */}
                       <div style={{
@@ -1134,15 +1144,15 @@ export default function AdminDashboard() {
                       <div style={{ marginTop: 14, paddingTop: 12, borderTop: `1px solid ${accent}15` }}>
                         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
                           <span style={{ fontSize: '0.65rem', color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
-                            Hire Rate
+                            Offer Rate
                           </span>
                           <span style={{ fontSize: '0.82rem', fontWeight: 800, color: accent, fontFamily: 'var(--font-mono)' }}>
-                            {conversionRate}%
+                            {offerRate}%
                           </span>
                         </div>
                         <div style={{ height: 6, borderRadius: 3, background: `${accent}12`, overflow: 'hidden' }}>
                           <div style={{
-                            height: '100%', borderRadius: 3, width: `${Math.min(conversionRate, 100)}%`,
+                            height: '100%', borderRadius: 3, width: `${Math.min(offerRate, 100)}%`,
                             background: `linear-gradient(90deg, ${accent}, ${accent}cc)`,
                             transition: 'width 1s ease-out'
                           }} />
@@ -1157,7 +1167,7 @@ export default function AdminDashboard() {
                           </div>
                         )}
                       </div>
-                    </div>
+                    </button>
                   )
                 })}
               </div>

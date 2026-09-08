@@ -1,6 +1,6 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
-import { Crown, Plus, Building2, Users, Briefcase, ToggleLeft, ToggleRight, Copy, Check, RefreshCw, Eye, EyeOff, Edit3, X, Zap, Layers, Trash2, ArrowLeft, ChevronDown, Upload, LogIn, UserPlus } from 'lucide-react'
+import { Crown, Plus, Building2, Users, Briefcase, ToggleLeft, ToggleRight, Copy, Check, RefreshCw, Eye, EyeOff, Edit3, X, Zap, Layers, Trash2, ArrowLeft, ChevronDown, ChevronRight, Upload, LogIn, UserPlus } from 'lucide-react'
 import api from '../../api/client'
 import {
   COMPANY_TYPE_OPTIONS, COMPANY_SIZE_OPTIONS, PLAN_OPTIONS,
@@ -210,7 +210,7 @@ const STYLES = `
     padding: 20px 22px;
     position: relative;
     overflow: hidden;
-    transition: border-color 0.2s, box-shadow 0.2s;
+    transition: border-color 0.2s, box-shadow 0.2s, transform 0.2s;
     box-shadow: 0 1px 4px rgba(0,0,0,0.04);
   }
 
@@ -223,9 +223,86 @@ const STYLES = `
     opacity: 0.85;
   }
 
+  /* These are <button> now, so they need the UA reset the global button.stat-card gets
+     (index.css:423) — these styles are component-scoped and inherit nothing from it. */
+  button.sa-accordion-head {
+    width: 100%;
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
+    -webkit-appearance: none;
+    appearance: none;
+    background: none;
+  }
+
+  .sa-accordion-head:focus-visible {
+    outline: 2px solid #f59e0b;
+    outline-offset: -2px;
+  }
+
+  button.sa-stat-card {
+    width: 100%;
+    text-align: inherit;
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
+    -webkit-appearance: none;
+    appearance: none;
+  }
+
   .sa-stat-card:hover {
     border-color: #d1d5db;
     box-shadow: 0 4px 16px rgba(0,0,0,0.08);
+    transform: translateY(-2px);
+  }
+
+  .sa-stat-card:active { transform: translateY(0); }
+
+  .sa-stat-card:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  /* The active filter is held down. Colour alone would not survive greyscale. */
+  .sa-stat-card[aria-pressed="true"] {
+    border-color: var(--accent);
+    box-shadow: inset 0 0 0 1px var(--accent);
+  }
+
+  /* The chevron is the visual promise that the card does something. */
+  .sa-stat-affordance {
+    position: absolute;
+    top: 16px;
+    right: 14px;
+    color: #9ca3af;
+    opacity: 0;
+    transform: translateX(-4px);
+    transition: opacity 0.25s, transform 0.25s;
+  }
+
+  .sa-stat-card:hover .sa-stat-affordance,
+  .sa-stat-card:focus-visible .sa-stat-affordance {
+    opacity: 1;
+    transform: translateX(0);
+  }
+
+  .sa-filter-clear {
+    margin-left: auto;
+    background: none;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    padding: 4px 10px;
+    font-size: 0.72rem;
+    font-family: 'DM Mono', monospace;
+    color: #6b7280;
+    cursor: pointer;
+  }
+
+  .sa-filter-clear:hover { border-color: #d1d5db; color: #374151; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .sa-stat-card, .sa-stat-affordance { transition: none; }
+    .sa-stat-card:hover { transform: none; }
   }
 
   .sa-stat-num {
@@ -297,10 +374,11 @@ const STYLES = `
     box-shadow: 0 1px 4px rgba(0,0,0,0.04);
   }
 
+  /* The company card is not clickable — its actions are the buttons inside it — so it
+     no longer lifts. Same rule as index.css:408: if it moves, it must navigate. */
   .sa-card:hover {
     border-color: #d1d5db;
-    transform: translateY(-3px);
-    box-shadow: 0 12px 32px rgba(0,0,0,0.1);
+    box-shadow: 0 6px 20px rgba(0,0,0,0.07);
   }
 
   @keyframes cardIn {
@@ -1163,6 +1241,21 @@ export default function SuperAdminDashboard() {
   const [adminError, setAdminError] = useState('')
   const [adminSuccess, setAdminSuccess] = useState('')
 
+  // Card filter + scroll targets. This page has no tabs, so its stat cards act on the two
+  // sections below them instead of navigating: the two count cards filter the client list,
+  // the two roll-up cards jump to the sheet those totals are broken down in.
+  const [companyFilter, setCompanyFilter] = useState('all')
+  const listRef = useRef(null)
+  const sheetRef = useRef(null)
+
+  // Honour the OS setting rather than always smooth-scrolling — the same guard
+  // index.css:470 applies to the card hover transition.
+  const revealSection = (ref) => {
+    if (!ref.current) return
+    const reduced = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+    ref.current.scrollIntoView({ behavior: reduced ? 'auto' : 'smooth', block: 'start' })
+  }
+
   // Quick-add department state (inside create modal)
   const [deptTargetCompany, setDeptTargetCompany] = useState('__new__')
   const [quickDeptName, setQuickDeptName] = useState('')
@@ -1454,6 +1547,8 @@ export default function SuperAdminDashboard() {
     }
   }
 
+  const visibleCompanies = companyFilter === 'active' ? companies.filter(c => c.is_active) : companies
+
   const totalUsers = companies.reduce((s, c) => s + (c.total_users || 0), 0)
   const totalJobs = companies.reduce((s, c) => s + (c.total_jobs || 0), 0)
   const totalDepartments = companies.reduce((s, c) => s + (c.total_departments || 0), 0)
@@ -1488,16 +1583,28 @@ export default function SuperAdminDashboard() {
         {/* Stats */}
         <div className="sa-stats">
           {[
-            { label: 'Total Clients', value: companies.length, icon: Building2, accent: '#f59e0b' },
-            { label: 'Active', value: activeCompanies, icon: Zap, accent: '#00d48c' },
-            { label: 'Total Users', value: totalUsers, icon: Users, accent: '#60a5fa' },
-            { label: 'Total Jobs', value: totalJobs, icon: Briefcase, accent: '#a78bfa' },
+            { label: 'Total Clients', value: companies.length, icon: Building2, accent: '#f59e0b',
+              hint: 'Show all clients', pressed: companyFilter === 'all',
+              act: () => { setCompanyFilter('all'); revealSection(listRef) } },
+            { label: 'Active', value: activeCompanies, icon: Zap, accent: '#00d48c',
+              hint: 'Show only active clients', pressed: companyFilter === 'active',
+              act: () => { setCompanyFilter('active'); revealSection(listRef) } },
+            { label: 'Total Users', value: totalUsers, icon: Users, accent: '#60a5fa',
+              hint: 'See the per-company breakdown', act: () => revealSection(sheetRef) },
+            { label: 'Total Jobs', value: totalJobs, icon: Briefcase, accent: '#a78bfa',
+              hint: 'See the per-company breakdown', act: () => revealSection(sheetRef) },
           ].map((s, i) => (
-            <div key={i} className="sa-stat-card" style={{ '--accent': s.accent }}>
-              <s.icon size={42} className="sa-stat-icon" color={s.accent} />
+            <button key={i} type="button" className="sa-stat-card" style={{ '--accent': s.accent }}
+              onClick={s.act}
+              // Only the two filter cards are a toggle; the roll-ups just scroll, and
+              // aria-pressed on a non-toggle would announce a state that does not exist.
+              aria-pressed={s.pressed === undefined ? undefined : s.pressed}
+              aria-label={`${s.label}: ${s.value}. ${s.hint}`}>
+              <s.icon size={42} className="sa-stat-icon" color={s.accent} aria-hidden="true" />
               <div className="sa-stat-num">{s.value}</div>
               <div className="sa-stat-label">{s.label}</div>
-            </div>
+              <ChevronRight size={16} className="sa-stat-affordance" aria-hidden="true" />
+            </button>
           ))}
         </div>
 
@@ -1621,22 +1728,34 @@ export default function SuperAdminDashboard() {
         )}
 
         {/* Section label */}
-        <div className="sa-section-head">
-          <div className="sa-section-title">Client Companies ({companies.length})</div>
+        <div className="sa-section-head" ref={listRef}>
+          <div className="sa-section-title">
+            {companyFilter === 'active' ? 'Active Clients' : 'Client Companies'} ({visibleCompanies.length})
+          </div>
+          {companyFilter !== 'all' && (
+            <button type="button" className="sa-filter-clear" onClick={() => setCompanyFilter('all')}>
+              Clear filter
+            </button>
+          )}
         </div>
 
         {/* Cards */}
         {loading ? (
           <div className="sa-loading">Fetching clients…</div>
-        ) : companies.length === 0 ? (
+        ) : visibleCompanies.length === 0 ? (
           <div className="sa-empty">
             <Crown size={36} style={{ marginBottom: 12, opacity: 0.25, color: '#9ca3af' }} />
-            <div style={{ fontFamily: 'DM Mono, monospace', fontSize: '0.75rem', letterSpacing: '0.08em', textTransform: 'uppercase', color: '#9ca3af' }}>No clients onboarded yet</div>
-            <div style={{ marginTop: 6, fontSize: '0.72rem', fontFamily: 'DM Mono, monospace', color: '#c4c9d4' }}>Click "Onboard Client" to get started</div>
+            {/* "No clients yet" and "no clients match this filter" are different facts. */}
+            <div style={{ fontFamily: 'DM Mono, monospace', fontSize: '0.75rem', letterSpacing: '0.08em', textTransform: 'uppercase', color: '#9ca3af' }}>
+              {companies.length === 0 ? 'No clients onboarded yet' : 'No active clients'}
+            </div>
+            <div style={{ marginTop: 6, fontSize: '0.72rem', fontFamily: 'DM Mono, monospace', color: '#c4c9d4' }}>
+              {companies.length === 0 ? 'Click "Onboard Client" to get started' : 'Every client is currently deactivated'}
+            </div>
           </div>
         ) : (
           <div className="sa-cards">
-            {companies.map((c, i) => (
+            {visibleCompanies.map((c, i) => (
               <div key={c.id} className="sa-card" style={{ animationDelay: `${i * 0.06}s` }}>
                 <div className="sa-card-bar" style={{ background: c.primary_color || '#f59e0b' }} />
 
@@ -1712,7 +1831,7 @@ export default function SuperAdminDashboard() {
 
         {/* ── Per-Company Overview Sheet ── */}
         {!loading && companies.length > 0 && (
-          <div className="sa-sheet-wrap" style={{ marginTop: 32, marginBottom: 0 }}>
+          <div className="sa-sheet-wrap" ref={sheetRef} style={{ marginTop: 32, marginBottom: 0 }}>
             <div className="sa-sheet-head">
               <Layers size={18} color="#f59e0b" />
               <span className="sa-sheet-head-title">Company Overview</span>
@@ -2001,12 +2120,17 @@ export default function SuperAdminDashboard() {
                         const isOpen = openContact === key
                         return (
                           <div key={key} className={'sa-accordion' + (isOpen ? ' is-open' : '')}>
-                            <div className="sa-accordion-head" onClick={() => setOpenContact(isOpen ? null : key)}>
+                            {/* Was a <div onClick>: not focusable, and nothing announced whether
+                                the section was open. A button with aria-expanded/aria-controls
+                                gives both. */}
+                            <button type="button" className="sa-accordion-head"
+                                    aria-expanded={isOpen} aria-controls={`sa-acc-${key}`}
+                                    onClick={() => setOpenContact(isOpen ? null : key)}>
                               <span>{title}</span>
-                              <ChevronDown size={14} className="sa-accordion-chev" />
-                            </div>
+                              <ChevronDown size={14} className="sa-accordion-chev" aria-hidden="true" />
+                            </button>
                             {isOpen && (
-                              <div className="sa-accordion-body">
+                              <div className="sa-accordion-body" id={`sa-acc-${key}`}>
                                 <div className="sa-grid2">
                                   <div className="sa-field">
                                     <label className="sa-label">Name</label>

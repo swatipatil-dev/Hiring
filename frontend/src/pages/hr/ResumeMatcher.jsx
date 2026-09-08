@@ -1711,6 +1711,13 @@ export default function ResumeMatcher() {
           filtered={hasFilters}
           onClear={clearFilters}
           onOpenStage={(stage) => { setTab('candidates'); setFilter('stage', stage) }}
+          // There is no `contacted` filter on the pool endpoint, so this sorts rather than
+          // filters: least-recently-contacted puts the never-contacted at the top.
+          onOpenNeverContacted={() => { setTab('candidates'); setFilter('sort', 'contact') }}
+          onOpenRecent={() => {
+            const d = new Date(); d.setDate(d.getDate() - 30)
+            setTab('candidates'); setFilter('uploaded_from', d.toISOString().slice(0, 10))
+          }}
           scoring={scoring} progress={scoreProgress}
           onScore={runScoring} onStop={() => { stopScoring.current = true }}
         />

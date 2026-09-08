@@ -1655,13 +1655,18 @@ export default function CreateTestWizard({
                     const isSelected = prevQSelected.has(q.id)
                     const opts = Array.isArray(q.options) ? q.options : (typeof q.options === 'string' ? (() => { try { return JSON.parse(q.options) } catch { return [] } })() : [])
                     return (
-                      <div key={q.id} onClick={() => toggleSelect(q.id)} style={{
+                      <label key={q.id} style={{
                         display: 'flex', gap: 12, padding: '14px 16px', marginBottom: 10,
                         border: `1px solid ${isSelected ? 'var(--accent-primary)' : 'var(--border-subtle)'}`,
                         borderRadius: 10, cursor: 'pointer', transition: 'all 0.15s',
                         background: isSelected ? 'var(--accent-primary-10, rgba(99,102,241,0.08))' : 'var(--bg-secondary)'
                       }}>
-                        <div style={{ flexShrink: 0, paddingTop: 2 }}>
+                        {/* A real checkbox, clipped rather than display:none so it stays
+                            focusable and in the accessibility tree. The row is a <label>, so
+                            clicking anywhere on it still toggles, exactly as before. */}
+                        <input type="checkbox" className="q-select__input"
+                               checked={isSelected} onChange={() => toggleSelect(q.id)} />
+                        <div style={{ flexShrink: 0, paddingTop: 2 }} aria-hidden="true">
                           {isSelected
                             ? <CheckSquare size={18} style={{ color: 'var(--accent-primary)' }} />
                             : <Square size={18} style={{ color: 'var(--text-tertiary)' }} />}
@@ -1711,7 +1716,7 @@ export default function CreateTestWizard({
                             )}
                           </div>
                         </div>
-                      </div>
+                      </label>
                     )
                   })
                 )}

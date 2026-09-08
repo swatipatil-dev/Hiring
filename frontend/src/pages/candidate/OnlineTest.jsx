@@ -1973,17 +1973,27 @@ export default function OnlineTest() {
               <p style={x.qText}>{q.question_text}</p>
 
               {q.options?.length > 0 && (
-                <div style={x.opts}>
+                <div style={x.opts} role="radiogroup" aria-label={`Answer options for question ${idx + 1}`}>
                   {q.options.map((opt, j) => {
                     const sel = answers[idx] === j
                     return (
-                      <div key={j} className="ot-opt" style={{ ...x.optRow, ...(sel ? x.optRowSel : {}) }} onClick={() => selectAnswer(j)}>
-                        <div style={{ ...x.optBox, ...(sel ? x.optBoxSel : {}) }}>
+                      // A real <input type="radio"> inside a <label>, visually hidden.
+                      //
+                      // This was a <div onClick>, which meant the only way to answer a question
+                      // was with a mouse — a candidate navigating by keyboard could open the
+                      // test and not sit it. Going native rather than adding role/tabIndex by
+                      // hand also brings arrow-key movement between options, the roving tab
+                      // stop, and the "option 2 of 4" announcement, none of which we would
+                      // otherwise get right.
+                      <label key={j} className="ot-opt" style={{ ...x.optRow, ...(sel ? x.optRowSel : {}) }}>
+                        <input type="radio" className="ot-opt__input" name={`ot-q-${idx}`}
+                               checked={sel} onChange={() => selectAnswer(j)} />
+                        <div style={{ ...x.optBox, ...(sel ? x.optBoxSel : {}) }} aria-hidden="true">
                           {sel && <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="3"><polyline points="20 6 9 17 4 12"/></svg>}
                         </div>
-                        <span style={{ ...x.optLetter, ...(sel ? x.optLetterSel : {}) }}>{String.fromCharCode(65 + j)}</span>
+                        <span style={{ ...x.optLetter, ...(sel ? x.optLetterSel : {}) }} aria-hidden="true">{String.fromCharCode(65 + j)}</span>
                         <span style={x.optText}>{opt}</span>
-                      </div>
+                      </label>
                     )
                   })}
                 </div>
@@ -2415,7 +2425,14 @@ const kf = `
 @keyframes ot-fadeup{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
 @keyframes ot-pulse{0%,100%{opacity:1}50%{opacity:.45}}
 textarea:focus{outline:none;}
+.ot-opt{cursor:pointer}
 .ot-opt:hover{border-color:#cfcabf!important;background:#faf9f7!important;transform:translateY(-1px)}
+/* Clipped, not display:none — a hidden-by-display input is unfocusable and drops out of
+   the accessibility tree, which would undo the whole point of using a real radio. */
+.ot-opt__input{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);clip-path:inset(50%);white-space:nowrap;border:0}
+/* The focus ring has to live on the row, since the input itself is 1px. */
+.ot-opt:focus-within{outline:2px solid #2b7cba;outline-offset:2px}
+@media (prefers-reduced-motion: reduce){.ot-opt:hover{transform:none}}
 .ot-pal:hover{transform:translateY(-1px) scale(1.04)}
 .ot-btn{transition:transform .12s cubic-bezier(0.16,1,0.3,1),box-shadow .2s,filter .2s}
 .ot-btn:hover:not(:disabled){transform:translateY(-1px);filter:brightness(1.04)}
