@@ -27,6 +27,12 @@ on:
         type: boolean
         default: false
 
+# GITHUB_TOKEN gets read-only access. Without an explicit block a workflow inherits
+# the repository default, which is commonly read/write — and this one only ever reads
+# the checkout. release.yml is the single workflow here that needs `contents: write`.
+permissions:
+  contents: read
+
 # Never let two deploys overlap. Not cancel-in-progress: interrupting a deploy
 # halfway is worse than queueing behind one.
 concurrency:

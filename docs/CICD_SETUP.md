@@ -246,6 +246,40 @@ listed and shows a reviewer.
 
 ---
 
+## Cutting a release
+
+Versions come from one place: the **`VERSION`** file at the repo root. `backend/main.py`
+reads it at import, so `/health`, `/api/v1/info` and the OpenAPI docs all report the same
+number and cannot drift apart. Before this there were three separate hardcoded copies of
+`2.0.0` and a `frontend/package.json` stuck at `1.0.0`.
+
+Actions → *Cut a release* → **Run workflow**, choose `patch`, `minor` or `major` (or type an
+exact version). The workflow writes `VERSION`, bumps `frontend/package.json` and its
+lockfile with `npm version`, commits, tags `vX.Y.Z` and publishes a GitHub Release with
+generated notes.
+
+Notes:
+
+- **Releases are cut from `main` only**, checked in the job for the same reason `deploy.yml`
+  checks it — the "Run workflow" dropdown offers every branch.
+- **A tag is never moved.** If the computed version already exists the run fails; re-releasing
+  a number would retroactively change what "v2.1.0 is in production" means.
+- The series starts at **v2.0.0**, not v1.0.0, because the API has reported `2.0.0` since
+  before tagging existed and a version that appears to go backwards is worse than one that
+  starts high.
+- **Cutting a release does not deploy it.** That is the next section.
+
+### Which version is in production?
+
+```bash
+curl -s https://career.innomaxskills.com/health | grep -o '"app_version":"[^"]*"'
+```
+
+Note the field is `app_version`. The `version` field in that same response is the **MySQL**
+server version and always has been — it was left alone rather than quietly repurposed.
+
+---
+
 ## Running a deploy
 
 **Every deploy is manual.** Actions → *Deploy to cPanel* → **Run workflow** → pick `main` →

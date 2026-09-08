@@ -1,0 +1,166 @@
+name: Cut a release
+
+# main → Release → vX.Y.Z → Deploy.
+#
+# This workflow owns the version number. It writes VERSION (read at boot by
+# backend/main.py, so /health can report it), bumps frontend/package.json to match,
+# tags the commit and publishes a GitHub Release.
+#
+# There is no automatic bumping from commit messages. Deciding that a change is a
+# minor rather than a patch is a judgement call, and this repo already treats
+# releasing as a deliberate button press — see docs/CICD_SETUP.md.
+#
+# Deploying is a SEPARATE, also-manual step: cutting v2.1.0 does not ship it.
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Which part of the version to raise'
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      version:
+        description: 'Exact version instead, e.g. 2.1.0 (leave blank to use the bump above)'
+        type: string
+        required: false
+
+run-name: >-
+  Release · ${{ inputs.version != '' && inputs.version || format('{0} bump', inputs.bump) }}
+
+# Pushing a commit and a tag. Nothing else in this repo needs write, and until now
+# no workflow declared permissions at all — see the note in ci.yml.
+permissions:
+  contents: write
+
+# Two releases at once would race on the tag list and could produce the same number
+# twice. Queue rather than cancel: a half-finished release is worse than a slow one.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      # Releases are cut from main and nowhere else. workflow_dispatch offers every
+      # branch in the Actions dropdown, so this has to be checked in the job — the
+      # same guard, for the same reason, as deploy.yml.
+      - name: Only main is releasable
+        run: |
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "::error::Refusing to release from '${{ github.ref_name }}'. Releases are cut from main."
+            exit 1
+          fi
+
+      # Tags are the input to the version calculation, so a shallow clone would make
+      # every release look like the first one.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Work out the next version
+        id: next
+        env:
+          BUMP: ${{ inputs.bump }}
+          EXPLICIT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          # Newest tag by version order, not by date: a patch cut after a minor must
+          # not be treated as the latest.
+          LATEST=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1)
+
+          if [ -n "$EXPLICIT" ]; then
+            NEXT="${EXPLICIT#v}"
+          elif [ -z "$LATEST" ]; then
+            # First release. Seeded at 2.0.0 rather than 1.0.0 because the API has
+            # been reporting 2.0.0 since before tagging existed, and a version that
+            # appears to go backwards is worse than one that starts high.
+            NEXT="2.0.0"
+            echo "No tags yet — seeding the series at $NEXT"
+          else
+            IFS=. read -r MA MI PA <<<"${LATEST#v}"
+            case "$BUMP" in
+              major) MA=$((MA+1)); MI=0; PA=0 ;;
+              minor) MI=$((MI+1)); PA=0 ;;
+              patch) PA=$((PA+1)) ;;
+              *) echo "::error::Unknown bump '$BUMP'"; exit 1 ;;
+            esac
+            NEXT="$MA.$MI.$PA"
+          fi
+
+          if ! printf '%s' "$NEXT" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::'$NEXT' is not X.Y.Z. Give the version without a leading v."
+            exit 1
+          fi
+
+          # Never move a tag that exists. Re-releasing a number silently changes what
+          # "v2.1.0 is in production" means, everywhere, retroactively.
+          if git rev-parse -q --verify "refs/tags/v$NEXT" >/dev/null; then
+            echo "::error::Tag v$NEXT already exists. Bump again, or delete it deliberately."
+            exit 1
+          fi
+
+          echo "version=$NEXT" >> "$GITHUB_OUTPUT"
+          echo "previous=${LATEST:-none}" >> "$GITHUB_OUTPUT"
+          echo "Releasing v$NEXT (previous: ${LATEST:-none})"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Write the version everywhere it is recorded
+        env:
+          NEXT: ${{ steps.next.outputs.version }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$NEXT" > VERSION
+
+          # `npm version` rather than editing JSON by hand: package-lock.json carries
+          # the number in two more places, and hand-editing one of the three is how
+          # they drift. --no-git-tag-version because the tagging is done below.
+          ( cd frontend && npm version "$NEXT" --no-git-tag-version --allow-same-version )
+
+          echo "--- VERSION ---";               cat VERSION
+          echo "--- package.json version ---";  node -p "require('./frontend/package.json').version"
+
+      - name: Tag it
+        env:
+          NEXT: ${{ steps.next.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add VERSION frontend/package.json frontend/package-lock.json
+          git commit -m "Release v$NEXT"
+          git tag -a "v$NEXT" -m "Release v$NEXT"
+          # Push the commit first: a tag pointing at a commit the remote does not
+          # have yet is rejected, and the reverse order leaves a tag with no branch.
+          git push origin HEAD:main
+          git push origin "v$NEXT"
+
+      - name: Publish the release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXT: ${{ steps.next.outputs.version }}
+          PREVIOUS: ${{ steps.next.outputs.previous }}
+        run: |
+          set -euo pipefail
+          if [ "$PREVIOUS" = "none" ]; then
+            gh release create "v$NEXT" --title "v$NEXT" --generate-notes
+          else
+            gh release create "v$NEXT" --title "v$NEXT" --generate-notes --notes-start-tag "$PREVIOUS"
+          fi
+
+      - name: Say what to do next
+        env:
+          NEXT: ${{ steps.next.outputs.version }}
+        run: |
+          {
+            echo "## Released \`v$NEXT\`"
+            echo
+            echo "Tagged and published. **This is not deployed yet.**"
+            echo
+            echo "To ship it: Actions → *Deploy to cPanel* → Run workflow → version \`v$NEXT\`,"
+            echo "then approve the deployment."
+          } >> "$GITHUB_STEP_SUMMARY"

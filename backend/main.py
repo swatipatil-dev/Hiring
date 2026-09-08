@@ -168,11 +168,35 @@ async def lifespan(app: FastAPI):
 # Rate limiter is defined in src.rate_limit (proxy-aware client-IP key) and
 # imported above, so this module and the auth routes share one instance.
 
+
+# The VERSION file at the repo root is the single source of truth for the release
+# number. It is written by .github/workflows/release.yml and committed alongside the
+# tag, so a checkout of v2.1.0 carries "2.1.0" here — which is what lets /health
+# answer "exactly which version is running in production?".
+#
+# Resolved from __file__, never the CWD: systemd, cron and an interactive shell all
+# start somewhere different, and a bare relative path would read nothing under two of
+# the three. Same reason _APP_DIR exists further down this file.
+#
+# Never raises. A missing or unreadable VERSION means we do not know the version, not
+# that the service should refuse to boot.
+def _read_version() -> str:
+    """Release number from the repo-root VERSION file, or 'unknown'."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "VERSION")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+APP_VERSION = _read_version()
+
 # Create FastAPI application
 app = FastAPI(
     title="HireFlow Recruitment System",
     description="Complete AI-powered recruitment system with ATS resume scoring - Microservice Architecture",
-    version="2.0.0",
+    version=APP_VERSION,
     docs_url="/docs",
     redoc_url="/redoc",
     lifespan=lifespan
@@ -213,7 +237,7 @@ async def root():
     """Root endpoint - API Information"""
     return {
         "message": "HireFlow Recruitment System API",
-        "version": "2.0.0",
+        "version": APP_VERSION,
         "architecture": "Microservice-based",
         "docs": "/docs",
         "health": "/health",
@@ -233,7 +257,11 @@ async def health_check():
                 "status": db_status.get("status", "unhealthy"),
                 "database": db_status.get("database", "recruitment_db"),
                 "user": db_status.get("user", ""),
+                # "version" here is MySQL's, and has been since this endpoint was
+                # written — renaming it would break whatever reads it. The release
+                # number gets its own key rather than quietly taking that one over.
                 "version": db_status.get("version", "MySQL"),
+                "app_version": APP_VERSION,
                 "timestamp": db_status.get("timestamp", datetime.now().isoformat()),
             }
         )
@@ -243,6 +271,9 @@ async def health_check():
             status_code=503,
             content={
                 "status": "unhealthy",
+                # Reported even when the database is down: knowing which release is
+                # failing is most of the value of asking.
+                "app_version": APP_VERSION,
                 "timestamp": datetime.now().isoformat(),
             }
         )
@@ -252,7 +283,7 @@ async def api_info():
     """API information and available endpoints"""
     return {
         "name": "HireFlow Recruitment API",
-        "version": "2.0.0",
+        "version": APP_VERSION,
         "architecture": "Microservice-based",
         "modules": {
             "authentication": "JWT-based auth with role management",

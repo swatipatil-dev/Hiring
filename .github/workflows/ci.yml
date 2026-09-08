@@ -31,6 +31,12 @@ on:
     branches: [main, testing, develop]
   workflow_dispatch:
 
+# GITHUB_TOKEN gets read-only access. Without an explicit block a workflow inherits
+# the repository default, which is commonly read/write — and this one only ever reads
+# the checkout. release.yml is the single workflow here that needs `contents: write`.
+permissions:
+  contents: read
+
 # A new push to the same branch makes the previous run irrelevant.
 concurrency:
   group: ci-${{ github.ref }}
