@@ -36,6 +36,13 @@ Run it after every deploy, not only when something looks wrong.
 
 ## 1. See what you are deploying
 
+> **The pipeline does this differently.** `.github/workflows/deploy.yml` deploys a *release
+> tag*, not a branch: it runs `git fetch --tags` then `git checkout --detach vX.Y.Z`, which
+> leaves the server in detached HEAD. The steps below are the by-hand equivalent and still
+> describe what has to happen; only the way the code arrives differs. If you deploy by hand
+> on a server the pipeline has touched, `git pull` will not work until you check out a
+> branch again.
+
 `[root]`
 
 ```bash

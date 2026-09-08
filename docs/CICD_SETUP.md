@@ -282,9 +282,25 @@ server version and always has been — it was left alone rather than quietly rep
 
 ## Running a deploy
 
-**Every deploy is manual.** Actions → *Deploy to cPanel* → **Run workflow** → pick `main` →
-then **Review deployments → Approve**. Merging to `main` no longer starts anything; see
-"Auto-deploy is paused" above.
+**Every deploy is manual, and only a tagged release can be deployed.** Actions → *Deploy to
+cPanel* → **Run workflow** → pick `main`, type the version (e.g. `v2.1.0`) → then **Review
+deployments → Approve**. Merging to `main` no longer starts anything; see "Auto-deploy is
+paused" above.
+
+A `validate` job runs first and refuses anything that is not an existing `vX.Y.Z` tag whose
+commit is an ancestor of `main`. That last check matters: a tag can be cut from any commit,
+so without it "only main reaches production" would hold for branches and be silently
+bypassable with a tag. Validation runs **before** the build, so a typo costs seconds rather
+than a full production build.
+
+On the server the checkout moves to the tag (`git fetch --tags && git checkout --detach`)
+rather than pulling a branch. That leaves it in **detached HEAD** — deliberate, and the
+reason nothing in the pipeline may go back to using `git pull`. The rollback is unaffected:
+the pre-deploy commit is captured as a SHA, and `git reset --hard <sha>` behaves the same
+detached.
+
+The run is named after the release, and its summary carries the version and commit, so the
+Actions list answers "what shipped, and when" without opening anything.
 
 **Dry run first.** The manual trigger has a `dry_run` input that prints the exact command
 sequence for the current diff without changing anything. Use it the first time, and any time

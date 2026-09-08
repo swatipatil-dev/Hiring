@@ -22,6 +22,10 @@ name: Deploy to cPanel
 on:
   workflow_dispatch:
     inputs:
+      version:
+        description: 'Release to deploy, e.g. v2.1.0 (must be an existing tag on main)'
+        type: string
+        required: true
       dry_run:
         description: 'Print the commands without changing anything'
         type: boolean
@@ -32,6 +36,8 @@ on:
 # the checkout. release.yml is the single workflow here that needs `contents: write`.
 permissions:
   contents: read
+
+run-name: "Deploy ${{ inputs.version }}${{ inputs.dry_run && ' (dry run)' || '' }}"
 
 # Never let two deploys overlap. Not cancel-in-progress: interrupting a deploy
 # halfway is worse than queueing behind one.
@@ -45,18 +51,80 @@ env:
   SERVICES: hireflow-api hireflow-proctor hireflow-judge-worker hireflow-email-worker
 
 jobs:
+  # ── Validate the release before anything is built ───────────────────────────
+  # Its own job, ahead of `build`, on purpose. Checking the tag inside the deploy
+  # job would mean a typo still costs a full npm install and production build first.
+  # Here a bad input fails in seconds and nothing else starts.
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.check.outputs.sha }}
+    steps:
+      # Releases are cut from main and only main is deployable, so the workflow file
+      # in use must be main's. workflow_dispatch offers every branch in the dropdown.
+      - name: Only main reaches production
+        run: |
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "::error::Run this from main. Deploys are dispatched from main and ship a tag."
+            exit 1
+          fi
+
+      # Tags and main's history are both needed to answer "is this tag on main?".
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: The version is a real release on main
+        id: check
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if ! printf '%s' "$VERSION" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::'$VERSION' is not a release tag. Expected vX.Y.Z, for example v2.1.0."
+            echo "::error::Cut one first: Actions -> Cut a release."
+            exit 1
+          fi
+
+          if ! git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
+            echo "::error::Tag $VERSION does not exist."
+            echo "::error::Existing releases: $(git tag -l 'v*' --sort=-v:refname | head -5 | xargs)"
+            exit 1
+          fi
+
+          # A tag can be cut from any commit, including one on a branch that was never
+          # merged. Without this, "only main reaches production" would be enforced for
+          # branches and quietly bypassed by tags.
+          if ! git merge-base --is-ancestor "$VERSION" origin/main; then
+            echo "::error::$VERSION is not an ancestor of main — it was tagged off a branch that is not merged."
+            echo "::error::Production only runs code that is on main."
+            exit 1
+          fi
+
+          SHA=$(git rev-parse "$VERSION^{commit}")
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "$VERSION is $SHA, and is on main."
+
   # ── Build the release ───────────────────────────────────────────────────────
   # The frontend is built HERE, never on the server. docs/DEPLOY_UPDATE.md:139
   # requires `npm install` over `npm ci` because the lockfile drifts — but
   # `npm install` rewrites the tracked package-lock.json, so on the server it
-  # dirties the tree and the NEXT `git pull` conflicts mid-deploy.
+  # dirties the tree and the NEXT checkout on the server fails mid-deploy.
   #
   # Safe to build here because dist/ is environment-independent: client.js uses a
   # relative baseURL and there are no VITE_ build variables.
   build:
+    needs: validate
     runs-on: ubuntu-latest
     steps:
+      # `ref` is not optional here. Without it this checks out the dispatched ref —
+      # main's HEAD — and the deploy would ship main's frontend against the tag's
+      # backend. A silent version skew, and the same class of stale-copy bug the rest
+      # of this pipeline exists to prevent.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version }}
 
       - uses: actions/setup-node@v4
         with:
@@ -79,31 +147,33 @@ jobs:
 
   # ── Deploy ──────────────────────────────────────────────────────────────────
   deploy:
-    needs: build
+    needs: [validate, build]
     runs-on: ubuntu-latest
     environment:
       name: production
       url: https://career.innomaxskills.com
     steps:
-      # This is now the ONLY branch enforcement in the workflow. With `on: push`
-      # removed every run is a workflow_dispatch, and the Actions "Run workflow"
-      # dropdown lets you pick ANY branch — while the approving reviewer sees a
-      # deploy request, not a branch name. Without this, shipping develop to the
-      # live site is two clicks. It refuses tags too (github.ref is refs/tags/*).
+      # What may reach production is enforced in the `validate` job above, before
+      # anything is built: the input must be an existing vX.Y.Z tag whose commit is an
+      # ancestor of main. That covers what this step used to check on its own — a
+      # dispatch from the wrong branch — and closes the hole that a tag could be cut
+      # off a branch that was never merged.
       #
-      # Belt and braces: the `production` environment should also carry a
-      # deployment branch rule limited to `main`, which refuses BEFORE a reviewer
-      # is prompted. See docs/CICD_SETUP.md section 5.
-      #
-      # develop and testing are CI-only by design — there is one server, so
-      # deploying them would replace production. See docs/CICD_SETUP.md.
-      - name: Only main reaches production
+      # Belt and braces: the `production` environment should also carry a deployment
+      # branch rule limited to `main`, which refuses BEFORE a reviewer is prompted.
+      # See docs/CICD_SETUP.md section 5.
+      - name: Say what is being deployed
         run: |
-          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
-            echo "::error::Refusing to deploy from '${{ github.ref_name }}'. Production deploys only from main."
-            exit 1
-          fi
-          echo "Deploying ${{ github.sha }} from main."
+          echo "Deploying ${{ inputs.version }} (${{ needs.validate.outputs.sha }}) to production."
+          {
+            echo "## Deploying \`${{ inputs.version }}\`"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Release | \`${{ inputs.version }}\` |"
+            echo "| Commit | \`${{ needs.validate.outputs.sha }}\` |"
+            echo "| Dry run | ${{ inputs.dry_run }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # The obscure-failure fix. On the first run this workflow ever had, none of
       # the six secrets below existed; the visible symptom was
@@ -209,7 +279,7 @@ jobs:
         id: pull
         run: |
           # An empty BEFORE used to be written to $GITHUB_OUTPUT and the step
-          # carried on into `git pull` — leaving a deploy running with no
+          # carried on into the checkout — leaving a deploy running with no
           # rollback point. Stop here instead, while the server is untouched.
           BEFORE=$(ssh target "cd $APP_DIR && git rev-parse HEAD")
           if [ -z "$BEFORE" ]; then
@@ -220,8 +290,17 @@ jobs:
           echo "before=$BEFORE" >> "$GITHUB_OUTPUT"
           echo "Rolling back to $BEFORE if anything fails."
 
+          # Check out the release rather than pulling a branch. --tags --force keeps the
+          # server's tag list honest, and --detach is explicit about where this leaves
+          # the checkout: detached HEAD.
+          #
+          # Deliberate, with one consequence worth knowing — a later `git pull` here
+          # would fail, so nothing in this pipeline may go back to using one. The
+          # rollback is unaffected: BEFORE is captured as a SHA just above, and
+          # `git reset --hard <sha>` behaves the same detached.
+
           ${{ inputs.dry_run && 'echo DRY-RUN would:' || '' }} \
-            ssh target "cd $APP_DIR && git pull --ff-only"
+            ssh target "cd $APP_DIR && git fetch --tags --force origin && git checkout --detach '${{ inputs.version }}'"
 
           CHANGED=$(ssh target "cd $APP_DIR && git diff --name-only $BEFORE HEAD")
           echo "$CHANGED"
@@ -317,8 +396,8 @@ jobs:
       #
       # $APP_DIR rather than /tmp: the deploy user can write it without sudo (it is in
       # the hireflow group and CICD_SETUP.md section 1 does `chmod -R g+rwX`), and it
-      # survives a reboot. It is untracked, so it blocks neither `git pull --ff-only`
-      # nor `git reset --hard` — neither of those touches untracked files.
+      # survives a reboot. It is untracked, so it blocks neither the tag checkout nor
+      # `git reset --hard` — neither of those touches untracked files.
       - name: Record the published bundle as the rollback point
         if: success() && steps.publish.outcome == 'success' && !inputs.dry_run
         run: |
@@ -335,10 +414,10 @@ jobs:
       # checkout. It would fire in exactly the case where the deploy died early
       # and the server was never touched, i.e. where doing nothing is correct.
       #
-      # `before` IS still set when the pull step itself failed: the runner reads
-      # $GITHUB_OUTPUT after a step exits regardless of its exit code. So a failed
-      # `git pull` still rolls back, which is the point. The guard suppresses only
-      # the case where `before` was never captured at all.
+      # `before` IS still set when the checkout step itself failed: the runner reads
+      # $GITHUB_OUTPUT after a step exits regardless of its exit code. So a tag
+      # checkout that half-applied still rolls back, which is the point. The guard
+      # suppresses only the case where `before` was never captured at all.
       - name: Roll back on failure
         if: failure() && steps.pull.outputs.before != '' && !inputs.dry_run
         env:
