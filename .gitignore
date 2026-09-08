@@ -15,6 +15,12 @@ frontend/dist/
 # Environment
 .env
 *.env.local
+# Editor backups of .env carry the same secrets. Found live on the server as
+# .env.save / .env.save.1 (nano) and .env.bak — untracked but NOT ignored, so a
+# `git add -A` there would have committed SECRET_KEY and the database password.
+.env.*
+!.env.example
+!.env.cpanel.example
 
 # GCP service-account keys — NEVER commit
 gcp-key.json

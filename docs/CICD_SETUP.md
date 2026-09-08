@@ -6,67 +6,83 @@ Deployment is otherwise nine hand-typed steps from [`DEPLOY_UPDATE.md`](DEPLOY_U
 each conditional on what changed. That runbook stays the source of truth — the pipeline
 automates it, it does not replace it. **Read it before changing the workflow.**
 
-The pipeline does **not** deploy on merge. Merging to `main` runs the tests and nothing else.
-
-**Auto-deploy is currently paused** — `deploy.yml` no longer triggers on push at all. A
-deploy is started by hand from the Actions tab and then waits for a reviewer. Read the next
-section before you expect a merge to release anything.
+**A merge to `main` deploys to production once CI passes.** Nobody clicks anything. Read
+the next section before merging.
 
 ---
 
-## Auto-deploy is paused
+## Auto-deploy: a push to main ships
 
-The first run this workflow ever had failed, and it failed for a boring reason with an
-unhelpful message.
+A merge to `main` runs CI. If CI passes, the deploy runs on its own. Nobody clicks anything.
 
-`deploy.yml` landed in `9188150` on `develop` and only reached `main` on 2026-09-07.
-Section 4 below — the six repository secrets — had never been done. With `DEPLOY_HOST`
-empty, the workflow wrote a bare `HostName` into `~/.ssh/config`, so every `ssh target`
-tried to resolve the literal alias `target`. What the run actually surfaced was:
+That is a deliberate choice with a known cost, recorded here so it stays a decision rather
+than a surprise:
 
+- **There is no human approval step.** Required reviewers are a paid feature for private
+  repositories and are unavailable on this plan — the option does not appear in the
+  environment settings. CI is the only gate.
+- **CI does not cover proctoring or the coding judge.** `requirements-ci.txt` omits
+  `opencv-python`, `mediapipe` and `ultralytics`, so those tests *skip* rather than run. A
+  regression in either reaches candidates mid-exam with nothing having checked it. Closing
+  that gap is the highest-value follow-up this pipeline has.
+- **Nothing runs the manual smoke matrix** at the end of this file. With a manual deploy you
+  were prompted to; now you are not.
+
+### Why it triggers on CI, not on push
+
+`deploy.yml` waits for the **"HireFlow CI" workflow to complete** and inspects its
+conclusion:
+
+```yaml
+on:
+  workflow_run:
+    workflows: ["HireFlow CI"]
+    types: [completed]
+    branches: [main]
 ```
-Warning: Deploy failed — rolling code back to
-ssh: Could not resolve hostname target: Temporary failure in name resolution
-Error: Process completed with exit code 255
-```
 
-Two things are wrong with that message, and both are now fixed. The failure is reported from
-the **rollback** step, a hundred lines past its cause. And the commit it claims to roll back
-to is *empty* — which meant `git reset --hard` with no argument, a command that resets to
-`HEAD` and discards uncommitted server-side changes rather than rolling anything back. It
-could only ever have fired in the case where nothing had been changed yet.
+A plain `on: push` would start `deploy.yml` and `ci.yml` at the same instant. The deploy
+would race the tests and could ship code whose suite is still running — or has already
+failed, with the red tick arriving after the bad code is live. That is worse than having no
+CI at all, because it looks like something checked.
 
-So three things changed:
+One consequence worth knowing: on a `workflow_run` event **`github.sha` is the default
+branch's HEAD, not the commit that was tested.** Every ref in this workflow comes from
+`github.event.workflow_run.head_sha` instead. The difference only shows up when two commits
+land close together — and then it ships the wrong one.
 
-1. **A preflight names the missing secrets**, as the second step of the deploy job, before
-   anything touches the server. It prints names, never values.
-2. **The rollback refuses to run without a real 40-character SHA**, and says so explicitly
-   when it skips, so a silent skip is never mistaken for a rollback that happened.
-3. **`on: push` is gone.** Deploys are `workflow_dispatch` only.
+### What gets deployed
 
-### Re-enabling automatic deploys
+| Trigger | Ships | Labelled |
+|---|---|---|
+| CI green on `main` | the tested commit | `main@<short sha>` |
+| **Run workflow** with a version | that release tag | `v2.1.0` |
 
-In order. Steps 1 and 2 are the ones that were skipped.
+Both paths are still available. Cutting a release and dispatching it gives you a numbered,
+re-deployable version; the automatic path gives you speed. `/health` reports whichever label
+was deployed.
 
-1. Complete **section 4** — all six secrets. The preflight will not accept a partial set.
-2. Complete **section 5** — the `production` environment, its required reviewer, **and** the
-   deployment branch rule limited to `main`.
-3. Dispatch once with **`dry_run` ticked**. This exercises the secrets, the host key and the
-   SSH config against the real server without changing it. Note it is not an offline
-   rehearsal — it does open a connection.
-4. Dispatch once for real, from `main`, and walk the smoke matrix at the end of this file.
-5. Only then, if you still want release-on-merge, restore the trigger in `deploy.yml`:
+`dry_run` exists only on the manual path, so an automatic deploy is always a real one.
 
-   ```yaml
-   on:
-     push:
-       branches: [main]
-     workflow_dispatch:
-       ...
-   ```
+### If you want to pause it again
 
-   The approval gate makes that safe, but it is not required. A deliberate button press is a
-   defensible end state, and it is the current one.
+Delete the `workflow_run:` block from `deploy.yml`. `workflow_dispatch` remains, and deploys
+go back to being a deliberate button press — which is where this started, and a defensible
+end state.
+
+### The first run
+
+Before relying on it, in this order:
+
+1. **Dispatch once with `dry_run` ticked.** Exercises the six secrets, the host key and the
+   SSH config against the real server without changing it. It does open a connection — it is
+   not an offline rehearsal.
+2. **Confirm the gate works.** Merge something with a failing test and check the deploy
+   *does not run*. Revert. If a red CI still deploys, the gate is decorative.
+3. **Confirm the right commit shipped** — compare the SHA in the run summary with
+   `git rev-parse HEAD` on the server. This is where the `head_sha` trap above would surface.
+4. **Then walk the smoke matrix** at the end of this file.
+
 
 ---
 
@@ -81,7 +97,7 @@ feature/*  →  develop  →  testing  →  main  →  production
 | feature branches | day-to-day work | ✅ full suite | ✗ |
 | `develop` | integration | ✅ full suite | ✗ |
 | `testing` | pre-release / QA | ✅ full suite | ✗ |
-| `main` | production | ✅ full suite | ⏸ **paused** — manual dispatch, then approval |
+| `main` | production | ✅ full suite | ✅ **automatically, if CI passes** |
 
 **`testing` does not deploy anywhere.** There is exactly one environment —
 `career.innomaxskills.com` on `66.116.207.71`. Deploying `testing` would replace the live
@@ -94,8 +110,9 @@ when neither existed, so a branch could sit 16 commits behind `main` with nothin
 running against it.
 
 `deploy.yml` refuses to run from anything but `main`, checked in the job itself rather than
-left to the trigger: `workflow_dispatch` lets you pick any branch from the Actions UI, and
-the approving reviewer sees a deploy request, not a branch name.
+left to the trigger. `workflow_dispatch` lets you pick any branch from the Actions UI, and
+on the automatic path `github.ref` is the default branch whatever was actually tested — so
+the branch has to be read from the triggering CI run, not from the event.
 
 ### If you add a staging server later
 
@@ -143,8 +160,26 @@ It needs to read the repo (`git pull` runs as `deploy`) while the tree stays
 ```bash
 usermod -aG hireflow deploy
 chmod -R g+rwX /opt/hireflow
-git config --global --add safe.directory /opt/hireflow
+chmod 600 /opt/hireflow/backend/.env
+sudo -u deploy git config --global --add safe.directory /opt/hireflow
 ```
+
+Two of those lines are not obvious, and both were found the hard way:
+
+**The `chmod 600` is not optional.** `chmod -R g+rwX` walks the whole tree including
+`backend/.env`, turning 0600 into 0660 — and `deploy` was just added to the `hireflow`
+group. Without the re-lock, the deploy user can read `SECRET_KEY`, `EMAIL_ENCRYPTION_KEY`
+and the database password, which is the exact access this whole design withholds. `.env` is
+gitignored, so `git pull` never touches it and re-locking costs nothing.
+
+While you are there, check for **copies**: `ls -la /opt/hireflow/backend/.env*`. Editor
+backups (`.env.save`, `.env.bak`) carry the same secrets, are not matched by the `.env`
+line in `.gitignore`, and the recursive chmod makes them group-readable too. Move them out
+of the tree.
+
+**`git config` must run as `deploy`, not root.** `--global` as root writes `/root/.gitconfig`,
+which the deploy user never reads — `git pull` then fails with "detected dubious ownership"
+because git checks the directory's owner UID and group membership does not satisfy it.
 
 ## 2. Grant it exactly six things
 
@@ -209,7 +244,8 @@ ssh -i hireflow-deploy deploy@66.116.207.71 "whoami"      # -> deploy
 
 `DB_NAME` is whatever `curl -s localhost:8000/health` reports as `database`.
 
-**None of these exist yet — that is what paused auto-deploy.** Confirm with:
+**All six must be present.** A missing one is what made the first deploy attempt fail with
+an unrelated-looking DNS error. Confirm with:
 
 ```bash
 gh secret list          # all six must appear
@@ -224,19 +260,21 @@ change if you do, because the check lives in the `deploy` job and that job decla
 `environment: production`. The same check in any *other* job would stop being able to see
 them.
 
-## 5. The approval gate
+## 5. The production environment
 
 **Settings → Environments → New environment → `production`**
 
-- Tick **Required reviewers** and add yourself (and ideally one other person).
-- Restrict **deployment branches** to `main`. Not optional: `workflow_dispatch` is now the
-  only trigger, and its "Run workflow" dropdown offers every branch in the repo. The in-job
-  guard at `deploy.yml:94` catches this too, but only *after* a reviewer has already been
-  asked to approve; the branch rule refuses before anyone is prompted.
+- Restrict **deployment branches** to `main` (Ref type: Branch, pattern `main`). Not
+  optional: `workflow_dispatch`'s "Run workflow" dropdown offers every branch in the repo.
+  The in-job guard catches this too, but the branch rule refuses earlier and makes the
+  intent visible in the UI rather than buried in a workflow file.
 
-Without this the deploy job runs unattended the moment anything merges. The gate is the
-point: proctoring and the coding judge have **no CI coverage at all**, so a human still has
-to look before a release goes out.
+> **Required reviewers are not available on this plan.** Environment protection rules are a
+> paid feature for private repositories — the checkbox simply does not appear. The same
+> limitation shows up on the secrets page for organization secrets. So there is **no human
+> approval step**, and CI is the only thing standing between a merge and production. If you
+> later upgrade the plan, tick Required reviewers here and the existing
+> `environment: production` in `deploy.yml` will start honouring it with no code change.
 
 **This step fails open, silently, if you skip it.** Referencing an environment that does not
 exist does not error — GitHub creates it on first use with *no* protection rules, and the
@@ -315,10 +353,10 @@ reporting the commit exactly.
 
 ## Running a deploy
 
-**Every deploy is manual, and only a tagged release can be deployed.** Actions → *Deploy to
-cPanel* → **Run workflow** → pick `main`, type the version (e.g. `v2.1.0`) → then **Review
-deployments → Approve**. Merging to `main` no longer starts anything; see "Auto-deploy is
-paused" above.
+**Merging to `main` deploys automatically once CI passes** — nothing to click. To ship a
+specific numbered release instead, Actions → *Deploy to cPanel* → **Run workflow** → pick
+`main`, type the version (e.g. `v2.1.0`). Tick `dry_run` there to rehearse without changing
+anything.
 
 A `validate` job runs first and refuses anything that is not an existing `vX.Y.Z` tag whose
 commit is an ancestor of `main`. That last check matters: a tag can be cut from any commit,

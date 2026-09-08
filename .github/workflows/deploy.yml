@@ -1,25 +1,32 @@
 name: Deploy to cPanel
 
-# Auto-deploy is PAUSED. `on: push` is deliberately absent.
+# Auto-deploy: a push to main ships, once CI is green.
 #
-# The six repository secrets in docs/CICD_SETUP.md section 4 were never created,
-# so the first run this workflow ever had — the merge to main on 2026-09-07 —
-# could only fail. It failed obscurely: DEPLOY_HOST expanded to nothing, ssh fell
-# back to resolving the literal alias `target`, and the visible error was a DNS
-# failure inside the ROLLBACK step, a hundred lines past the actual cause.
+# NOT `on: push`. deploy.yml and ci.yml would then start at the same instant and
+# race — a deploy could ship code whose tests are still running, or have already
+# failed, with the red tick arriving after the bad code is live. That is worse
+# than no CI, because it looks like a check happened.
 #
-# Until those secrets exist, a deploy is a deliberate button press. To restore
-# automatic release-on-merge, add back:
+# So the trigger is CI *completing*, and the conclusion is inspected below. A red
+# run deploys nothing.
 #
-#   push:
-#     branches: [main]
+# Required reviewers are a paid feature on private repos and are unavailable on
+# this plan, so CI is the only gate between a merge and production. Two things it
+# does NOT cover, deliberately recorded here: proctoring and the coding judge have
+# no tests in CI at all (requirements-ci.txt omits opencv-python, mediapipe and
+# ultralytics, so those tests skip rather than run), and nothing checks the manual
+# smoke matrix at docs/DEPLOY_UPDATE.md:165-171.
 #
-# and see docs/CICD_SETUP.md, "Auto-deploy is paused", for the full checklist.
+# workflow_dispatch is kept for deploying a specific release tag, and for dry runs.
 #
 # This automates docs/DEPLOY_UPDATE.md step for step, including its conditionals
 # — git pull leaves four things stale (database, systemd units, Apache config,
 # built frontend) and each of those has an incident behind it.
 on:
+  workflow_run:
+    workflows: ["HireFlow CI"]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       version:
@@ -37,7 +44,8 @@ on:
 permissions:
   contents: read
 
-run-name: "Deploy ${{ inputs.version }}${{ inputs.dry_run && ' (dry run)' || '' }}"
+run-name: >-
+  Deploy ${{ inputs.version || format('main@{0}', github.event.workflow_run.head_sha) }}${{ inputs.dry_run && ' (dry run)' || '' }}
 
 # Never let two deploys overlap. Not cancel-in-progress: interrupting a deploy
 # halfway is worse than queueing behind one.
@@ -57,14 +65,31 @@ jobs:
   # Here a bad input fails in seconds and nothing else starts.
   validate:
     runs-on: ubuntu-latest
+    # A failed, cancelled or timed-out CI run must not deploy. This `if` is the
+    # entire gate — without it the workflow_run trigger fires on ANY completion,
+    # success or not.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
     outputs:
       sha: ${{ steps.check.outputs.sha }}
+      ref: ${{ steps.check.outputs.ref }}
+      label: ${{ steps.check.outputs.label }}
     steps:
       # Releases are cut from main and only main is deployable, so the workflow file
       # in use must be main's. workflow_dispatch offers every branch in the dropdown.
+      #
+      # On workflow_run, github.ref is the DEFAULT branch regardless of what was
+      # tested, so the branch has to come from the triggering run instead.
       - name: Only main reaches production
         run: |
-          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            BRANCH="${{ github.event.workflow_run.head_branch }}"
+            if [ "$BRANCH" != "main" ]; then
+              echo "::error::CI ran on '$BRANCH'. Production only deploys main."
+              exit 1
+            fi
+          elif [ "${{ github.ref }}" != "refs/heads/main" ]; then
             echo "::error::Run this from main. Deploys are dispatched from main and ship a tag."
             exit 1
           fi
@@ -74,12 +99,33 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: The version is a real release on main
+      # Resolves two things every later job needs:
+      #   ref   — the exact commit-ish to check out and ship
+      #   label — what to call it in the UI and record on the server
+      #
+      # An automatic deploy has no tag, so it ships the tested commit by SHA. A
+      # dispatched deploy ships a release tag and keeps the full validation.
+      - name: What are we deploying
         id: check
         env:
           VERSION: ${{ inputs.version }}
+          EVENT: ${{ github.event_name }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
+
+          if [ "$EVENT" = "workflow_run" ]; then
+            # CI already ran against this exact commit on main — the branch was
+            # checked above — so there is nothing further to validate.
+            SHORT=$(printf '%s' "$RUN_SHA" | cut -c1-7)
+            {
+              echo "sha=$RUN_SHA"
+              echo "ref=$RUN_SHA"
+              echo "label=main@$SHORT"
+            } >> "$GITHUB_OUTPUT"
+            echo "Auto-deploy of main@$SHORT ($RUN_SHA), CI green."
+            exit 0
+          fi
 
           if ! printf '%s' "$VERSION" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
             echo "::error::'$VERSION' is not a release tag. Expected vX.Y.Z, for example v2.1.0."
@@ -103,7 +149,11 @@ jobs:
           fi
 
           SHA=$(git rev-parse "$VERSION^{commit}")
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          {
+            echo "sha=$SHA"
+            echo "ref=$VERSION"
+            echo "label=$VERSION"
+          } >> "$GITHUB_OUTPUT"
           echo "$VERSION is $SHA, and is on main."
 
   # ── Build the release ───────────────────────────────────────────────────────
@@ -124,7 +174,7 @@ jobs:
       # of this pipeline exists to prevent.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.version }}
+          ref: ${{ needs.validate.outputs.ref }}
 
       - uses: actions/setup-node@v4
         with:
@@ -164,15 +214,16 @@ jobs:
       # See docs/CICD_SETUP.md section 5.
       - name: Say what is being deployed
         run: |
-          echo "Deploying ${{ inputs.version }} (${{ needs.validate.outputs.sha }}) to production."
+          echo "Deploying ${{ needs.validate.outputs.label }} (${{ needs.validate.outputs.sha }}) to production."
           {
-            echo "## Deploying \`${{ inputs.version }}\`"
+            echo "## Deploying \`${{ needs.validate.outputs.label }}\`"
             echo
             echo "| | |"
             echo "|---|---|"
-            echo "| Release | \`${{ inputs.version }}\` |"
+            echo "| Release | \`${{ needs.validate.outputs.label }}\` |"
             echo "| Commit | \`${{ needs.validate.outputs.sha }}\` |"
-            echo "| Dry run | ${{ inputs.dry_run }} |"
+            echo "| Trigger | ${{ github.event_name }} |"
+            echo "| Dry run | ${{ inputs.dry_run || false }} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       # The obscure-failure fix. On the first run this workflow ever had, none of
@@ -300,7 +351,7 @@ jobs:
           # `git reset --hard <sha>` behaves the same detached.
 
           ${{ inputs.dry_run && 'echo DRY-RUN would:' || '' }} \
-            ssh target "cd $APP_DIR && git fetch --tags --force origin && git checkout --detach '${{ inputs.version }}'"
+            ssh target "cd $APP_DIR && git fetch --tags --force origin && git checkout --detach '${{ needs.validate.outputs.ref }}'"
 
           CHANGED=$(ssh target "cd $APP_DIR && git diff --name-only $BEFORE HEAD")
           echo "$CHANGED"
@@ -408,7 +459,7 @@ jobs:
           # version that is actually live — which is NOT the same as the release just
           # deployed. A deploy that did not touch frontend/ leaves an older bundle in
           # place, and that skew is the whole reason frontend_version is recorded.
-          ssh target "printf '%s' '${{ inputs.version }}' | sed 's/^v//' > $APP_DIR/.dist-prev.version"
+          ssh target "printf '%s' '${{ needs.validate.outputs.label }}' | sed 's/^v//' > $APP_DIR/.dist-prev.version"
           echo "Recorded this bundle as the rollback point for the next deploy."
 
       # What is actually deployed, written where the app can read it. VERSION says what
@@ -426,7 +477,9 @@ jobs:
       - name: Record what was deployed
         if: success() && !inputs.dry_run
         env:
-          VERSION: ${{ inputs.version }}
+          # label, not inputs.version: an auto-deploy has no tag, and an empty value
+          # here would leave the deployment record unable to say what is running.
+          VERSION: ${{ needs.validate.outputs.label }}
           COMMIT: ${{ needs.validate.outputs.sha }}
           PUBLISHED: ${{ steps.publish.outcome }}
           ACTOR: ${{ github.actor }}
@@ -496,7 +549,7 @@ jobs:
           # Mapped into env rather than spliced into the script text, the same rule the
           # SSH step follows: an expression expanded inside a heredoc would land in the
           # middle of a JSON document, where a quote in the value corrupts the file.
-          FAILED_VERSION: ${{ inputs.version }}
+          FAILED_VERSION: ${{ needs.validate.outputs.label }}
           ACTOR: ${{ github.actor }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
