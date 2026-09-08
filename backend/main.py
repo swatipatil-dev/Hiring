@@ -24,6 +24,7 @@ Author: AI Assistant
 Version: 2.0.0 (Microservice Architecture)
 """
 
+import json
 import os
 import asyncio
 import logging
@@ -163,6 +164,26 @@ async def lifespan(app: FastAPI):
         shutdown_runtime()
     except Exception:
         pass
+    # One line naming the full picture at every boot. This is the cheapest of the
+    # three tracking mechanisms and the only one that survives the manifest being
+    # lost: `journalctl -u hireflow-api | grep "| release "` is a dated history of
+    # everything this box has ever run.
+    _rel = _release_summary()
+    logger.info(
+        "HireFlow %s | release %s | commit %s | frontend %s | deployed %s by %s",
+        _rel["app_version"],
+        _rel["release"] or "not recorded",
+        (_rel["commit"] or "unknown")[:12],
+        _rel["frontend_version"] or "not recorded",
+        _rel["deployed_at"] or "unknown",
+        _rel["deployed_by"] or "unknown",
+    )
+    if _rel["frontend_matches"] is False:
+        logger.warning(
+            "Frontend bundle is %s but the backend is %s — the browser is being served "
+            "a different release from the API.",
+            _rel["frontend_version"], _rel["app_version"],
+        )
     logger.info("🎉 HireFlow Recruitment System started successfully!")
 
 # Rate limiter is defined in src.rate_limit (proxy-aware client-IP key) and
@@ -191,6 +212,60 @@ def _read_version() -> str:
 
 
 APP_VERSION = _read_version()
+
+
+# What the pipeline actually deployed, as opposed to what this checkout claims to be.
+#
+# VERSION answers "what does this code say it is". It cannot answer "when did this get
+# here, who put it here, and is the frontend being served the same release" — the
+# deploy publishes dist/ only when frontend/ changed, and a rollback restores an older
+# bundle, so the two genuinely can diverge.
+#
+# .release.json is written by .github/workflows/deploy.yml at the end of a successful
+# deploy and rewritten by its rollback, so it never advertises a release that was
+# undone. Untracked, and absent on any developer machine — which is why "not recorded"
+# is the ordinary case here, not an error.
+#
+# Same rules as _read_version above: resolved from __file__ rather than the CWD, and
+# never raises. A corrupt manifest is treated exactly like a missing one; a malformed
+# JSON file is not a reason to refuse to serve traffic.
+def _read_release() -> dict:
+    """The deploy manifest, or {} when nothing has been recorded."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".release.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    # A JSON file whose top level is a list or a string parses fine and would then
+    # break every caller that does .get(). Only an object is a manifest.
+    return data if isinstance(data, dict) else {}
+
+
+def _release_summary() -> dict:
+    """Version facts for /health and /api/v1/version, including frontend skew.
+
+    `frontend_version` is the bundle the deploy published, which after a rollback can
+    sit behind the backend. Reporting the mismatch here is the only automatic check in
+    the system for the stale-copy failure docs/DEPLOY_UPDATE.md is built around — it
+    otherwise shows up as a user seeing an old screen against a new API.
+    """
+    release = _read_release()
+    frontend = release.get("frontend_version")
+    return {
+        "app_version": APP_VERSION,
+        "release": release.get("version"),
+        "commit": release.get("commit"),
+        "deployed_at": release.get("deployed_at"),
+        "deployed_by": release.get("deployed_by"),
+        "state": release.get("state"),
+        "frontend_version": frontend,
+        # None rather than False when there is no manifest: "we did not check" and
+        # "we checked and they match" are different answers.
+        "frontend_matches": None if not frontend else frontend == APP_VERSION,
+        "recorded": bool(release),
+    }
+
 
 # Create FastAPI application
 app = FastAPI(
@@ -262,6 +337,9 @@ async def health_check():
                 # number gets its own key rather than quietly taking that one over.
                 "version": db_status.get("version", "MySQL"),
                 "app_version": APP_VERSION,
+                # What the pipeline recorded as deployed. Additive: the deploy's own
+                # health check greps for "status":"healthy", so extra keys are safe.
+                "release": _release_summary(),
                 "timestamp": db_status.get("timestamp", datetime.now().isoformat()),
             }
         )
@@ -274,9 +352,31 @@ async def health_check():
                 # Reported even when the database is down: knowing which release is
                 # failing is most of the value of asking.
                 "app_version": APP_VERSION,
+                "release": _release_summary(),
                 "timestamp": datetime.now().isoformat(),
             }
         )
+
+@app.get("/api/v1/version")
+async def version_info():
+    """Everything known about what is running here.
+
+    One call for the support question "which version are you on?". Deliberately
+    unauthenticated and free of anything sensitive — the release number, its commit
+    and when it shipped are all public facts about a public site, and requiring a
+    login to read them would defeat the point when the complaint is that login is
+    broken.
+
+    `release` is null on any machine the pipeline has not deployed to, which includes
+    every developer laptop. That is a normal answer, not an error.
+    """
+    return {
+        **_release_summary(),
+        # The raw manifest as written, so a future field added by the pipeline is
+        # readable without another backend change.
+        "manifest": _read_release() or None,
+    }
+
 
 @app.get("/api/v1/info")
 async def api_info():

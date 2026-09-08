@@ -60,3 +60,9 @@ backend/backups/
 # health check, kept on the server so a failed deploy can put the old UI back.
 # Written by .github/workflows/deploy.yml, never by a developer.
 .dist-prev/
+
+# Deploy manifest and history, written on the server by .github/workflows/deploy.yml.
+# backend/main.py reads .release.json for /api/v1/version and the startup log.
+.release.json
+.release-history.jsonl
+.dist-prev.version

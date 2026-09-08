@@ -272,11 +272,44 @@ Notes:
 ### Which version is in production?
 
 ```bash
-curl -s https://career.innomaxskills.com/health | grep -o '"app_version":"[^"]*"'
+curl -s https://career.innomaxskills.com/api/v1/version
 ```
 
-Note the field is `app_version`. The `version` field in that same response is the **MySQL**
-server version and always has been — it was left alone rather than quietly repurposed.
+That is the whole picture in one call: the release tag, its commit, when it shipped and who
+shipped it, the frontend bundle actually being served, and whether that bundle matches the
+backend.
+
+Unauthenticated on purpose — a release number is a public fact about a public site, and
+needing to log in to read it defeats the point when the complaint is that logging in is
+broken.
+
+The same block appears under `release` in `/health`. Note that the `version` field there is
+the **MySQL** server version and always has been; the application number is `app_version`.
+
+**Where it is recorded on the server**
+
+| Where | What it is |
+|---|---|
+| `VERSION` (in the checkout) | what this code claims to be |
+| `/opt/hireflow/.release.json` | what the pipeline actually deployed, rewritten by a rollback |
+| `/opt/hireflow/.release-history.jsonl` | one appended line per deploy and per rollback |
+| `journalctl -u hireflow-api` | one line at every boot, so it survives the files being lost |
+
+```bash
+tail -5 /opt/hireflow/.release-history.jsonl          # recent deploys and rollbacks
+journalctl -u hireflow-api | grep "| release "        # every boot, dated
+```
+
+**Frontend skew.** `frontend_version` is the bundle actually being served, which is not always
+this release: a deploy that did not touch `frontend/` leaves the previous bundle in place, and
+a rollback restores an older one. When it differs from the backend, the API reports the
+mismatch and the service logs a warning at boot. That is the only automatic check in the
+system for the stale-copy failure [`DEPLOY_UPDATE.md`](DEPLOY_UPDATE.md) is built around.
+
+**After a rollback** the manifest reads `state: "rolled-back"`, `version: null` and names the
+commit the server was reset to. Null rather than a guessed tag name: what is on the box is
+whatever release that commit belonged to, and inventing a version string would be worse than
+reporting the commit exactly.
 
 ---
 

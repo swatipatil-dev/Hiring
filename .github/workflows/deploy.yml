@@ -402,7 +402,74 @@ jobs:
         if: success() && steps.publish.outcome == 'success' && !inputs.dry_run
         run: |
           ssh target "rsync -a --delete /tmp/hireflow-dist/ $APP_DIR/.dist-prev/"
+
+          # Stamp the bundle with the release it came from. .dist-prev always holds the
+          # bundle currently being served, so this file always names the frontend
+          # version that is actually live — which is NOT the same as the release just
+          # deployed. A deploy that did not touch frontend/ leaves an older bundle in
+          # place, and that skew is the whole reason frontend_version is recorded.
+          ssh target "printf '%s' '${{ inputs.version }}' | sed 's/^v//' > $APP_DIR/.dist-prev.version"
           echo "Recorded this bundle as the rollback point for the next deploy."
+
+      # What is actually deployed, written where the app can read it. VERSION says what
+      # the checkout claims to be; this says when it got here, who put it there, and
+      # which frontend bundle is being served — none of which the code can know about
+      # itself. backend/main.py reads it for /api/v1/version and the startup log.
+      #
+      # frontend_version is the part that earns its keep: the deploy publishes dist/
+      # only when frontend/ changed, and the rollback restores an older bundle, so the
+      # frontend genuinely can sit behind the backend.
+      #
+      # Written with a heredoc through `cat >`, not `echo`, so quoting in a field can
+      # never break the JSON. Unprivileged — same $APP_DIR the deploy user already
+      # writes .dist-prev into.
+      - name: Record what was deployed
+        if: success() && !inputs.dry_run
+        env:
+          VERSION: ${{ inputs.version }}
+          COMMIT: ${{ needs.validate.outputs.sha }}
+          PUBLISHED: ${{ steps.publish.outcome }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          FE_PUBLISHED=false
+          [ "$PUBLISHED" = "success" ] && FE_PUBLISHED=true
+
+          # Read the version of the bundle that is actually live rather than assuming
+          # it is this release. When frontend/ did not change, the publish step is
+          # skipped and an OLDER bundle stays in place — recording this release as the
+          # frontend version would then assert a match that is not true, and defeat the
+          # skew detection in backend/main.py entirely.
+          FE_VERSION=$(ssh target "cat $APP_DIR/.dist-prev.version 2>/dev/null" || true)
+          if [ -n "$FE_VERSION" ]; then
+            FE_FIELD="\"$FE_VERSION\""
+          else
+            # Nothing published yet on this box. null, not "unknown": the app treats a
+            # missing frontend version as "not compared", which is the honest answer.
+            FE_FIELD=null
+          fi
+
+          ssh target "cat > $APP_DIR/.release.json" <<JSON
+          {
+            "version": "$VERSION",
+            "commit": "$COMMIT",
+            "frontend_version": $FE_FIELD,
+            "frontend_published": $FE_PUBLISHED,
+            "deployed_at": "$NOW",
+            "deployed_by": "$ACTOR",
+            "run_url": "$RUN_URL",
+            "state": "deployed"
+          }
+          JSON
+
+          # Append-only: this is what answers "what was running last Tuesday".
+          ssh target "cat >> $APP_DIR/.release-history.jsonl" <<LINE
+          {"at":"$NOW","event":"deploy","version":"$VERSION","commit":"$COMMIT","frontend_version":$FE_FIELD,"frontend_published":$FE_PUBLISHED,"by":"$ACTOR","run":"$RUN_URL"}
+          LINE
+
+          echo "Recorded $VERSION as deployed."
 
       # Roll the CODE back, not the schema. DEPLOY_UPDATE.md:185-188 is explicit:
       # a half-applied migration is worse than a newer schema under older code,
@@ -426,6 +493,12 @@ jobs:
           # died part-way, so the docroot is in a mixed state and MUST be restored —
           # which is why this tests for "not skipped" rather than "succeeded".
           PUBLISHED: ${{ steps.publish.outcome }}
+          # Mapped into env rather than spliced into the script text, the same rule the
+          # SSH step follows: an expression expanded inside a heredoc would land in the
+          # middle of a JSON document, where a quote in the value corrupts the file.
+          FAILED_VERSION: ${{ inputs.version }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           # Belt and braces behind the `if:`. GitHub casts both sides of a
           # mixed-type comparison to number, so the expression guard alone has a
@@ -475,6 +548,39 @@ jobs:
           ssh target "sudo systemctl restart $SERVICES" || true
           sleep 20
           ssh target "curl -sf localhost:8000/health" || echo "::error::Still unhealthy after rollback — needs a human."
+
+          # Record the rollback. Without this the manifest keeps advertising the release
+          # that just failed, and /api/v1/version would confidently report a version
+          # that is no longer running — worse than having no manifest at all.
+          #
+          # The release is written as the pre-deploy COMMIT, not a version string: what
+          # is on the box now is whatever tag that commit belonged to, and guessing at
+          # its name would be inventing information. The commit is exact.
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          FE_VERSION=$(ssh target "cat $APP_DIR/.dist-prev.version 2>/dev/null" || true)
+          if [ -n "$FE_VERSION" ] && [ "$RESTORED" = "yes" ]; then
+            FE_FIELD="\"$FE_VERSION\""
+          else
+            FE_FIELD=null
+          fi
+
+          ssh target "cat > $APP_DIR/.release.json" <<JSON || true
+          {
+            "version": null,
+            "commit": "$BEFORE",
+            "frontend_version": $FE_FIELD,
+            "frontend_published": false,
+            "deployed_at": "$NOW",
+            "deployed_by": "$ACTOR",
+            "run_url": "$RUN_URL",
+            "state": "rolled-back",
+            "failed_version": "$FAILED_VERSION"
+          }
+          JSON
+
+          ssh target "cat >> $APP_DIR/.release-history.jsonl" <<LINE || true
+          {"at":"$NOW","event":"rollback","from":"$FAILED_VERSION","to_commit":"$BEFORE","frontend_restored":"$RESTORED","by":"$ACTOR","run":"$RUN_URL"}
+          LINE
 
           # Say which of the four copies git pull does not update are now consistent,
           # rather than leaving the reader to infer it from which steps ran.

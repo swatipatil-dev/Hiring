@@ -94,3 +94,98 @@ def test_frontend_package_json_agrees_with_the_version_file():
     pkg = os.path.join(REPO_ROOT, "frontend", "package.json")
     version = io.open(VERSION_FILE, encoding="utf-8").read().strip()
     assert json.load(io.open(pkg, encoding="utf-8"))["version"] == version
+
+
+# ── Deploy manifest ────────────────────────────────────────────────────────────
+#
+# .release.json records what the pipeline actually deployed. It is absent on every
+# developer machine, so "not recorded" is the ordinary path through this code and the
+# one most likely to break if someone assumes the file is there.
+
+MANIFEST = {
+    "version": "v2.4.0",
+    "commit": "abc123def456abc123def456abc123def456abcd",
+    "frontend_version": "2.4.0",
+    "frontend_published": True,
+    "deployed_at": "2026-09-08T10:00:00Z",
+    "deployed_by": "someone",
+    "run_url": "https://example.invalid/run/1",
+    "state": "deployed",
+}
+
+
+@pytest.fixture
+def manifest(monkeypatch, tmp_path):
+    """Point _read_release at a manifest we control."""
+    def _write(payload, raw=None):
+        f = tmp_path / ".release.json"
+        f.write_text(raw if raw is not None else __import__("json").dumps(payload),
+                     encoding="utf-8")
+        real_open = io.open
+        monkeypatch.setattr(
+            "builtins.open",
+            lambda p, *a, **kw: real_open(f, *a, **kw) if str(p).endswith(".release.json")
+            else real_open(p, *a, **kw),
+        )
+        return f
+    return _write
+
+
+def test_version_endpoint_works_with_no_manifest(client):
+    """The local-dev and fresh-install case. This one must never 500."""
+    resp = client.get("/api/v1/version")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["app_version"] == main.APP_VERSION
+    assert body["recorded"] is False
+    assert body["release"] is None
+    assert body["manifest"] is None
+    # Nothing was compared, so the answer is "unknown", not "they match".
+    assert body["frontend_matches"] is None
+
+
+def test_version_endpoint_reports_the_manifest(manifest):
+    manifest(MANIFEST)
+    summary = main._release_summary()
+    assert summary["recorded"] is True
+    assert summary["release"] == "v2.4.0"
+    assert summary["commit"].startswith("abc123")
+    assert summary["deployed_by"] == "someone"
+    assert summary["state"] == "deployed"
+
+
+def test_frontend_skew_is_flagged(manifest):
+    """A rollback restores an older bundle, so the frontend can sit behind the API.
+
+    This is the only automatic check in the system for that — it otherwise surfaces as
+    a user looking at an old screen against a new API.
+    """
+    manifest({**MANIFEST, "frontend_version": "2.3.0"})
+    assert main._release_summary()["frontend_matches"] is False
+
+
+def test_matching_frontend_is_not_flagged(manifest):
+    manifest({**MANIFEST, "frontend_version": main.APP_VERSION})
+    assert main._release_summary()["frontend_matches"] is True
+
+
+def test_a_corrupt_manifest_reads_as_not_recorded(manifest):
+    """Truncated mid-write, or hand-edited badly. Not a reason to stop serving."""
+    manifest(None, raw='{"version": "v2.4.0", "commit":')
+    assert main._read_release() == {}
+    assert main._release_summary()["recorded"] is False
+
+
+def test_a_manifest_that_is_not_an_object_is_rejected(manifest):
+    """Valid JSON, wrong shape — a list would parse and then break every .get()."""
+    manifest(None, raw='["v2.4.0"]')
+    assert main._read_release() == {}
+
+
+def test_health_carries_the_release_block(client):
+    body = client.get("/health").json()
+    assert "release" in body
+    assert body["release"]["app_version"] == main.APP_VERSION
+    # And the guarantees from the previous commit still hold.
+    assert body["app_version"] == main.APP_VERSION
+    assert "version" in body
