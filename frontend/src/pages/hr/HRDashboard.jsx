@@ -774,7 +774,17 @@ HR Team`,
   // never again, so after creating a job / scheduling an interview / sending an
   // offer the dashboard kept showing the old numbers until a full page reload —
   // which reads to a user as "my action didn't save".
+  const [counts, setCounts] = useState(null)
+
   const refreshOverview = useCallback(() => {
+    // The overview cards read this, not the arrays below. /hr/jobs, /hr/interviews and
+    // /hr/offers all cap at limit=50, so counting what came back reported "50" for any
+    // HR with more than fifty of anything, and the number stopped moving there.
+    //
+    // Left at null on failure rather than 0: the cards render "—" for null, and a flash
+    // of zero reads as "you have no jobs" instead of "not loaded yet". Same rule the
+    // admin role cards follow (AdminDashboard.jsx:1305).
+    api.get('/hr/dashboard/counts').then(r => setCounts(r.data)).catch(() => setCounts(null))
     api.get('/hr/departments').then(r => setDepartments(r.data || [])).catch(() => {})
     api.get('/hr/interviews').then(r => setInterviews(r.data || [])).catch(() => {})
     api.get('/hr/offers').then(r => setOffers(r.data || [])).catch(() => {})
@@ -1297,24 +1307,22 @@ HR Team`,
             <div className="stats-grid">
               {[
                 {
-                  label: 'Job Postings', value: jobs.length, cls: 'amber',
+                  label: 'Job Postings', value: counts?.jobs, cls: 'amber',
                   hint: 'View all job postings',
                   onSelect: () => { setJobFilters({ ...jobFilters, status: '' }); setTab('jobs') },
                 },
                 {
-                  label: 'Active Jobs',
-                  value: jobs.filter(j => j.status === 'active' || j.status === 'open').length,
-                  cls: 'blue',
+                  label: 'Active Jobs', value: counts?.active_jobs, cls: 'blue',
                   hint: 'View active job postings',
                   onSelect: () => { setJobFilters({ ...jobFilters, status: 'active' }); setTab('jobs') },
                 },
                 {
-                  label: 'Interviews', value: interviews.length, cls: 'green',
+                  label: 'Interviews', value: counts?.interviews, cls: 'green',
                   hint: 'View all interviews',
                   onSelect: () => setTab('interviews'),
                 },
                 {
-                  label: 'Offers', value: offers.length, cls: 'purple',
+                  label: 'Offers', value: counts?.offers, cls: 'purple',
                   hint: 'View all offers',
                   onSelect: () => setTab('offers'),
                 },
@@ -1324,10 +1332,12 @@ HR Team`,
                   type="button"
                   className={`stat-card ${s.cls}`}
                   onClick={s.onSelect}
-                  aria-label={`${s.label}: ${s.value}. ${s.hint}`}
+                  aria-label={s.value == null
+                    ? `${s.label}, loading count. ${s.hint}`
+                    : `${s.label}: ${s.value.toLocaleString()}. ${s.hint}`}
                 >
                   <div className="stat-label">{s.label}</div>
-                  <div className="stat-value">{s.value}</div>
+                  <div className="stat-value">{s.value == null ? '—' : s.value.toLocaleString()}</div>
                   <ChevronRight size={16} className="stat-affordance" aria-hidden="true" />
                 </button>
               ))}

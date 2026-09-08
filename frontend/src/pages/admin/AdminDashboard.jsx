@@ -606,10 +606,14 @@ export default function AdminDashboard() {
               already declared here but never rendered — it is shown now. */}
           <div className="stats-grid">
             {[
-              { label: 'Total Users', value: analytics?.total_users ?? roleCounts?.all ?? 0, icon: Users, cls: 'amber', to: 'users', hint: 'Manage users' },
-              { label: 'Departments', value: departments.length, icon: Building2, cls: 'blue', to: 'departments', hint: 'Manage departments' },
-              { label: 'Active Jobs', value: analytics?.active_jobs ?? 0, icon: Briefcase, cls: 'green', to: 'analytics', hint: 'View hiring analytics' },
-              { label: 'Total Candidates', value: analytics?.total_candidates ?? 0, icon: TrendingUp, cls: 'purple', to: 'analytics', hint: 'View hiring analytics' },
+              // null, not 0, until the numbers land — a flash of zero reads as an empty
+              // system rather than as "not loaded yet" (same rule as the role cards below).
+              // `departments.length` was wrong for a second reason: GET /departments caps
+              // at limit=50, so it described the first page, not the company.
+              { label: 'Total Users', value: analytics?.total_users ?? roleCounts?.all, icon: Users, cls: 'amber', to: 'users', hint: 'Manage users' },
+              { label: 'Departments', value: analytics?.total_departments, icon: Building2, cls: 'blue', to: 'departments', hint: 'Manage departments' },
+              { label: 'Active Jobs', value: analytics?.active_jobs, icon: Briefcase, cls: 'green', to: 'analytics', hint: 'View hiring analytics' },
+              { label: 'Total Candidates', value: analytics?.total_candidates, icon: TrendingUp, cls: 'purple', to: 'analytics', hint: 'View hiring analytics' },
             ].map((s, i) => (
               <button
                 key={s.label}
@@ -617,13 +621,15 @@ export default function AdminDashboard() {
                 className={`stat-card ${s.cls}`}
                 style={{ animationDelay: `${i * 80}ms` }}
                 onClick={() => setTab(s.to)}
-                aria-label={`${s.label}: ${s.value.toLocaleString()}. ${s.hint}`}
+                aria-label={s.value == null
+                  ? `${s.label}, loading count. ${s.hint}`
+                  : `${s.label}: ${s.value.toLocaleString()}. ${s.hint}`}
               >
                 <div className="stat-label" style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
                   <s.icon size={13} aria-hidden="true" />
                   <span>{s.label}</span>
                 </div>
-                <div className="stat-value">{s.value.toLocaleString()}</div>
+                <div className="stat-value">{s.value == null ? '—' : s.value.toLocaleString()}</div>
                 <ChevronRight size={16} className="stat-affordance" aria-hidden="true" />
               </button>
             ))}

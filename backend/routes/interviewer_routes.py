@@ -5,6 +5,7 @@ Handles interview viewing, feedback submission, and interviewer-specific operati
 
 from fastapi import APIRouter, HTTPException, status, Depends
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from typing import List, Optional
 from src.config.database_config_mysql import get_db
 from src.auth import get_current_user, AuthMiddleware
@@ -199,6 +200,44 @@ async def get_interview_history(
         })
 
     return {"interviews": result}
+
+
+@router.get("/interviews/counts")
+async def get_interview_counts(
+    current_user: User = Depends(AuthMiddleware.get_current_interviewer),
+    db: Session = Depends(get_db)
+):
+    """Per-status interview totals for the dashboard cards and the pipeline donut.
+
+    Registered ABOVE /interviews/{interview_id} for the reason spelled out over
+    /interviews/history: Starlette matches in registration order, so below it this
+    would be served by get_interview_details with interview_id="counts".
+
+    The cards and the donut were both derived from the /interviews array, which
+    caps at limit=50 — so "Tests Ready" and every donut segment quietly stopped
+    counting at the cap. Scoping here repeats GET /interviews exactly, panel-member
+    match included, so a card cannot disagree with the list it opens.
+    """
+    get_interviewer_profile(db, current_user)
+
+    rows = db.query(Interview.status, func.count(Interview.id)).filter(
+        Interview.company_id == current_user.company_id,
+        (Interview.interviewer_email == current_user.email) |
+        (Interview.created_by == current_user.email) |
+        (Interview.panel_members.like(f'%"{current_user.email}"%'))
+    ).group_by(Interview.status).all()
+
+    by_status = {(status or "UNKNOWN"): count for status, count in rows}
+    return {
+        "total": sum(by_status.values()),
+        # Named explicitly rather than returned raw, so a new status value on the
+        # model cannot silently add an unlabelled slice to the donut.
+        "draft": by_status.get("DRAFT", 0) + by_status.get("GENERATING", 0),
+        "ready": by_status.get("READY", 0),
+        "scheduled": by_status.get("SCHEDULED", 0),
+        "completed": by_status.get("COMPLETED", 0),
+        "by_status": by_status,
+    }
 
 
 @router.get("/interviews/{interview_id}", response_model=InterviewResponse)

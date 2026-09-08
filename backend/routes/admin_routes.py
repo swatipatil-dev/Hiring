@@ -131,6 +131,10 @@ class SystemAnalytics(BaseModel):
     total_users: int
     total_jobs: int
     active_jobs: int
+    # The overview card for departments used to be departments.length over
+    # GET /departments, which caps at limit=50. Counted here instead so the card
+    # describes the company rather than the first page of it.
+    total_departments: int
     total_candidates: int
     candidates_by_stage: List[dict]
     recent_applications: List[dict]
@@ -1011,6 +1015,8 @@ async def get_system_analytics(
     total_users = db.query(User).filter(User.company_id == cid).count()
     total_jobs = db.query(JobPosting).filter(JobPosting.company_id == cid).count()
     active_jobs = db.query(JobPosting).filter(JobPosting.company_id == cid, JobPosting.status == "active").count()
+    # Scoped exactly as GET /departments is, so the card matches the list it opens.
+    total_departments = db.query(Department).filter(Department.company_id == cid).count()
     total_candidates = db.query(Candidate).filter(Candidate.company_id == cid).count()
 
     # Get candidates by stage
@@ -1030,6 +1036,7 @@ async def get_system_analytics(
         total_users=total_users,
         total_jobs=total_jobs,
         active_jobs=active_jobs,
+        total_departments=total_departments,
         total_candidates=total_candidates,
         candidates_by_stage=[
             {"stage": stage or "unknown", "count": count} for stage, count in candidates_by_stage

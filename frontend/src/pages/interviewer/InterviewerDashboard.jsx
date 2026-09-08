@@ -614,7 +614,15 @@ export default function InterviewerDashboard() {
     }
   }, [])
 
+  const [ivCounts, setIvCounts] = useState(null)
+
   const fetchInterviews = () => {
+    // The list stays capped — the dashboard only lists a page of it. The CARDS and the
+    // donut read ivCounts instead, because deriving them from this array made every one
+    // of them stop counting at 50.
+    api.get('/interviewer/interviews/counts')
+      .then(r => setIvCounts(r.data))
+      .catch(() => setIvCounts(null))
     api.get('/interviewer/interviews', { params: { limit: 50 } })
       .then(r => setInterviews(r.data?.interviews || r.data || []))
       .catch(() => {})
@@ -1450,22 +1458,25 @@ export default function InterviewerDashboard() {
         const user = JSON.parse(localStorage.getItem('hireflow_user') || '{}')
         const firstName = user.first_name || 'Interviewer'
 
-        // Derive stats from already-fetched state
-        const draftTests    = interviews.filter(i => ['DRAFT','GENERATING'].includes(i.status))
-        const readyTests    = interviews.filter(i => i.status === 'READY')
-        const scheduledTests = interviews.filter(i => i.status === 'SCHEDULED')
-        const completedTests = interviews.filter(i => i.status === 'COMPLETED')
+        // Counts come from /interviews/counts; the arrays are only ever a capped page.
+        const draftCount     = ivCounts?.draft
+        const readyCount     = ivCounts?.ready
+        const scheduledCount = ivCounts?.scheduled
+        const completedCount = ivCounts?.completed
+        const testsTotal     = ivCounts?.total
+
         const upcomingMeetings = myMeetings.slice(0, 5)
         const pendingRequests  = crRequests.filter(r => r.status === 'PENDING' || r.status === 'pending')
 
         // Pipeline donut data
         const pipelineData = [
-          { label: 'Draft',     count: draftTests.length,     color: '#64748b' },
-          { label: 'Ready',     count: readyTests.length,     color: '#22c55e' },
-          { label: 'Scheduled', count: scheduledTests.length, color: '#3b82f6' },
-          { label: 'Completed', count: completedTests.length, color: '#a855f7' },
+          { label: 'Draft',     count: draftCount ?? 0,     color: '#64748b' },
+          { label: 'Ready',     count: readyCount ?? 0,     color: '#22c55e' },
+          { label: 'Scheduled', count: scheduledCount ?? 0, color: '#3b82f6' },
+          { label: 'Completed', count: completedCount ?? 0, color: '#a855f7' },
         ]
-        const totalTests = interviews.length || 1
+        // Denominator only — `|| 1` keeps the arc maths finite before the counts land.
+        const totalTests = testsTotal || 1
 
         // SVG donut
         const R = 54, CX = 70, CY = 70, stroke = 18
@@ -1534,7 +1545,9 @@ export default function InterviewerDashboard() {
                   : myMeetings.length > upcomingMeetings.length ? `next ${upcomingMeetings.length} shown below`
                   : 'all shown below',
                 '#3b82f6', Calendar, 'interviews', 'View my interviews')}
-              {statCard('Tests Ready', readyTests.length, `${draftTests.length} draft · ${scheduledTests.length} scheduled`, '#22c55e', CheckCircle2, 'interviews', 'View my interviews')}
+              {statCard('Tests Ready', readyCount == null ? '—' : readyCount,
+                ivCounts == null ? 'Loading…' : `${draftCount} draft · ${scheduledCount} scheduled`,
+                '#22c55e', CheckCircle2, 'interviews', 'View my interviews')}
               {statCard('Assigned Jobs', assignments.length, assignments.length > 0 ? `${assignments.reduce((s, a) => s + (a.candidate_count || 0), 0)} candidates` : 'No jobs assigned', '#f59e0b', Briefcase, 'request-candidates', 'Request candidates')}
               {statCard('Candidate Requests', crRequests.length, `${pendingRequests.length} pending review`, '#a855f7', Users, 'request-candidates', 'Review candidate requests')}
             </div>
@@ -1546,7 +1559,7 @@ export default function InterviewerDashboard() {
                 <div style={{ fontWeight: 700, fontSize: '1rem', marginBottom: 16 }}>Test Pipeline</div>
                 <div style={{ display: 'flex', gap: 20, alignItems: 'center' }}>
                   <svg width={140} height={140} viewBox="0 0 140 140">
-                    {interviews.length === 0 ? (
+                    {testsTotal === 0 ? (
                       <circle cx={CX} cy={CY} r={R} fill="none" stroke="var(--border-subtle)" strokeWidth={stroke} />
                     ) : donutSegments.map((seg, i) => seg.count > 0 && (
                       <circle key={i} cx={CX} cy={CY} r={R} fill="none"
@@ -1556,7 +1569,7 @@ export default function InterviewerDashboard() {
                         style={{ transition: 'stroke-dasharray 0.4s ease' }}
                         transform={`rotate(-90 ${CX} ${CY})`} />
                     ))}
-                    <text x={CX} y={CY - 6} textAnchor="middle" style={{ fontSize: 22, fontWeight: 700, fill: 'var(--text-primary)' }}>{interviews.length}</text>
+                    <text x={CX} y={CY - 6} textAnchor="middle" style={{ fontSize: 22, fontWeight: 700, fill: 'var(--text-primary)' }}>{testsTotal == null ? '—' : testsTotal}</text>
                     <text x={CX} y={CY + 12} textAnchor="middle" style={{ fontSize: 11, fill: 'var(--text-secondary)' }}>total</text>
                   </svg>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 8, flex: 1 }}>
@@ -1625,14 +1638,14 @@ export default function InterviewerDashboard() {
               <div style={{ background: 'var(--bg-secondary)', borderRadius: 14, padding: 24, border: '1px solid var(--border-subtle)' }}>
                 <div style={{ fontWeight: 700, fontSize: '1rem', marginBottom: 4 }}>Question Bank</div>
                 <div style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', marginBottom: 16 }}>
-                  {dashStats?.total_questions ?? '—'} questions · {dashStats?.total_interviews ?? interviews.length} tests
+                  {dashStats?.total_questions ?? '—'} questions · {testsTotal ?? '—'} tests
                 </div>
                 {Object.keys(qtMap).length === 0 ? (
                   <div>
                     {/* Difficulty breakdown from interviews */}
                     {['DRAFT', 'READY', 'SCHEDULED', 'COMPLETED'].map(s => {
                       const cnt = interviews.filter(i => i.status === s).length
-                      const pct = interviews.length ? Math.round((cnt / interviews.length) * 100) : 0
+                      const pct = testsTotal ? Math.round((cnt / testsTotal) * 100) : 0
                       const color = { DRAFT: '#64748b', READY: '#22c55e', SCHEDULED: '#3b82f6', COMPLETED: '#a855f7' }[s]
                       return (
                         <div key={s} style={{ marginBottom: 10 }}>
@@ -1701,7 +1714,7 @@ export default function InterviewerDashboard() {
             </div>
 
             {/* Row 4: Recent Tests */}
-            {interviews.length > 0 && (
+            {testsTotal > 0 && (
               <div style={{ background: 'var(--bg-secondary)', borderRadius: 14, padding: 24, border: '1px solid var(--border-subtle)' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
                   <div style={{ fontWeight: 700, fontSize: '1rem' }}>Recent Tests</div>

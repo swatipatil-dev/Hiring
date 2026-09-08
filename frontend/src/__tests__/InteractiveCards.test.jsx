@@ -29,6 +29,7 @@ vi.mock('recharts', async () => {
 import api from '../api/client'
 import InterviewerDashboard from '../pages/interviewer/InterviewerDashboard'
 import SuperAdminDashboard from '../pages/superadmin/SuperAdminDashboard'
+import HRDashboard from '../pages/hr/HRDashboard'
 
 const userEvent = async () => (await import('@testing-library/user-event')).default
 
@@ -59,6 +60,8 @@ describe('Interviewer dashboard stat cards', () => {
     api.get.mockImplementation((url) => {
       const u = String(url)
       if (u === '/interviewer/my-meetings') return Promise.resolve({ data: MEETINGS })
+      if (u === '/interviewer/interviews/counts')
+        return Promise.resolve({ data: { total: 62, draft: 1, ready: 60, scheduled: 1, completed: 0, by_status: { DRAFT: 1, READY: 60, SCHEDULED: 1 } } })
       if (u === '/interviewer/interviews') return Promise.resolve({ data: INTERVIEWS })
       if (u === '/interviewer/my-assignments') return Promise.resolve({ data: [] })
       if (u === '/interviewer/candidate-requests') return Promise.resolve({ data: [] })
@@ -77,9 +80,16 @@ describe('Interviewer dashboard stat cards', () => {
 
   it('puts the value in the accessible name, not just the label', async () => {
     renderIv()
-    // "2Tests Ready" is what the raw text content reads; the label has to spell it out.
-    const card = await screen.findByRole('button', { name: /^Tests Ready: 2\./ })
+    // "60Tests Ready" is what the raw text content reads; the label has to spell it out.
+    const card = await screen.findByRole('button', { name: /^Tests Ready: 60\./ })
     expect(card).toBeTruthy()
+  })
+
+  it('reports every test, not the page of 50 the list endpoint returns', async () => {
+    renderIv()
+    // The mocked list holds 3 rows; the count endpoint says 60 are READY. The card has
+    // to believe the count — deriving it from the list is what capped it at 50.
+    expect(await screen.findByRole('button', { name: /^Tests Ready: 60\./ })).toBeTruthy()
   })
 
   it('counts every meeting assigned, not the five it lists below', async () => {
@@ -144,5 +154,52 @@ describe('Super-admin stat cards', () => {
     await waitFor(() => expect(screen.getByText(/Active Clients \(1\)/)).toBeTruthy())
     await user.click(screen.getByRole('button', { name: /Clear filter/i }))
     await waitFor(() => expect(screen.getByText(/Client Companies \(2\)/)).toBeTruthy())
+  })
+})
+
+describe('Counts come from the server, not from the fetched page', () => {
+  const HR_COUNTS = { jobs: 80, active_jobs: 61, interviews: 55, offers: 12 }
+
+  const renderHr = () =>
+    render(<MemoryRouter initialEntries={['/hr']}><HRDashboard /></MemoryRouter>)
+
+  it('HR cards report the company total, not the 50 rows the list returns', async () => {
+    api.get.mockImplementation((url) => {
+      const u = String(url)
+      if (u === '/hr/dashboard/counts') return Promise.resolve({ data: HR_COUNTS })
+      // One job in the page. Counting this array is what produced the capped number.
+      if (u === '/hr/jobs') return Promise.resolve({ data: [{ id: 'j1', title: 'A', status: 'active' }] })
+      return Promise.resolve({ data: [] })
+    })
+    renderHr()
+    expect(await screen.findByRole('button', { name: /^Job Postings: 80\./ })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /^Active Jobs: 61\./ })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /^Interviews: 55\./ })).toBeTruthy()
+  })
+
+  it('shows a dash rather than zero while the counts are still loading', async () => {
+    api.get.mockImplementation((url) => {
+      const u = String(url)
+      // Never resolves — the state a slow network leaves the card in.
+      if (u === '/hr/dashboard/counts') return new Promise(() => {})
+      return Promise.resolve({ data: [] })
+    })
+    renderHr()
+    // A flash of 0 reads as "you have no jobs", not as "not loaded yet".
+    const card = await screen.findByRole('button', { name: /^Job Postings, loading count/ })
+    expect(card.textContent).toContain('—')
+    expect(card.textContent).not.toContain('0')
+  })
+
+  it('still says loading rather than zero when the counts request fails', async () => {
+    api.get.mockImplementation((url) => {
+      const u = String(url)
+      if (u === '/hr/dashboard/counts') return Promise.reject(new Error('500'))
+      return Promise.resolve({ data: [] })
+    })
+    renderHr()
+    // A failed fetch must not be reported as a confident zero.
+    const card = await screen.findByRole('button', { name: /^Offers, loading count/ })
+    expect(card.textContent).toContain('—')
   })
 })

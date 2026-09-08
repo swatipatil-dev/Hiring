@@ -5044,6 +5044,75 @@ async def schedule_interview(
         "scheduled_datetime": db_interview.scheduled_datetime
     }
 
+class DashboardCounts(BaseModel):
+    jobs: int
+    active_jobs: int
+    interviews: int
+    offers: int
+
+
+@router.get("/dashboard/counts", response_model=DashboardCounts)
+async def get_dashboard_counts(
+    current_user: User = Depends(AuthMiddleware.get_current_hr),
+    db: Session = Depends(get_db),
+):
+    """Totals for the HR overview cards.
+
+    The cards used to count the arrays the dashboard had already fetched, but
+    GET /jobs, /interviews and /offers all default to limit=50 and the dashboard
+    passes no limit — so an HR with 80 jobs saw "50", and the number silently
+    stopped moving at the cap. Counting in SQL is also cheaper than shipping
+    hundreds of serialised rows just to take their length.
+
+    Each count below repeats the scoping of the list endpoint it describes,
+    deliberately and line for line, so a card can never disagree with the list it
+    opens. That includes the `if current_user.company_id:` guards on interviews and
+    offers, which DASHBOARD_DATA_PITFALLS.md #2 rightly calls a mistake — but
+    fixing it here and not there would make the count and the list disagree, which
+    is the one thing this endpoint exists to prevent. Fix both together or neither.
+    """
+    # Admins see every job in the company; everyone else is scoped to their own,
+    # matching the list endpoints.
+    own_only = current_user.role != "admin"
+    hr_profile = get_hr_profile(db, current_user) if own_only else None
+
+    # ── jobs ── mirrors GET /jobs
+    jobs_q = db.query(func.count(JobPosting.id)).filter(
+        JobPosting.company_id == current_user.company_id
+    )
+    if own_only:
+        jobs_q = jobs_q.filter(JobPosting.hr_id == hr_profile.id)
+    jobs = jobs_q.scalar() or 0
+
+    # The card reads "Active Jobs" and the click filters status=active, so count
+    # exactly that one status rather than "not closed".
+    # .filter() returns a new Query rather than mutating jobs_q, so this is the same
+    # scoping narrowed by one status, not a second pass over a consumed query.
+    active_jobs = jobs_q.filter(JobPosting.status == "active").scalar() or 0
+
+    # ── interviews ── mirrors GET /interviews
+    iv_q = db.query(func.count(Interview.id)).join(
+        JobPosting, Interview.job_id == JobPosting.id
+    )
+    if current_user.company_id:
+        iv_q = iv_q.filter(JobPosting.company_id == current_user.company_id)
+    if own_only:
+        iv_q = iv_q.filter(JobPosting.hr_id == hr_profile.id)
+    interviews = iv_q.scalar() or 0
+
+    # ── offers ── mirrors GET /offers
+    of_q = db.query(func.count(Offer.id)).join(Candidate).join(JobPosting)
+    if current_user.company_id:
+        of_q = of_q.filter(JobPosting.company_id == current_user.company_id)
+    if own_only:
+        of_q = of_q.filter(Offer.hr_id == hr_profile.id)
+    offers = of_q.scalar() or 0
+
+    return DashboardCounts(
+        jobs=jobs, active_jobs=active_jobs, interviews=interviews, offers=offers
+    )
+
+
 @router.get("/interviews")
 async def get_scheduled_interviews(
     skip: int = 0,
