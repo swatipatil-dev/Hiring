@@ -1582,9 +1582,22 @@ HR Team`,
                       <div style={{ padding: '20px 22px 0' }}>
                         <div className="flex-between" style={{ marginBottom: 4 }}>
                           <h3 style={{ fontSize: '1.05rem', margin: 0 }}>{j.title}</h3>
-                          <span className={`badge ${j.status === 'active' ? 'badge-green' : j.status === 'closed' ? 'badge-neutral' : 'badge-amber'}`}>
-                            {j.status === 'active' ? 'Open' : j.status === 'closed' ? 'Closed' : j.status}
-                          </span>
+                          <div className="flex gap-6" style={{ alignItems: 'center' }}>
+                            {/* The status badge is the JOB's lifecycle and says nothing about
+                                its test, so a job holding an unfinished draft used to look
+                                identical to one with no test at all. */}
+                            {j.has_test && (
+                              <span className={`badge ${String(j.test_status || '').toUpperCase() === 'DRAFT' ? 'badge-amber' : 'badge-green'}`}
+                                title={String(j.test_status || '').toUpperCase() === 'DRAFT'
+                                  ? 'An unfinished test draft is attached to this job'
+                                  : `Test status: ${j.test_status}`}>
+                                {String(j.test_status || '').toUpperCase() === 'DRAFT' ? 'Test: draft' : 'Test: ready'}
+                              </span>
+                            )}
+                            <span className={`badge ${j.status === 'active' ? 'badge-green' : j.status === 'closed' ? 'badge-neutral' : 'badge-amber'}`}>
+                              {j.status === 'active' ? 'Open' : j.status === 'closed' ? 'Closed' : j.status}
+                            </span>
+                          </div>
                         </div>
                         <div style={{ fontSize: '0.78rem', color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono)', marginBottom: 16 }}>
                           REQ-{j.id?.slice(0, 8)?.toUpperCase() || '000'}
@@ -1640,10 +1653,20 @@ HR Team`,
                           onClick={() => setViewJob(j)}>
                           Open Job
                         </button>
-                        <button className="btn btn-secondary btn-sm" style={{ flex: 1, justifyContent: 'center', borderRadius: 8 }}
-                          onClick={() => openCreateTest(j.id)} title="Create an assessment for this job">
-                          <ClipboardList size={14} /> Create Test
-                        </button>
+                        {(() => {
+                          // Same action either way, but "Create Test" promised a new test and
+                          // delivered a half-finished one.
+                          const isDraft = j.has_test && String(j.test_status || '').toUpperCase() === 'DRAFT'
+                          return (
+                            <button className="btn btn-secondary btn-sm" style={{ flex: 1, justifyContent: 'center', borderRadius: 8 }}
+                              onClick={() => openCreateTest(j.id)}
+                              title={isDraft
+                                ? 'Continue the unfinished test draft for this job'
+                                : 'Create an assessment for this job'}>
+                              <ClipboardList size={14} /> {isDraft ? 'Resume Draft' : 'Create Test'}
+                            </button>
+                          )
+                        })()}
                       </div>
                     </div>
                   )

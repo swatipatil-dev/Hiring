@@ -119,6 +119,10 @@ export default function CreateTestWizard({
   const [csvUploading, setCsvUploading] = useState(false)
   const csvInputRef = useRef(null)   // one hidden <input type=file> shared by every MCQ pool card
 
+  // Set when picking a job pulled its unfinished draft in, so the wizard filling itself is
+  // explained rather than looking like stale state.
+  const [resumedDraft, setResumedDraft] = useState(null)
+
   const [replacingQ, setReplacingQ] = useState(null)
   const [genLoading, setGenLoading] = useState(false)
 
@@ -170,6 +174,38 @@ export default function CreateTestWizard({
   }
 
   // Apply a job/candidate-request selection to the form (shared by the dropdown + preselect).
+  /**
+   * Can this job still be picked? A job whose only test is an unfinished DRAFT can — you
+   * resume that draft. A job with a finished test cannot: POST /interviews/draft answers 409.
+   *
+   * Fails closed. has_test with an unrecognised status counts as blocked, not resumable,
+   * so a status we don't know about never opens an edit path we can't honour.
+   */
+  const isResumableDraft = (job) =>
+    !!job?.has_test && String(job?.test_status || '').toUpperCase() === 'DRAFT' && !!job?.test_id
+
+  // Pull the job's unfinished draft into the wizard. /interviewer/tests/drafts returns the
+  // same _test_payload shape loadDraftIntoWizard already consumes, so there is nothing to
+  // reshape and no new endpoint.
+  const jobDraftLoadingRef = useRef(null)   // job_id currently loading — guards a double-change
+  const loadDraftForJob = async (job) => {
+    if (jobDraftLoadingRef.current === job.job_id) return
+    jobDraftLoadingRef.current = job.job_id
+    setResumedDraft(null)
+    try {
+      const r = await api.get('/interviewer/tests/drafts')
+      const draft = (r.data?.drafts || []).find(d => String(d.id) === String(job.test_id))
+      if (draft) {
+        await loadDraftIntoWizard(draft)
+        setResumedDraft(draft)
+      }
+    } catch {
+      // Non-fatal: the wizard still works as a fresh one, and ensureDraft() will reuse the
+      // same draft server-side anyway. Staying silent beats blocking on a banner.
+    }
+    jobDraftLoadingRef.current = null
+  }
+
   const applyJobSelection = (val) => {
     const job = allJobs.find(j => j.job_id === val)
     const cr = crRequests.find(r => r.id === val)
@@ -182,6 +218,11 @@ export default function CreateTestWizard({
         job_title: job.job_title,
         interview_type: mapped || prev.interview_type,
       }))
+      // The draft is the source of truth and deliberately overwrites what was just set.
+      // Skipped when the parent handed us an openDraft: the Exam Drafts tab sets both that
+      // and preselectedJobId, and that path already loads the same draft.
+      if (isResumableDraft(job) && !openDraft) loadDraftForJob(job)
+      else if (!isResumableDraft(job)) setResumedDraft(null)
     } else if (cr) {
       const skills = Array.isArray(cr.required_skills)
         ? cr.required_skills
@@ -823,12 +864,25 @@ export default function CreateTestWizard({
                 <select className="select" value={ctForm.job_id}
                   onChange={e => applyJobSelection(e.target.value)}>
                   <option value="">Select a job...</option>
-                  {allJobs.filter(j => !j.has_test).length > 0 && <optgroup label="Job Postings">
-                    {allJobs.filter(j => !j.has_test).map(j => (
-                      <option key={j.job_id} value={j.job_id}>
-                        {j.job_title} — {j.department}{j.status !== 'active' ? ` (${j.status})` : ''}
-                      </option>
-                    ))}
+                  {allJobs.length > 0 && <optgroup label="Job Postings">
+                    {allJobs.map(j => {
+                      const draft = isResumableDraft(j)
+                      // Blocked jobs stay VISIBLE but disabled. Filtering them out made a job
+                      // vanish with no explanation — and worse, a preselected job that had a
+                      // draft had no matching <option>, so the select fell back to showing
+                      // "Select a job..." while ctForm.job_id was in fact set.
+                      const blocked = j.has_test && !draft
+                      const suffix = draft
+                        ? ' (draft in progress)'
+                        : blocked
+                          ? ' (test already exists)'
+                          : j.status !== 'active' ? ` (${j.status})` : ''
+                      return (
+                        <option key={j.job_id} value={j.job_id} disabled={blocked}>
+                          {j.job_title} — {j.department}{suffix}
+                        </option>
+                      )
+                    })}
                   </optgroup>}
                   {showCandidateRequests && (() => {
                     const unmatchedRequests = crRequests.filter(r => !r.job_id)
@@ -843,6 +897,14 @@ export default function CreateTestWizard({
                     ) : null
                   })()}
                 </select>
+                {resumedDraft && (
+                  <div style={{ marginTop: 10, fontSize: '0.8rem', color: 'var(--accent-primary)', fontWeight: 600 }}>
+                    Resuming an unfinished draft for this job —{' '}
+                    {resumedDraft.question_count > 0
+                      ? `${resumedDraft.question_count} question${resumedDraft.question_count === 1 ? '' : 's'} already in the pool.`
+                      : 'nothing generated in it yet.'}
+                  </div>
+                )}
               </div>
               <div className="grid-2">
                 <div className="input-group">

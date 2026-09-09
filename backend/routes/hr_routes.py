@@ -215,6 +215,14 @@ class JobPostingResponse(BaseModel):
     created_at: datetime
     assigned_interviewer_email: Optional[str] = None
     assigned_interviewer_name: Optional[str] = None
+    # The job's assessment, if one has been started. `status` above is the JOB's own
+    # lifecycle and says nothing about its test — which is why a job holding an unfinished
+    # draft looked identical to one with no test at all.
+    # Defaulted: only the list endpoint populates these; the other create_job_response
+    # call sites leave them alone.
+    has_test: bool = False
+    test_id: Optional[int] = None
+    test_status: Optional[str] = None
 
 class CandidateATSResponse(BaseModel):
     candidate_id: str
@@ -374,8 +382,13 @@ async def get_tests_for_job(
     ]
 
 
-def create_job_response(job: JobPosting) -> JobPostingResponse:
-    """Create job posting response"""
+def create_job_response(job: JobPosting, test: Optional[Interview] = None) -> JobPostingResponse:
+    """Create job posting response.
+
+    ``test`` is the job's template Interview when the caller has already looked it up in
+    bulk. Left None the response reports no test, which is what every single-job caller
+    wants — only the list endpoint pays for the lookup.
+    """
     interviewer_email = None
     interviewer_name = None
     if hasattr(job, 'interviewer') and job.interviewer:
@@ -399,7 +412,10 @@ def create_job_response(job: JobPosting) -> JobPostingResponse:
         status=job.status,
         created_at=job.created_at,
         assigned_interviewer_email=interviewer_email,
-        assigned_interviewer_name=interviewer_name
+        assigned_interviewer_name=interviewer_name,
+        has_test=test is not None,
+        test_id=test.id if test else None,
+        test_status=test.status if test else None,
     )
 
 def update_candidate_stage(db: Session, candidate_id: str, new_stage: str, changed_by_id: str, notes: str = None):
@@ -591,7 +607,24 @@ async def get_my_jobs(
 
     jobs = query.order_by(JobPosting.created_at.desc()).offset(skip).limit(limit).all()
 
-    return [create_job_response(job) for job in jobs]
+    # Each job's template test, in ONE query rather than one per card. candidate_id IS NULL
+    # is what separates a template from a per-candidate attempt; a DRAFT counts, because a
+    # job holding an unfinished draft cannot take a second test either.
+    tests_by_job = {}
+    job_ids = [j.id for j in jobs]
+    if job_ids:
+        for iv in db.query(Interview).filter(
+            Interview.job_id.in_(job_ids),
+            Interview.candidate_id.is_(None),
+        ).all():
+            # Several templates for one job should not happen (create_draft_interview is
+            # get-or-create), but if it does, prefer a finished test over a draft — that is
+            # the one that actually blocks creating another.
+            existing = tests_by_job.get(iv.job_id)
+            if existing is None or (existing.status or "").upper() == "DRAFT":
+                tests_by_job[iv.job_id] = iv
+
+    return [create_job_response(job, tests_by_job.get(job.id)) for job in jobs]
 
 
 # ==================== RESUME MATCHER (reverse ATS) ====================
