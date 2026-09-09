@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import axios from 'axios'
 import {
   Plus, XCircle, Loader2, Brain, Eye, BookOpen, CheckCircle2,
-  RefreshCw, Filter, Square, CheckSquare, Send
+  RefreshCw, Filter, Square, CheckSquare, Send, Upload, FileText
 } from 'lucide-react'
 import api from '../../api/client'
 
@@ -108,6 +108,17 @@ export default function CreateTestWizard({
   const [prevQFilters, setPrevQFilters] = useState({ difficulty: 'all', status: 'all' })
   const [prevQSelected, setPrevQSelected] = useState(new Set())
   const [prevQImporting, setPrevQImporting] = useState(false)
+
+  // Manual MCQ entry + CSV bulk import. Both feed the same pool the AI generator fills,
+  // so a question typed by hand is indistinguishable downstream from a generated one.
+  const [manualQPopup, setManualQPopup] = useState(null)          // { skillIndex, typeIndex } | null
+  const [manualQForm, setManualQForm] = useState({ question_text: '', options: ['', '', '', ''], correct: 0 })
+  const [manualQSaving, setManualQSaving] = useState(false)
+  const [manualQAddedCount, setManualQAddedCount] = useState(0)
+  const [csvTarget, setCsvTarget] = useState(null)                // { skillIndex, typeIndex } | null
+  const [csvUploading, setCsvUploading] = useState(false)
+  const csvInputRef = useRef(null)   // one hidden <input type=file> shared by every MCQ pool card
+
   const [replacingQ, setReplacingQ] = useState(null)
   const [genLoading, setGenLoading] = useState(false)
 
@@ -489,6 +500,129 @@ export default function CreateTestWizard({
       alert('Failed to import questions: ' + (err.response?.data?.detail || err.message))
     }
     setPrevQImporting(false)
+  }
+
+  // ─────────── Manual MCQ entry + CSV upload ───────────
+  const openManualQuestion = (skillIndex, typeIndex) => {
+    const skill = ctForm.skills[skillIndex]
+    if (!skill?.name?.trim()) { alert('Please enter a skill name first'); return }
+    setManualQForm({ question_text: '', options: ['', '', '', ''], correct: 0 })
+    setManualQAddedCount(0)
+    setManualQPopup({ skillIndex, typeIndex })
+  }
+
+  const addManualQuestion = async () => {
+    if (!manualQPopup) return
+    const skill = ctForm.skills[manualQPopup.skillIndex]
+    const qt = skill?.question_types[manualQPopup.typeIndex]
+    if (!skill || !qt) return
+    const qtext = manualQForm.question_text.trim()
+    const opts = manualQForm.options.map(o => o.trim())
+    if (!qtext) { alert('Please enter the question text'); return }
+    if (opts.some(o => !o)) { alert('Please fill in all four options'); return }
+    const poolKey = getPoolKey(skill.name, qt.type)
+    const letter = ['A', 'B', 'C', 'D'][manualQForm.correct] || 'A'
+
+    let interviewId
+    try {
+      interviewId = await ensureDraft()
+    } catch (err) {
+      alert('Failed to create draft interview: ' + (err.response?.data?.detail || err.message))
+      return
+    }
+
+    setManualQSaving(true)
+    try {
+      const res = await qApi.post(`/interviews/${interviewId}/manual-questions`, {
+        skill_name: skill.name,
+        question_type: 'multiple_choice',
+        difficulty: skill.difficulty,
+        marks_per_question: skill.marks_per_question || 1,
+        questions: [{ question_text: qtext, options: opts, correct_answer: letter }],
+      })
+      const added = res.data?.questions || []
+      if (added.length === 0) {
+        // The backend de-dupes by normalized question text and returns an empty list
+        // rather than an error, so an empty response is the duplicate signal.
+        alert(res.data?.message || 'Question not added (possibly a duplicate)')
+      } else {
+        setSkillQuestionPool(prev => ({
+          ...prev,
+          [poolKey]: [...(prev[poolKey] || []), ...added],
+        }))
+        setManualQAddedCount(c => c + added.length)
+        // Clear the form so the user can immediately add another
+        setManualQForm({ question_text: '', options: ['', '', '', ''], correct: 0 })
+      }
+    } catch (err) {
+      alert('Failed to add question: ' + (err.response?.data?.detail || err.message))
+    }
+    setManualQSaving(false)
+  }
+
+  const triggerCsvUpload = (skillIndex, typeIndex) => {
+    const skill = ctForm.skills[skillIndex]
+    if (!skill?.name?.trim()) { alert('Please enter a skill name first'); return }
+    setCsvTarget({ skillIndex, typeIndex })
+    if (csvInputRef.current) { csvInputRef.current.value = ''; csvInputRef.current.click() }
+  }
+
+  const handleCsvSelected = async (e) => {
+    const fileEl = e.target
+    const file = fileEl.files?.[0]
+    if (!file || !csvTarget) return
+    const skill = ctForm.skills[csvTarget.skillIndex]
+    const qt = skill?.question_types[csvTarget.typeIndex]
+    if (!skill || !qt) { fileEl.value = ''; return }
+    const poolKey = getPoolKey(skill.name, qt.type)
+
+    let interviewId
+    try {
+      interviewId = await ensureDraft()
+    } catch (err) {
+      alert('Failed to create draft interview: ' + (err.response?.data?.detail || err.message))
+      fileEl.value = ''
+      return
+    }
+
+    setCsvUploading(true)
+    try {
+      const fd = new FormData()
+      fd.append('file', file)
+      fd.append('skill_name', skill.name)
+      fd.append('question_type', 'multiple_choice')
+      fd.append('difficulty', skill.difficulty)
+      fd.append('marks_per_question', String(skill.marks_per_question || 1))
+      const res = await qApi.post(`/interviews/${interviewId}/manual-questions/csv`, fd, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      })
+      const added = res.data?.questions || []
+      setSkillQuestionPool(prev => ({
+        ...prev,
+        [poolKey]: [...(prev[poolKey] || []), ...added],
+      }))
+      alert(res.data?.message || `Imported ${added.length} question(s)`)
+    } catch (err) {
+      alert('Failed to import CSV: ' + (err.response?.data?.detail || err.message))
+    }
+    setCsvUploading(false)
+    fileEl.value = ''
+  }
+
+  const downloadCsvTemplate = () => {
+    const rows = [
+      ['question', 'option_a', 'option_b', 'option_c', 'option_d', 'correct_option'],
+      ['What is 2 + 2?', '3', '4', '5', '6', 'B'],
+      ['Capital of France?', 'Paris', 'London', 'Berlin', 'Rome', 'A'],
+    ]
+    const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\r\n')
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = 'mcq_template.csv'
+    a.click()
+    URL.revokeObjectURL(url)
   }
 
   const handleCreateTest = async () => {
@@ -1096,6 +1230,19 @@ export default function CreateTestWizard({
                               onClick={() => openPreviousQuestionsPopup(realIndex, ti)}>
                               <BookOpen size={12} /> Use Previous
                             </button>
+                            {qt.type === 'multiple_choice' && (<>
+                              <button className="btn btn-secondary btn-sm" style={{ whiteSpace: 'nowrap', fontSize: '0.78rem' }}
+                                onClick={() => openManualQuestion(realIndex, ti)}>
+                                <Plus size={12} /> Add Manually
+                              </button>
+                              <button className="btn btn-secondary btn-sm" style={{ whiteSpace: 'nowrap', fontSize: '0.78rem' }}
+                                disabled={csvUploading}
+                                onClick={() => triggerCsvUpload(realIndex, ti)}>
+                                {csvUploading
+                                  ? <><Loader2 size={12} className="spin" /> Uploading...</>
+                                  : <><Upload size={12} /> CSV</>}
+                              </button>
+                            </>)}
                           </div>
                           {stats.total > 0 && stats.accepted < needed && (
                             <div style={{ fontSize: '0.7rem', color: '#ef4444', fontWeight: 600 }}>
@@ -1747,6 +1894,57 @@ export default function CreateTestWizard({
           </div>
         )
       })()}
+
+      {/* ─────────── Add MCQ manually ─────────── */}
+      {manualQPopup !== null && (() => {
+        const skill = ctForm.skills[manualQPopup.skillIndex]
+        const qt = skill?.question_types[manualQPopup.typeIndex]
+        if (!skill || !qt) return null
+        return (
+          <div className="modal-overlay" onClick={() => setManualQPopup(null)} style={{ zIndex: 1200 }}>
+            <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 640, maxHeight: '90vh', overflow: 'auto' }}>
+              <h2 style={{ marginTop: 0, marginBottom: 6 }}>Add MCQ manually</h2>
+              <div style={{ fontSize: '0.8rem', color: 'var(--text-tertiary)', marginBottom: 16 }}>
+                Skill: <strong>{skill.name}</strong> · Multiple Choice
+                {manualQAddedCount > 0 && <span style={{ color: '#16a34a', marginLeft: 8, fontWeight: 600 }}>· {manualQAddedCount} added</span>}
+              </div>
+              <div className="input-group" style={{ marginBottom: 14 }}>
+                <label>Question</label>
+                <textarea className="textarea" rows={3} value={manualQForm.question_text}
+                  onChange={e => setManualQForm(f => ({ ...f, question_text: e.target.value }))}
+                  placeholder="Enter the question" />
+              </div>
+              <div style={{ fontSize: '0.72rem', fontWeight: 700, textTransform: 'uppercase', color: 'var(--text-tertiary)', marginBottom: 8 }}>
+                Options — select the radio for the correct answer
+              </div>
+              {['A', 'B', 'C', 'D'].map((L, i) => (
+                <div key={L} style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+                  <input type="radio" name="manualCorrect" checked={manualQForm.correct === i}
+                    onChange={() => setManualQForm(f => ({ ...f, correct: i }))} title="Mark as correct" />
+                  <span style={{ fontWeight: 700, width: 16, color: manualQForm.correct === i ? '#16a34a' : 'var(--text-tertiary)' }}>{L}</span>
+                  <input className="input" style={{ flex: 1 }} value={manualQForm.options[i]}
+                    onChange={e => setManualQForm(f => { const o = [...f.options]; o[i] = e.target.value; return { ...f, options: o } })}
+                    placeholder={`Option ${L}`} />
+                </div>
+              ))}
+              <div style={{ display: 'flex', gap: 10, justifyContent: 'space-between', alignItems: 'center', marginTop: 18, borderTop: '1px solid var(--border-subtle)', paddingTop: 14 }}>
+                <button onClick={downloadCsvTemplate} style={{ background: 'none', border: 'none', color: 'var(--accent-primary, #6366f1)', fontSize: '0.76rem', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 4, padding: 0 }}>
+                  <FileText size={12} /> Download CSV template
+                </button>
+                <div style={{ display: 'flex', gap: 10 }}>
+                  <button className="btn btn-secondary" onClick={() => setManualQPopup(null)}>Done</button>
+                  <button className="btn btn-primary" onClick={addManualQuestion} disabled={manualQSaving}>
+                    {manualQSaving ? <><Loader2 size={13} className="spin" /> Adding...</> : <><Plus size={13} /> Add to Pool</>}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )
+      })()}
+
+      {/* Hidden CSV file input (shared across all MCQ pool cards) */}
+      <input ref={csvInputRef} type="file" accept=".csv,text/csv" style={{ display: 'none' }} onChange={handleCsvSelected} />
     </>
   )
 }
