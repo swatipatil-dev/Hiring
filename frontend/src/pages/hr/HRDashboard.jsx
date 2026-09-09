@@ -9,6 +9,7 @@ import ProctoringReport from '../../components/ProctoringReport'
 import PipelineNotifications from './PipelineNotifications'
 import MailFromPicker from './MailFromPicker'
 import CreateTestWizard from '../shared/CreateTestWizard'
+import ExamDrafts from '../../components/ExamDrafts'
 import ResumeMatcher from './ResumeMatcher'
 
 const CHART_COLORS = ['#2b7cba', '#3b82f6', '#22c55e', '#8b5cf6', '#ef4444', '#06b6d4', '#f59e0b', '#ec4899']
@@ -107,7 +108,7 @@ const UNSENT_STAGES = new Set(['applied', 'ats_screening', 'hr_review'])
 const isMailSent = (c) => !UNSENT_STAGES.has(c.current_stage)
 
 // 'resume-match' is kept as an alias for 'talent-pool' so existing bookmarks still work.
-const TAB_MAP = { jobs: 'jobs', pipeline: 'pipeline', interviews: 'interviews', offers: 'offers', ats: 'ats', 'talent-pool': 'resume-match', 'resume-match': 'resume-match', 'test-results': 'test-results', feedback: 'feedback', requirements: 'requirements', notifications: 'notifications' }
+const TAB_MAP = { jobs: 'jobs', pipeline: 'pipeline', interviews: 'interviews', offers: 'offers', ats: 'ats', 'talent-pool': 'resume-match', 'resume-match': 'resume-match', 'test-results': 'test-results', feedback: 'feedback', requirements: 'requirements', notifications: 'notifications', 'exam-drafts': 'exam-drafts' }
 
 export default function HRDashboard() {
   const location = useLocation()
@@ -128,6 +129,17 @@ export default function HRDashboard() {
   // Job Postings screen renders the wizard; createTestJobId pre-selects a job.
   const [showCreateTest, setShowCreateTest] = useState(false)
   const [createTestJobId, setCreateTestJobId] = useState(null)
+  // A draft picked from the Exam Drafts tab, handed to the wizard to reopen.
+  const [draftToOpen, setDraftToOpen] = useState(null)
+  const closeCreateTest = () => { setShowCreateTest(false); setCreateTestJobId(null); setDraftToOpen(null) }
+  // Resume an unfinished draft. The wizard lives inside the Job Postings screen, so this
+  // switches tabs as well as setting the draft — otherwise nothing would render.
+  const openDraftInWizard = (d) => {
+    setDraftToOpen(d)
+    setCreateTestJobId(d.job_id || null)
+    setShowCreateTest(true)
+    setTab('jobs')
+  }
   const [jobs, setJobs] = useState([])
   const [jobsLoading, setJobsLoading] = useState(true)
   const [interviews, setInterviews] = useState([])
@@ -1463,17 +1475,22 @@ HR Team`,
                   <h3 style={{ fontSize: '1.2rem' }}>Create Test</h3>
                   <span className="text-sm text-muted">Build an AI-generated assessment for a job posting</span>
                 </div>
-                <button className="btn btn-secondary" onClick={() => { setShowCreateTest(false); setCreateTestJobId(null) }}>
+                <button className="btn btn-secondary" onClick={closeCreateTest}>
                   ← Back to Job Postings
                 </button>
               </div>
               <CreateTestWizard
+                // Remount per draft. openDraftDoneRef inside the wizard is a one-shot latch,
+                // so without a changing key, opening a second draft would be ignored.
+                key={draftToOpen?.id || 'new'}
                 role="hr"
                 showCandidateRequests={false}
                 preselectedJobId={createTestJobId}
+                openDraft={draftToOpen}
+                onDraftConsumed={() => setDraftToOpen(null)}
                 onSaved={fetchJobs}
                 onPublished={fetchJobs}
-                onNavigateAway={() => { setShowCreateTest(false); setCreateTestJobId(null) }}
+                onNavigateAway={closeCreateTest}
               />
             </div>
           )
@@ -2497,6 +2514,12 @@ HR Team`,
       )}
 
       {tab === 'resume-match' && <ResumeMatcher />}
+
+      {/* ═══════════ EXAM DRAFTS TAB ═══════════ */}
+      {/* Shared with the interviewer dashboard — see components/ExamDrafts.jsx. Until this
+          existed, an HR user who abandoned the wizard had no way back to the draft and no way
+          to free the job it was holding, because /hr/jobs/{id}/tests deliberately hides drafts. */}
+      {tab === 'exam-drafts' && <ExamDrafts onContinue={openDraftInWizard} />}
 
       {/* ═══════════ TEST RESULTS TAB — same pattern as ATS ═══════════ */}
       {tab === 'test-results' && (() => {

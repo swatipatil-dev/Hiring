@@ -13,6 +13,7 @@ import './InterviewerDashboard.css'
 // shared with the HR one so both produce the same duration.
 import { TYPE_LABELS, TYPE_TIME_DEFAULTS, computeDuration } from '../shared/CreateTestWizard'
 import ProctoringReport from '../../components/ProctoringReport'
+import ExamDrafts from '../../components/ExamDrafts'
 import Header from '../../components/Header'
 
 // Separate axios instance for /interviews/* routes (not under /api/v1)
@@ -314,7 +315,6 @@ export default function InterviewerDashboard() {
   // that path is route-shadowed server-side and 500s whenever a DRAFT exists.
   const [eeSection, setEeSection] = useState('exams')      // exams | drafts | questions
   const [eeTests, setEeTests] = useState([])
-  const [eeDrafts, setEeDrafts] = useState([])
   const [eeLoading, setEeLoading] = useState(false)
   const [eeOpenTest, setEeOpenTest] = useState(null)       // id of the test whose editor is expanded
   const [eeDraftVals, setEeDraftVals] = useState({})       // unsaved edits for the open test
@@ -341,13 +341,6 @@ export default function InterviewerDashboard() {
       .catch(err => { setEeTests([]); setEeError(`Couldn't load tests — ${eeErrText(err)}`) })
       .finally(() => setEeLoading(false))
   }
-  const fetchEeDrafts = () => {
-    setEeLoading(true); setEeError('')
-    api.get('/interviewer/tests/drafts')
-      .then(r => setEeDrafts(r.data?.drafts || []))
-      .catch(err => { setEeDrafts([]); setEeError(`Couldn't load drafts — ${eeErrText(err)}`) })
-      .finally(() => setEeLoading(false))
-  }
   const fetchEeSkills = () => {
     setEeLoading(true); setEeError('')
     api.get('/interviewer/skills')
@@ -360,8 +353,8 @@ export default function InterviewerDashboard() {
   useEffect(() => {
     if (tab !== 'edit-exam') return
     setEeMsg('')
+    // 'drafts' is absent on purpose: <ExamDrafts/> fetches for itself.
     if (eeSection === 'exams') fetchEeTests()
-    else if (eeSection === 'drafts') fetchEeDrafts()
     else if (eeSection === 'questions') fetchEeSkills()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab, eeSection])
@@ -4508,45 +4501,10 @@ export default function InterviewerDashboard() {
           )}
 
           {/* ───────── Section 2: Exam Drafts ───────── */}
-          {eeSection === 'drafts' && (
-            <div className="card">
-              <h3 style={{ marginBottom: 16 }}>Unfinished Drafts</h3>
-              {eeLoading ? (
-                <div style={{ padding: 30, textAlign: 'center', color: 'var(--text-tertiary)' }}>Loading…</div>
-              ) : eeDrafts.length === 0 ? (
-                <div style={{ padding: 30, textAlign: 'center', color: 'var(--text-tertiary)' }}>
-                  No unfinished drafts.
-                </div>
-              ) : (
-                <div className="table-wrapper">
-                  <table>
-                    <thead><tr><th>Title</th><th>Type</th><th>Questions</th><th>Last edited</th><th>Action</th></tr></thead>
-                    <tbody>
-                      {eeDrafts.map(d => (
-                        <tr key={d.id}>
-                          <td style={{ fontWeight: 600 }}>{d.title || d.job_position || `Draft #${d.id}`}</td>
-                          <td><span className="badge badge-blue">{d.interview_configuration?.interview_type || 'N/A'}</span></td>
-                          <td>
-                            {d.question_count > 0
-                              ? <span className="badge badge-green">{d.question_count}</span>
-                              : <span className="badge badge-neutral" title="Nothing generated yet">empty</span>}
-                          </td>
-                          <td className="mono text-sm">
-                            {d.updated_at ? new Date(d.updated_at).toLocaleDateString() : '—'}
-                          </td>
-                          <td>
-                            <button className="btn btn-ghost btn-sm" onClick={() => loadDraftIntoWizard(d)}>
-                              <Edit3 size={14} /> Continue
-                            </button>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </div>
-          )}
+          {/* Shared with the HR dashboard — see components/ExamDrafts.jsx. It owns its own
+              fetch, so there is no eeDrafts state here. loadDraftIntoWizard already ends with
+              setTab('create-test'), so Continue lands on the wizard unchanged. */}
+          {eeSection === 'drafts' && <ExamDrafts onContinue={loadDraftIntoWizard} />}
 
           {/* ───────── Section 3: Edit Questions ───────── */}
           {eeSection === 'questions' && (

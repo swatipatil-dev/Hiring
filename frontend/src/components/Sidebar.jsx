@@ -26,6 +26,7 @@ const NAV = {
     { to: '/hr/pipeline', icon: KanbanSquare, label: 'Pipeline' },
     { to: '/hr/requirements', icon: UserPlus, label: 'Requirements' },
     { to: '/hr/jobs', icon: Briefcase, label: 'Job Postings' },
+    { to: '/hr/exam-drafts', icon: SlidersHorizontal, label: 'Exam Drafts' },
     { to: '/hr/ats', icon: ScanSearch, label: 'ATS Scores' },
     { to: '/hr/talent-pool', icon: Users, label: 'Talent Pool' },
     { to: '/hr/test-results', icon: ClipboardList, label: 'Test Results' },

@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, status, Depends, Query
 from sqlalchemy.orm import Session
 from typing import List, Optional, Dict, Any, Union
 from src.config.database_config_mysql import get_db
-from src.auth import get_current_user, AuthMiddleware
+from src.auth import get_current_user, AuthMiddleware, require_role
 from src.models.models import Interview, User, Candidate, InterviewerProfile, JobPosting, Department, CandidateRequest, JDTemplate, HRProfile
 from src.services.job_dedup import (
     find_open_duplicate_job, find_open_duplicate_request, duplicate_request_detail,
@@ -1451,26 +1451,70 @@ async def update_interview(
 async def delete_interview(
     interview_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_role(["interviewer", "hr", "admin", "superadmin"]))
 ):
-    """Delete an interview"""
+    """Delete an unfinished DRAFT test.
+
+    Three guards, all load-bearing. This endpoint used to have none of them: it took only
+    get_current_user and looked the interview up by id alone.
+
+    * Role. Any authenticated user — a CANDIDATE included — could delete any interview,
+      template or live attempt with its answers.
+    * Company, explicitly via _company_scope. Interview is TenantScoped, but the auto-filter
+      does NOT reach this handler: against a bare `Interview.id ==` query, Company B's HR
+      successfully deleted Company A's draft (see test_delete_blocks_cross_tenant). That is
+      the same reason every other tenant-safe route in this file filters by hand.
+    * DRAFT templates only. A published test and a candidate's in-flight attempt are not
+      one-click deletable; those need a deliberate flow, not this endpoint.
+    """
     try:
-        interview = db.query(Interview).filter(Interview.id == interview_id).first()
-        
+        interview = _company_scope(
+            db.query(Interview).filter(Interview.id == interview_id),
+            Interview,
+            current_user,
+        ).first()
+
         if not interview:
             raise HTTPException(
                 status_code=404,
                 detail="Interview not found"
             )
-        
+
+        if interview.candidate_id is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="This is a candidate's test attempt, not a draft. It cannot be deleted here."
+            )
+        if (interview.status or "").upper() != "DRAFT":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Only DRAFT tests can be deleted (this one is {interview.status})."
+            )
+
+        # Children are deleted explicitly, not by cascade. Neither backref declares one
+        # (question_models.py:70, :85), so SQLAlchemy's default is to NULL the child FK on
+        # parent delete — which orphans interview_questions into the interview_id IS NULL
+        # state that has no derivable tenant owner, and outright fails on
+        # question_set_assignments, whose interview_id is NOT NULL.
+        from src.models.question_models import (
+            Question as _DelQ,
+            QuestionSetAssignment as _DelQSA,
+            CandidateQuestionHistory as _DelCQH,
+        )
+        db.query(_DelQSA).filter(_DelQSA.interview_id == interview_id).delete(synchronize_session=False)
+        db.query(_DelCQH).filter(_DelCQH.interview_id == interview_id).delete(synchronize_session=False)
+        db.query(_DelQ).filter(_DelQ.interview_id == interview_id).delete(synchronize_session=False)
+
         db.delete(interview)
         db.commit()
-        
-        return {"message": "Interview deleted successfully"}
-        
+
+        return {"message": "Draft deleted successfully"}
+
     except HTTPException:
+        db.rollback()
         raise
     except Exception as e:
+        db.rollback()
         raise HTTPException(
             status_code=500,
             detail=f"Failed to delete interview: {str(e)}"
