@@ -243,6 +243,19 @@ One line, safe to run at any time, and it rewrites nothing:
 mysql -u <user> -p -e "ALTER DATABASE <db> CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;"
 ```
 
+That repairs a database already in this state. Migrations defend themselves against
+it independently, and must: **a `create_table` with a foreign key takes its collation
+from `referenced_collation()` (`backend/migration_helpers.py`), never from the
+database default and never from a hardcoded name.** No two environments agree on
+what that default is — cPanel gives `utf8mb3`, CI's `mysql:8.0` service gives
+`utf8mb4_0900_ai_ci`, and `init_db()` gives `utf8mb4_unicode_ci` — so a named
+collation works in exactly one of them and is rejected with 3780 in the rest. That
+is not hypothetical: `x4n5o6p7q8r9` already carried a workaround for it, and
+`d0t1u2v3w4x5` still took CI red by naming `utf8mb4_unicode_ci` anyway.
+Pass the result as `mysql_collate` alone; MySQL derives the character set
+from it, and the charset behind `utf8mb3_general_ci` is spelled `utf8` on some
+servers and `utf8mb3` on others.
+
 `utf8mb3` also cannot store 4-byte characters, so a table left on it silently
 mangles emoji and several scripts in candidate names and résumé text. After any
 import, check that nothing was left behind:

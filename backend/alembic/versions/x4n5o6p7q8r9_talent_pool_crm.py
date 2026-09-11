@@ -23,10 +23,12 @@ Revision ID: x4n5o6p7q8r9
 Revises: w3m4n5o6p7q8
 Create Date: 2026-07-31 00:00:00.000000
 """
-from typing import Optional, Sequence, Union
+from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
+
+from migration_helpers import referenced_collation
 
 
 revision: str = 'x4n5o6p7q8r9'
@@ -52,22 +54,6 @@ def _has_column(table: str, column: str) -> bool:
 
 def _has_index(table: str, index: str) -> bool:
     return index in {i["name"] for i in _inspector().get_indexes(table)}
-
-
-def _referenced_collation() -> Optional[str]:
-    """Collation of `companies.id`, which the new table's FKs must match.
-
-    Returns None on anything unexpected (a non-MySQL backend, a missing table) so the
-    table is created with the database default — the previous behaviour.
-    """
-    try:
-        return op.get_bind().execute(sa.text(
-            "SELECT COLLATION_NAME FROM information_schema.COLUMNS "
-            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'companies' "
-            "AND COLUMN_NAME = 'id'"
-        )).scalar()
-    except Exception:
-        return None
 
 
 def _drop_fk_on(table: str, column: str) -> None:
@@ -108,17 +94,14 @@ def upgrade() -> None:
             op.create_index(name, POOL, cols)
 
     if not _has_table(ATTACH):
-        # Create with the SAME collation as the columns we point foreign keys at.
-        # A new table otherwise inherits the DATABASE default, and if that differs
-        # from the existing tables' collation MySQL rejects every FK with
-        # "Referencing column ... and referenced column ... are incompatible" (3780).
-        # That is environment-dependent — it passes wherever the database default
-        # happens to match and fails everywhere else — so it must not be left to luck.
+        # Create with the SAME collation as the columns we point foreign keys at —
+        # see referenced_collation() for why this must not be left to the database
+        # default or to a hardcoded name.
         table_kwargs = {}
-        collation = _referenced_collation()
+        collation = referenced_collation(
+            op.get_bind(), ("companies", "id"), ("resume_pool", "id"), ("users", "id"))
         if collation:
-            table_kwargs = {"mysql_charset": collation.split("_")[0],
-                            "mysql_collate": collation}
+            table_kwargs = {"mysql_collate": collation}
 
         op.create_table(
             ATTACH,

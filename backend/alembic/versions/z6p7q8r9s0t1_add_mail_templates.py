@@ -22,6 +22,8 @@ from typing import Sequence, Union
 from alembic import op
 import sqlalchemy as sa
 
+from migration_helpers import referenced_collation
+
 
 revision: str = 'z6p7q8r9s0t1'
 down_revision: Union[str, None] = 'y5o6p7q8r9s0'
@@ -49,6 +51,16 @@ def upgrade() -> None:
     # A fresh database is built by create_all() then stamped, so this table may
     # already exist by the time the migration runs. See docs/DEPLOYMENT_NOTES.md.
     if not _has_table(TABLE):
+        # Create with the SAME collation as the columns the foreign keys point at —
+        # see referenced_collation(). Left to the database default this table is
+        # rejected outright (3780) wherever that default differs from companies.id,
+        # which is every environment but the one it was written on.
+        table_kwargs = {}
+        collation = referenced_collation(
+            op.get_bind(), ("companies", "id"), ("users", "id"))
+        if collation:
+            table_kwargs = {"mysql_collate": collation}
+
         op.create_table(
             TABLE,
             sa.Column("id", sa.String(36), primary_key=True),
@@ -65,6 +77,7 @@ def upgrade() -> None:
             sa.Column("created_at", sa.DateTime, nullable=True),
             sa.Column("updated_at", sa.DateTime, nullable=True),
             sa.UniqueConstraint("company_id", "name", name="uq_mail_tpl_company_name"),
+            **table_kwargs,
         )
 
     if not _has_index(TABLE, "ix_mail_templates_company_id"):
