@@ -1599,6 +1599,78 @@ async def delete_mailbox(
     return {"deleted": True}
 
 
+@router.post("/mailboxes/{mailbox_id}/test")
+async def test_mailbox(
+    mailbox_id: str,
+    payload: EmailTestRequest,
+    current_user: User = Depends(require_role(["admin"])),
+    db: Session = Depends(get_db),
+):
+    """Send a real message using THIS mailbox's own credentials.
+
+    Saving a mailbox does not verify anything — create/update just encrypt
+    whatever password was typed. Without this, a typo is only discovered when a
+    candidate-facing send fails later, and the mailbox quietly falls back to the
+    company default in the meantime. This is the one place that proves the
+    credential actually works.
+
+    Deliberately synchronous (``_send``, not ``dispatch``): a queued send returns
+    "accepted onto the queue" and the auth failure surfaces in the worker log
+    minutes later, which is exactly the false confidence this endpoint exists to
+    remove.
+    """
+    if not current_user.company_id:
+        raise HTTPException(status_code=400, detail="Admin is not associated with a company")
+
+    from src.services import email_service
+    from src.services.pipeline_notifications import mailbox_smtp_config, mailbox_unusable_reason
+
+    mb = (
+        db.query(CompanyMailbox)
+        .filter(CompanyMailbox.id == mailbox_id,
+                CompanyMailbox.company_id == current_user.company_id)
+        .first()
+    )
+    if not mb:
+        raise HTTPException(status_code=404, detail="Mailbox not found")
+
+    summary = {"id": mb.id, "name": mb.name,
+               "from_email": mb.smtp_from_email or mb.smtp_user}
+
+    # A missing password is a configuration answer, not an SMTP round trip.
+    # Sharing mailbox_unusable_reason keeps this wording identical to the routing
+    # panel and to what the real send path decides.
+    reason = mailbox_unusable_reason(mb)
+    if reason:
+        return {"mailbox": summary, "config": None, "sent": False,
+                "error": reason, "error_type": "unusable"}
+
+    # Company-scoped lookup: never the id-only _mailbox_smtp_config, which would
+    # let a guessed id reach another tenant's SMTP credentials.
+    smtp_config = mailbox_smtp_config(db, current_user.company_id, mailbox_id)
+    if not smtp_config:
+        return {"mailbox": summary, "config": None, "sent": False,
+                "error": "Mailbox could not be resolved for sending",
+                "error_type": "unusable"}
+
+    result = email_service._send(
+        payload.to, payload.subject, payload.body,
+        smtp_config=smtp_config, db=db,
+    )
+    return {
+        "mailbox": summary,
+        # Non-secret fields only — the password never leaves the server.
+        "config": {
+            "smtp_host": smtp_config.get("host"),
+            "smtp_port": smtp_config.get("port"),
+            "smtp_user": smtp_config.get("user"),
+            "from_email": smtp_config.get("from_email"),
+            "email_enabled": email_service.EMAIL_ENABLED,
+        },
+        **result,
+    }
+
+
 # ==================== MAIL ROUTING (read-only diagnostics) ====================
 
 

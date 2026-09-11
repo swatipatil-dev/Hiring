@@ -124,9 +124,18 @@ export default function PipelineNotifications() {
       const r = await api.post('/hr/pipeline-notifications/test', null, {
         params: { step_key: step.step_key, to },
       })
-      setTestResult(r.data?.sent
-        ? { type: 'success', text: `Test sent to ${to}${r.data.cc?.length ? ` (CC: ${r.data.cc.join(', ')})` : ''}.` }
-        : { type: 'error', text: `Test failed: ${r.data?.error || 'unknown error'}` })
+      const cc = r.data?.cc?.length ? ` (CC: ${r.data.cc.join(', ')})` : ''
+      if (!r.data?.sent) {
+        setTestResult({ type: 'error', text: `Test failed: ${r.data?.error || 'unknown error'}` })
+      } else if (r.data?.using_step_smtp === false) {
+        // The send worked, but NOT from the mailbox chosen for this step — it was
+        // missing, inactive or has no password, so it silently fell back to the
+        // company default. Reporting this as a plain success is what made a
+        // misconfigured mailbox look correct.
+        setTestResult({ type: 'warn', text: `Sent to ${to}${cc}, but NOT from this step's mailbox — it is unset or unusable, so the company default sender was used. Check Admin → Email Settings.` })
+      } else {
+        setTestResult({ type: 'success', text: `Test sent to ${to}${cc}.` })
+      }
     } catch (err) {
       setTestResult({ type: 'error', text: err.response?.data?.detail || 'Test failed.' })
     }
@@ -151,8 +160,10 @@ export default function PipelineNotifications() {
         <div style={{
           display: 'flex', alignItems: 'center', gap: 8,
           marginBottom: 14, padding: '10px 14px', borderRadius: 8, fontSize: '0.85rem',
-          background: (msg || testResult).type === 'success' ? 'rgba(34,197,94,0.10)' : 'rgba(239,68,68,0.10)',
-          color: (msg || testResult).type === 'success' ? '#16a34a' : '#dc2626',
+          background: (msg || testResult).type === 'success' ? 'rgba(34,197,94,0.10)'
+            : (msg || testResult).type === 'warn' ? 'rgba(245,158,11,0.10)' : 'rgba(239,68,68,0.10)',
+          color: (msg || testResult).type === 'success' ? '#16a34a'
+            : (msg || testResult).type === 'warn' ? '#b45309' : '#dc2626',
         }}>
           {(msg || testResult).type === 'success' ? <CheckCircle2 size={16} /> : <AlertCircle size={16} />}
           {(msg || testResult).text}

@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useCallback } from 'react'
-import { Inbox, Plus, Trash2, Edit3, X } from 'lucide-react'
+import { Inbox, Plus, Trash2, Edit3, X, Send } from 'lucide-react'
 import api from '../../api/client'
 
 const BLANK = {
@@ -13,7 +13,8 @@ export default function MailboxManager() {
   const [list, setList]   = useState([])
   const [form, setForm]   = useState(null)     // null = no form open; else BLANK or an existing row
   const [saving, setSaving] = useState(false)
-  const [msg, setMsg]     = useState(null)     // {type, text}
+  const [msg, setMsg]     = useState(null)     // {type: success|warn|error, text}
+  const [testing, setTesting] = useState(null) // id of the mailbox being tested
 
   const [loading, setLoading] = useState(true)
   const load = useCallback(() => {
@@ -54,6 +55,36 @@ export default function MailboxManager() {
     setSaving(false)
   }
 
+  // Saving a mailbox verifies nothing — the password is encrypted and stored
+  // as typed. Without this button a typo only surfaces when a candidate-facing
+  // send fails, and until then the step silently uses the company default.
+  const runTest = async (m) => {
+    const to = window.prompt(`Send a test message from "${m.name}" to which address?`)
+    if (!to) return
+    setMsg(null)
+    setTesting(m.id)
+    try {
+      const r = await api.post(`/admin/mailboxes/${m.id}/test`, {
+        to,
+        subject: `HireFlow test — ${m.name}`,
+        body: `<p>This confirms the <b>${m.name}</b> mailbox can send.</p>`,
+      })
+      const d = r.data || {}
+      if (d.sent) {
+        setMsg({ type: 'success', text: `${m.name}: sent to ${to} from ${d.config?.smtp_user}.` })
+      } else if (d.error_type === 'unusable') {
+        // Config problem, not a rejected credential — no connection was attempted.
+        setMsg({ type: 'warn', text: `${m.name}: ${d.error}` })
+      } else {
+        setMsg({ type: 'error', text: `${m.name}: ${d.error || 'send failed'} (${d.error_type || 'unknown'})` })
+      }
+    } catch (err) {
+      setMsg({ type: 'error', text: err.response?.data?.detail || `Could not test ${m.name}.` })
+    } finally {
+      setTesting(null)
+    }
+  }
+
   const remove = async (m) => {
     if (!confirm(`Delete mailbox "${m.name}"? Steps using it revert to the company default.`)) return
     try { await api.delete(`/admin/mailboxes/${m.id}`); load() }
@@ -80,8 +111,10 @@ export default function MailboxManager() {
       {msg && (
         <div style={{
           marginBottom: 14, padding: '10px 14px', borderRadius: 8, fontSize: '0.85rem',
-          background: msg.type === 'success' ? 'rgba(34,197,94,0.10)' : 'rgba(239,68,68,0.10)',
-          color: msg.type === 'success' ? '#16a34a' : '#dc2626',
+          background: msg.type === 'success' ? 'rgba(34,197,94,0.10)'
+            : msg.type === 'warn' ? 'rgba(245,158,11,0.10)' : 'rgba(239,68,68,0.10)',
+          color: msg.type === 'success' ? '#16a34a'
+            : msg.type === 'warn' ? '#b45309' : '#dc2626',
         }}>{msg.text}</div>
       )}
 
@@ -103,6 +136,9 @@ export default function MailboxManager() {
                   {!m.has_password && <span style={{ color: '#f59e0b' }}> · no password set</span>}
                 </div>
               </div>
+              <button type="button" className="btn btn-secondary" style={{ padding: '4px 12px', fontSize: '0.8rem', display: 'inline-flex', alignItems: 'center', gap: 5 }} onClick={() => runTest(m)} disabled={testing === m.id} title={`Send a test message from ${m.name}`}>
+                <Send size={14} /> {testing === m.id ? 'Testing…' : 'Test'}
+              </button>
               <button type="button" className="btn btn-secondary" style={{ padding: '4px 12px', fontSize: '0.8rem', display: 'inline-flex', alignItems: 'center', gap: 5 }} onClick={() => openEdit(m)}>
                 <Edit3 size={14} /> Edit
               </button>
@@ -159,10 +195,15 @@ export default function MailboxManager() {
           </div>
 
           <div className="input-group">
-            <label>App Password {form.has_password && <span style={{ color: 'var(--text-tertiary)', fontWeight: 400 }}>(leave blank to keep existing)</span>}</label>
+            <label>Password {form.has_password && <span style={{ color: 'var(--text-tertiary)', fontWeight: 400 }}>(leave blank to keep existing)</span>}</label>
             <input className="input" type="password"
-                   placeholder={form.has_password ? '••••••••••••••••' : 'xxxx xxxx xxxx xxxx'}
+                   placeholder={form.has_password ? '••••••••••••••••' : 'mailbox password'}
                    value={form.smtp_pass} onChange={e => setForm({ ...form, smtp_pass: e.target.value })} />
+            <div style={{ fontSize: '0.75rem', color: 'var(--text-tertiary)', marginTop: 4 }}>
+              Gmail hosts need an App Password (Google Account → Security → App
+              passwords). Other hosts, including cPanel mail, take the mailbox’s
+              own password. Save, then press <b>Test</b> to confirm it works.
+            </div>
           </div>
 
           <div className="input-group">
