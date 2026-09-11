@@ -10,6 +10,8 @@ Covers:
 """
 import uuid
 import pytest
+import logging
+import ssl
 from unittest.mock import patch, MagicMock
 
 
@@ -393,3 +395,187 @@ def test_send_test_email_falls_back_to_global_when_not_configured(client, admin_
     assert resp.status_code == 200, resp.text
     data = resp.json()
     assert data["using_company_smtp"] is False  # global env-var path taken
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SMTP TLS is authenticated, not merely encrypted
+#
+# smtplib falls back to ssl._create_stdlib_context() when no context is passed:
+# check_hostname=False, verify_mode=CERT_NONE. The session is then encrypted but
+# unauthenticated, so anyone on the path can present their own certificate and
+# read the mailbox password out of server.login(). These pin the fix.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _sending_config(port: int) -> dict:
+    return {
+        "host": "smtp.example.com",
+        "port": port,
+        "user": "mailbox@tenant.com",
+        "password": "app-pass",
+        "from_email": "mailbox@tenant.com",
+    }
+
+
+@pytest.mark.security
+def test_starttls_receives_a_verifying_ssl_context():
+    """The 587/STARTTLS path must upgrade with a verified context."""
+    from src.services import email_service as es
+
+    with patch.object(es, "EMAIL_ENABLED", True), \
+         patch("src.services.email_service.smtplib.SMTP") as MockSMTP:
+        instance = MagicMock()
+        MockSMTP.return_value.__enter__.return_value = instance
+
+        result = es._send("to@example.com", "S", "<p>b</p>",
+                          smtp_config=_sending_config(587))
+
+    assert result["sent"] is True, result
+    instance.starttls.assert_called_once()
+
+    ctx = instance.starttls.call_args.kwargs.get("context")
+    assert ctx is not None, "starttls() called with no context — unverified TLS"
+    assert ctx.check_hostname is True
+    assert ctx.verify_mode == ssl.CERT_REQUIRED
+
+    assert MockSMTP.call_args.kwargs["timeout"] == es.SMTP_TIMEOUT_S
+
+
+@pytest.mark.security
+def test_implicit_ssl_receives_a_verifying_ssl_context():
+    """The 465/SMTPS path must connect with a verified context."""
+    from src.services import email_service as es
+
+    with patch.object(es, "EMAIL_ENABLED", True), \
+         patch("src.services.email_service.smtplib.SMTP_SSL") as MockSSL:
+        MockSSL.return_value.__enter__.return_value = MagicMock()
+
+        result = es._send("to@example.com", "S", "<p>b</p>",
+                          smtp_config=_sending_config(465))
+
+    assert result["sent"] is True, result
+
+    ctx = MockSSL.call_args.kwargs.get("context")
+    assert ctx is not None, "SMTP_SSL() called with no context — unverified TLS"
+    assert ctx.check_hostname is True
+    assert ctx.verify_mode == ssl.CERT_REQUIRED
+
+    assert MockSSL.call_args.kwargs["timeout"] == es.SMTP_TIMEOUT_S
+
+
+@pytest.mark.security
+def test_certificate_failure_is_reported_as_tls_and_not_retried():
+    """A bad certificate is a config fault, so it must not enter the retry set.
+
+    ssl.SSLError subclasses OSError. Without its own except arm it would be
+    classified "network" and the queue worker would retry it five times with
+    exponential backoff before reporting anything.
+    """
+    from src.services import email_service as es
+    from src.mailq import worker
+
+    with patch.object(es, "EMAIL_ENABLED", True), \
+         patch("src.services.email_service.smtplib.SMTP") as MockSMTP:
+        instance = MagicMock()
+        instance.starttls.side_effect = ssl.SSLCertVerificationError(
+            "certificate verify failed: self signed certificate"
+        )
+        MockSMTP.return_value.__enter__.return_value = instance
+
+        result = es._send("to@example.com", "S", "<p>b</p>",
+                          smtp_config=_sending_config(587))
+
+    assert result["sent"] is False
+    assert result["error_type"] == "tls", result
+    # Mirrors the worker's retry predicate at src/mailq/worker.py.
+    assert result["error_type"] not in ("network", "smtp")
+    assert worker.MAX_RETRIES >= 0  # module imports cleanly alongside the new type
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Message bodies must not reach the log
+#
+# _send used to log the full body at INFO on every send. OTP and password-reset
+# codes are rendered into that body, so live authentication material landed in
+# journald and everything downstream of it.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _send_otp(es, otp="381927"):
+    return es.send_password_reset_otp(
+        "victim@example.com", "Vic", otp, smtp_config=_sending_config(587)
+    )
+
+
+@pytest.mark.security
+def test_otp_code_is_never_logged_by_default(caplog):
+    from src.services import email_service as es
+
+    caplog.set_level(logging.DEBUG, logger="src.services.email_service")
+    with patch.object(es, "EMAIL_ENABLED", True), \
+         patch.object(es, "EMAIL_LOG_BODIES", False), \
+         patch("src.services.email_service.smtplib.SMTP") as MockSMTP:
+        MockSMTP.return_value.__enter__.return_value = MagicMock()
+        _send_otp(es)
+
+    assert "381927" not in caplog.text, "OTP code written to the log"
+    assert "[EMAIL BODY]" not in caplog.text
+    # The envelope line stays — it is the only send trace we have.
+    assert "victim@example.com" in caplog.text
+
+
+@pytest.mark.security
+def test_otp_body_stays_unlogged_even_with_body_logging_enabled(caplog):
+    """EMAIL_LOG_BODIES is an escape hatch for debugging, not for OTP mail."""
+    from src.services import email_service as es
+
+    caplog.set_level(logging.DEBUG, logger="src.services.email_service")
+    with patch.object(es, "EMAIL_ENABLED", True), \
+         patch.object(es, "EMAIL_LOG_BODIES", True), \
+         patch("src.services.email_service.smtplib.SMTP") as MockSMTP:
+        MockSMTP.return_value.__enter__.return_value = MagicMock()
+        _send_otp(es)
+
+    assert "381927" not in caplog.text, (
+        "OTP code logged when EMAIL_LOG_BODIES was enabled — is_otp must win"
+    )
+    assert "[EMAIL BODY]" not in caplog.text
+
+
+@pytest.mark.security
+def test_non_otp_body_logs_only_with_optin_and_debug(caplog):
+    """Both conditions are required, so a global DEBUG flip alone logs nothing."""
+    from src.services import email_service as es
+
+    def _send_plain():
+        return es._send("c@example.com", "S", "<p>marker-body-text</p>",
+                        smtp_config=_sending_config(587))
+
+    # Opt-in off, DEBUG on -> no body.
+    caplog.set_level(logging.DEBUG, logger="src.services.email_service")
+    with patch.object(es, "EMAIL_ENABLED", True), \
+         patch.object(es, "EMAIL_LOG_BODIES", False), \
+         patch("src.services.email_service.smtplib.SMTP") as MockSMTP:
+        MockSMTP.return_value.__enter__.return_value = MagicMock()
+        _send_plain()
+    assert "marker-body-text" not in caplog.text
+
+    # Opt-in on, level raised above DEBUG -> still no body.
+    caplog.clear()
+    caplog.set_level(logging.INFO, logger="src.services.email_service")
+    with patch.object(es, "EMAIL_ENABLED", True), \
+         patch.object(es, "EMAIL_LOG_BODIES", True), \
+         patch("src.services.email_service.smtplib.SMTP") as MockSMTP:
+        MockSMTP.return_value.__enter__.return_value = MagicMock()
+        _send_plain()
+    assert "marker-body-text" not in caplog.text
+
+    # Both -> body is logged, at DEBUG.
+    caplog.clear()
+    caplog.set_level(logging.DEBUG, logger="src.services.email_service")
+    with patch.object(es, "EMAIL_ENABLED", True), \
+         patch.object(es, "EMAIL_LOG_BODIES", True), \
+         patch("src.services.email_service.smtplib.SMTP") as MockSMTP:
+        MockSMTP.return_value.__enter__.return_value = MagicMock()
+        _send_plain()
+    assert "marker-body-text" in caplog.text
+    body_records = [r for r in caplog.records if "[EMAIL BODY]" in r.getMessage()]
+    assert body_records and all(r.levelno == logging.DEBUG for r in body_records)

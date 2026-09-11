@@ -768,6 +768,45 @@ class MailTemplate(Base, TenantScoped):
     creator = relationship("User", foreign_keys=[created_by])
 
 
+class EmailLog(Base, TenantScoped):
+    """One row per outbound message — what was attempted, and what came of it.
+
+    Delivery used to leave no trace in the database at all. The send helpers
+    report failure by return value rather than by raising, and most callers
+    discarded that return, so a failed offer letter produced no log line, no row,
+    and an API response that said it had been sent. Retry state lived only in
+    Redis and vanished on flush. "Did candidate X get their offer letter?" was
+    unanswerable.
+
+    Written from two places: in-request senders pass their own session, and the
+    RQ worker opens its own (see src/services/email_log.py). ``status`` is the
+    three-state delivery contract from ``email_service.delivery_outcome`` plus
+    ``deferred`` for a rate-limit hold — ``queued`` is written at enqueue time so
+    a worker that never runs still leaves evidence.
+    """
+    __tablename__ = "email_log"
+
+    id             = Column(String(36), primary_key=True, default=_uuid)
+    # Nullable to match every other tenant-scoped table, but always written: the
+    # worker has no tenant bound, so it sets this explicitly from the RQ payload.
+    # A NULL here would make the row invisible to the HR listing endpoint.
+    company_id     = Column(String(36), ForeignKey("companies.id"), nullable=True, index=True)
+    step_key       = Column(String(50), nullable=True)
+    to_email       = Column(String(255), nullable=False, index=True)
+    subject        = Column(String(500), nullable=True)
+    # The mailbox that actually sent, after the six-layer sender resolution.
+    sender_user    = Column(String(255), nullable=True)
+    # queued | sent | failed | deferred
+    status         = Column(String(20), nullable=False, default="queued")
+    error_type     = Column(String(20), nullable=True)
+    error          = Column(Text, nullable=True)
+    attempt        = Column(Integer, default=0)
+    reference_type = Column(String(50), nullable=True)
+    reference_id   = Column(String(36), nullable=True)
+    created_at     = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at     = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class Notification(Base, TenantScoped):
     __tablename__ = "notifications"
 

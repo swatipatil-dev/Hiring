@@ -7,6 +7,7 @@ Uses SMTP (configurable). Falls back to console logging if not configured.
 import re
 import smtplib
 import socket
+import ssl
 import logging
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -26,6 +27,55 @@ EMAIL_ENABLED = os.getenv("EMAIL_ENABLED", "true").lower() == "true"
 # Note: Cloud Run blocks outbound port 25 — use 587 (STARTTLS) or 465 (SSL) to a relay.
 SMTP_USE_SSL = os.getenv("SMTP_USE_SSL", "").lower() in ("1", "true", "yes")
 MSGID_DOMAIN = os.getenv("EMAIL_MSGID_DOMAIN", "hireflow.io")
+# Connect/read timeout for the SMTP socket. Keep it well under EMAIL_JOB_TIMEOUT_S
+# (default 60) so a hung relay fails the send rather than the whole RQ job.
+SMTP_TIMEOUT_S = int(os.getenv("SMTP_TIMEOUT_S", "15"))
+
+# ── Body logging ──────────────────────────────────────────────────────────────
+# Message bodies are never logged by default. They carry OTP and password-reset
+# codes — live authentication material — plus offer salaries, bonuses and terms,
+# and a log line reaches journald, log shipping and any crash reporter behind it.
+#
+# Turning this on requires BOTH an explicit opt-in and DEBUG level, so flipping
+# the app to DEBUG to chase an unrelated bug cannot start dumping offer letters.
+# OTP mail is excluded unconditionally and cannot be re-enabled by either.
+EMAIL_LOG_BODIES = os.getenv("EMAIL_LOG_BODIES", "").lower() in ("1", "true", "yes")
+
+if EMAIL_LOG_BODIES:
+    logger.warning(
+        "EMAIL_LOG_BODIES is enabled — non-OTP message bodies will be written to "
+        "the log at DEBUG level. This exposes offer salaries and terms. Do not "
+        "leave this on in production."
+    )
+
+
+def _log_bodies_allowed(is_otp: bool) -> bool:
+    """Whether this message's body may be logged. OTP mail: never."""
+    if is_otp or not EMAIL_LOG_BODIES:
+        return False
+    return logger.isEnabledFor(logging.DEBUG)
+
+# ── TLS ───────────────────────────────────────────────────────────────────────
+# smtplib defaults to ssl._create_stdlib_context() when no context is passed,
+# which is check_hostname=False / verify_mode=CERT_NONE — encrypted but NOT
+# authenticated. That let anyone on the path present their own certificate and
+# read the mailbox password out of server.login(). Both connection styles below
+# get this verified context instead.
+#
+# SMTP_TLS_VERIFY=false is an escape hatch for an internal relay with a
+# self-signed certificate. It restores the old, unauthenticated behaviour — the
+# credential is exposed to an on-path attacker — so prefer trusting the relay's
+# CA over setting it.
+SMTP_TLS_VERIFY = os.getenv("SMTP_TLS_VERIFY", "true").lower() not in ("0", "false", "no")
+
+if SMTP_TLS_VERIFY:
+    _SSL_CONTEXT = ssl.create_default_context()
+else:
+    _SSL_CONTEXT = ssl._create_unverified_context()
+    logger.warning(
+        "SMTP_TLS_VERIFY is disabled — SMTP server certificates are NOT verified. "
+        "Mailbox credentials can be intercepted by an on-path attacker."
+    )
 
 # ── Innomax (platform) per-category sender mailboxes ──
 # For the platform's OWN company only, route mail by category to dedicated domain
@@ -86,13 +136,18 @@ def resolve_smtp_for_company(db, company_id: Optional[str]) -> Optional[Dict[str
             "user": tc.smtp_user,
             "password": password,
             "from_email": tc.smtp_from_email or tc.smtp_user,
+            # Carried for the delivery log, not for SMTP. _send/dispatch only
+            # ever .get() from this dict, so extra keys are inert -- the same
+            # trick _mailbox_smtp_config already uses to carry hourly_limit.
+            "company_id": company_id,
         }
     except Exception as e:
         logger.warning(f"resolve_smtp_for_company failed for {company_id}: {e}")
         return None
 
 
-def _innomax_mailbox(user: str, password: str) -> Optional[Dict[str, Any]]:
+def _innomax_mailbox(user: str, password: str,
+                     company_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Build an smtp_config for an Innomax domain mailbox, or None if not configured."""
     if not user or not password:
         return None
@@ -102,6 +157,7 @@ def _innomax_mailbox(user: str, password: str) -> Optional[Dict[str, Any]]:
         "user": user,
         "password": password,
         "from_email": user,
+        "company_id": company_id,
     }
 
 
@@ -128,10 +184,10 @@ def resolve_sender(db, company_id: Optional[str], category: str = "system") -> O
     """
     if _is_platform_company(db, company_id):
         if category == "candidate":
-            return _innomax_mailbox(INNOMAX_HR_USER, INNOMAX_HR_PASS) \
+            return _innomax_mailbox(INNOMAX_HR_USER, INNOMAX_HR_PASS, company_id) \
                 or resolve_smtp_for_company(db, company_id)
         if category == "client":
-            return _innomax_mailbox(INNOMAX_OFFICIAL_USER, INNOMAX_OFFICIAL_PASS) \
+            return _innomax_mailbox(INNOMAX_OFFICIAL_USER, INNOMAX_OFFICIAL_PASS, company_id) \
                 or resolve_smtp_for_company(db, company_id)
         # system/support → default env (Gmail)
         return None
@@ -172,6 +228,10 @@ def resolve_company_mailbox(db, company_id: Optional[str], name: str) -> Optiona
             "user": mb.smtp_user,
             "password": password,
             "from_email": mb.smtp_from_email or mb.smtp_user,
+            "company_id": company_id,
+            # Was never set here, so Auth-mailbox sends silently used the env
+            # default cap rather than the one Admin configured for the mailbox.
+            "hourly_limit": mb.hourly_limit,
         }
     except Exception as e:
         logger.warning(f"resolve_company_mailbox({name!r}) failed for {company_id}: {e}")
@@ -360,7 +420,11 @@ def _send(to: str, subject: str, body: str, reply_to: Optional[str] = None,
           smtp_config: Optional[Dict[str, Any]] = None,
           branding: Optional[Dict[str, Any]] = None,
           is_otp: bool = False,
-          cc: Optional[list] = None) -> Dict[str, Any]:
+          cc: Optional[list] = None,
+          db=None, log_id: Optional[str] = None,
+          attempt: int = 0,
+          reference_type: Optional[str] = None,
+          reference_id: Optional[str] = None) -> Dict[str, Any]:
     """Send email and return delivery result.
 
     If ``smtp_config`` is provided (host/port/user/password/from_email keys),
@@ -376,9 +440,40 @@ def _send(to: str, subject: str, body: str, reply_to: Optional[str] = None,
 
     Returns:
         {"sent": bool, "error": str | None, "error_type": str | None}
-        error_type is one of: None, "disabled", "auth", "smtp", "network", "unknown"
+        error_type is one of: None, "disabled", "auth", "tls", "smtp", "network",
+        "unknown". Only "smtp" and "network" are retried by the queue worker —
+        "tls" is a configuration fault, so retrying it just delays the report.
     """
     cfg = smtp_config or {}
+    result = _deliver(to, subject, body, reply_to, cfg, branding, is_otp, cc)
+    # Record the outcome. The queued path passes the log_id dispatch() already
+    # created, so this UPDATEs that row rather than adding a second; an inline
+    # send that supplied a session gets its own row.
+    #
+    # With neither a log_id nor a session there is nothing safe to write to:
+    # opening a private session here would target DATABASE_URL rather than the
+    # caller's, escape the caller's transaction, and in tests write to the dev
+    # database. Inline senders that want a row pass db= instead.
+    if log_id or db is not None:
+        try:
+            from src.services import email_log
+            email_log.finalize(
+                db, log_id,
+                status=email_log.SENT if result.get("sent") else email_log.FAILED,
+                to_email=to, subject=subject,
+                error=result.get("error"), error_type=result.get("error_type"),
+                attempt=attempt, sender_user=cfg.get("user") or SMTP_USER,
+                company_id=cfg.get("company_id"), step_key=cfg.get("step_key"),
+                commit=db is None,
+            )
+        except Exception as e:      # bookkeeping must never fail a send
+            logger.warning(f"email_log write failed for {to}: {e}")
+    return result
+
+
+def _deliver(to: str, subject: str, body: str, reply_to, cfg, branding,
+             is_otp: bool, cc) -> Dict[str, Any]:
+    """The actual SMTP transaction. Split out so _send can record every outcome."""
     host = cfg.get("host") or SMTP_HOST
     port = int(cfg.get("port") or SMTP_PORT)
     user = cfg.get("user") or SMTP_USER
@@ -406,8 +501,13 @@ def _send(to: str, subject: str, body: str, reply_to: Optional[str] = None,
                 _seen.add(a.lower())
                 cc_list.append(a)
 
+    # Envelope only. The body is NOT logged: OTP and password-reset codes are
+    # rendered directly into it, so this line used to put live authentication
+    # material into journald and anything downstream of it (log shipping,
+    # aggregation, crash reporters) — as well as offer salaries and terms.
     logger.info(f"[EMAIL] To: {to} | Cc: {', '.join(cc_list) or '-'} | From: {from_header} | Subject: {subject}")
-    logger.info(f"[EMAIL BODY]\n{body}\n{'=' * 60}")
+    if _log_bodies_allowed(is_otp):
+        logger.debug(f"[EMAIL BODY]\n{body}\n{'=' * 60}")
     if not EMAIL_ENABLED or not user:
         return {"sent": False, "error": "EMAIL_ENABLED is false or SMTP user not set", "error_type": "disabled"}
     try:
@@ -443,13 +543,14 @@ def _send(to: str, subject: str, body: str, reply_to: Optional[str] = None,
         use_ssl = bool(cfg.get("use_ssl")) or SMTP_USE_SSL or port == 465
         recipients = [to] + cc_list
         if use_ssl:
-            with smtplib.SMTP_SSL(host, port, timeout=15) as server:
+            with smtplib.SMTP_SSL(host, port, timeout=SMTP_TIMEOUT_S,
+                                  context=_SSL_CONTEXT) as server:
                 server.login(user, password)
                 server.sendmail(from_email, recipients, msg.as_string())
         else:
-            with smtplib.SMTP(host, port, timeout=15) as server:
+            with smtplib.SMTP(host, port, timeout=SMTP_TIMEOUT_S) as server:
                 server.ehlo()
-                server.starttls()
+                server.starttls(context=_SSL_CONTEXT)
                 server.ehlo()
                 server.login(user, password)
                 server.sendmail(from_email, recipients, msg.as_string())
@@ -460,6 +561,17 @@ def _send(to: str, subject: str, body: str, reply_to: Optional[str] = None,
     except smtplib.SMTPException as e:
         logger.error(f"SMTP error sending to {to}: {e}")
         return {"sent": False, "error": str(e), "error_type": "smtp"}
+    except ssl.SSLError as e:
+        # Must precede the OSError arm — SSLError subclasses OSError, so without
+        # this a certificate failure would be filed as "network" and the worker
+        # would retry it five times with backoff. It is a configuration fault,
+        # not a transient one, so it is deliberately outside the retry set.
+        logger.error(
+            f"SMTP TLS verification failed for {host}:{port} sending to {to}: {e}. "
+            f"Check the relay's certificate chain, or set SMTP_TLS_VERIFY=false "
+            f"if it uses a self-signed certificate (this exposes the credential)."
+        )
+        return {"sent": False, "error": str(e), "error_type": "tls"}
     except (socket.gaierror, socket.timeout, TimeoutError, ConnectionError, OSError) as e:
         logger.error(f"Network error sending to {to}: {e}")
         return {"sent": False, "error": str(e), "error_type": "network"}
@@ -472,7 +584,9 @@ def dispatch(to: str, subject: str, body: str, reply_to: Optional[str] = None,
              smtp_config: Optional[Dict[str, Any]] = None,
              branding: Optional[Dict[str, Any]] = None,
              is_otp: bool = False, cc: Optional[list] = None,
-             hourly_limit: Optional[int] = None) -> Dict[str, Any]:
+             hourly_limit: Optional[int] = None, db=None,
+             reference_type: Optional[str] = None,
+             reference_id: Optional[str] = None) -> Dict[str, Any]:
     """Queue an email for rate-limited async delivery, or send inline.
 
     Used by the fire-and-forget stage notifications so a provider's per-hour cap
@@ -481,11 +595,32 @@ def dispatch(to: str, subject: str, body: str, reply_to: Optional[str] = None,
     The sender password is Fernet-encrypted in the queued payload so no plaintext
     credential sits in Redis.
     """
+    cfg = smtp_config or {}
     try:
         from src.mailq.queue import enqueue_email
     except Exception:
         return _send(to, subject, body, reply_to=reply_to, smtp_config=smtp_config,
-                     branding=branding, is_otp=is_otp, cc=cc)
+                     branding=branding, is_otp=is_otp, cc=cc, db=db,
+                     reference_type=reference_type, reference_id=reference_id)
+
+    # Record the message as queued BEFORE handing it to RQ. A worker that never
+    # runs would otherwise leave no trace at all, which is exactly the failure
+    # the Admin routing panel warns about ("reported as successful while no mail
+    # is delivered"). The worker updates this same row by id.
+    log_id = None
+    try:
+        from src.services import email_log
+        log_id = email_log.new_log_id()
+        email_log.record(
+            db, log_id=log_id, to_email=to, subject=subject,
+            status=email_log.QUEUED,
+            company_id=cfg.get("company_id"), step_key=cfg.get("step_key"),
+            sender_user=cfg.get("user") or SMTP_USER,
+            reference_type=reference_type, reference_id=reference_id,
+            commit=db is None,
+        )
+    except Exception as e:      # never let bookkeeping stop a send
+        logger.warning(f"email_log queued-row write failed for {to}: {e}")
 
     sender = None
     if smtp_config:
@@ -506,14 +641,21 @@ def dispatch(to: str, subject: str, body: str, reply_to: Optional[str] = None,
         "to": to, "subject": subject, "body": body, "reply_to": reply_to,
         "branding": branding, "is_otp": is_otp, "cc": cc, "sender": sender,
         "hourly_limit": hourly_limit if hourly_limit is not None
-        else (smtp_config or {}).get("hourly_limit"),
+        else cfg.get("hourly_limit"),
+        # Plain strings only — this dict is pickled into Redis. The worker has no
+        # tenant bound, so it needs company_id explicitly or the row lands with
+        # company_id NULL and becomes invisible to every tenant-scoped read.
+        "log_id": log_id,
+        "company_id": cfg.get("company_id"),
+        "step_key": cfg.get("step_key"),
     }
     try:
         return enqueue_email(payload)
     except Exception as e:
         logger.warning(f"email enqueue failed ({e}); sending inline")
         return _send(to, subject, body, reply_to=reply_to, smtp_config=smtp_config,
-                     branding=branding, is_otp=is_otp, cc=cc)
+                     branding=branding, is_otp=is_otp, cc=cc, db=db, log_id=log_id,
+                     reference_type=reference_type, reference_id=reference_id)
 
 
 def delivery_outcome(result: Any) -> Dict[str, Any]:
@@ -624,6 +766,11 @@ def send_application_received(candidate_email: str, candidate_name: str, job_tit
                  smtp_config=smtp_config, branding=branding, cc=cc)
 
 
+# NOT CALLED ANYWHERE. Kept because the copy is written and the stage is real,
+# but nothing sends it and "shortlisted" was removed from STEP_LABELS so the HR
+# UI no longer offers a mailbox for it. To turn it on you need three things: a
+# call site at the point candidates are shortlisted, a resolve_step_sender lookup
+# there, and the "shortlisted" key back in STEP_LABELS.
 def send_candidate_shortlisted(candidate_email: str, candidate_name: str, job_title: str,
                                 ats_score: float, branding: Optional[Dict[str, Any]] = None,
                                 smtp_config: Optional[Dict[str, Any]] = None,
@@ -658,7 +805,7 @@ def send_candidate_rejected(candidate_email: str, candidate_name: str, job_title
                  smtp_config=smtp_config, branding=branding, cc=cc)
 
 
-def notify_candidate_rejected(db, candidate) -> None:
+def notify_candidate_rejected(db, candidate) -> Dict[str, Any]:
     """Look up candidate's job title and dispatch a rejection email.
 
     Safe to call from any rejection workflow:
@@ -666,10 +813,16 @@ def notify_candidate_rejected(db, candidate) -> None:
     - Falls back to "the position" if the job lookup fails.
     - Uses candidate's company SMTP if configured; otherwise global defaults.
     - All exceptions are caught and logged; never raises.
+
+    Returns a ``delivery_outcome`` dict so callers can tell what happened. It used
+    to return None, which was worse than useless: ``delivery_outcome`` maps None
+    to "sent" on purpose ("absence of a result is not evidence of failure"), so a
+    caller that started reading the return would have been told every rejection
+    succeeded, including the ones that never left the building.
     """
     try:
         if not candidate or not getattr(candidate, "email", None):
-            return
+            return {"status": "skipped", "error": None, "error_type": None, "ok": False}
         # Local import avoids a circular dependency with src.models
         from src.models.models import JobPosting
         job = None
@@ -686,13 +839,21 @@ def notify_candidate_rejected(db, candidate) -> None:
         from src.services.pipeline_notifications import resolve_step_dispatch
         disp = resolve_step_dispatch(db, company_id, "candidate_rejected", job=job)
         smtp_config = disp["smtp_config"] or resolve_sender(db, company_id, "candidate")
-        send_candidate_rejected(candidate.email, name, job_title,
-                                smtp_config=smtp_config, cc=disp["cc"])
+        result = send_candidate_rejected(candidate.email, name, job_title,
+                                         smtp_config=smtp_config, cc=disp["cc"])
+        outcome = delivery_outcome(result)
+        if not outcome["ok"]:
+            logger.warning(
+                f"rejection email to {candidate.email} not delivered: "
+                f"{outcome['error_type']} — {outcome['error']}"
+            )
+        return outcome
     except Exception as e:
         logger.warning(
             f"notify_candidate_rejected failed for "
             f"{getattr(candidate, 'id', '?')}: {e}"
         )
+        return {"status": "failed", "error": str(e), "error_type": "unknown", "ok": False}
 
 
 def send_test_invitation(candidate_email: str, candidate_name: str, job_title: str,

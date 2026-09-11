@@ -22,7 +22,12 @@ logger = logging.getLogger(__name__)
 # step_key -> human label. Order matters: the HR UI renders steps in this order.
 STEP_LABELS: Dict[str, str] = {
     "application_received": "Application Received",
-    "shortlisted":         "Candidate Shortlisted",
+    # No "shortlisted" entry on purpose. There is a send_candidate_shortlisted
+    # template, but nothing ever calls it and "shortlisted" is never passed to
+    # resolve_step_dispatch/resolve_step_sender — so the row was configurable in
+    # the HR UI while being incapable of sending anything. Listing it invited
+    # admins to assign a mailbox to a stage that cannot fire. Re-add it here at
+    # the same time as wiring the sender, not before.
     "test_invitation":     "Assessment Invitation",
     "mcq_result":          "Assessment Result",
     "interview_scheduled": "Interview Scheduled",
@@ -101,7 +106,8 @@ def mailbox_unusable_reason(mb) -> Optional[str]:
     return None
 
 
-def _mailbox_smtp_config(db, mailbox_id: Optional[str]) -> Optional[Dict[str, Any]]:
+def _mailbox_smtp_config(db, mailbox_id: Optional[str],
+                         step_key: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Build an smtp_config dict from an Admin-defined mailbox, or None.
 
     Returns None when no mailbox is selected, the mailbox is missing/inactive,
@@ -139,6 +145,10 @@ def _mailbox_smtp_config(db, mailbox_id: Optional[str]) -> Optional[Dict[str, An
         "password": password,
         "from_email": mb.smtp_from_email or mb.smtp_user,
         "hourly_limit": mb.hourly_limit,
+        # Ride along for the delivery log. _send/dispatch only .get() from this
+        # dict, so non-SMTP keys are inert here -- hourly_limit set the precedent.
+        "company_id": getattr(mb, "company_id", None),
+        "step_key": step_key,
     }
 
 
@@ -164,7 +174,8 @@ def resolve_step_dispatch(db, company_id: Optional[str], step_key: str, *,
         # expansion or any other automatic mapping.
         return {
             "cc": _clean_emails(_json_list(row.extra_emails)),
-            "smtp_config": _mailbox_smtp_config(db, getattr(row, "mailbox_id", None)),
+            "smtp_config": _mailbox_smtp_config(db, getattr(row, "mailbox_id", None),
+                                                step_key),
             "enabled": True,
         }
     except Exception as e:
@@ -173,7 +184,8 @@ def resolve_step_dispatch(db, company_id: Optional[str], step_key: str, *,
 
 
 def mailbox_smtp_config(db, company_id: Optional[str],
-                        mailbox_id: Optional[str]) -> Optional[Dict[str, Any]]:
+                        mailbox_id: Optional[str],
+                        step_key: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Company-scoped mailbox lookup for a CALLER-SUPPLIED mailbox id.
 
     ``_mailbox_smtp_config`` looks a mailbox up by id alone, which is safe there
@@ -202,7 +214,7 @@ def mailbox_smtp_config(db, company_id: Optional[str],
         logger.warning("Mailbox %s not found for company %s — ignoring override.",
                        mailbox_id, company_id)
         return None
-    return _mailbox_smtp_config(db, mb.id)
+    return _mailbox_smtp_config(db, mb.id, step_key)
 
 
 def resolve_step_sender(db, company_id: Optional[str], step_key: str,
@@ -222,7 +234,7 @@ def resolve_step_sender(db, company_id: Optional[str], step_key: str,
 
     disp = resolve_step_dispatch(db, company_id, step_key, job=job)
     smtp = (
-        mailbox_smtp_config(db, company_id, override_mailbox_id)
+        mailbox_smtp_config(db, company_id, override_mailbox_id, step_key)
         or disp["smtp_config"]
         or resolve_sender(db, company_id, category)
     )

@@ -3452,6 +3452,7 @@ async def send_test_invite_and_reject(
     # Extra CC recipients are added only to the first message of each kind so a
     # bulk run doesn't deliver one duplicate copy per candidate.
     from src.services.pipeline_notifications import resolve_step_sender
+    from src.services.email_service import delivery_outcome
     ti_smtp, ti_disp = resolve_step_sender(
         db, job.company_id, "test_invitation", request.mailbox_id, job=job)
     rej_smtp, rej_disp = resolve_step_sender(
@@ -3468,6 +3469,10 @@ async def send_test_invite_and_reject(
     invited = 0
     rejected = 0
     skipped = 0
+    # Delivery failures, tracked separately from the business counts above so the
+    # response can distinguish "we sent 12" from "we tried 12 times".
+    invite_failed = 0
+    reject_failed = 0
     for c in all_candidates:
         name = f"{c.first_name} {c.last_name}"
         is_unsent = c.current_stage in UNSENT_STAGES
@@ -3496,10 +3501,16 @@ async def send_test_invite_and_reject(
             subject = (request.invite_subject or f"Test Invitation – {job.title}")
             body = (request.invite_body or "").replace("{{test_link}}", test_link).replace("{{candidate_name}}", name).replace("{{deadline}}", request.test_deadline)
             body_html = body.replace("\n", "<br>")
-            dispatch(c.email, subject, f"<div style='font-family:sans-serif;line-height:1.7'>{body_html}</div>",
-                  smtp_config=ti_smtp, cc=(ti_disp["cc"] if not ti_cc_sent else None))
+            _res = dispatch(c.email, subject, f"<div style='font-family:sans-serif;line-height:1.7'>{body_html}</div>",
+                  smtp_config=ti_smtp, cc=(ti_disp["cc"] if not ti_cc_sent else None), db=db)
             ti_cc_sent = True
-            invited += 1
+            # dispatch reports failure by return value. Counting before reading it
+            # meant "invitations sent to N" was really "N attempts made".
+            if delivery_outcome(_res)["ok"]:
+                invited += 1
+            else:
+                invite_failed += 1
+                logger.warning(f"test-invite email to {c.email} not delivered")
         elif request.reject_others and is_unsent:
             prev_stage = c.current_stage
             c.current_stage = "rejected"
@@ -3511,10 +3522,13 @@ async def send_test_invite_and_reject(
             subject = (request.reject_subject or f"Application Update – {job.title}")
             body = (request.reject_body or "").replace("{{candidate_name}}", name)
             body_html = body.replace("\n", "<br>")
-            dispatch(c.email, subject, f"<div style='font-family:sans-serif;line-height:1.7'>{body_html}</div>",
-                  smtp_config=rej_smtp, cc=(rej_disp["cc"] if not rej_cc_sent else None))
+            _res = dispatch(c.email, subject, f"<div style='font-family:sans-serif;line-height:1.7'>{body_html}</div>",
+                  smtp_config=rej_smtp, cc=(rej_disp["cc"] if not rej_cc_sent else None), db=db)
             rej_cc_sent = True
             rejected += 1
+            if not delivery_outcome(_res)["ok"]:
+                reject_failed += 1
+                logger.warning(f"auto-reject email to {c.email} not delivered")
         elif c.id in request.candidate_ids and not is_unsent:
             # Selected, but already emailed from this stage — skip to avoid duplicate mail.
             skipped += 1
@@ -3522,6 +3536,9 @@ async def send_test_invite_and_reject(
     db.commit()
 
     message = f"Test invitations sent to {invited} candidates. {rejected} candidates auto-rejected."
+    if invite_failed or reject_failed:
+        message += (f" WARNING: {invite_failed} invitation and {reject_failed} "
+                    f"rejection emails could not be sent.")
     if skipped:
         message += f" {skipped} already-notified candidates were skipped."
 
@@ -5296,14 +5313,20 @@ async def create_offer(
             reference_id=db_offer.id,
         )
 
-    from src.services.email_service import send_offer_letter
+    from src.services.email_service import send_offer_letter, delivery_outcome
     from src.services.pipeline_notifications import resolve_step_sender
+    # The offer itself is already created and visible in the candidate's portal —
+    # that is independent of whether the notification email got out. Report the
+    # two separately instead of claiming both succeeded.
+    email_sent = False
+    email_status = "skipped"
+    email_error = None
     if candidate.email:
         try:
             _cid = getattr(candidate, "company_id", None)
             smtp_config, disp = resolve_step_sender(
                 db, _cid, "offer_letter", offer_data.mailbox_id, job=candidate.job)
-            send_offer_letter(
+            send_result = send_offer_letter(
                 candidate.email,
                 f"{candidate.first_name} {candidate.last_name}",
                 candidate.job.title if candidate.job else "",
@@ -5316,11 +5339,34 @@ async def create_offer(
                 smtp_config=smtp_config,
                 cc=disp["cc"]
             )
+            # send_* reports failure by return value, not by raising — the
+            # try/except above never saw a failed send.
+            outcome = delivery_outcome(send_result)
+            email_status = outcome["status"]
+            email_sent = outcome["ok"]
+            email_error = outcome["error"]
+            if not outcome["ok"]:
+                logger.warning(
+                    f"offer-letter email to {candidate.email} not delivered: "
+                    f"{outcome['error_type']} — {outcome['error']}"
+                )
         except Exception as _e:
+            email_status = "failed"
+            email_error = str(_e)
             logger.warning(f"offer-letter email to {candidate.email} failed: {_e}")
 
+    email_note = {
+        "sent": " — offer letter emailed to the candidate",
+        "queued": " — offer letter queued for delivery",
+        "failed": " — WARNING: the offer letter email could not be sent",
+        "skipped": " — no email address on file, so nothing was sent",
+    }.get(email_status, "")
+
     return {
-        "message": "Offer created and sent successfully",
+        "message": "Offer created" + email_note,
+        "email_sent": email_sent,
+        "email_status": email_status,
+        "email_error": email_error,
         "offer_id": str(db_offer.id),
         "candidate_name": f"{candidate.first_name} {candidate.last_name}",
         "salary": float(db_offer.salary),
@@ -5399,6 +5445,80 @@ def _format_candidate_request(r, requester, job=None):
         "updated_at": r.updated_at,
         "matched_job_id": str(job.id) if job else None,
         "matched_job_title": job.title if job else None,
+    }
+
+
+@router.get("/email-log")
+async def get_email_log(
+    to_email: Optional[str] = None,
+    step_key: Optional[str] = None,
+    status: Optional[str] = None,
+    since: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 50,
+    current_user: User = Depends(AuthMiddleware.get_current_hr),
+    db: Session = Depends(get_db)
+):
+    """Delivery history for outbound mail — "did candidate X get their offer?".
+
+    Before this existed the only trace of a message was a log line, and the send
+    helpers report failure by return value rather than by raising, so a failed
+    offer letter left nothing behind at all.
+
+    ``status`` is the three-state delivery contract: ``queued`` (accepted, worker
+    has not finished), ``sent``, ``failed``, plus ``deferred`` for a rate-limit
+    hold. A queued row that never becomes ``sent`` means the worker is not
+    draining — that is the signal to look for.
+    """
+    from src.models.models import EmailLog
+
+    q = db.query(EmailLog)
+    # The before_compile filter already scopes this, but mail rows are written
+    # from the worker where no tenant is bound, so filter explicitly too — a
+    # company_id that somehow landed NULL must not leak into another tenant's view.
+    if current_user.role != "superadmin":
+        q = q.filter(EmailLog.company_id == current_user.company_id)
+    if to_email:
+        # utf8mb4_unicode_ci compares case-insensitively, so a plain ==
+        # matches regardless of how the address was cased when sent.
+        q = q.filter(EmailLog.to_email == to_email.strip())
+    if step_key:
+        q = q.filter(EmailLog.step_key == step_key)
+    if status:
+        q = q.filter(EmailLog.status == status)
+    if since:
+        try:
+            q = q.filter(EmailLog.created_at >= datetime.fromisoformat(since))
+        except ValueError:
+            raise HTTPException(status_code=400,
+                                detail="since must be ISO-8601, e.g. 2026-09-01")
+
+    total = q.count()
+    rows = (q.order_by(EmailLog.created_at.desc())
+             .offset(max(0, skip)).limit(min(max(1, limit), 200)).all())
+
+    return {
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+        "entries": [
+            {
+                "id": r.id,
+                "to_email": r.to_email,
+                "subject": r.subject,
+                "step_key": r.step_key,
+                "status": r.status,
+                "error_type": r.error_type,
+                "error": r.error,
+                "attempt": r.attempt,
+                "sender_user": r.sender_user,
+                "reference_type": r.reference_type,
+                "reference_id": r.reference_id,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+            }
+            for r in rows
+        ],
     }
 
 

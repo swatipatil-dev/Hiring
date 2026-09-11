@@ -47,7 +47,6 @@ MAILBOXES = [
 # pipeline step_key -> mailbox name (must exist in MAILBOXES).
 STEP_MAP = {
     "application_received": "Careers",
-    "shortlisted":         "Notifications",
     "test_invitation":     "Assessments",
     "mcq_result":          "Assessments",
     "interview_scheduled": "Scheduling",
