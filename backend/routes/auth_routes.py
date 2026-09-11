@@ -169,12 +169,8 @@ async def resend_otp(request: Request, data: ResendOTPRequest, db: Session = Dep
         raise HTTPException(status_code=400, detail="Email already verified")
     otp = set_user_otp(user, db)
     try:
-        from src.services.email_service import (
-            send_otp_email, resolve_sender, resolve_company_mailbox, AUTH_MAILBOX_NAME,
-        )
-        # Prefer the Admin-configured "Auth" mailbox; fall back to the default sender.
-        smtp_config = resolve_company_mailbox(db, user.company_id, AUTH_MAILBOX_NAME) \
-            or resolve_sender(db, user.company_id)
+        from src.services.email_service import send_otp_email, resolve_auth_sender
+        smtp_config = resolve_auth_sender(db, user.company_id)
         result = send_otp_email(user.email, user.first_name, otp, smtp_config=smtp_config)
     except Exception as e:
         result = {"sent": False, "error": str(e)}
@@ -341,12 +337,8 @@ async def forgot_password(request: Request, data: ForgotPasswordRequest, db: Ses
         return {"message": "If that email is registered, an OTP has been sent."}
     otp = set_user_otp(user, db)
     try:
-        from src.services.email_service import (
-            send_password_reset_otp, resolve_sender, resolve_company_mailbox, AUTH_MAILBOX_NAME,
-        )
-        # Prefer the Admin-configured "Auth" mailbox; fall back to the default sender.
-        smtp_config = resolve_company_mailbox(db, user.company_id, AUTH_MAILBOX_NAME) \
-            or resolve_sender(db, user.company_id)
+        from src.services.email_service import send_password_reset_otp, resolve_auth_sender
+        smtp_config = resolve_auth_sender(db, user.company_id)
         send_password_reset_otp(user.email, user.first_name, otp, smtp_config=smtp_config)
     except Exception as _e:
         logger.warning(f"password-reset OTP email to {user.email} failed: {_e}")

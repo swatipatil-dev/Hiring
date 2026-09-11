@@ -291,6 +291,72 @@ def test_chain_falls_through_to_env_when_unconfigured(client, admin_with_company
 
 
 @pytest.mark.admin
+def test_auth_layer_reports_the_usable_mailbox(client, db, admin_with_company):
+    from src.services.email_service import AUTH_MAILBOX_NAME
+    headers, cid = admin_with_company
+    _make_mailbox(db, cid, AUTH_MAILBOX_NAME, user="auth@acme.com")
+
+    auth = {c["layer"]: c for c in _routing(client, headers)["chain"]}["auth_mailbox"]
+
+    assert auth["configured"] is True
+    assert auth["sender"]["from_email"] == "auth@acme.com"
+
+
+@pytest.mark.admin
+@pytest.mark.parametrize("kwargs,expected", [
+    ({"password": None},   "no password set"),
+    ({"is_active": False}, "mailbox is inactive"),
+    ({"user": None},       "no SMTP user"),
+])
+def test_auth_layer_names_why_the_mailbox_cannot_send(client, db, admin_with_company,
+                                                      kwargs, expected):
+    """Reporting absence sends an admin off to create a mailbox that already exists.
+
+    The password case is the one that matters: seed_innomax_mailboxes.py creates
+    mailboxes with smtp_pass=None by design, and that is how auth mail ended up
+    going out from the env Gmail account.
+    """
+    from src.services.email_service import AUTH_MAILBOX_NAME
+    headers, cid = admin_with_company
+    _make_mailbox(db, cid, AUTH_MAILBOX_NAME, **kwargs)
+
+    auth = {c["layer"]: c for c in _routing(client, headers)["chain"]}["auth_mailbox"]
+
+    assert auth["configured"] is False
+    assert expected in auth["detail"]
+    assert "No mailbox named" not in auth["detail"]
+
+
+@pytest.mark.admin
+def test_auth_layer_says_absent_when_there_is_no_mailbox(client, admin_with_company):
+    """Genuinely absent reads differently from present-but-broken."""
+    headers, _ = admin_with_company
+
+    auth = {c["layer"]: c for c in _routing(client, headers)["chain"]}["auth_mailbox"]
+
+    assert auth["configured"] is False
+    assert "No mailbox named" in auth["detail"]
+
+
+@pytest.mark.admin
+def test_routing_view_does_not_log_the_send_path_warning(client, db, admin_with_company,
+                                                         caplog):
+    """This panel gets reloaded while somebody debugs exactly this — it must stay quiet.
+
+    The reason belongs in the response, not in the log, for a read-only view.
+    """
+    import logging
+    from src.services.email_service import AUTH_MAILBOX_NAME
+    headers, cid = admin_with_company
+    _make_mailbox(db, cid, AUTH_MAILBOX_NAME, password=None)
+
+    caplog.set_level(logging.WARNING, logger="src.services.email_service")
+    _routing(client, headers)
+
+    assert "Falling back to the default sender" not in caplog.text
+
+
+@pytest.mark.admin
 def test_chain_counts_usable_step_mailboxes(client, db, admin_with_company):
     headers, cid = admin_with_company
     good = _make_mailbox(db, cid, "Good")

@@ -308,12 +308,8 @@ def create_user(db: Session, user_data: UserCreate, company_id: Optional[str] = 
     # Generate and send OTP using the company's SMTP if configured.
     otp = set_user_otp(db_user, db)
     try:
-        from .services.email_service import (
-            send_otp_email, resolve_smtp_for_company, resolve_company_mailbox, AUTH_MAILBOX_NAME,
-        )
-        # Prefer the Admin-configured "Auth" mailbox; fall back to company SMTP.
-        smtp_config = resolve_company_mailbox(db, db_user.company_id, AUTH_MAILBOX_NAME) \
-            or resolve_smtp_for_company(db, db_user.company_id)
+        from .services.email_service import send_otp_email, resolve_auth_sender
+        smtp_config = resolve_auth_sender(db, db_user.company_id)
         result = send_otp_email(db_user.email, db_user.first_name, otp, smtp_config=smtp_config)
         if isinstance(result, dict) and not result.get("sent"):
             # Surface the underlying SMTP error so ops can see why the user

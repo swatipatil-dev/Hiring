@@ -200,26 +200,38 @@ def resolve_sender(db, company_id: Optional[str], category: str = "system") -> O
 AUTH_MAILBOX_NAME = os.getenv("AUTH_MAILBOX_NAME", "Auth")
 
 
-def resolve_company_mailbox(db, company_id: Optional[str], name: str) -> Optional[Dict[str, Any]]:
-    """Return an smtp_config for a named, active CompanyMailbox, or None.
+_NO_MAILBOX = "no such mailbox"   # mailbox_unusable_reason(None); absence, not misconfiguration
 
-    None when the company/name is missing, the mailbox is absent/inactive, or it
-    has no credentials — the caller then falls back to its previous sender
-    resolution (so this is always safe to prepend).
+
+def _resolve_named_mailbox(db, company_id: Optional[str],
+                           name: str) -> tuple:
+    """Resolve a named CompanyMailbox to ``(smtp_config, unusable_reason)``.
+
+    Exactly one side is ever populated: a usable mailbox gives ``(cfg, None)``, an
+    absent or unusable one ``(None, reason)``. ``(None, None)`` means there was
+    nothing to look up at all — no company bound, no session, no name.
+
+    Split out from ``resolve_company_mailbox`` so the read-only Admin routing view
+    can report the reason without the send path's log line firing every time
+    somebody opens the page.
     """
     if not company_id or db is None or not name:
-        return None
+        return None, None
     try:
         from src.models.models import CompanyMailbox
+        from src.services.pipeline_notifications import mailbox_unusable_reason
+        # is_active deliberately NOT in the WHERE clause. Filtering on it here
+        # would collapse a disabled mailbox into "no such mailbox" and lose the
+        # one detail that tells an admin which switch to flip.
         mb = (
             db.query(CompanyMailbox)
             .filter(CompanyMailbox.company_id == company_id,
-                    CompanyMailbox.name == name,
-                    CompanyMailbox.is_active == True)  # noqa: E712
+                    CompanyMailbox.name == name)
             .first()
         )
-        if not mb or not mb.smtp_user or not mb.smtp_pass:
-            return None
+        reason = mailbox_unusable_reason(mb)
+        if reason:
+            return None, reason
         from src.security import decrypt
         password = decrypt(mb.smtp_pass) or mb.smtp_pass  # tolerate legacy plain
         return {
@@ -232,10 +244,61 @@ def resolve_company_mailbox(db, company_id: Optional[str], name: str) -> Optiona
             # Was never set here, so Auth-mailbox sends silently used the env
             # default cap rather than the one Admin configured for the mailbox.
             "hourly_limit": mb.hourly_limit,
-        }
+        }, None
     except Exception as e:
         logger.warning(f"resolve_company_mailbox({name!r}) failed for {company_id}: {e}")
-        return None
+        return None, "mailbox lookup failed"
+
+
+def resolve_company_mailbox(db, company_id: Optional[str], name: str) -> Optional[Dict[str, Any]]:
+    """Return an smtp_config for a named, usable CompanyMailbox, or None.
+
+    None when the company/name is missing, the mailbox is absent/inactive, or it
+    has no credentials — the caller then falls back to its previous sender
+    resolution (so this is always safe to prepend).
+
+    A mailbox that EXISTS but cannot send is logged. That case used to return None
+    in silence, and it is how auth mail went out from the env Gmail account with
+    nothing anywhere to explain it: ``seed_innomax_mailboxes.py`` creates mailboxes
+    with ``smtp_pass=None`` by design, and one left that way is inert. An ABSENT
+    mailbox is not logged — a company that never configured one is not misconfigured
+    and would otherwise warn on every single send.
+    """
+    cfg, reason = _resolve_named_mailbox(db, company_id, name)
+    if reason and reason != _NO_MAILBOX:
+        logger.warning("Mailbox %r unusable for company %s: %s. "
+                       "Falling back to the default sender.", name, company_id, reason)
+    return cfg
+
+
+def resolve_auth_sender(db, company_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Resolve the sender for OTP / email-verification / password-reset mail.
+
+    The chain, in one place: the mailbox named ``AUTH_MAILBOX_NAME`` → the company's
+    own SMTP override → None, meaning the env ``SMTP_*`` default.
+
+    The three auth call sites each inlined this and had drifted apart. ``src/auth.py``
+    fell back to ``resolve_smtp_for_company``; ``auth_routes.py`` used
+    ``resolve_sender()``, whose default ``category="system"`` returns None for the
+    PLATFORM company without consulting ``tenant_configs`` at all. So registration and
+    resend could send one user two codes from two different addresses.
+
+    ``resolve_smtp_for_company`` is the survivor: auth mail should reach for the
+    company's configured sender before it falls back to the platform's env account,
+    which is a generic address and the reason this was reported in the first place.
+    """
+    return (resolve_company_mailbox(db, company_id, AUTH_MAILBOX_NAME)
+            or resolve_smtp_for_company(db, company_id))
+
+
+def _auth_layer_detail(cfg: Optional[Dict[str, Any]], reason: Optional[str]) -> str:
+    """One line explaining what the auth mailbox is doing, for the Admin routing view."""
+    if cfg:
+        return "Verification and reset codes send from this mailbox"
+    tail = "auth mail uses the layers below"
+    if not reason or reason == _NO_MAILBOX:
+        return f"No mailbox named “{AUTH_MAILBOX_NAME}” — {tail}"
+    return f"Mailbox “{AUTH_MAILBOX_NAME}” cannot send: {reason} — {tail}"
 
 
 def _public_sender(cfg: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -276,7 +339,10 @@ def describe_sender_chain(db, company_id: Optional[str],
     """
     is_platform = _is_platform_company(db, company_id)
     company_cfg = resolve_smtp_for_company(db, company_id)
-    auth_cfg    = resolve_company_mailbox(db, company_id, AUTH_MAILBOX_NAME)
+    # The underscore form, not resolve_company_mailbox: this view is read-only and
+    # gets opened repeatedly while somebody debugs exactly this, so it must not emit
+    # the send path's warning each time. It wants the reason to display, not to log.
+    auth_cfg, auth_reason = _resolve_named_mailbox(db, company_id, AUTH_MAILBOX_NAME)
     winner      = resolve_sender(db, company_id, category)
 
     # Which company-wide layer produced `winner`? None means "fell through to env".
@@ -330,11 +396,10 @@ def describe_sender_chain(db, company_id: Optional[str],
             "configured": auth_cfg is not None,
             "active": False,
             "sender": _public_sender(auth_cfg),
-            "detail": (
-                "Verification and reset codes send from this mailbox"
-                if auth_cfg else
-                f"No active mailbox named “{AUTH_MAILBOX_NAME}” — auth mail uses the layers below"
-            ),
+            # Name the actual reason. "No active mailbox" reads as "create one",
+            # which is wrong and slow when the mailbox is sitting right there in the
+            # UI with no password — the case this panel exists to catch.
+            "detail": _auth_layer_detail(auth_cfg, auth_reason),
         },
         {
             "layer": "platform_category",
