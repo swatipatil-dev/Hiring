@@ -25,7 +25,7 @@ Revision ID: d0t1u2v3w4x5
 Revises: c9s0t1u2v3w4
 Create Date: 2026-09-10 00:00:00.000000
 """
-from typing import Sequence, Union
+from typing import Optional, Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
@@ -53,10 +53,39 @@ def _has_index(table: str, name: str) -> bool:
     return name in {i["name"] for i in _inspector().get_indexes(table)}
 
 
+def _referenced_collation() -> Optional[str]:
+    """Collation of `companies.id`, which this table's foreign key must match.
+
+    Returns None on anything unexpected (a non-MySQL backend, a missing table) so
+    the table is created with the database default.
+    """
+    try:
+        return op.get_bind().execute(sa.text(
+            "SELECT COLLATION_NAME FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'companies' "
+            "AND COLUMN_NAME = 'id'"
+        )).scalar()
+    except Exception:
+        return None
+
+
 def upgrade() -> None:
     # A fresh database is built by create_all() then stamped, so this table may
     # already exist by the time the migration runs. See docs/DEPLOYMENT_NOTES.md.
     if not _has_table(TABLE):
+        # Match the collation of the column the foreign key points at, rather than
+        # naming one. A new table otherwise takes the DATABASE default, and where
+        # that differs from companies.id MySQL rejects the FK outright with
+        # "Referencing column ... are incompatible" (3780). Hardcoding a collation
+        # has the same failure with extra steps: it works wherever the default
+        # happens to agree and breaks everywhere else. Same approach as
+        # x4n5o6p7q8r9_talent_pool_crm.py, which hit this first.
+        table_kwargs = {"mysql_engine": "InnoDB"}
+        collation = _referenced_collation()
+        if collation:
+            table_kwargs["mysql_charset"] = collation.split("_")[0]
+            table_kwargs["mysql_collate"] = collation
+
         op.create_table(
             TABLE,
             sa.Column("id", sa.String(36), primary_key=True),
@@ -75,9 +104,7 @@ def upgrade() -> None:
             sa.Column("reference_id", sa.String(36), nullable=True),
             sa.Column("created_at", sa.DateTime(), nullable=True),
             sa.Column("updated_at", sa.DateTime(), nullable=True),
-            mysql_engine="InnoDB",
-            mysql_charset="utf8mb4",
-            mysql_collate="utf8mb4_unicode_ci",
+            **table_kwargs,
         )
 
     if not _has_index(TABLE, "ix_email_log_company_id"):
