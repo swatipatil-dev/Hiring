@@ -78,6 +78,22 @@ def submit_mcq_test(
        interview.company_id != current_user.company_id:
         raise HTTPException(404, "Interview not found")
 
+    # Who this submission is *about* is decided by the database, never by the
+    # request. submission.candidate_name/candidate_email are still accepted for
+    # wire compatibility but are deliberately ignored: the submitter controls
+    # them, and trusting them made this endpoint an authenticated open relay —
+    # any signed-in user could name an arbitrary recipient and have the tenant's
+    # SMTP identity deliver to it, with company branding and aligned SPF/DKIM.
+    candidate = None
+    if interview.candidate_id:
+        candidate = db.query(_CandidateModel).filter(
+            _CandidateModel.id == interview.candidate_id
+        ).first()
+    candidate_display_name = (
+        f"{candidate.first_name} {candidate.last_name}".strip()
+        if candidate is not None else "Candidate"
+    )
+
     # Load questions
     rows = db.execute(text(
         "SELECT id, question_text, correct_answer, points, question_type, difficulty_level, approval_notes "
@@ -136,45 +152,67 @@ def submit_mcq_test(
         if r["is_correct"]:
             by_type[t]["correct"] += 1
 
-    # Advance candidate stage to test_submitted
-    try:
-        db.execute(text(
-            "UPDATE candidates SET current_stage='test_submitted', updated_at=NOW() "
-            "WHERE email=:email AND current_stage='shortlisted'"
-        ), {"email": submission.candidate_email})
-        db.execute(text(
-            "INSERT INTO candidate_stage_history (id, candidate_id, from_stage, to_stage, notes, created_at) "
-            "SELECT :hid, id, 'shortlisted', 'test_submitted', :notes, NOW() "
-            "FROM candidates WHERE email=:email AND current_stage='test_submitted' LIMIT 1"
-        ), {
-            "hid": str(uuid.uuid4()),
-            "email": submission.candidate_email,
-            "notes": f"Test submitted — Score: {round(percentage, 1)}% ({'PASS' if passed else 'FAIL'})"
-        })
-        db.commit()
-    except Exception:
-        db.rollback()
+    # Advance candidate stage to test_submitted.
+    # Keyed on the interview's own candidate id, not the submitted email. Matching
+    # on email here was both spoofable and unscoped — the raw SQL bypasses the
+    # before_compile tenant filter, so one address could move candidate rows in
+    # every company that happened to share it.
+    if candidate is not None:
+        try:
+            db.execute(text(
+                "UPDATE candidates SET current_stage='test_submitted', updated_at=NOW() "
+                "WHERE id=:cid AND current_stage='shortlisted'"
+            ), {"cid": candidate.id})
+            db.execute(text(
+                "INSERT INTO candidate_stage_history (id, candidate_id, from_stage, to_stage, notes, created_at) "
+                "SELECT :hid, id, 'shortlisted', 'test_submitted', :notes, NOW() "
+                "FROM candidates WHERE id=:cid AND current_stage='test_submitted' LIMIT 1"
+            ), {
+                "hid": str(uuid.uuid4()),
+                "cid": candidate.id,
+                "notes": f"Test submitted — Score: {round(percentage, 1)}% ({'PASS' if passed else 'FAIL'})"
+            })
+            db.commit()
+        except Exception:
+            db.rollback()
 
-    # Send result email — resolve company SMTP from candidate's company.
-    try:
-        cand = db.query(_CandidateModel).filter(_CandidateModel.email == submission.candidate_email).first()
-        from src.services.pipeline_notifications import resolve_step_dispatch
-        _cid = getattr(cand, "company_id", None)
-        disp = resolve_step_dispatch(db, _cid, "mcq_result")
-        smtp_config = disp["smtp_config"] or resolve_sender(db, _cid, "candidate")
-        send_mcq_result(
-            submission.candidate_email, submission.candidate_name,
-            f"Interview #{submission.interview_id}",
-            earned_points, total_points, passed,
-            smtp_config=smtp_config,
-            cc=disp["cc"]
+    # Send result email to the interview's own candidate, using that candidate's
+    # company to resolve the sender. Both the recipient and the company come from
+    # the database — see the note above the candidate lookup.
+    email_status = "skipped"
+    if candidate is None or not candidate.email:
+        logger.warning(
+            "MCQ result email skipped: interview %s has no candidate to notify",
+            submission.interview_id,
         )
-    except Exception as _e:
-        logger.warning(f"MCQ result email to {submission.candidate_email} failed: {_e}")
+    elif not candidate.company_id:
+        # Never resolve a sender with company_id=None. resolve_sender falls through
+        # to the platform's env SMTP identity, which would let a tenant-less row
+        # borrow the platform's sending reputation.
+        logger.warning(
+            "MCQ result email skipped: candidate %s has no company", candidate.id
+        )
+    else:
+        try:
+            from src.services.pipeline_notifications import resolve_step_dispatch
+            from src.services.email_service import delivery_outcome
+            disp = resolve_step_dispatch(db, candidate.company_id, "mcq_result")
+            smtp_config = disp["smtp_config"] or resolve_sender(db, candidate.company_id, "candidate")
+            _result = send_mcq_result(
+                candidate.email, candidate_display_name,
+                f"Interview #{submission.interview_id}",
+                earned_points, total_points, passed,
+                smtp_config=smtp_config,
+                cc=disp["cc"]
+            )
+            email_status = delivery_outcome(_result)["status"]
+        except Exception as _e:
+            logger.warning(f"MCQ result email to {candidate.email} failed: {_e}")
+            email_status = "failed"
 
     return {
         "mark_sheet": {
-            "candidate_name": submission.candidate_name,
+            "candidate_name": candidate_display_name,
             "interview_id": submission.interview_id,
             "submitted_at": datetime.now().isoformat(),
             "total_questions": len(questions),
@@ -196,7 +234,10 @@ def submit_mcq_test(
             "by_question_type": by_type
         },
         "detailed_results": results,
-        "email_sent": True
+        # Was hardcoded True. "sent" and "queued" both mean the message was
+        # accepted for delivery; anything else means it was not.
+        "email_sent": email_status in ("sent", "queued"),
+        "email_status": email_status,
     }
 
 
@@ -369,20 +410,35 @@ def respond_to_offer(
     from src.services.pipeline_notifications import resolve_step_dispatch
     _cid = getattr(cand_obj, "company_id", None) if cand_obj else None
     _step = "offer_accepted" if new_status == "accepted" else "offer_rejected"
-    disp = resolve_step_dispatch(db, _cid, _step, offer=offer_obj)
-    smtp_config = disp["smtp_config"] or resolve_sender(db, _cid, "candidate")
-    if new_status == "accepted":
-        try:
-            send_offer_accepted(hr_email or "hr@company.com", candidate_name, job_title,
-                                str(start_date), smtp_config=smtp_config, cc=disp["cc"])
-        except Exception as _e:
-            logger.warning(f"offer-accepted email to HR ({hr_email}) failed: {_e}")
+    hr_email_status = "skipped"
+    if not _cid:
+        # Same guard as the MCQ path: resolve_sender(db, None, ...) falls through
+        # to the platform's env SMTP identity, letting a tenant-less row borrow
+        # the platform's sending reputation.
+        logger.warning("offer-response email skipped: offer %s has no company", offer_id)
     else:
+        from src.services.email_service import delivery_outcome
+        disp = resolve_step_dispatch(db, _cid, _step, offer=offer_obj)
+        smtp_config = disp["smtp_config"] or resolve_sender(db, _cid, "candidate")
         try:
-            send_offer_rejected(hr_email or "hr@company.com", candidate_name, job_title,
-                                smtp_config=smtp_config, cc=disp["cc"])
+            if new_status == "accepted":
+                _res = send_offer_accepted(hr_email or "hr@company.com", candidate_name,
+                                           job_title, str(start_date),
+                                           smtp_config=smtp_config, cc=disp["cc"])
+            else:
+                _res = send_offer_rejected(hr_email or "hr@company.com", candidate_name,
+                                           job_title, smtp_config=smtp_config,
+                                           cc=disp["cc"])
+            outcome = delivery_outcome(_res)
+            hr_email_status = outcome["status"]
+            if not outcome["ok"]:
+                logger.warning(
+                    f"offer-{new_status} email to HR ({hr_email}) not delivered: "
+                    f"{outcome['error_type']} — {outcome['error']}"
+                )
         except Exception as _e:
-            logger.warning(f"offer-rejected email to HR ({hr_email}) failed: {_e}")
+            hr_email_status = "failed"
+            logger.warning(f"offer-{new_status} email to HR ({hr_email}) failed: {_e}")
 
     db.commit()
 
@@ -394,7 +450,13 @@ def respond_to_offer(
         "job_title": job_title,
         "notes": response.notes,
         "responded_at": datetime.now().isoformat(),
-        "message": f"Offer {new_status} successfully. HR has been notified via email."
+        "message": f"Offer {new_status} successfully." + {
+            "sent": " HR has been notified via email.",
+            "queued": " An email to HR is queued for delivery.",
+            "failed": " WARNING: HR could not be notified by email.",
+            "skipped": " No HR notification was sent.",
+        }.get(hr_email_status, ""),
+        "hr_email_status": hr_email_status,
     }
 
 

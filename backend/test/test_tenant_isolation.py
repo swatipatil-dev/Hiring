@@ -360,6 +360,128 @@ def test_mcq_submit_blocks_cross_tenant_interview(client, two_companies):
     assert resp.status_code == 404, resp.text
 
 
+def _make_mcq_candidate_and_question(db, company_id, job_id, interview_id, email):
+    """Attach a real candidate + one MCQ question to an interview.
+
+    The MCQ submit handler 404s when an interview has no questions, so a test
+    that needs to reach the email path has to seed one.
+    """
+    from sqlalchemy import text as _text
+    from src.models.models import Candidate, Interview
+
+    cand = Candidate(
+        id=str(uuid.uuid4()), company_id=company_id, job_id=job_id,
+        email=email, first_name="Real", last_name="Candidate",
+        current_stage="shortlisted",
+    )
+    db.add(cand)
+    db.flush()
+
+    db.query(Interview).filter(Interview.id == interview_id).update(
+        {"candidate_id": cand.id}
+    )
+
+    qid = str(uuid.uuid4())
+    db.execute(_text(
+        "INSERT INTO interview_questions "
+        "(id, interview_id, question_text, question_type, difficulty_level, "
+        " correct_answer, points) "
+        "VALUES (:id, :iid, '2+2?', 'MCQ', 'EASY', '4', 10)"
+    ), {"id": qid, "iid": interview_id})
+    db.flush()
+    return cand, qid
+
+
+@pytest.mark.security
+def test_mcq_submit_ignores_client_supplied_recipient(client, db, two_companies, monkeypatch):
+    """The result email goes to the interview's candidate, not the request body.
+
+    Regression for the authenticated open relay: the handler used to mail
+    whatever ``candidate_email`` the submitter sent, so any signed-in user could
+    have the tenant's SMTP identity deliver to an arbitrary address with company
+    branding and aligned SPF/DKIM.
+    """
+    import routes.evaluation_routes as ev
+
+    a = two_companies["a"]
+    real_email = f"real_{uuid.uuid4().hex[:6]}@a.com"
+    _, qid = _make_mcq_candidate_and_question(
+        db, a["company_id"], a["job_id"], a["interview_id"], real_email
+    )
+
+    captured = {}
+    monkeypatch.setattr(
+        ev, "send_mcq_result",
+        lambda to, name, *args, **kwargs: captured.update(to=to, name=name)
+                                          or {"sent": True},
+    )
+
+    resp = client.post(
+        "/api/v1/evaluation/mcq/submit",
+        headers=a["candidate"],
+        json={
+            "interview_id": a["interview_id"],
+            "candidate_name": "Attacker Display Name",
+            "candidate_email": "attacker@evil.com",
+            "answers": [{"question_id": qid, "selected_answer": "4"}],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    assert captured.get("to") == real_email, (
+        f"MCQ result mailed to {captured.get('to')!r} — the client-supplied "
+        f"address was trusted. Recipient must come from interview.candidate_id."
+    )
+    assert captured["to"] != "attacker@evil.com"
+    assert "Attacker" not in (captured.get("name") or "")
+    assert resp.json()["email_sent"] is True
+
+
+@pytest.mark.security
+def test_mcq_submit_sends_nothing_when_interview_has_no_candidate(
+    client, db, two_companies, monkeypatch
+):
+    """No candidate on the interview means no mail — and no sender resolution.
+
+    Falling through to ``resolve_sender(db, None, ...)`` would reach the
+    platform's env SMTP identity, letting an unattached interview borrow the
+    platform's sending reputation.
+    """
+    from sqlalchemy import text as _text
+    import routes.evaluation_routes as ev
+
+    a = two_companies["a"]
+    qid = str(uuid.uuid4())
+    db.execute(_text(
+        "INSERT INTO interview_questions "
+        "(id, interview_id, question_text, question_type, difficulty_level, "
+        " correct_answer, points) "
+        "VALUES (:id, :iid, '2+2?', 'MCQ', 'EASY', '4', 10)"
+    ), {"id": qid, "iid": a["interview_id"]})
+    db.flush()
+
+    calls = []
+    monkeypatch.setattr(ev, "send_mcq_result",
+                        lambda *args, **kwargs: calls.append(args) or {"sent": True})
+    monkeypatch.setattr(ev, "resolve_sender",
+                        lambda *a_, **k_: pytest.fail("resolve_sender must not run"))
+
+    resp = client.post(
+        "/api/v1/evaluation/mcq/submit",
+        headers=a["candidate"],
+        json={
+            "interview_id": a["interview_id"],
+            "candidate_name": "Attacker",
+            "candidate_email": "attacker@evil.com",
+            "answers": [{"question_id": qid, "selected_answer": "4"}],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert calls == [], "mail was sent for an interview with no candidate"
+    assert resp.json()["email_sent"] is False
+    assert resp.json()["email_status"] == "skipped"
+
+
 @pytest.mark.security
 def test_marksheet_blocks_cross_tenant_interview(client, two_companies):
     """Company-A user cannot read marksheet of Company-B's interview."""
