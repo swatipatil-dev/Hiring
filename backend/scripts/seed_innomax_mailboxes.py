@@ -1,17 +1,23 @@
 """Seed the Innomax sender mailboxes and pre-map pipeline steps to them.
 
-Creates the 10 named sender mailboxes (Admin → Email Settings → Sender Mailboxes)
-for the platform (Innomax) company and points each hiring-pipeline step at the
-right one, so HR doesn't have to wire them by hand.
+Creates the named sender mailboxes (Admin → Email Settings → Sender Mailboxes)
+for the platform company and points each hiring-pipeline step at the right one,
+so HR doesn't have to wire them by hand.
 
 Passwords are intentionally left BLANK — a mailbox only sends once an admin fills
-its App Password in the UI (until then that step falls back to the company
-default sender). Idempotent: existing mailboxes are updated in place and their
-stored password is preserved; existing step rows keep their extra_emails/roles.
+its password in the UI (until then that step falls back to the company default
+sender). Idempotent: existing mailboxes are updated in place and their stored
+password is preserved; existing step rows keep their extra_emails/roles.
 
-Scope: only the candidate/HR pipeline-step senders. auth@ (OTPs), support@
-tickets, admin@ and no-reply@ are still created as selectable mailboxes but are
-NOT auto-wired — those flows keep using their existing routing.
+``Auth`` is created but deliberately NOT in STEP_MAP: OTP and password-reset mail
+find it by NAME (AUTH_MAILBOX_NAME, src/services/email_service.py), not through a
+pipeline step. Renaming it silently drops auth mail to the company default.
+
+The Admin UI is the supported way to manage these. Re-running this script after
+manual edits is destructive in three ways: it force-resets is_active and enabled,
+it overwrites mailbox_id on every step in STEP_MAP, and because it matches on
+(company_id, name) a mailbox RENAMED in the UI gets recreated empty and the steps
+repointed at it. Treat this as first-run convenience, not the source of truth.
 
 Usage (from backend/):
     python scripts/seed_innomax_mailboxes.py                # platform company
@@ -27,34 +33,26 @@ from src.config.database_config_mysql import db_manager
 from src.models.models import Company, CompanyMailbox, PipelineStepConfig
 from src.tenancy.platform_company import get_platform_company
 
-SMTP_HOST = "mail.innomaxsol.com"
+SMTP_HOST = "mail.innomaxskills.com"
 SMTP_PORT = 465  # implicit SSL
 
 # name -> address. name is what HR sees in the "Send from" dropdown.
 MAILBOXES = [
-    ("Careers",       "careers@innomaxsol.com"),
-    ("Support",       "support@innomaxsol.com"),
-    ("Auth",          "auth@innomaxsol.com"),
-    ("Scheduling",    "scheduling@innomaxsol.com"),
-    ("Assessments",   "assessments@innomaxsol.com"),
-    ("Notifications", "notifications@innomaxsol.com"),
-    ("Offers",        "offers@innomaxsol.com"),
-    ("HR",            "hr@innomaxsol.com"),
-    ("Admin",         "admin@innomaxsol.com"),
-    ("No-Reply",      "no-reply@innomaxsol.com"),
+    ("Auth",        "auth@innomaxskills.com"),
+    ("Assessments", "assessments@innomaxskills.com"),
+    ("Scheduling",  "scheduling@innomaxskills.com"),
+    ("Offers",      "offers@innomaxskills.com"),
 ]
 
 # pipeline step_key -> mailbox name (must exist in MAILBOXES).
+# Steps NOT listed here keep the company default sender, which is correct - there
+# is no mailbox for them yet. Add one only once it exists in MAILBOXES.
 STEP_MAP = {
-    "application_received": "Careers",
     "test_invitation":     "Assessments",
     "mcq_result":          "Assessments",
     "interview_scheduled": "Scheduling",
     "panel_invite":        "Scheduling",
     "offer_letter":        "Offers",
-    "offer_accepted":      "HR",
-    "offer_rejected":      "HR",
-    "candidate_rejected":  "Notifications",
 }
 
 
@@ -124,8 +122,10 @@ def main() -> None:
         print(f"Mailboxes: {created} created, {updated} updated (total {len(MAILBOXES)}).")
         print(f"Pipeline steps mapped: {mapped}.")
         no_pw = [n for n, _ in MAILBOXES]
-        print("\nNEXT STEP: set each mailbox's App Password in Admin -> Email Settings -> "
-              "Sender Mailboxes. Until then, that step falls back to the company default sender.")
+        print("\nNEXT STEP: set each mailbox's password in Admin -> Email Settings -> "
+              "Sender Mailboxes, then press Test on each row to prove it works. Until a "
+              "mailbox has a password it is inert and its step falls back to the "
+              "company default sender.")
         print("Mailboxes needing a password:", ", ".join(no_pw))
     except Exception as e:
         db.rollback()
