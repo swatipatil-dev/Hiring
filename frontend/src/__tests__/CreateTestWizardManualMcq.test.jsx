@@ -63,6 +63,20 @@ describe('CreateTestWizard — manual MCQ entry (HR)', () => {
     expect(screen.getByRole('button', { name: /^CSV$/i })).toBeInTheDocument()
   })
 
+  it('keeps the pool row wrapping so the last buttons are never clipped away', async () => {
+    // The buttons existing is not the same as HR being able to click them. The row is a flex
+    // line of nowrap buttons inside a body with overflow-x:hidden, so without wrapping the
+    // trailing Add Manually / CSV simply run off the right edge, with no scrollbar to reach
+    // them — which is exactly how HR lost the feature while the markup was still present.
+    const user = userEvent.setup()
+    await openStep4(user)
+
+    const buttonGroup = screen.getByRole('button', { name: /Add Manually/i }).parentElement
+    const poolRow = buttonGroup.parentElement
+    expect(buttonGroup.style.flexWrap).toBe('wrap')
+    expect(poolRow.style.flexWrap).toBe('wrap')
+  })
+
   it('posts a hand-written question to the draft and keeps the modal open for the next one', async () => {
     const user = userEvent.setup()
     qApi.post.mockResolvedValue({

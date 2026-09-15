@@ -1261,17 +1261,21 @@ export default function CreateTestWizard({
                       const isReady = stats.accepted >= needed
                       return (
                         <div key={ti} style={{
-                          display: 'flex', alignItems: 'center', gap: 12, padding: '10px 14px', marginBottom: 8,
+                          // Wraps rather than overflowing: body has overflow-x:hidden, so a row that
+                          // runs past the right edge silently swallows its last buttons (Add Manually,
+                          // CSV) with no scrollbar to reach them.
+                          display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 12, rowGap: 8,
+                          padding: '10px 14px', marginBottom: 8,
                           background: 'var(--bg-primary)', borderRadius: 8,
                           borderLeft: `3px solid ${isReady ? '#22c55e' : stats.total > 0 ? '#f59e0b' : 'var(--border-subtle)'}`,
                         }}>
-                          <div style={{ flex: 1 }}>
+                          <div style={{ flex: 1, minWidth: 180 }}>
                             <div style={{ fontWeight: 600, fontSize: '0.85rem' }}>{typeLabels[qt.type] || qt.type}</div>
                             <div style={{ fontSize: '0.72rem', color: 'var(--text-tertiary)', marginTop: 2 }}>
                               {qt.count_per_set}/set &middot; need {needed} for {ctForm.num_sets} sets &middot; pool: {poolSize}
                             </div>
                           </div>
-                          <div className="flex gap-6" style={{ alignItems: 'center' }}>
+                          <div className="flex gap-6" style={{ alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end', minWidth: 0 }}>
                             {stats.total > 0 && (<>
                               <span className="badge badge-green" style={{ fontSize: '0.7rem' }}>{stats.accepted} accepted</span>
                               <span className="badge badge-neutral" style={{ fontSize: '0.7rem' }}>{stats.pending} pending</span>
@@ -1307,7 +1311,7 @@ export default function CreateTestWizard({
                             </>)}
                           </div>
                           {stats.total > 0 && stats.accepted < needed && (
-                            <div style={{ fontSize: '0.7rem', color: '#ef4444', fontWeight: 600 }}>
+                            <div style={{ flexBasis: '100%', fontSize: '0.7rem', color: '#ef4444', fontWeight: 600 }}>
                               Need {needed - stats.accepted} more
                             </div>
                           )}

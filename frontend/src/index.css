@@ -667,6 +667,7 @@ button.stat-card:focus-visible .stat-affordance,
 .flex { display: flex; }
 .flex-between { display: flex; justify-content: space-between; align-items: center; }
 .flex-center { display: flex; align-items: center; }
+.gap-6 { gap: 6px; }
 .gap-8 { gap: 8px; }
 .gap-12 { gap: 12px; }
 .gap-16 { gap: 16px; }
