@@ -211,12 +211,25 @@ export default function CreateTestWizard({
     const cr = crRequests.find(r => r.id === val)
     if (job) {
       const mapped = typeFromCategory(job.job_category)
+      // Seed the skills from the job posting. /interviewer/all-jobs already returns
+      // required_skills for every job, and the candidate-request branch below has always
+      // used them — but this branch dropped them, so HR (who reaches the wizard by clicking
+      // "Create Test" on a job card, never through a candidate request) landed on Step 4 with
+      // "No skills configured" and no way to generate or hand-write a question.
+      const jobSkills = (Array.isArray(job.required_skills)
+        ? job.required_skills
+        : String(job.required_skills || '').split(','))
+        .map(x => String(x).trim()).filter(Boolean)
       setCtForm(prev => ({
         ...prev,
         job_id: val,
         job_position: job.job_title,
         job_title: job.job_title,
         interview_type: mapped || prev.interview_type,
+        // A job with no skills listed leaves Step 2 as it was, for HR to fill in by hand.
+        skills: jobSkills.length > 0
+          ? jobSkills.map(name => ({ name, difficulty: 'MEDIUM', marks_per_question: 1, question_types: [{ type: 'multiple_choice', count_per_set: 3, pool_size: null }] }))
+          : prev.skills,
       }))
       // The draft is the source of truth and deliberately overwrites what was just set.
       // Skipped when the parent handed us an openDraft: the Exam Drafts tab sets both that

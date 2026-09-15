@@ -38,6 +38,11 @@ const DRAFT_JOB = {
   status: 'active', job_category: 'technical', required_skills: [],
   has_test: true, test_id: 42, test_status: 'DRAFT',
 }
+const SKILLED_JOB = {
+  job_id: 'job-skilled', job_title: 'Python Developer', department: 'Tech',
+  status: 'active', job_category: 'technical', required_skills: ['Python programming', 'SQL'],
+  has_test: false, test_id: null, test_status: null,
+}
 const READY_JOB = {
   job_id: 'job-ready', job_title: 'QA Engineer', department: 'Tech',
   status: 'active', job_category: 'technical', required_skills: [],
@@ -62,7 +67,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   localStorage.clear()
   api.get.mockImplementation((url) => {
-    if (url === '/interviewer/all-jobs') return Promise.resolve({ data: [FREE_JOB, DRAFT_JOB, READY_JOB] })
+    if (url === '/interviewer/all-jobs') return Promise.resolve({ data: [FREE_JOB, DRAFT_JOB, READY_JOB, SKILLED_JOB] })
     if (url === '/interviewer/tests/drafts') return Promise.resolve({ data: { drafts: [DRAFT_PAYLOAD] } })
     return Promise.resolve({ data: [] })
   })
@@ -148,6 +153,33 @@ describe('Step 1 job dropdown', () => {
     })
     // Fail closed: never open an edit path for a state we do not understand.
     expect(opt).toBeDisabled()
+  })
+
+  it('seeds the skills from the job posting, so Step 4 has something to generate', async () => {
+    // HR reaches the wizard by clicking "Create Test" on a job card, which lands in the
+    // job branch of applyJobSelection. That branch used to drop job.required_skills — only
+    // the candidate-request branch (interviewer-only) read them — so HR arrived at Step 4
+    // on "No skills configured" with no Generate and no Add Manually button to reach.
+    const user = userEvent.setup()
+    render(<CreateTestWizard role="hr" preselectedJobId="job-skilled" />)
+
+    await waitFor(() => expect(jobSelect()).toHaveValue('job-skilled'))
+    await user.click(screen.getByRole('button', { name: '4. Generate Questions' }))
+
+    expect(screen.queryByText(/No skills configured/)).not.toBeInTheDocument()
+    expect(screen.getByText('Python programming')).toBeInTheDocument()
+    expect(screen.getByText('SQL')).toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: /Add Manually/i }).length).toBe(2)
+  })
+
+  it('leaves Step 2 alone when the job lists no skills, for HR to fill in by hand', async () => {
+    const user = userEvent.setup()
+    render(<CreateTestWizard role="hr" preselectedJobId="job-free" />)
+
+    await waitFor(() => expect(jobSelect()).toHaveValue('job-free'))
+    await user.click(screen.getByRole('button', { name: '4. Generate Questions' }))
+
+    expect(screen.getByText(/No skills configured/)).toBeInTheDocument()
   })
 
   it('does not double-load when the parent already handed over a draft', async () => {
