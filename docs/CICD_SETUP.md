@@ -181,6 +181,43 @@ of the tree.
 which the deploy user never reads — `git pull` then fails with "detected dubious ownership"
 because git checks the directory's owner UID and group membership does not satisfy it.
 
+### Let it reach GitHub
+
+`/opt/hireflow`'s remote is **SSH** — `git@github.com:innomax-it-solutions/Hiring_system_Cpanel.git`
+— against a private repository. Creating the user is therefore not enough: the fetch runs as
+`deploy`, so `deploy` needs its own key, that key has to be registered on the repo, and
+github.com has to be a known host *for that user*.
+
+```bash
+sudo -u deploy ssh-keygen -t ed25519 -N '' -f /home/deploy/.ssh/id_ed25519
+ssh-keyscan github.com > /home/deploy/.ssh/known_hosts
+chown deploy:deploy /home/deploy/.ssh/known_hosts
+cat /home/deploy/.ssh/id_ed25519.pub
+```
+
+Add that public key at **repo → Settings → Deploy keys → Add deploy key**, **read-only** — the
+server only ever fetches. A deploy key is scoped to the one repository, which is why it is used
+here rather than a personal access token sitting on disk. Verify before going further:
+
+```bash
+sudo -u deploy git -C /opt/hireflow fetch origin      # must exit silently
+```
+
+**`ssh-keyscan` is not optional, and neither line can be skipped because "SSH works".** Both
+were missing on the live server and cost a week of deploys. The two failures look nothing alike
+and neither names its cause:
+
+- no `known_hosts` entry → `Host key verification failed`. Interactively this is the familiar
+  "Are you sure you want to continue connecting?" prompt; in a pipeline there is nobody to
+  answer it, so it is simply an error. Note `/home/deploy/.ssh` must exist first — the redirect
+  above fails if the `mkdir` at the top of this section was skipped.
+- key not on the repo → `git@github.com: Permission denied (publickey)`.
+
+Neither reaches anyone. `deploy.yml` reports the raw git error, the run goes red, and unless
+somebody opens the Actions tab the site simply keeps serving its last good build while every
+merge appears to succeed. Seven consecutive deploys failed that way before anyone noticed, and
+the `notify` job in `deploy.yml` now opens an issue precisely so that cannot repeat.
+
 ## 2. Grant it exactly six things
 
 ```bash

@@ -459,11 +459,21 @@ is fine at this stage — nothing is installed yet.
 `[root]`
 
 ```bash
-git clone https://github.com/innomax-it-solutions/Hiring_system_Cpanel.git /opt/hireflow
+git clone git@github.com:innomax-it-solutions/Hiring_system_Cpanel.git /opt/hireflow
 chown -R hireflow:hireflow /opt/hireflow
 ```
 
 **Check:** `ls /opt/hireflow` shows `backend`, `frontend`, `deploy`, `docs`.
+
+**SSH, not HTTPS.** The repository is private and the pipeline fetches into this clone as the
+`deploy` user, which authenticates with a deploy key — see
+[`CICD_SETUP.md` §1](CICD_SETUP.md#1-create-the-deploy-user). An HTTPS remote here looks
+identical until the first automated deploy, which then fails on credentials it has no way to
+supply. If a clone already exists on the HTTPS URL, repoint it rather than re-cloning:
+
+```bash
+git -C /opt/hireflow remote set-url origin git@github.com:innomax-it-solutions/Hiring_system_Cpanel.git
+```
 
 ### 6.2 Create the Python environment
 
