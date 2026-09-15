@@ -182,6 +182,37 @@ describe('Step 1 job dropdown', () => {
     expect(screen.getByText(/No skills configured/)).toBeInTheDocument()
   })
 
+  it('canonicalises a draft whose stored question type is a display label', async () => {
+    // SkillQuestionType.type is an unvalidated str on the backend, and the drafts endpoint
+    // returns it with a bare json.loads, so a row saved with "MCQ" where the key belongs
+    // comes back verbatim. It then renders as "MCQ" anyway — TYPE_LABELS misses and the
+    // label falls through to the raw value — so the row looks right while losing the
+    // MCQ-only actions, its per-question minutes, and the question_type it generates with.
+    const user = userEvent.setup()
+    api.get.mockImplementation((url) => {
+      if (url === '/interviewer/all-jobs') return Promise.resolve({ data: [DRAFT_JOB] })
+      if (url === '/interviewer/tests/drafts') {
+        return Promise.resolve({ data: { drafts: [{
+          ...DRAFT_PAYLOAD,
+          skills_configuration: { skills: [{
+            name: 'PYTHON', difficulty: 'MEDIUM', marks_per_question: 1,
+            question_types: [{ type: 'MCQ', count_per_set: 3 }],
+          }] },
+        }] } })
+      }
+      return Promise.resolve({ data: [] })
+    })
+    render(<CreateTestWizard role="hr" preselectedJobId="job-draft" />)
+
+    // The banner is the wizard's own signal that the draft finished loading into ctForm.
+    expect(await screen.findByText(/Resuming an unfinished draft/)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '4. Generate Questions' }))
+
+    expect(screen.getByText('PYTHON')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Add Manually/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^CSV$/i })).toBeInTheDocument()
+  })
+
   it('does not double-load when the parent already handed over a draft', async () => {
     // The Exam Drafts tab sets openDraft AND preselectedJobId; that path owns the loading.
     render(

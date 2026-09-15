@@ -19,6 +19,34 @@ export const TYPE_LABELS = {
   case_study: 'Case Study', aptitude: 'Aptitude', communication: 'Communication',
 }
 
+/**
+ * The canonical key for a stored question type.
+ *
+ * SkillQuestionType.type is an unvalidated free-form str on the backend
+ * (enhanced_interviewer_routes.py), written with model_dump() and read back by the drafts
+ * endpoint with a bare json.loads — so a draft keeps whatever spelling it was saved with, and
+ * a display label stored in a key's place ("MCQ" for multiple_choice) survives the round trip.
+ *
+ * That is not cosmetic. Every lookup in this wizard is keyed by the canonical value: TYPE_LABELS,
+ * TYPE_TIME_DEFAULTS, getPoolKey, the MCQ-only actions, and the question_type sent to the
+ * generator. A stray spelling costs the row its Add Manually / CSV buttons, silently drops its
+ * per-question minutes to the 5-minute fallback, and stamps itself onto every question generated
+ * from it — which then fails to match at set-assembly time.
+ *
+ * Unrecognised values are cleaned but not remapped, so a genuinely new type is never rewritten
+ * into an MCQ behind the user's back.
+ */
+const TYPE_ALIASES = {
+  mcq: 'multiple_choice', multiplechoice: 'multiple_choice',
+  descriptive: 'short_answer', shortanswer: 'short_answer',
+  casestudy: 'case_study',
+}
+export const normalizeQuestionType = (t) => {
+  const key = String(t ?? '').trim().toLowerCase().replace(/[\s-]+/g, '_')
+  if (!key) return 'multiple_choice'
+  return TYPE_ALIASES[key] || TYPE_ALIASES[key.replace(/_/g, '')] || key
+}
+
 // Minutes granted per question, by type — what a new test starts with. HR can change any of
 // them per test; the backend keeps its own fallback for tests saved before this setting existed
 // (generator_router._TYPE_TIME_DEFAULTS), which stays at the old values so their clocks don't move.
@@ -306,9 +334,11 @@ export default function CreateTestWizard({
       time_per_question_type: { ...TYPE_TIME_DEFAULTS, ...(ic.time_per_question_type || {}) },
       scheduled_datetime: ic.scheduled_datetime || '',
       skills: (sc.skills && sc.skills.length > 0)
+        // Canonicalise on the way in: this is the one boundary a stored spelling crosses, so
+        // fixing it here heals an old draft everywhere at once rather than guarding each lookup.
         ? sc.skills.map(s => s.question_types
-          ? { marks_per_question: 1, ...s }
-          : { name: s.name || '', difficulty: s.difficulty_override || s.difficulty || 'MEDIUM', marks_per_question: s.marks_per_question || 1, question_types: [{ type: s.question_type || 'multiple_choice', count_per_set: s.question_count || 3, pool_size: null }] }
+          ? { marks_per_question: 1, ...s, question_types: s.question_types.map(qt => ({ ...qt, type: normalizeQuestionType(qt.type) })) }
+          : { name: s.name || '', difficulty: s.difficulty_override || s.difficulty || 'MEDIUM', marks_per_question: s.marks_per_question || 1, question_types: [{ type: normalizeQuestionType(s.question_type), count_per_set: s.question_count || 3, pool_size: null }] }
         )
         : [{ name: '', difficulty: 'MEDIUM', marks_per_question: 1, question_types: [{ type: 'multiple_choice', count_per_set: 3, pool_size: null }] }],
       num_sets: iv.num_sets || 2,

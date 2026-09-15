@@ -11,7 +11,7 @@ import api from '../../api/client'
 import './InterviewerDashboard.css'
 // This dashboard carries its own inlined copy of the create-test wizard; the timing rules are
 // shared with the HR one so both produce the same duration.
-import { TYPE_LABELS, TYPE_TIME_DEFAULTS, computeDuration } from '../shared/CreateTestWizard'
+import { TYPE_LABELS, TYPE_TIME_DEFAULTS, computeDuration, normalizeQuestionType } from '../shared/CreateTestWizard'
 import ProctoringReport from '../../components/ProctoringReport'
 import ExamDrafts from '../../components/ExamDrafts'
 import Header from '../../components/Header'
@@ -881,9 +881,11 @@ export default function InterviewerDashboard() {
       time_per_question_type: { ...TYPE_TIME_DEFAULTS, ...(ic.time_per_question_type || {}) },
       scheduled_datetime: ic.scheduled_datetime || '',
       skills: (sc.skills && sc.skills.length > 0)
+        // Same canonicalisation as the shared wizard — a draft saved with a display label in
+        // the type's place would otherwise lose its MCQ-only actions and its per-question minutes.
         ? sc.skills.map(s => s.question_types
-          ? { marks_per_question: 1, ...s }  // new shape, ensure default
-          : { name: s.name || '', difficulty: s.difficulty_override || s.difficulty || 'MEDIUM', marks_per_question: s.marks_per_question || 1, question_types: [{ type: s.question_type || 'multiple_choice', count_per_set: s.question_count || 3, pool_size: null }] }
+          ? { marks_per_question: 1, ...s, question_types: s.question_types.map(qt => ({ ...qt, type: normalizeQuestionType(qt.type) })) }
+          : { name: s.name || '', difficulty: s.difficulty_override || s.difficulty || 'MEDIUM', marks_per_question: s.marks_per_question || 1, question_types: [{ type: normalizeQuestionType(s.question_type), count_per_set: s.question_count || 3, pool_size: null }] }
         )
         : [{ name: '', difficulty: 'MEDIUM', marks_per_question: 1, question_types: [{ type: 'multiple_choice', count_per_set: 3, pool_size: null }] }],
       num_sets: iv.num_sets || 2,
