@@ -30,11 +30,17 @@ Cmnd_Alias HF_SERVICES = \
 
 # The app runs as `hireflow`; pip/alembic/python go through its venv. Bare
 # `sudo -u hireflow /bin/sh` is not granted — only these three binaries.
+#
+# These are the COMMANDS, not `sudo` invocations of them. The pipeline runs
+# `sudo -u hireflow /opt/hireflow/venv/bin/alembic upgrade head`, so what sudo
+# matches is the binary, and the runas it must authorise is `hireflow`. Writing
+# them as `/usr/bin/sudo -u hireflow <binary>` described a nested `sudo sudo`
+# that nothing invokes — and could not have worked anyway, because the `noexec`
+# default below would stop the inner sudo exec'ing its target.
 Cmnd_Alias HF_APP = \
-    /usr/bin/sudo -u hireflow /opt/hireflow/venv/bin/pip *, \
-    /usr/bin/sudo -u hireflow /opt/hireflow/venv/bin/alembic *, \
-    /usr/bin/sudo -u hireflow /opt/hireflow/venv/bin/python *, \
-    /usr/bin/sudo -u hireflow HF_HOME=/opt/hireflow/hf-cache /opt/hireflow/venv/bin/python *
+    /opt/hireflow/venv/bin/pip *, \
+    /opt/hireflow/venv/bin/alembic *, \
+    /opt/hireflow/venv/bin/python *
 
 # Config that `git pull` does not update. Sources are pinned to the repo tree so
 # this cannot be used to write arbitrary files into /etc.
@@ -54,12 +60,23 @@ Cmnd_Alias HF_WEB = \
     /usr/bin/cp -f /opt/hireflow/deploy/cpanel/htaccess-spa /home/innomaxskills/public_html/career/.htaccess, \
     /usr/bin/chown -R innomaxskills\:innomaxskills /home/innomaxskills/public_html/career
 
-# Pre-migration dump only. Read-only against the database; the destination is
-# fixed so this cannot be used to write elsewhere.
+# Pre-migration dump only. Read-only against the database. Note this grants
+# `mysqldump *`, so the destination is NOT confined — the deploy step pins it with
+# --result-file, but this line does not enforce that.
 Cmnd_Alias HF_BACKUP = \
     /usr/bin/mysqldump *
 
-deploy ALL=(root) NOPASSWD: HF_SERVICES, HF_APP, HF_CONFIG, HF_APACHE, HF_WEB, HF_BACKUP
+# Two runas specs, because they genuinely differ: everything above acts as root,
+# while the venv commands must act as `hireflow` — the user that owns the tree and
+# the virtualenv. A single `(root)` spec makes sudo refuse the latter with
+# "user deploy is not allowed to execute ... as hireflow", which is precisely what
+# it did on every deploy carrying a migration.
+#
+# SETENV is needed for one caller only: the pipeline runs
+# `sudo -u hireflow HF_HOME=/opt/hireflow/hf-cache <venv>/python ...`, and without
+# it sudo refuses to let the command line set that variable.
+deploy ALL=(root)     NOPASSWD: HF_SERVICES, HF_CONFIG, HF_APACHE, HF_WEB, HF_BACKUP
+deploy ALL=(hireflow) NOPASSWD: SETENV: HF_APP
 
 # Refuse to run any of the above through a shell or an editor escape.
 Defaults:deploy !authenticate
