@@ -363,13 +363,29 @@ jobs:
 
       # Step 2 — back up before any migration. A dump with zero CREATE TABLE
       # lines is not a backup; the runbook says stop if the count is 0.
+      #
+      # `--result-file`, not `> file`. A redirect is performed by the calling shell,
+      # which here is the DEPLOY user — only mysqldump itself is elevated — so writing
+      # to /root failed with "Permission denied" on every deploy that carried a
+      # migration, and the dump the rollback advertises was never written at all.
+      # --result-file is mysqldump's own output path, opened by the elevated process.
+      #
+      # The dump therefore stays root-only, which is also why its tables are not
+      # counted by reading it back: `deploy` cannot read /root, and the old `ls | grep`
+      # would have failed for the same reason even once the write worked. The count
+      # comes from a second, schema-only dump streamed to the runner instead — same
+      # credentials and database, and it leaves no copy of the data anywhere `deploy`
+      # can reach. Both calls are plain mysqldump, which is all HF_BACKUP grants.
       - name: Back up the database
         if: steps.pull.outputs.migrations == 'true' && !inputs.dry_run
         run: |
           ssh target "sudo mysqldump -u '${{ secrets.DB_USER }}' -p'${{ secrets.DB_PASSWORD }}' \
-            --single-transaction --no-tablespaces '${{ secrets.DB_NAME }}' \
-            > /root/predeploy-\$(date +%F-%H%M).sql"
-          TABLES=$(ssh target "grep -c '^CREATE TABLE' \$(ls -t /root/predeploy-*.sql | head -1)")
+            --single-transaction --no-tablespaces \
+            --result-file=/root/predeploy-\$(date +%F-%H%M).sql '${{ secrets.DB_NAME }}'"
+          # grep -c exits 1 on no match, and the step would abort before the message
+          # below ever prints — so let it report 0 and fail on the explicit check.
+          TABLES=$(ssh target "sudo mysqldump -u '${{ secrets.DB_USER }}' -p'${{ secrets.DB_PASSWORD }}' \
+            --no-data --no-tablespaces '${{ secrets.DB_NAME }}'" | grep -c '^CREATE TABLE' || true)
           echo "tables in dump: $TABLES"
           [ "$TABLES" -gt 0 ] || { echo "::error::Backup contains no tables — refusing to migrate."; exit 1; }
 
