@@ -656,3 +656,111 @@ jobs:
           echo "::notice::Deployed. Proctoring and the coding judge have NO CI coverage —"
           echo "::notice::verify by hand (DEPLOY_UPDATE.md:165-171): HR login, one real email,"
           echo "::notice::a proctoring WebSocket reaching 101, Run Code, and opening a CV."
+
+  # ── Tell a human ────────────────────────────────────────────────────────────
+  # Every failure path above writes ::warning:: and rolls back, and all of it lands
+  # in a run log. That was not enough. Nine deploys ran; #2 was the last green one;
+  # seven consecutive failures — starting with the commit that shipped HR's manual
+  # MCQ entry — sat unread for a week while the feature was assumed live, and three
+  # more fixes were written against a symptom that only existed on the stale build.
+  #
+  # So a failure opens an issue. The search comes FIRST on purpose: a run of seven
+  # failures must leave one issue with seven comments. Seven issues would be noise,
+  # and noise is what let this go unread to begin with.
+  #
+  # A red CI skips `validate` (see its `if:`), which skips everything downstream —
+  # and a skipped job is not a failed one, so this stays quiet and lets CI own its
+  # own signal. That is deliberate, not a gap.
+  notify:
+    needs: [validate, build, deploy]
+    if: failure() && !inputs.dry_run
+    runs-on: ubuntu-latest
+    # The top-level grant is `contents: read`. A job-level block REPLACES it, so this
+    # job trades read access it does not need for the one write it does.
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          LABEL: ${{ needs.validate.outputs.label || 'main' }}
+        with:
+          script: |
+            const label = 'deploy-failure'
+            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            const body = [
+              `Deploy of \`${process.env.LABEL}\` failed.`,
+              ``,
+              `- Run: ${run}`,
+              `- Commit: ${context.sha}`,
+              `- Triggered by: ${context.eventName}`,
+              ``,
+              `The run log names the failing step. Nothing is assumed here about the state of`,
+              `the server: the deploy job rolls back when it recorded a pre-deploy commit, and`,
+              `says so explicitly when there was nothing to roll back.`,
+            ].join('\n')
+
+            const open = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: label, per_page: 1,
+            })
+
+            if (open.data.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: open.data[0].number, body,
+              })
+              core.notice(`Commented on #${open.data[0].number}`)
+              return
+            }
+
+            // Creating an issue with a label that does not exist yet is a 422, so the
+            // first-ever failure has to make the label before it can use it.
+            try {
+              await github.rest.issues.createLabel({
+                owner: context.repo.owner, repo: context.repo.repo,
+                name: label, color: 'b60205',
+                description: 'A production deploy failed',
+              })
+            } catch (e) {
+              if (e.status !== 422) throw e
+            }
+
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner, repo: context.repo.repo,
+              title: 'Production deploy is failing',
+              labels: [label], body,
+            })
+            core.notice(`Opened #${issue.data.number}`)
+
+  # A green deploy closes the thread, so a stale issue does not outlive the outage
+  # and become one more thing nobody reads.
+  resolve:
+    needs: [validate, build, deploy]
+    if: success() && !inputs.dry_run
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          LABEL: ${{ needs.validate.outputs.label || 'main' }}
+        with:
+          script: |
+            const label = 'deploy-failure'
+            const open = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: label, per_page: 1,
+            })
+            if (open.data.length === 0) return
+
+            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: open.data[0].number,
+              body: `Deploy of \`${process.env.LABEL}\` succeeded — ${run}`,
+            })
+            await github.rest.issues.update({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: open.data[0].number, state: 'closed',
+            })
+            core.notice(`Closed #${open.data[0].number}`)
