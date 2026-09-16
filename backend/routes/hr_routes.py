@@ -22,6 +22,12 @@ from src.services.resume_pool_import import (
     score_backlog, count_unscored,
 )
 from src.services.job_dedup import find_open_duplicate_job, duplicate_job_detail
+from src.services.staff_directory import (
+    active_interviewer_query, active_hr_query, active_user_by_email,
+)
+from src.services.interview_panel import (
+    build_panel, parse_panel, apply_panel, diff_panel,
+)
 from src.services.llm_resume_extractor import (
     PROFILE_FIELDS, missing_fields, extract_gaps, profile_source_map as _profile_source,
     LLM_RESUME_CONCURRENCY,
@@ -532,10 +538,12 @@ async def create_job(
     if not department:
         raise HTTPException(status_code=404, detail="Department not found")
 
-    # AUTO-ASSIGN interviewer from same department
-    assigned_interviewer = db.query(InterviewerProfile).filter(
+    # AUTO-ASSIGN interviewer from same department. Active users only: a deactivated
+    # interviewer is refused at login (src/auth.py:178), so assigning one routes the job
+    # to nobody. Ordered so the pick is reproducible instead of storage-engine order.
+    assigned_interviewer = active_interviewer_query(db, current_user.company_id).filter(
         InterviewerProfile.department_id == dept_id
-    ).first()
+    ).order_by(InterviewerProfile.employee_id).first()
 
     # Resolve company_id robustly: HR's user.company_id is canonical, but fall
     # back to the resolved department's company_id so a job is never created
@@ -668,6 +676,25 @@ class PoolAttachment(BaseModel):
     uploaded_at: Optional[datetime] = None
 
 
+class ArchivedInterview(BaseModel):
+    """An interview that happened, replayed off a pool row after its job was deleted.
+
+    Names the colleagues who conducted it and what they concluded. Nothing else keeps
+    this once the job is hard-deleted — the Interview and InterviewFeedback rows go with it.
+    """
+    interview_id: Optional[int] = None
+    title: Optional[str] = None
+    interview_type: Optional[str] = None
+    held_at: Optional[datetime] = None
+    is_scheduled_interview: bool = False
+    interviewers: List[str] = []
+    interviewer_email: Optional[str] = None
+    test_score: Optional[float] = None
+    overall_score: Optional[float] = None
+    hire_recommendation: Optional[str] = None
+    feedback_notes: Optional[str] = None
+
+
 class PoolApplication(BaseModel):
     """One application this person made. Read live from `candidates`, never stored on
     the pool row — a stored copy would go stale the moment anyone changed a stage."""
@@ -681,6 +708,8 @@ class PoolApplication(BaseModel):
     # job was hard-deleted and took the Candidate row with it. The title survives here
     # and nowhere else, so this is the one application record that cannot self-update.
     archived: bool = False
+    # Populated only on archived rows: who interviewed this person and what they said.
+    interviews: List[ArchivedInterview] = []
 
 
 class ResumeMatchResult(BaseModel):
@@ -1003,6 +1032,10 @@ def _archived_applications(entry: ResumePoolEntry) -> List[PoolApplication]:
             applied_at=applied_at,
             ats_score=a.get("ats_score"),
             archived=True,
+            interviews=[
+                ArchivedInterview(**iv) for iv in (a.get("interviews") or [])
+                if isinstance(iv, dict)
+            ],
         ))
     return out
 
@@ -2770,11 +2803,24 @@ async def assign_interviewer_to_job(
     ).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    interviewer = db.query(InterviewerProfile).join(User, InterviewerProfile.user_id == User.id).filter(
+    interviewer = active_interviewer_query(db, current_user.company_id).filter(
         InterviewerProfile.id == interviewer_id,
         User.company_id == current_user.company_id
     ).first()
     if not interviewer:
+        # Distinguish "no such interviewer" from "deactivated" — HR needs to know which,
+        # and a 404 on a name they can still see in a stale tab is baffling.
+        deactivated = db.query(InterviewerProfile).join(
+            User, InterviewerProfile.user_id == User.id
+        ).filter(
+            InterviewerProfile.id == interviewer_id,
+            User.company_id == current_user.company_id
+        ).first()
+        if deactivated:
+            raise HTTPException(
+                status_code=400,
+                detail="That interviewer has been deactivated and cannot be assigned."
+            )
         raise HTTPException(status_code=404, detail="Interviewer not found")
     job.interviewer_id = interviewer_id
     job.updated_at = datetime.utcnow()
@@ -2801,11 +2847,22 @@ async def assign_hr_to_job(
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    hr_profile = db.query(HRProfile).join(User, HRProfile.user_id == User.id).filter(
+    hr_profile = active_hr_query(db, current_user.company_id).filter(
         HRProfile.id == hr_id,
         User.company_id == current_user.company_id
     ).first()
     if not hr_profile:
+        # Same split as assign_interviewer_to_job: a deactivated person is a different
+        # problem from a bad id, and HR needs to be told which.
+        deactivated = db.query(HRProfile).join(User, HRProfile.user_id == User.id).filter(
+            HRProfile.id == hr_id,
+            User.company_id == current_user.company_id
+        ).first()
+        if deactivated:
+            raise HTTPException(
+                status_code=400,
+                detail="That HR user has been deactivated and cannot be assigned."
+            )
         raise HTTPException(status_code=404, detail="HR profile not found")
 
     job.hr_id = hr_id
@@ -2925,8 +2982,17 @@ async def delete_job_permanent(
     ATS results, interviews + feedback, questions, code/proctoring data and offers.
     Irreversible. FK-safe: children are removed bottom-up in a single transaction
     before the job row itself, so a missing table rolls the whole thing back cleanly.
-    (The plain DELETE /jobs/{id} above is only a soft close — status='closed'.)"""
-    from src.models.models import ProctoringSession, ProctoringViolation, ProctoringTranscript
+    (The plain DELETE /jobs/{id} above is only a soft close — status='closed'.)
+
+    What survives, by design: the PEOPLE. Step 0 copies every candidate back to the
+    talent pool, and that snapshot now also carries each completed interview — the
+    colleagues who conducted it and what they recommended. Deleting a job used to erase
+    who interviewed whom, because Interview and InterviewFeedback are the only place
+    that is recorded; the pool entry is now the surviving copy.
+    """
+    from src.models.models import (
+        JobDeletionArchive, ProctoringSession, ProctoringTranscript, ProctoringViolation,
+    )
     from src.models.question_models import (
         Question as InterviewQuestion, QuestionSetAssignment,
         CandidateQuestionHistory, CommunicationAnswer,
@@ -2956,6 +3022,33 @@ async def delete_job_permanent(
         if conds:
             db.query(model).filter(or_(*conds)).delete(synchronize_session=False)
 
+    # 0a) Snapshot the TESTS written for this job and who wrote them.
+    # Templates have no candidate, so unlike a completed interview they cannot ride along
+    # on a pool entry — without this row the author of a job's test is simply erased.
+    # Read before any delete runs, for the same reason step 0 is ordered first.
+    template_rows = db.query(Interview).filter(
+        Interview.job_id == job_id,
+        Interview.candidate_id.is_(None),
+    ).all() if job_id else []
+    tests_snapshot = []
+    for t in template_rows:
+        author = (t.interviewer_name or "").strip()
+        tests_snapshot.append({
+            "interview_id": t.id,
+            "title": t.title,
+            "interview_type": t.interview_type,
+            "status": t.status,
+            "author_name": author or None,
+            "author_email": (t.interviewer_email or "").strip() or None,
+            # created_by is the account that actually saved it; interviewer_name can be a
+            # display value typed into the wizard, so both are kept.
+            "created_by": t.created_by,
+            "question_count": db.query(InterviewQuestion).filter(
+                InterviewQuestion.interview_id == t.id).count(),
+            "created_at": t.created_at.isoformat() if t.created_at else None,
+        })
+
+    archived_interview_count = 0
     _in_iv = interview_ids or None
     _in_cand = cand_ids or None
     _in_q = question_ids or None
@@ -2977,6 +3070,10 @@ async def delete_job_permanent(
             actor_user_id=current_user.id,
             archive_applications=True,
         )
+        archived_interview_count = db.query(Interview).filter(
+            Interview.candidate_id.in_(cand_ids),
+            func.upper(Interview.status) == "COMPLETED",
+        ).count()
 
     # 1) Proctoring (deepest — references interviews via test_id)
     if session_ids:
@@ -3041,15 +3138,80 @@ async def delete_job_permanent(
     bulk_delete(Candidate, Candidate.id.in_(cand_ids) if _in_cand else None)
     bulk_delete(CandidateRequest, CandidateRequest.job_id == job_id)
 
-    # 5) The job itself
+    # 5) The archive row, then the job itself. Written last so it only exists if every
+    # destructive step above succeeded — a rolled-back delete must not leave a record
+    # claiming a job was removed.
     title = job.title
+    db.add(JobDeletionArchive(
+        company_id=job.company_id or current_user.company_id,
+        job_id=str(job.id),
+        job_title=title,
+        department_name=job.department.name if job.department else None,
+        deleted_by_id=current_user.id,
+        deleted_by_email=current_user.email,
+        candidates_archived=len(cand_ids),
+        interviews_archived=archived_interview_count,
+        tests=json.dumps(tests_snapshot) if tests_snapshot else None,
+    ))
     db.delete(job)
     db.commit()
     return {
-        "message": f"Job '{title}' and all related data were permanently deleted.",
+        "message": (
+            f"Job '{title}' was permanently deleted. "
+            f"{len(cand_ids)} candidate(s) and their completed interview records were "
+            f"kept in the talent pool; {len(tests_snapshot)} test(s) and their authors "
+            "are listed under Deleted Jobs."
+        ),
         "deleted_candidates": len(cand_ids),
         "deleted_interviews": len(interview_ids),
+        "archived_candidates": len(cand_ids),
+        "archived_interviews": archived_interview_count,
+        "archived_tests": len(tests_snapshot),
     }
+
+
+@router.get("/deleted-jobs")
+async def list_deleted_jobs(
+    skip: int = 0,
+    limit: int = 50,
+    current_user: User = Depends(AuthMiddleware.get_current_hr),
+    db: Session = Depends(get_db),
+):
+    """Jobs that were permanently deleted, and the tests written for them.
+
+    The counterpart to DELETE /jobs/{id}/permanent. Candidates and their completed
+    interviews survive in the talent pool; a test template has no candidate to attach to,
+    so this is the only surviving record of who authored a deleted job's test.
+    """
+    from src.models.models import JobDeletionArchive
+
+    q = db.query(JobDeletionArchive)
+    if current_user.company_id:
+        q = q.filter(JobDeletionArchive.company_id == current_user.company_id)
+
+    total = q.count()
+    rows = (q.order_by(JobDeletionArchive.created_at.desc())
+             .offset(skip).limit(limit).all())
+
+    out = []
+    for r in rows:
+        try:
+            tests = json.loads(r.tests) if r.tests else []
+        except (json.JSONDecodeError, TypeError, ValueError):
+            tests = []
+        out.append({
+            "id": str(r.id),
+            "job_id": r.job_id,
+            "job_title": r.job_title,
+            "department": r.department_name,
+            "deleted_by": r.deleted_by_email,
+            "deleted_at": r.created_at,
+            "candidates_archived": r.candidates_archived or 0,
+            "interviews_archived": r.interviews_archived or 0,
+            "tests": tests,
+        })
+    return {"total": total, "results": out}
+
 
 
 @router.get("/hr-profiles")
@@ -3058,10 +3220,8 @@ async def get_available_hr_profiles(
     db: Session = Depends(get_db)
 ):
     """Get all available HR profiles for assignment"""
-    hr_q = db.query(HRProfile).join(User, HRProfile.user_id == User.id)
-    if current_user.company_id:
-        hr_q = hr_q.filter(User.company_id == current_user.company_id)
-    profiles = hr_q.all()
+    # Active only: this is an assignment picker, and a deactivated HR cannot log in.
+    profiles = active_hr_query(db, current_user.company_id).all()
     return [
         {
             "id": str(p.id),
@@ -3080,10 +3240,9 @@ async def get_available_interviewers(
     db: Session = Depends(get_db)
 ):
     """Get all available interviewers for assignment"""
-    iv_q = db.query(InterviewerProfile).join(User, InterviewerProfile.user_id == User.id)
-    if current_user.company_id:
-        iv_q = iv_q.filter(User.company_id == current_user.company_id)
-    profiles = iv_q.all()
+    # Active only. This feeds HR's "Assign Interviewer" dropdown and the panel picker,
+    # so listing a deactivated user here is precisely how they get re-assigned.
+    profiles = active_interviewer_query(db, current_user.company_id).all()
     return [
         {
             "id": str(p.id),
@@ -3869,7 +4028,7 @@ async def hr_submit_interview_feedback(
         )
         db.add(fb)
 
-    interview.status = "completed"
+    interview.status = "COMPLETED"
     if interview.candidate_id:
         cand = db.query(Candidate).filter(Candidate.id == interview.candidate_id).first()
         if cand and cand.current_stage != "interview_completed":
@@ -4329,57 +4488,15 @@ async def hr_schedule_interview(
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    # Build the interview panel. If interviewer_ids are supplied, look up each
-    # InterviewerProfile + its User (preserving HR's selection order — first is the
-    # lead). Otherwise fall back to the job's single assigned interviewer.
-    panel = []  # list of {"id","name","email","user_id"}
-    if body.interviewer_ids:
-        profiles = db.query(InterviewerProfile).filter(
-            InterviewerProfile.id.in_(body.interviewer_ids),
-            InterviewerProfile.company_id == current_user.company_id,
-        ).all()
-        by_id = {str(p.id): p for p in profiles}
-        for pid in body.interviewer_ids:
-            p = by_id.get(str(pid))
-            if p and p.user:
-                panel.append({
-                    "id": str(p.id),
-                    "name": f"{p.user.first_name} {p.user.last_name}".strip(),
-                    "email": p.user.email,
-                    "user_id": str(p.user.id),
-                })
-    if not panel and job.interviewer and job.interviewer.user:
-        u = job.interviewer.user
-        panel.append({
-            "id": str(job.interviewer.id),
-            "name": f"{u.first_name} {u.last_name}".strip(),
-            "email": u.email,
-            "user_id": str(u.id),
-        })
-
-    # Append ad-hoc panelists (typed name+email, or picked HR/Admin staff). Dedup by
-    # email against the interviewer panel; resolve to a company user by email so they
-    # still receive the in-app notification when they have an account.
-    if body.manual_panelists:
-        existing_emails = {(p.get("email") or "").strip().lower() for p in panel}
-        for mp in body.manual_panelists:
-            email = (mp.email or "").strip()
-            if not email or email.lower() in existing_emails:
-                continue
-            existing_emails.add(email.lower())
-            u = db.query(User).filter(
-                User.company_id == current_user.company_id,
-                User.email == email,
-            ).first()
-            name = (mp.name or "").strip() or (
-                f"{u.first_name} {u.last_name}".strip() if u else email
-            )
-            panel.append({
-                "id": str(u.id) if u else None,
-                "name": name,
-                "email": email,
-                "user_id": str(u.id) if u else None,
-            })
+    # Panel roster — shared with PUT /hr/interviews/{id}/panel so the two cannot drift.
+    # Order is HR's selection order (first = lead); a deactivated pick raises 400.
+    panel = build_panel(
+        db,
+        current_user.company_id,
+        interviewer_ids=body.interviewer_ids,
+        manual_panelists=body.manual_panelists,
+        job=job,
+    )
 
     lead = panel[0] if panel else None
     panel_names = ", ".join(p["name"] for p in panel) if panel else "TBD"
@@ -4558,6 +4675,137 @@ async def hr_schedule_interview(
         "email_status": email_status,
         "email_error": email_error,
     }
+
+
+class UpdatePanelRequest(BaseModel):
+    interviewer_ids: Optional[List[str]] = None
+    manual_panelists: Optional[List[ManualPanelist]] = None
+    # Off switches for a silent correction (fixing a typo'd name, say).
+    notify: bool = True
+
+
+@router.put("/interviews/{interview_id}/panel")
+async def update_interview_panel(
+    interview_id: int,
+    body: UpdatePanelRequest,
+    current_user: User = Depends(AuthMiddleware.get_current_hr),
+    db: Session = Depends(get_db),
+):
+    """Change who is on a scheduled interview's panel.
+
+    Until this existed, panel_members was write-once: set at creation, and otherwise only
+    touched by the deactivation cascade. Swapping an interviewer meant cancelling the
+    interview and booking a new one.
+
+    Only the delta is notified. Re-inviting the whole panel on every edit trains people to
+    ignore the invite, and the unchanged members already have the meeting.
+    """
+    interview = db.query(Interview).filter(
+        Interview.id == interview_id,
+        Interview.company_id == current_user.company_id,
+    ).first()
+    if not interview:
+        raise HTTPException(status_code=404, detail="Interview not found")
+
+    if not interview.is_scheduled_interview:
+        raise HTTPException(
+            status_code=409,
+            detail="Only a scheduled interview has a panel. Tests are edited in the wizard.",
+        )
+    if (interview.status or "").upper() not in ("SCHEDULED", "RESCHEDULED"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot re-panel an interview that is {interview.status}.",
+        )
+
+    job = interview.job
+    old_panel = parse_panel(interview)
+    new_panel = build_panel(
+        db,
+        current_user.company_id,
+        interviewer_ids=body.interviewer_ids,
+        manual_panelists=body.manual_panelists,
+        job=None,          # no silent fallback to the job default on an explicit edit
+    )
+    added, removed = diff_panel(old_panel, new_panel)
+
+    apply_panel(interview, new_panel)
+    interview.updated_at = datetime.utcnow()
+
+    candidate = interview.candidate
+    candidate_full = (
+        f"{candidate.first_name} {candidate.last_name}" if candidate else "the candidate"
+    )
+    job_title = job.title if job else (interview.job_title or "the role")
+    when = interview.scheduled_datetime
+
+    from src.services.notification_service import create_notification
+
+    if body.notify:
+        for member in added:
+            if member.get("user_id"):
+                create_notification(
+                    db,
+                    user_id=member["user_id"],
+                    company_id=current_user.company_id,
+                    title="Added to an interview panel",
+                    message=f"You are on the panel for {candidate_full} — '{job_title}' on {when}.",
+                    type="interview_scheduled",
+                    reference_type="interview",
+                    reference_id=interview.id,
+                    commit=False,
+                )
+        for member in removed:
+            if member.get("user_id"):
+                create_notification(
+                    db,
+                    user_id=member["user_id"],
+                    company_id=current_user.company_id,
+                    title="Removed from an interview panel",
+                    message=f"You are no longer on the panel for {candidate_full} — '{job_title}'.",
+                    type="interview_scheduled",
+                    reference_type="interview",
+                    reference_id=interview.id,
+                    commit=False,
+                )
+
+    db.commit()
+    db.refresh(interview)
+
+    # Invite only the newly added, and never let a mail failure undo the panel change.
+    if body.notify and added:
+        try:
+            from src.services.email_service import send_panel_invite, resolve_sender
+            from src.services.pipeline_notifications import resolve_step_dispatch
+            company_id = job.company_id if job else current_user.company_id
+            panel_disp = resolve_step_dispatch(db, company_id, "panel_invite",
+                                               interview=interview, job=job)
+            smtp_config = panel_disp["smtp_config"] or resolve_sender(db, company_id, "candidate")
+            meeting_details = interview.meeting_link or "TBD"
+            member_emails = {p["email"] for p in new_panel}
+            extra_cc = [e for e in panel_disp["cc"] if e not in member_emails]
+            for idx, member in enumerate(added):
+                fellow = [p["name"] for p in new_panel if p["email"] != member["email"]]
+                try:
+                    send_panel_invite(
+                        member["email"], member["name"], candidate_full, job_title,
+                        str(when), meeting_details, fellow,
+                        smtp_config=smtp_config,
+                        cc=(extra_cc if idx == 0 else None),
+                    )
+                except Exception as e:
+                    logger.warning(f"panel invite to {member['email']} failed: {e}")
+        except Exception as e:
+            logger.warning(f"panel invite dispatch failed for interview {interview.id}: {e}")
+
+    return {
+        "interview_id": interview.id,
+        "panel": [p["email"] for p in new_panel],
+        "added": [p["email"] for p in added],
+        "removed": [p["email"] for p in removed],
+        "needs_interviewer": not new_panel,
+    }
+
 
 
 # ==================== ATS SCREENING ENDPOINTS ====================
@@ -5012,11 +5260,12 @@ async def schedule_interview(
 
     # Validate interviewer
     from src.models.models import InterviewerProfile
-    interviewer = db.query(InterviewerProfile).filter(
+    # Tenant scoping was absent here — this matched on id alone, across companies.
+    interviewer = active_interviewer_query(db, current_user.company_id).filter(
         InterviewerProfile.id == interview_data.interviewer_id
     ).first()
     if not interviewer:
-        raise HTTPException(status_code=404, detail="Interviewer not found")
+        raise HTTPException(status_code=404, detail="Interviewer not found or deactivated")
     
     # Create interview
     _mode = "online" if interview_data.meeting_link else "offline"
@@ -5181,7 +5430,8 @@ async def get_scheduled_interviews(
         query = query.filter(JobPosting.hr_id == hr_profile.id)
 
     if status:
-        query = query.filter(Interview.status == status)
+        # Stored uppercase; normalise the client's casing so ?status=scheduled works.
+        query = query.filter(func.upper(Interview.status) == status.upper())
 
     interviews = query.order_by(Interview.created_at.desc()).offset(skip).limit(limit).all()
 
@@ -5209,6 +5459,8 @@ async def get_scheduled_interviews(
                 if line.startswith("Location:"):
                     location = line.replace("Location:", "").strip()
 
+        panel_members = json.loads(iv.panel_members) if iv.panel_members else []
+
         result.append({
             "id": iv.id,
             "title": iv.title,
@@ -5227,10 +5479,17 @@ async def get_scheduled_interviews(
             "status": iv.status,
             "interviewer_name": iv.interviewer_name or "—",
             "interviewer_email": iv.interviewer_email or "",
-            "panel_members": (json.loads(iv.panel_members) if iv.panel_members else []),
+            "panel_members": panel_members,
             "notes": iv.notes,
             "created_at": iv.created_at,
             "is_scheduled_interview": bool(iv.is_scheduled_interview),
+            # Derived, not stored: a scheduled interview with an empty panel and no lead
+            # has nobody to run it — usually its interviewer was deactivated.
+            "needs_interviewer": (
+                bool(iv.is_scheduled_interview)
+                and not panel_members
+                and not (iv.interviewer_email or "").strip()
+            ),
         })
 
     return result

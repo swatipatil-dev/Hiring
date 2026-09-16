@@ -645,7 +645,7 @@ CREATE TABLE IF NOT EXISTS interviews (
 	panel_members TEXT, 
 	meeting_link VARCHAR(500), 
 	interviewer_details_data TEXT, 
-	status VARCHAR(20), 
+	status VARCHAR(20) DEFAULT 'DRAFT', 
 	notes TEXT, 
 	created_by VARCHAR(255), 
 	job_id VARCHAR(36), 

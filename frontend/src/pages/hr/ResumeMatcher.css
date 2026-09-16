@@ -744,6 +744,46 @@
   white-space: nowrap;
 }
 
+/* Interviews preserved from a deleted job. The parent row is a three-column grid, so
+   this spans the full width and sits under the application it belongs to. */
+.rm-hist__ivs {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 4px 0 2px;
+  padding-left: 10px;
+  border-left: 2px solid var(--rm-rule);
+}
+
+.rm-hist__iv {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+}
+
+/* The name is the point of this row — everything else is context. */
+.rm-hist__iv-who { font-weight: 600; }
+
+.rm-hist__iv-type,
+.rm-hist__iv-when,
+.rm-hist__iv-score {
+  font-family: var(--rm-mono);
+  font-size: 0.66rem;
+  color: var(--text-tertiary);
+}
+
+.rm-hist__iv-rec {
+  font-size: 0.66rem;
+  text-transform: capitalize;
+  padding: 1px 6px;
+  border: 1px solid var(--rm-rule);
+  border-radius: 4px;
+}
+
 /* Stage chips reuse the pill type spec; only the colour family changes. */
 .rm-stage {
   font-family: var(--rm-mono);

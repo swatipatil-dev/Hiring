@@ -5,15 +5,18 @@ import enum
 
 
 class InterviewStatus(str, enum.Enum):
-    DRAFT        = "draft"
-    GENERATING   = "generating"
-    READY        = "ready"
-    ERROR        = "error"
-    SCHEDULED    = "scheduled"
-    IN_PROGRESS  = "in_progress"
-    COMPLETED    = "completed"
-    CANCELLED    = "cancelled"
-    RESCHEDULED  = "rescheduled"
+    """Values are UPPERCASE to match what is actually written to interviews.status
+    (and the same-named enum in routes/enhanced_interviewer_routes.py). These used to be
+    lowercase, which made the two definitions disagree about the same column."""
+    DRAFT        = "DRAFT"
+    GENERATING   = "GENERATING"
+    READY        = "READY"
+    ERROR        = "ERROR"
+    SCHEDULED    = "SCHEDULED"
+    IN_PROGRESS  = "IN_PROGRESS"
+    COMPLETED    = "COMPLETED"
+    CANCELLED    = "CANCELLED"
+    RESCHEDULED  = "RESCHEDULED"
 
 
 class InterviewType(str, enum.Enum):

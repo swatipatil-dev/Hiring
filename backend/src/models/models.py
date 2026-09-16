@@ -807,6 +807,38 @@ class EmailLog(Base, TenantScoped):
     updated_at     = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class JobDeletionArchive(Base, TenantScoped):
+    """What a permanently-deleted job took with it, kept so the people are still named.
+
+    Deleting a job is a genuine hard delete — candidates, interviews, feedback and the
+    tests written for it all go. Candidates survive via the talent pool, and their
+    completed interviews ride along on that pool entry. Test TEMPLATES have no candidate,
+    so they had nowhere to land: the colleague who authored a job's test was simply erased.
+
+    This is that missing home. One row per deleted job, holding the job's own details plus
+    a JSON snapshot of the tests written for it and who wrote each one. Nothing here is an
+    FK to the job or the interviews — they no longer exist, which is the whole point.
+    """
+    __tablename__ = "job_deletion_archives"
+
+    id              = Column(String(36), primary_key=True, default=_uuid)
+    company_id      = Column(String(36), ForeignKey("companies.id"), nullable=True, index=True)
+    # The deleted job's id, kept as a plain string: there is no row left to reference.
+    job_id          = Column(String(36), nullable=False, index=True)
+    job_title       = Column(String(255), nullable=False)
+    department_name = Column(String(255), nullable=True)
+    # Who pressed delete, by id and by email — the id so it links, the email so the
+    # record still reads if that account is later removed from view.
+    deleted_by_id    = Column(String(36), ForeignKey("users.id"), nullable=True)
+    deleted_by_email = Column(String(255), nullable=True)
+    candidates_archived = Column(Integer, default=0)
+    interviews_archived = Column(Integer, default=0)
+    # JSON list of {interview_id, title, interview_type, status, author_name,
+    # author_email, created_by, question_count, created_at}.
+    tests           = Column(Text, nullable=True)
+    created_at      = Column(DateTime, default=datetime.utcnow, index=True)
+
+
 class Notification(Base, TenantScoped):
     __tablename__ = "notifications"
 

@@ -1362,8 +1362,12 @@ def department_dashboard(
             if cand_ids else 0
         )
 
-        interviewers = db.query(InterviewerProfile).filter(
-            InterviewerProfile.department_id == dept.id
+        # Active only — a deactivated interviewer is not available capacity.
+        interviewers = db.query(InterviewerProfile).join(
+            User, InterviewerProfile.user_id == User.id
+        ).filter(
+            InterviewerProfile.department_id == dept.id,
+            User.is_active == True,  # noqa: E712
         ).all()
 
         result.append({

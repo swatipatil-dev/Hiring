@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Legend, AreaChart, Area, CartesianGrid } from 'recharts'
-import { Users, Building2, Briefcase, TrendingUp, Plus, Edit3, Trash2, Search, Camera, Upload, X, Mail, CheckCircle2, AlertCircle, Send, ChevronRight } from 'lucide-react'
+import { Users, Building2, Briefcase, TrendingUp, Plus, Edit3, Trash2, UserX, UserCheck, Search, Camera, Upload, X, Mail, CheckCircle2, AlertCircle, Send, ChevronRight } from 'lucide-react'
 import api from '../../api/client'
 import Header from '../../components/Header'
 import SupportPanel from './SupportPanel'
@@ -546,10 +546,19 @@ export default function AdminDashboard() {
   }
 
   const handleToggleUser = async (userId, currentActive) => {
-    if (!confirm(`${currentActive ? 'Deactivate' : 'Activate'} this user?`)) return
+    if (!confirm(currentActive
+      ? 'Deactivate this user?\n\nThey lose access and drop off assignment lists, but the account, their name and their interview history are kept — you can reactivate them at any time.'
+      : 'Activate this user?')) return
     try {
       if (currentActive) {
-        await api.delete(`/admin/users/${userId}`)
+        const { data } = await api.delete(`/admin/users/${userId}`)
+        // Deactivating an interviewer also detaches them from jobs and upcoming panels.
+        // Say so, otherwise HR discovers the reassignment work by accident.
+        const parts = []
+        if (data?.jobs_unassigned) parts.push(`unassigned from ${data.jobs_unassigned} job(s)`)
+        if (data?.interviews_updated) parts.push(`${data.interviews_updated} upcoming interview(s) updated`)
+        if (data?.interviews_needing_interviewer) parts.push(`${data.interviews_needing_interviewer} now need an interviewer`)
+        if (parts.length) alert(`User deactivated — ${parts.join('; ')}.`)
       } else {
         await api.put(`/admin/users/${userId}/status?is_active=true`)
       }
@@ -1356,7 +1365,7 @@ export default function AdminDashboard() {
                         <button className="btn btn-ghost btn-sm"
                           onClick={() => handleToggleUser(u.id, u.is_active)}
                           title={u.is_active ? 'Deactivate' : 'Activate'}>
-                          {u.is_active ? <Trash2 size={14} /> : <Edit3 size={14} />}
+                          {u.is_active ? <UserX size={14} /> : <UserCheck size={14} />}
                           {u.is_active ? 'Deactivate' : 'Activate'}
                         </button>
                       </div>

@@ -505,6 +505,59 @@ def sync_pool_on_apply(db: Session, *, candidate, job, ats_result,
         logger.warning(f"Talent pool sync skipped for candidate {getattr(candidate, 'id', '?')}: {e}")
 
 
+def _interview_snapshots(db: Session, cand_ids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+    """Who interviewed these candidates, and what they concluded.
+
+    A hard job delete destroys the Interview and InterviewFeedback rows, and those are
+    the only record of which colleague conducted an interview and what they recommended.
+    Snapshotting it here — before anything is deleted — is what keeps a person's
+    completed work attributed to them after the job is gone.
+
+    Keyed by candidate_id. Only interviews that actually happened are kept; a scheduled
+    interview that never took place has no outcome worth preserving.
+    """
+    from src.models.models import Interview, InterviewFeedback
+
+    if not cand_ids:
+        return {}
+
+    rows = (
+        db.query(Interview, InterviewFeedback)
+        .outerjoin(InterviewFeedback, InterviewFeedback.interview_id == Interview.id)
+        .filter(
+            Interview.candidate_id.in_(cand_ids),
+            # UPPER() because both casings exist in older rows.
+            func.upper(Interview.status) == "COMPLETED",
+        )
+        .all()
+    )
+
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for iv, fb in rows:
+        try:
+            panel = json.loads(iv.panel_members) if iv.panel_members else []
+        except (json.JSONDecodeError, TypeError, ValueError):
+            panel = []
+        panel_names = [p.get("name") for p in panel if isinstance(p, dict) and p.get("name")]
+        if not panel_names and iv.interviewer_name:
+            panel_names = [iv.interviewer_name]
+
+        out.setdefault(iv.candidate_id, []).append({
+            "interview_id": iv.id,
+            "title": iv.title,
+            "interview_type": iv.interview_type,
+            "held_at": iv.scheduled_datetime.isoformat() if iv.scheduled_datetime else None,
+            "is_scheduled_interview": bool(iv.is_scheduled_interview),
+            "interviewers": panel_names,
+            "interviewer_email": iv.interviewer_email or None,
+            "test_score": float(iv.test_score) if iv.test_score is not None else None,
+            "overall_score": float(fb.overall_score) if fb is not None and fb.overall_score is not None else None,
+            "hire_recommendation": fb.hire_recommendation if fb is not None else None,
+            "feedback_notes": fb.additional_notes if fb is not None else None,
+        })
+    return out
+
+
 def return_candidates_to_pool(db: Session, *, job, candidates,
                               actor_user_id: Optional[str] = None,
                               archive_applications: bool = False) -> int:
@@ -531,12 +584,14 @@ def return_candidates_to_pool(db: Session, *, job, candidates,
         return 0
 
     scores: Dict[str, Any] = {}
+    interviews: Dict[str, List[Dict[str, Any]]] = {}
     if archive_applications:
         cand_ids = [c.id for c in candidates]
         if cand_ids:
             scores = {r.candidate_id: r.ats_score for r in
                       db.query(ATSResult.candidate_id, ATSResult.ats_score)
                         .filter(ATSResult.candidate_id.in_(cand_ids)).all()}
+            interviews = _interview_snapshots(db, cand_ids)
 
     touched = 0
     for candidate in candidates:
@@ -619,6 +674,10 @@ def return_candidates_to_pool(db: Session, *, job, candidates,
                 "stage": candidate.current_stage or "applied",
                 "applied_at": candidate.created_at.isoformat() if candidate.created_at else None,
                 "ats_score": float(score) if score is not None else None,
+                # Who conducted their interviews and what was concluded. The Interview
+                # and InterviewFeedback rows are about to be destroyed with the job;
+                # this is the only surviving copy.
+                "interviews": interviews.get(candidate.id, []),
             })
             entry.archived_applications = json.dumps(archived)
 
