@@ -191,15 +191,58 @@ describe('Counts come from the server, not from the fetched page', () => {
     expect(card.textContent).not.toContain('0')
   })
 
-  it('still says loading rather than zero when the counts request fails', async () => {
+  // A failed load used to render the same em dash as a slow one, so a half-finished
+  // deploy — new frontend, old API, 404 on the endpoint — looked exactly like an empty
+  // pipeline. These pin the three states apart.
+  const failWith = (err) => {
     api.get.mockImplementation((url) => {
-      const u = String(url)
-      if (u === '/hr/dashboard/counts') return Promise.reject(new Error('500'))
+      if (String(url) === '/hr/dashboard/counts') return Promise.reject(err)
       return Promise.resolve({ data: [] })
     })
+  }
+
+  it('reports a failed counts request as unavailable, not as loading or zero', async () => {
+    failWith({ response: { status: 500 } })
     renderHr()
-    // A failed fetch must not be reported as a confident zero.
-    const card = await screen.findByRole('button', { name: /^Offers, loading count/ })
-    expect(card.textContent).toContain('—')
+
+    const card = await screen.findByRole('button', { name: /^Offers, count unavailable/ })
+    // Never a confident zero, and no longer the same dash a slow load shows.
+    expect(card.textContent).not.toContain('0')
+    expect(card.textContent).toContain('!')
+  })
+
+  it('names a 404 as an out-of-date backend, which is what a half-deploy looks like', async () => {
+    failWith({ response: { status: 404 } })
+    renderHr()
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toContain('Totals unavailable')
+    expect(alert.textContent).toMatch(/backend may be out of date/i)
+  })
+
+  it('says it could not reach the server when there is no response at all', async () => {
+    failWith(new Error('Network Error'))
+    renderHr()
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toMatch(/could not reach the server/i)
+  })
+
+  it('retry re-requests and fills the cards in', async () => {
+    const user = await userEvent()
+    failWith({ response: { status: 404 } })
+    renderHr()
+
+    await screen.findByRole('alert')
+
+    // The deploy finishes; the same button must recover without a page reload.
+    api.get.mockImplementation((url) => {
+      if (String(url) === '/hr/dashboard/counts') return Promise.resolve({ data: HR_COUNTS })
+      return Promise.resolve({ data: [] })
+    })
+    await user.click(screen.getByRole('button', { name: /^Retry$/ }))
+
+    expect(await screen.findByRole('button', { name: /^Job Postings: 80\./ })).toBeTruthy()
+    expect(screen.queryByRole('alert')).toBeNull()
   })
 })

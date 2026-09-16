@@ -831,22 +831,46 @@ HR Team`,
   // offer the dashboard kept showing the old numbers until a full page reload —
   // which reads to a user as "my action didn't save".
   const [counts, setCounts] = useState(null)
+  // Null counts used to mean both "still loading" and "the request failed", and both
+  // rendered as an em dash — which reads as "you have no jobs" when it actually means
+  // the call errored. Tracking the failure separately lets the cards say so and offer
+  // a retry, instead of a broken deploy looking like an empty pipeline.
+  const [countsError, setCountsError] = useState(null)
+
+  // Named the likely causes rather than showing a bare "failed": a 404 here means the
+  // running API predates the endpoint, which is exactly what a half-finished deploy
+  // looks like from the browser.
+  const countsErrorText = (err) => {
+    const status = err?.response?.status
+    if (status === 404) return 'The server does not have this endpoint — the backend may be out of date.'
+    if (status === 401 || status === 403) return 'You are not authorised to see these totals.'
+    if (status >= 500) return `The server failed to calculate them (HTTP ${status}).`
+    if (!err?.response) return 'Could not reach the server.'
+    return `The request failed (HTTP ${status}).`
+  }
+
+  const fetchCounts = useCallback(() => {
+    setCountsError(null)
+    return api.get('/hr/dashboard/counts')
+      .then(r => { setCounts(r.data); setCountsError(null) })
+      .catch(err => { setCounts(null); setCountsError(countsErrorText(err)) })
+  }, [])
 
   const refreshOverview = useCallback(() => {
     // The overview cards read this, not the arrays below. /hr/jobs, /hr/interviews and
     // /hr/offers all cap at limit=50, so counting what came back reported "50" for any
     // HR with more than fifty of anything, and the number stopped moving there.
     //
-    // Left at null on failure rather than 0: the cards render "—" for null, and a flash
-    // of zero reads as "you have no jobs" instead of "not loaded yet". Same rule the
-    // admin role cards follow (AdminDashboard.jsx:1305).
-    api.get('/hr/dashboard/counts').then(r => setCounts(r.data)).catch(() => setCounts(null))
+    // Left at null on failure rather than 0: a flash of zero reads as "you have no
+    // jobs" instead of "not loaded yet". Same rule the admin role cards follow
+    // (AdminDashboard.jsx:1305). countsError carries the reason so the UI can say it.
+    fetchCounts()
     api.get('/hr/departments').then(r => setDepartments(r.data || [])).catch(() => {})
     api.get('/hr/interviews').then(r => setInterviews(r.data || [])).catch(() => {})
     api.get('/hr/offers').then(r => setOffers(r.data || [])).catch(() => {})
     api.get('/hr/test-results').then(r => setTestResults(r.data || [])).catch(() => {})
     api.get('/hr/feedback').then(r => setFeedbackData(r.data || [])).catch(() => {})
-  }, [])
+  }, [fetchCounts])
 
   useEffect(() => {
     fetchRequirements()
@@ -1369,6 +1393,17 @@ HR Team`,
             {/* Stats Cards — each one is a drill-down into the tab it summarises.
                 These used to be plain <div>s that lifted on hover, so they read as
                 buttons and did nothing when clicked. */}
+            {countsError && (
+              <div role="alert"
+                style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 12, marginBottom: 16, padding: '10px 14px', borderRadius: 10, background: '#fef2f2', border: '1px solid #fecaca', color: '#991b1b', fontSize: '0.84rem' }}>
+                <span style={{ fontWeight: 600 }}>Totals unavailable.</span>
+                <span style={{ color: '#b91c1c' }}>{countsError}</span>
+                <button type="button" onClick={fetchCounts}
+                  style={{ marginLeft: 'auto', padding: '5px 14px', borderRadius: 8, border: '1px solid #fecaca', background: '#fff', color: '#991b1b', fontWeight: 600, fontSize: '0.8rem', cursor: 'pointer' }}>
+                  Retry
+                </button>
+              </div>
+            )}
             <div className="stats-grid">
               {[
                 {
@@ -1397,12 +1432,19 @@ HR Team`,
                   type="button"
                   className={`stat-card ${s.cls}`}
                   onClick={s.onSelect}
-                  aria-label={s.value == null
-                    ? `${s.label}, loading count. ${s.hint}`
-                    : `${s.label}: ${s.value.toLocaleString()}. ${s.hint}`}
+                  aria-label={s.value != null
+                    ? `${s.label}: ${s.value.toLocaleString()}. ${s.hint}`
+                    : countsError
+                      ? `${s.label}, count unavailable: ${countsError} ${s.hint}`
+                      : `${s.label}, loading count. ${s.hint}`}
                 >
                   <div className="stat-label">{s.label}</div>
-                  <div className="stat-value">{s.value == null ? '—' : s.value.toLocaleString()}</div>
+                  {/* Three states, not two: a failed load must not look like a real zero. */}
+                  <div className="stat-value"
+                    title={s.value == null && countsError ? countsError : undefined}
+                    style={s.value == null && countsError ? { color: '#b91c1c' } : undefined}>
+                    {s.value != null ? s.value.toLocaleString() : countsError ? '!' : '—'}
+                  </div>
                   <ChevronRight size={16} className="stat-affordance" aria-hidden="true" />
                 </button>
               ))}
