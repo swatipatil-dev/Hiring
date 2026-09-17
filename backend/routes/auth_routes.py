@@ -5,18 +5,20 @@ Handles user registration, login, logout, and token management
 
 import json
 import logging
+import re
 from datetime import datetime
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Request, status, Depends
 from src.rate_limit import limiter
 
 logger = logging.getLogger(__name__)
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 from sqlalchemy.orm import Session
 from src.config.database_config_mysql import get_db
 from src.auth import (
     UserCreate, UserLogin, Token, create_user, login_user,
-    create_token_response, get_current_user, set_user_otp
+    create_token_response, get_current_user, set_user_otp,
+    verify_password, get_password_hash, validate_password_strength
 )
 from src.models.models import User, Company
 from src.services.permissions_catalog import get_permissions_for_role
@@ -356,44 +358,176 @@ def _parse_expertise(raw) -> list:
         return [part.strip() for part in str(raw).split(",") if part.strip()]
 
 
-@router.get("/me")
-async def get_current_user_info(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
+def _serialise_me(db: Session, user: User) -> dict:
     """
-    Get current authenticated user information.
+    The /auth/me payload. GET and PUT both return this so their shapes can
+    never drift apart.
 
     Built field-by-field on purpose — password_hash, otp_code and
     otp_expires_at live on the same model and must never be serialised.
     """
     company_name = None
-    if current_user.company_id:
+    if user.company_id:
         try:
             # Company is not TenantScoped, so this is a plain lookup and is
             # safe for every role including superadmin.
-            company = db.query(Company).filter(Company.id == current_user.company_id).first()
+            company = db.query(Company).filter(Company.id == user.company_id).first()
             company_name = company.name if company else None
         except Exception as exc:
-            logger.warning(f"Could not resolve company for user {current_user.id}: {exc}")
+            logger.warning(f"Could not resolve company for user {user.id}: {exc}")
 
     return {
-        "id": str(current_user.id),
-        "email": current_user.email,
-        "role": current_user.role,
-        "first_name": current_user.first_name,
-        "last_name": current_user.last_name,
-        "phone": current_user.phone,
-        "gender": current_user.gender,
-        "date_of_birth": _iso(current_user.date_of_birth),
-        "is_active": current_user.is_active,
-        "email_verified": current_user.email_verified,
-        "created_at": _iso(current_user.created_at),
-        "updated_at": _iso(current_user.updated_at),
-        "company_id": current_user.company_id,
+        "id": str(user.id),
+        "email": user.email,
+        "role": user.role,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "phone": user.phone,
+        "gender": user.gender,
+        "date_of_birth": _iso(user.date_of_birth),
+        "is_active": user.is_active,
+        "email_verified": user.email_verified,
+        "created_at": _iso(user.created_at),
+        "updated_at": _iso(user.updated_at),
+        "company_id": user.company_id,
         "company_name": company_name,
-        "profile": _role_profile(current_user),
+        "profile": _role_profile(user),
     }
+
+
+class UpdateMeRequest(BaseModel):
+    """
+    The only fields a user may change about themselves.
+
+    `extra="forbid"` is the privilege-escalation defence, and it is structural
+    rather than a blocklist: {"role": "admin"} is rejected with a 422 before any
+    handler code runs, and a column added to User later cannot quietly become
+    writable without first being added here. Pydantic's default ("ignore")
+    would accept-and-drop and return 200, which tells someone probing for
+    escalation that the request "worked".
+
+    Deliberately absent: role, email, is_active, company_id, email_verified,
+    password, id. Those are administrative decisions or the login identity.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    first_name: Optional[str] = Field(None, min_length=1, max_length=100)
+    last_name: Optional[str] = Field(None, min_length=1, max_length=100)
+    # String(20) in the DB — without this cap a longer value is a MySQL
+    # DataError at commit time, i.e. a 500 instead of a 422.
+    phone: Optional[str] = Field(None, max_length=20)
+
+    @field_validator("first_name", "last_name")
+    @classmethod
+    def _non_blank(cls, v):
+        if v is None:
+            return v
+        v = v.strip()
+        if not v:
+            raise ValueError("cannot be blank")  # the columns are NOT NULL
+        return v
+
+    @field_validator("phone")
+    @classmethod
+    def _clean_phone(cls, v):
+        if v is None:
+            return v
+        v = v.strip()
+        if not v:
+            return None  # let the field be cleared
+        # Light on purpose: registration validates phone not at all, so a
+        # stricter rule would reject numbers users already have on file.
+        if not re.fullmatch(r"[0-9+\-() ]+", v):
+            raise ValueError("may contain only digits, spaces and + - ( )")
+        return v
+
+
+@router.get("/me")
+async def get_current_user_info(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get current authenticated user information."""
+    return _serialise_me(db, current_user)
+
+
+@router.put("/me")
+async def update_current_user_info(
+    data: UpdateMeRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Update your own name and phone. Every other field is immutable here —
+    see UpdateMeRequest.
+    """
+    changes = data.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(status_code=400, detail="No changes supplied.")
+
+    for field, value in changes.items():
+        setattr(current_user, field, value)
+
+    db.commit()
+    db.refresh(current_user)
+    return _serialise_me(db, current_user)
+
+
+class ChangePasswordRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    current_password: str
+    # max_length because bcrypt only hashes the first 72 bytes (src/auth.py
+    # _bcrypt_bytes) — better to reject a novel than silently truncate it.
+    new_password: str = Field(..., min_length=8, max_length=128)
+
+
+@router.post("/change-password")
+@limiter.limit("5/minute")
+async def change_password(
+    request: Request,
+    data: ChangePasswordRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Change your own password, proving you know the current one.
+
+    Returns 400 — never 401 — when the current password is wrong. The frontend's
+    response interceptor (frontend/src/api/client.js) treats any 401 as a dead
+    session: it clears localStorage and hard-redirects to /login. A 401 here
+    would sign the user out for a typo and throw away the form.
+
+    No enumeration concern: the identity comes from the JWT, and the body
+    carries no email or user id.
+
+    Note this CANNOT invalidate tokens already issued. There is no blocklist,
+    no session table and no password_changed_at column, so every JWT minted
+    before now stays valid until it expires. The UI says so rather than
+    implying otherwise. Fixing that properly means a password_changed_at column
+    plus a matching JWT claim checked in get_current_user.
+    """
+    if not verify_password(data.current_password, current_user.password_hash):
+        raise HTTPException(status_code=400, detail="Current password is incorrect.")
+
+    # Compare against the hash, not the two plaintexts — the hash is what
+    # actually decides whether the password changed.
+    if verify_password(data.new_password, current_user.password_hash):
+        raise HTTPException(
+            status_code=400,
+            detail="New password must be different from your current password.",
+        )
+
+    validate_password_strength(data.new_password)
+
+    current_user.password_hash = get_password_hash(data.new_password)
+    # A reset OTP still sitting on the row must not outlive an authenticated
+    # change — otherwise an old emailed code could undo this.
+    current_user.otp_code = None
+    current_user.otp_expires_at = None
+    db.commit()
+
+    return {"message": "Password changed successfully."}
 
 
 @router.get("/my-permissions")
@@ -451,8 +585,7 @@ async def reset_password(request: Request, data: ResetPasswordRequest, db: Sessi
         raise HTTPException(status_code=400, detail="Invalid OTP")
     if user.otp_expires_at and datetime.utcnow() > user.otp_expires_at:
         raise HTTPException(status_code=400, detail="OTP has expired. Request a new one.")
-    if len(data.new_password) < 8:
-        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    validate_password_strength(data.new_password)
     from src.auth import get_password_hash
     user.password_hash = get_password_hash(data.new_password)
     user.otp_code = None

@@ -5350,31 +5350,16 @@ class DashboardCounts(BaseModel):
     offers: int
 
 
-@router.get("/dashboard/counts", response_model=DashboardCounts)
-async def get_dashboard_counts(
-    current_user: User = Depends(AuthMiddleware.get_current_hr),
-    db: Session = Depends(get_db),
-):
-    """Totals for the HR overview cards.
+def _dashboard_counts(db: Session, current_user: User, own_only: bool, hr_profile) -> DashboardCounts:
+    """The counting itself, shared by GET /dashboard/counts and GET /my-activity.
 
-    The cards used to count the arrays the dashboard had already fetched, but
-    GET /jobs, /interviews and /offers all default to limit=50 and the dashboard
-    passes no limit — so an HR with 80 jobs saw "50", and the number silently
-    stopped moving at the cap. Counting in SQL is also cheaper than shipping
-    hundreds of serialised rows just to take their length.
+    Extracted rather than copied precisely because of the "fix both together or
+    neither" rule in the caller's docstring — a second copy of these queries is
+    a second thing to forget.
 
-    Each count below repeats the scoping of the list endpoint it describes,
-    deliberately and line for line, so a card can never disagree with the list it
-    opens. That includes the `if current_user.company_id:` guards on interviews and
-    offers, which DASHBOARD_DATA_PITFALLS.md #2 rightly calls a mistake — but
-    fixing it here and not there would make the count and the list disagree, which
-    is the one thing this endpoint exists to prevent. Fix both together or neither.
+    `own_only` is the caller's decision: the dashboard grants admins a
+    company-wide view, while a personal profile page always means "mine".
     """
-    # Admins see every job in the company; everyone else is scoped to their own,
-    # matching the list endpoints.
-    own_only = current_user.role != "admin"
-    hr_profile = get_hr_profile(db, current_user) if own_only else None
-
     # ── jobs ── mirrors GET /jobs
     jobs_q = db.query(func.count(JobPosting.id)).filter(
         JobPosting.company_id == current_user.company_id
@@ -5410,6 +5395,33 @@ async def get_dashboard_counts(
     return DashboardCounts(
         jobs=jobs, active_jobs=active_jobs, interviews=interviews, offers=offers
     )
+
+
+@router.get("/dashboard/counts", response_model=DashboardCounts)
+async def get_dashboard_counts(
+    current_user: User = Depends(AuthMiddleware.get_current_hr),
+    db: Session = Depends(get_db),
+):
+    """Totals for the HR overview cards.
+
+    The cards used to count the arrays the dashboard had already fetched, but
+    GET /jobs, /interviews and /offers all default to limit=50 and the dashboard
+    passes no limit — so an HR with 80 jobs saw "50", and the number silently
+    stopped moving at the cap. Counting in SQL is also cheaper than shipping
+    hundreds of serialised rows just to take their length.
+
+    Each count repeats the scoping of the list endpoint it describes,
+    deliberately and line for line, so a card can never disagree with the list it
+    opens. That includes the `if current_user.company_id:` guards on interviews and
+    offers, which DASHBOARD_DATA_PITFALLS.md #2 rightly calls a mistake — but
+    fixing it here and not there would make the count and the list disagree, which
+    is the one thing this endpoint exists to prevent. Fix both together or neither.
+    """
+    # Admins see every job in the company; everyone else is scoped to their own,
+    # matching the list endpoints.
+    own_only = current_user.role != "admin"
+    hr_profile = get_hr_profile(db, current_user) if own_only else None
+    return _dashboard_counts(db, current_user, own_only, hr_profile)
 
 
 @router.get("/interviews")
@@ -6461,4 +6473,143 @@ async def test_pipeline_notification(
         "error_type": result.get("error_type"),
         "cc": disp["cc"],
         "using_step_smtp": disp["smtp_config"] is not None,
+    }
+
+
+# ==================== MY ACTIVITY (personal profile page) ====================
+
+ACTIVITY_WINDOW_DAYS = 30
+ACTIVITY_FEED_LIMIT = 10
+_NOTE_SENTINEL = "__note__"
+
+
+def _require_hr_self(current_user: User = Depends(get_current_user)) -> User:
+    """Exactly role == "hr". Deliberately NOT AuthMiddleware.get_current_hr.
+
+    That dependency also admits admins, which would be wrong here twice over:
+
+    1. get_hr_profile() INSERTs and commits an HRProfile when one is missing, so
+       an admin merely opening their own profile page would silently acquire an
+       HR profile — a write side effect of a GET.
+    2. The admin path in _dashboard_counts is company-wide, and company-wide
+       totals under a heading reading "Your work at a glance" are simply false.
+
+    An admin who genuinely owns job postings sees nothing here. That is the
+    accepted cost: company numbers belong on the admin analytics screens, not on
+    a personal page.
+    """
+    if (current_user.role or "").lower() != "hr":
+        raise HTTPException(status_code=403, detail="HR access required")
+    return current_user
+
+
+@router.get("/my-activity")
+async def get_my_activity(
+    current_user: User = Depends(_require_hr_self),
+    db: Session = Depends(get_db),
+):
+    """Everything the profile page shows about this HR's own work."""
+    # Read-only lookup on purpose — get_hr_profile() would CREATE a row, and a
+    # GET must not. No profile row means no jobs can reference it (JobPosting.hr_id
+    # FKs hr_profiles.id), so zeros are the correct answer, not a degraded one.
+    hr_profile = db.query(HRProfile).filter(HRProfile.user_id == current_user.id).first()
+
+    if hr_profile is None:
+        at_a_glance = DashboardCounts(jobs=0, active_jobs=0, interviews=0, offers=0)
+    else:
+        at_a_glance = _dashboard_counts(db, current_user, own_only=True, hr_profile=hr_profile)
+
+    since = datetime.utcnow() - timedelta(days=ACTIVITY_WINDOW_DAYS)
+    if hr_profile is None:
+        window = {"jobs_created": 0, "candidates": 0, "interviews_scheduled": 0, "offers_sent": 0}
+    else:
+        # Mirrors admin_routes.get_hr_analytics, with one deliberate difference:
+        # that version's candidate count has no date filter, so it reports a
+        # lifetime total inside a block labelled with a period. Here the label
+        # says "last 30 days", so the filter has to be real.
+        window = {
+            "jobs_created": db.query(func.count(JobPosting.id)).filter(
+                JobPosting.hr_id == hr_profile.id,
+                JobPosting.created_at >= since,
+            ).scalar() or 0,
+            "candidates": db.query(func.count(Candidate.id)).join(
+                JobPosting, Candidate.job_id == JobPosting.id
+            ).filter(
+                JobPosting.hr_id == hr_profile.id,
+                Candidate.created_at >= since,
+            ).scalar() or 0,
+            "interviews_scheduled": db.query(func.count(Interview.id)).join(
+                Candidate, Interview.candidate_id == Candidate.id
+            ).join(
+                JobPosting, Candidate.job_id == JobPosting.id
+            ).filter(
+                JobPosting.hr_id == hr_profile.id,
+                Interview.created_at >= since,
+            ).scalar() or 0,
+            "offers_sent": db.query(func.count(Offer.id)).filter(
+                Offer.hr_id == hr_profile.id,
+                Offer.created_at >= since,
+            ).scalar() or 0,
+        }
+
+    # ── recent activity ──
+    # Filtered on the actor, which makes a cross-HR leak structurally impossible.
+    #
+    # coalesce, not a bare `!= _NOTE_SENTINEL`: candidate self-applications write
+    # from_stage=NULL, and SQL evaluates NULL != 'x' as NULL rather than true, so
+    # the naive form would silently drop every "applied" event.
+    history = (
+        db.query(CandidateStageHistory)
+        .filter(
+            CandidateStageHistory.changed_by_id == current_user.id,
+            CandidateStageHistory.company_id == current_user.company_id,
+            func.coalesce(CandidateStageHistory.from_stage, "") != _NOTE_SENTINEL,
+        )
+        .order_by(desc(CandidateStageHistory.created_at))
+        .limit(ACTIVITY_FEED_LIMIT)
+        .all()
+    )
+
+    # Resolved with flat IN queries rather than a join: the tenancy auto-filter
+    # injects JobPosting.company_id into the WHERE clause, which would silently
+    # turn an outer join inner and drop candidates that have no job.
+    candidates = {}
+    jobs = {}
+    if history:
+        cand_ids = {h.candidate_id for h in history if h.candidate_id}
+        if cand_ids:
+            candidates = {
+                c.id: c for c in db.query(Candidate).filter(Candidate.id.in_(cand_ids)).all()
+            }
+        job_ids = {c.job_id for c in candidates.values() if c.job_id}
+        if job_ids:
+            jobs = {
+                j.id: j for j in db.query(JobPosting).filter(JobPosting.id.in_(job_ids)).all()
+            }
+
+    recent_activity = []
+    for row in history:
+        cand = candidates.get(row.candidate_id)
+        job = jobs.get(cand.job_id) if cand and cand.job_id else None
+        notes = (row.notes or "")[:160] or None
+        recent_activity.append({
+            "id": str(row.id),
+            "candidate_id": str(row.candidate_id) if row.candidate_id else None,
+            "candidate_name": f"{cand.first_name} {cand.last_name}".strip() if cand else None,
+            "job_id": str(cand.job_id) if cand and cand.job_id else None,
+            "job_title": job.title if job else None,
+            "from_stage": row.from_stage,
+            "to_stage": row.to_stage,
+            "notes": notes,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        })
+
+    return {
+        "at_a_glance": at_a_glance.model_dump(),
+        "last_30_days": {
+            "days": ACTIVITY_WINDOW_DAYS,
+            "since": since.isoformat(),
+            **window,
+        },
+        "recent_activity": recent_activity,
     }

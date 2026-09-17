@@ -131,6 +131,28 @@ def get_password_hash(password: str) -> str:
     """Hash a password using bcrypt directly."""
     return bcrypt.hashpw(_bcrypt_bytes(password), bcrypt.gensalt()).decode("utf-8")
 
+
+MIN_PASSWORD_LENGTH = 8
+
+
+def validate_password_strength(password: str) -> None:
+    """Raise HTTPException(400) if the password is too weak.
+
+    The single rule for every path that sets a password, so the OTP reset and
+    the authenticated change can never diverge.
+
+    Deliberately just a length floor. Registration accepts any 8-character
+    password, so requiring more here would let someone set a password they
+    could never have chosen at signup. Tightening this is a real decision that
+    has to be applied to registration too, not a side effect of adding a
+    change-password form.
+    """
+    if not password or len(password) < MIN_PASSWORD_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Password must be at least {MIN_PASSWORD_LENGTH} characters",
+        )
+
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     """Create JWT access token"""
     to_encode = data.copy()

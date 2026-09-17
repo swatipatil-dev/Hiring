@@ -244,3 +244,189 @@ def test_me_does_not_leak_another_tenants_profile_to_superadmin(client, db):
 
     assert body["role"] == "superadmin"
     assert body["profile"] is None, "superadmin picked up an unrelated tenant's HR profile"
+
+
+# ── PUT /auth/me ──────────────────────────────────────────────────────────────
+
+def test_update_me_changes_name_and_phone(client, hr_headers):
+    resp = client.put("/api/v1/auth/me", headers=hr_headers,
+                      json={"first_name": "Renamed", "last_name": "Person", "phone": "+91 98765 43210"})
+    assert resp.status_code == 200, resp.text
+
+    body = resp.json()
+    assert set(body) == EXPECTED_ME_KEYS, "PUT must return the same shape as GET"
+    assert not (set(body) & FORBIDDEN_ME_KEYS)
+    assert body["first_name"] == "Renamed"
+    assert body["last_name"] == "Person"
+    assert body["phone"] == "+91 98765 43210"
+
+    assert client.get("/api/v1/auth/me", headers=hr_headers).json()["first_name"] == "Renamed"
+
+
+@pytest.mark.parametrize("field,evil", [
+    ("role", "admin"),
+    ("email", "attacker@evil.com"),
+    ("is_active", False),
+    ("company_id", "00000000-0000-0000-0000-000000000000"),
+    ("email_verified", True),
+    ("password", "hunter2hunter2"),
+    ("password_hash", "not-a-real-hash"),
+    ("id", "00000000-0000-0000-0000-000000000000"),
+])
+def test_update_me_rejects_privilege_escalation(client, db, hr_headers, field, evil):
+    """
+    The escalation regression test.
+
+    extra="forbid" must reject the WHOLE request, so the legitimate first_name
+    sent in the same body must not be applied either. A partial apply would mean
+    the handler ran before validation did.
+    """
+    from src.models.models import User
+
+    before = client.get("/api/v1/auth/me", headers=hr_headers).json()
+
+    resp = client.put("/api/v1/auth/me", headers=hr_headers,
+                      json={"first_name": "Escalated", field: evil})
+    assert resp.status_code == 422, f"{field} was not rejected: {resp.text}"
+
+    after = client.get("/api/v1/auth/me", headers=hr_headers).json()
+    assert after["first_name"] == before["first_name"], "request was partially applied"
+    if field in after:
+        assert after[field] == before[field], f"{field} changed"
+
+    # Belt and braces: the columns the API never exposes, checked on the row.
+    row = db.query(User).filter(User.email == "hr_test@test.com").first()
+    assert row.role == "hr"
+    assert row.password_hash != "not-a-real-hash"
+
+
+@pytest.mark.parametrize("payload", [
+    {"first_name": ""},
+    {"first_name": "   "},
+    {"last_name": ""},
+])
+def test_update_me_rejects_blank_name(client, hr_headers, payload):
+    assert client.put("/api/v1/auth/me", headers=hr_headers, json=payload).status_code == 422
+
+
+def test_update_me_rejects_overlong_phone(client, hr_headers):
+    """phone is String(20); an over-long value must 422, never 500 from MySQL."""
+    resp = client.put("/api/v1/auth/me", headers=hr_headers, json={"phone": "1" * 21})
+    assert resp.status_code == 422, resp.text
+
+
+def test_update_me_rejects_garbage_phone(client, hr_headers):
+    resp = client.put("/api/v1/auth/me", headers=hr_headers, json={"phone": "call me maybe!"})
+    assert resp.status_code == 422
+
+
+def test_update_me_allows_clearing_phone(client, hr_headers):
+    client.put("/api/v1/auth/me", headers=hr_headers, json={"phone": "9876543210"})
+    resp = client.put("/api/v1/auth/me", headers=hr_headers, json={"phone": ""})
+    assert resp.status_code == 200
+    assert resp.json()["phone"] is None
+
+
+def test_update_me_rejects_empty_body(client, hr_headers):
+    resp = client.put("/api/v1/auth/me", headers=hr_headers, json={})
+    assert resp.status_code == 400
+    assert "No changes" in resp.json()["detail"]
+
+
+def test_update_me_requires_authentication(client):
+    assert client.put("/api/v1/auth/me", json={"first_name": "X"}).status_code in (401, 403)
+
+
+@pytest.mark.parametrize("fixture_name", [
+    "admin_headers", "hr_headers", "interviewer_headers", "candidate_headers",
+])
+def test_update_me_reachable_by_every_role(client, request, fixture_name):
+    headers = request.getfixturevalue(fixture_name)
+    resp = client.put("/api/v1/auth/me", headers=headers, json={"first_name": "Updated"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["first_name"] == "Updated"
+
+
+def test_update_me_does_not_touch_another_user(client, db, hr_headers, candidate_headers):
+    from src.models.models import User
+
+    before = db.query(User).filter(User.email == "candidate_test@test.com").first().first_name
+    client.put("/api/v1/auth/me", headers=hr_headers, json={"first_name": "OnlyMine"})
+    after = db.query(User).filter(User.email == "candidate_test@test.com").first().first_name
+    assert after == before
+
+
+# ── POST /auth/change-password ────────────────────────────────────────────────
+
+def test_change_password_rejects_wrong_current(client, hr_headers):
+    """
+    Must be 400, NOT 401.
+
+    frontend/src/api/client.js treats any 401 as a dead session: it clears
+    localStorage and hard-redirects to /login. Returning 401 here would sign the
+    user out for mistyping their own password and discard the form.
+    """
+    resp = client.post("/api/v1/auth/change-password", headers=hr_headers,
+                       json={"current_password": "WrongPass@1", "new_password": "BrandNew@123"})
+    assert resp.status_code == 400, resp.text
+    assert resp.status_code != 401
+
+
+def test_change_password_succeeds_and_rotates_credentials(client, hr_headers):
+    resp = client.post("/api/v1/auth/change-password", headers=hr_headers,
+                       json={"current_password": "Pass@1234", "new_password": "BrandNew@123"})
+    assert resp.status_code == 200, resp.text
+
+    ok = client.post("/api/v1/auth/login",
+                     json={"email": "hr_test@test.com", "password": "BrandNew@123"})
+    assert ok.status_code == 200, ok.text
+
+    stale = client.post("/api/v1/auth/login",
+                        json={"email": "hr_test@test.com", "password": "Pass@1234"})
+    assert stale.status_code == 401
+
+
+def test_change_password_rejects_same_as_current(client, hr_headers):
+    resp = client.post("/api/v1/auth/change-password", headers=hr_headers,
+                       json={"current_password": "Pass@1234", "new_password": "Pass@1234"})
+    assert resp.status_code == 400
+    assert "different" in resp.json()["detail"].lower()
+
+
+def test_change_password_rejects_short_password(client, hr_headers):
+    resp = client.post("/api/v1/auth/change-password", headers=hr_headers,
+                       json={"current_password": "Pass@1234", "new_password": "short"})
+    assert resp.status_code == 422
+
+
+def test_change_password_rejects_extra_fields(client, hr_headers):
+    resp = client.post("/api/v1/auth/change-password", headers=hr_headers,
+                       json={"current_password": "Pass@1234", "new_password": "BrandNew@123",
+                             "email": "attacker@evil.com"})
+    assert resp.status_code == 422
+
+
+def test_change_password_requires_authentication(client):
+    resp = client.post("/api/v1/auth/change-password",
+                       json={"current_password": "Pass@1234", "new_password": "BrandNew@123"})
+    assert resp.status_code in (401, 403)
+
+
+def test_change_password_clears_pending_reset_otp(client, db, hr_headers):
+    """A reset OTP already in flight must not outlive an authenticated change."""
+    from datetime import datetime, timedelta
+
+    from src.models.models import User
+
+    user = db.query(User).filter(User.email == "hr_test@test.com").first()
+    user.otp_code = "123456"
+    user.otp_expires_at = datetime.utcnow() + timedelta(minutes=10)
+    db.flush()
+
+    resp = client.post("/api/v1/auth/change-password", headers=hr_headers,
+                       json={"current_password": "Pass@1234", "new_password": "BrandNew@123"})
+    assert resp.status_code == 200, resp.text
+
+    db.refresh(user)
+    assert user.otp_code is None
+    assert user.otp_expires_at is None
