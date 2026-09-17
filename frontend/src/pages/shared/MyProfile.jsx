@@ -77,7 +77,6 @@ export default function MyProfile() {
 
   const [query, setQuery] = useState('')
   const [grantedOnly, setGrantedOnly] = useState(true)
-  const [showEndpoints, setShowEndpoints] = useState(false)
 
   useEffect(() => {
     // The 401 interceptor in api/client.js hard-redirects to /login, so guard
@@ -128,9 +127,10 @@ export default function MyProfile() {
         permissions: g.permissions.filter(p => {
           if (grantedOnly && !p.granted) return false
           if (!q) return true
+          // Label and slug only. Endpoints are no longer shown, so matching on
+          // them would return rows with no visible reason for matching.
           return p.label.toLowerCase().includes(q)
             || p.slug.toLowerCase().includes(q)
-            || (p.endpoints || []).some(e => e.toLowerCase().includes(q))
         }),
       }))
       .filter(g => g.permissions.length > 0)
@@ -328,10 +328,6 @@ export default function MyProfile() {
                   <button className={`btn btn-sm ${grantedOnly ? 'btn-secondary' : 'btn-primary'}`} onClick={() => setGrantedOnly(false)}>
                     All ({perms.total})
                   </button>
-                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: '0.78rem', color: 'var(--text-secondary)', cursor: 'pointer' }}>
-                    <input type="checkbox" checked={showEndpoints} onChange={e => setShowEndpoints(e.target.checked)} />
-                    Show endpoints
-                  </label>
                 </div>
               </div>
 
@@ -380,13 +376,6 @@ export default function MyProfile() {
                               </span>
                             )}
                           </div>
-                          {showEndpoints && p.endpoints?.length > 0 && (
-                            <div style={{ marginTop: 5, display: 'flex', flexDirection: 'column', gap: 2 }}>
-                              {p.endpoints.map(e => (
-                                <code key={e} style={{ fontFamily: 'var(--font-mono)', fontSize: '0.68rem', color: 'var(--text-tertiary)', wordBreak: 'break-all' }}>{e}</code>
-                              ))}
-                            </div>
-                          )}
                         </div>
                       </div>
                     ))}
