@@ -178,13 +178,19 @@ export default function Sidebar() {
 
       {/* User + Logout */}
       <div className="sidebar-footer">
-        <div className="sidebar-user">
+        {/* A NavLink, not an onClick div — that buys keyboard focus, Enter to
+            activate, middle-click to open in a tab and the focus ring for free. */}
+        <NavLink
+          to="/profile"
+          className={({ isActive }) => `sidebar-user${isActive ? ' active' : ''}`}
+          aria-label="View my profile"
+        >
           <div className="user-avatar">{avatarInitial}</div>
           <div className="user-info">
             <div className="user-name" title={displayName}>{displayName}</div>
             <div className="user-email" title={user?.email || ''}>{user?.email || ''}</div>
           </div>
-        </div>
+        </NavLink>
         <button className="nav-item logout-btn" onClick={handleLogout}>
           <LogOut size={18} />
           <span>Sign Out</span>
@@ -316,6 +322,32 @@ export default function Sidebar() {
           gap: 10px;
           padding: 8px 12px;
           margin-bottom: 6px;
+          /* Added when this became a link to /profile. display:flex must stay —
+             it is what lets .user-info's flex:1 drive the truncation below. */
+          border-radius: 10px;
+          text-decoration: none;
+          color: inherit;
+          cursor: pointer;
+          font-family: var(--font-body);
+          transition: background 0.2s ease;
+          -webkit-tap-highlight-color: transparent;
+        }
+        .sidebar-user:hover {
+          background: rgba(255,255,255,0.05);
+        }
+        .sidebar-user:hover .user-name {
+          color: #ffffff;
+        }
+        .sidebar-user.active {
+          background: var(--nav-active-bg, rgba(61,142,214,0.14));
+        }
+        .sidebar-user.active .user-name {
+          color: var(--nav-active, #4ecdb5);
+        }
+        .sidebar-user:focus { outline: none; }
+        .sidebar-user:focus-visible {
+          outline: 2px solid var(--nav-active, #3d8ed6);
+          outline-offset: 2px;
         }
         .user-avatar {
           width: 34px;

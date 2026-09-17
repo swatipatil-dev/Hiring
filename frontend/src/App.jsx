@@ -18,6 +18,7 @@ import InterviewerDashboard from './pages/interviewer/InterviewerDashboard'
 import CandidateDashboard from './pages/candidate/CandidateDashboard'
 import OnlineTest from './pages/candidate/OnlineTest'
 import TestInstructions from './pages/candidate/TestInstructions'
+import MyProfile from './pages/shared/MyProfile'
 import ErrorBoundary from './components/ErrorBoundary'
 
 const ROLE_ROUTES = { superadmin: '/superadmin', admin: '/admin', hr: '/hr', interviewer: '/interviewer', candidate: '/candidate' }
@@ -83,6 +84,16 @@ export default function App() {
       <Route path="/jobs" element={<JobBoard />} />
       <Route path="/portal" element={<CompanyPortal />} />
       <Route path="/app" element={<CompanyLogin />} />
+
+      {/* Shared — every authenticated role. Declared at the top level, not under
+          a role wildcard: /superadmin/*, /admin/*, /hr/*, /interviewer/* and
+          /candidate/* are each role-locked and would bounce the other four.
+          No allowedRoles → any signed-in user. */}
+      <Route path="/profile" element={
+        <ProtectedRoute>
+          <DashboardShell><MyProfile /></DashboardShell>
+        </ProtectedRoute>
+      } />
 
       {/* Super Admin — departments gets its own route so sidebar stays */}
       <Route path="/superadmin/departments" element={

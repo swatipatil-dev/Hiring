@@ -133,6 +133,25 @@ export function AuthProvider({ children }) {
     }
   }, [])
 
+  // The cached user is written at login and never again — the axios interceptor's
+  // proactive refresh rewrites hireflow_token only. So a name or email changed
+  // after sign-in stays stale in the sidebar until the next login. Any page that
+  // fetches fresh user data from the server can hand it back here.
+  //
+  // MERGE, never replace: the cached object carries the JWT-derived branding keys
+  // (company_logo, company_color, company_slug, …) that /auth/me does not return,
+  // and a blind overwrite would blank a tenant's sidebar colour and logo.
+  const setUserFromServer = useCallback((fresh) => {
+    if (!fresh) return null
+    let merged = null
+    setUser(prev => {
+      merged = { ...(prev || {}), ...fresh }
+      try { localStorage.setItem('hireflow_user', JSON.stringify(merged)) } catch { /* private mode */ }
+      return merged
+    })
+    return merged
+  }, [])
+
   const logout = useCallback(() => {
     localStorage.removeItem('hireflow_token')
     localStorage.removeItem('hireflow_user')
@@ -141,7 +160,7 @@ export function AuthProvider({ children }) {
   }, [])
 
   return (
-    <AuthContext.Provider value={{ user, token, login, loginDirect, register, verifyOtp, resendOtp, logout, refreshToken, isAuthenticated: !!token }}>
+    <AuthContext.Provider value={{ user, token, login, loginDirect, register, verifyOtp, resendOtp, logout, refreshToken, setUserFromServer, isAuthenticated: !!token }}>
       {children}
     </AuthContext.Provider>
   )

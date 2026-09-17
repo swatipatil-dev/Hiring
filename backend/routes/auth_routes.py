@@ -3,6 +3,7 @@
 Handles user registration, login, logout, and token management
 """
 
+import json
 import logging
 from datetime import datetime
 from typing import Optional
@@ -18,6 +19,7 @@ from src.auth import (
     create_token_response, get_current_user, set_user_otp
 )
 from src.models.models import User, Company
+from src.services.permissions_catalog import get_permissions_for_role
 
 
 def _resolve_company_id(db: Session, request: Request, api_key: Optional[str]) -> Optional[str]:
@@ -298,11 +300,83 @@ async def logout(current_user: User = Depends(get_current_user)):
     """
     return {"message": "Successfully logged out"}
 
+def _iso(value):
+    """Serialise a date/datetime, or None. Keeps the JSON shape stable rather
+    than leaving it to FastAPI's encoder."""
+    return value.isoformat() if value else None
+
+
+def _role_profile(current_user: User) -> Optional[dict]:
+    """
+    The per-role profile stub for hr / interviewer, or None.
+
+    Reached through the ``uselist=False`` relationships, never a bare query:
+    a superadmin has no tenant bound (``src/auth.py`` calls
+    ``set_current_company(None)`` for them), so the tenancy auto-filter is a
+    no-op and ``db.query(HRProfile).first()`` would hand them an arbitrary
+    profile from an arbitrary company. The relationship's join is on
+    ``user_id`` and cannot be forgotten.
+    """
+    role = (current_user.role or "").lower()
+    try:
+        if role == "hr":
+            profile, kind = current_user.hr_profile, "hr"
+        elif role == "interviewer":
+            profile, kind = current_user.interviewer_profile, "interviewer"
+        else:
+            return None
+        if not profile:
+            return None
+
+        data = {
+            "kind": kind,
+            "employee_id": profile.employee_id,
+            "department_id": profile.department_id,
+            "department_name": profile.department.name if profile.department else None,
+        }
+        if kind == "interviewer":
+            data["years_experience"] = profile.years_experience
+            data["expertise_areas"] = _parse_expertise(profile.expertise_areas)
+        return data
+    except Exception as exc:  # a missing FK row must not 500 the profile page
+        logger.warning(f"Could not load role profile for user {current_user.id}: {exc}")
+        return None
+
+
+def _parse_expertise(raw) -> list:
+    """expertise_areas is a Text column holding JSON; legacy rows hold CSV."""
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        return raw
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, list) else [str(parsed)]
+    except (ValueError, TypeError):
+        return [part.strip() for part in str(raw).split(",") if part.strip()]
+
+
 @router.get("/me")
-async def get_current_user_info(current_user: User = Depends(get_current_user)):
+async def get_current_user_info(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """
-    Get current authenticated user information
+    Get current authenticated user information.
+
+    Built field-by-field on purpose — password_hash, otp_code and
+    otp_expires_at live on the same model and must never be serialised.
     """
+    company_name = None
+    if current_user.company_id:
+        try:
+            # Company is not TenantScoped, so this is a plain lookup and is
+            # safe for every role including superadmin.
+            company = db.query(Company).filter(Company.id == current_user.company_id).first()
+            company_name = company.name if company else None
+        except Exception as exc:
+            logger.warning(f"Could not resolve company for user {current_user.id}: {exc}")
+
     return {
         "id": str(current_user.id),
         "email": current_user.email,
@@ -310,9 +384,30 @@ async def get_current_user_info(current_user: User = Depends(get_current_user)):
         "first_name": current_user.first_name,
         "last_name": current_user.last_name,
         "phone": current_user.phone,
+        "gender": current_user.gender,
+        "date_of_birth": _iso(current_user.date_of_birth),
         "is_active": current_user.is_active,
-        "created_at": current_user.created_at
+        "email_verified": current_user.email_verified,
+        "created_at": _iso(current_user.created_at),
+        "updated_at": _iso(current_user.updated_at),
+        "company_id": current_user.company_id,
+        "company_name": company_name,
+        "profile": _role_profile(current_user),
     }
+
+
+@router.get("/my-permissions")
+async def get_my_permissions(current_user: User = Depends(get_current_user)):
+    """
+    What the caller's role is allowed to do, grouped, from the bundled RBAC matrix.
+
+    Descriptive only — the server re-checks every action regardless of what
+    this returns. Reachable by all five roles (no role gate), and returns the
+    full catalog with a ``granted`` flag on each entry so the UI can show what
+    the role *cannot* do as well.
+    """
+    return get_permissions_for_role(current_user.role)
+
 
 @router.get("/verify-token")
 async def verify_token(current_user: User = Depends(get_current_user)):
