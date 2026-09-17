@@ -18,7 +18,8 @@ from src.models.models import (
     TenantConfig, CompanyMailbox, PipelineStepConfig
 )
 from src.security import encrypt, decrypt
-from pydantic import BaseModel, EmailStr
+from src.services.interviewer_deactivation import deactivate_interviewer_assignments
+from pydantic import BaseModel, EmailStr, field_validator
 from datetime import datetime, timedelta
 import uuid
 
@@ -60,6 +61,22 @@ class UserUpdate(BaseModel):
     employee_id: Optional[str] = None
     expertise_areas: Optional[List[str]] = None
     years_experience: Optional[int] = None
+
+    @field_validator("first_name", "last_name")
+    @classmethod
+    def _name_not_blank(cls, v):
+        """A name may be left out of the payload, but never emptied.
+
+        first_name is NOT NULL on the model, but "" satisfies that in MySQL, so an edit
+        form that posted an empty field permanently erased the person's name. Whitespace
+        is stripped first so "   " is not a loophole.
+        """
+        if v is None:
+            return v
+        v = v.strip()
+        if not v:
+            raise ValueError("Name cannot be blank")
+        return v
 
 class DepartmentCreate(BaseModel):
     name: str
@@ -384,12 +401,24 @@ async def update_user_status(
     
     if user.id == current_user.id:
         raise HTTPException(status_code=400, detail="Cannot change your own status")
-    
+
+    was_active = bool(user.is_active)
     user.is_active = is_active
     user.updated_at = datetime.utcnow()
+
+    # Deactivation must detach the user from active work, not just flip the flag.
+    # src/auth.py refuses their login from here on, so anything still pointing at them
+    # (job defaults, upcoming panels) would route work to someone who cannot act on it.
+    summary = None
+    if was_active and not is_active:
+        summary = deactivate_interviewer_assignments(db, user, current_user.id)
+
     db.commit()
 
-    return {"message": f"User {'activated' if is_active else 'deactivated'} successfully"}
+    response = {"message": f"User {'activated' if is_active else 'deactivated'} successfully"}
+    if summary:
+        response.update(summary)
+    return response
 
 @router.put("/users/{user_id}", response_model=UserResponse)
 async def update_user(
@@ -524,8 +553,12 @@ async def department_chat(
         dept_id = str(d.id)
 
         # Employees in this department
-        hr_users = db.query(User).join(HRProfile).filter(HRProfile.department_id == dept_id).all()
-        interviewer_users = db.query(User).join(InterviewerProfile).filter(InterviewerProfile.department_id == dept_id).all()
+        hr_users = db.query(User).join(HRProfile).filter(
+            HRProfile.department_id == dept_id, User.is_active == True  # noqa: E712
+        ).all()
+        interviewer_users = db.query(User).join(InterviewerProfile).filter(
+            InterviewerProfile.department_id == dept_id, User.is_active == True  # noqa: E712
+        ).all()
         all_employees = hr_users + interviewer_users
         emp_count = len(all_employees)
 
@@ -641,7 +674,11 @@ async def get_department_stats(
     for d in departments:
         dept_id = str(d.id)
         hr_count = db.query(func.count(HRProfile.id)).filter(HRProfile.department_id == dept_id).scalar() or 0
-        int_count = db.query(func.count(InterviewerProfile.id)).filter(InterviewerProfile.department_id == dept_id).scalar() or 0
+        int_count = db.query(func.count(InterviewerProfile.id)).join(
+            User, InterviewerProfile.user_id == User.id
+        ).filter(
+            InterviewerProfile.department_id == dept_id, User.is_active == True  # noqa: E712
+        ).scalar() or 0
         job_count = db.query(func.count(JobPosting.id)).filter(JobPosting.department_id == dept_id).scalar() or 0
         job_ids = [str(j.id) for j in db.query(JobPosting.id).filter(JobPosting.department_id == dept_id).all()]
         cand_count = db.query(func.count(Candidate.id)).filter(Candidate.job_id.in_(job_ids)).scalar() if job_ids else 0
@@ -956,7 +993,14 @@ async def delete_user(
     current_user: User = Depends(AuthMiddleware.get_current_admin),
     db: Session = Depends(get_db)
 ):
-    """Deactivate/delete a user"""
+    """Deactivate a user. NOTHING is deleted, despite the HTTP verb.
+
+    The path is a DELETE because that is what the admin UI has always called; the row is
+    never removed. The user, their name, their email and their HR/InterviewerProfile all
+    survive, which is what makes Activate work and what keeps completed interviews and
+    submitted feedback attributed to a real person. ``deleted: false`` is in the response
+    so the contract says so too, not just this docstring.
+    """
     user = db.query(User).filter(
         User.id == user_id,
         User.company_id == current_user.company_id,
@@ -965,9 +1009,18 @@ async def delete_user(
         raise HTTPException(status_code=404, detail="User not found")
     if user.id == current_user.id:
         raise HTTPException(status_code=400, detail="Cannot delete yourself")
+    was_active = bool(user.is_active)
     user.is_active = False
+    summary = deactivate_interviewer_assignments(db, user, current_user.id) if was_active else None
     db.commit()
-    return {"message": "User deactivated successfully"}
+    response = {
+        "message": "User deactivated successfully — the account is kept and can be reactivated",
+        "deleted": False,
+        "is_active": False,
+    }
+    if summary:
+        response.update(summary)
+    return response
 
 
 # ==================== HR COMPARISON ANALYTICS ====================

@@ -8,7 +8,7 @@ Handles all extended profile sections:
 from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
 from sqlalchemy.orm import Session
 from typing import List, Optional, Dict, Any
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 import uuid, os, json, re, logging
 from pathlib import Path
 from datetime import datetime
@@ -1260,6 +1260,23 @@ class PersonalUpdate(BaseModel):
     gender: Optional[str] = None
     date_of_birth: Optional[str] = None
     alternate_phone: Optional[str] = None
+
+    @field_validator("first_name", "last_name")
+    @classmethod
+    def _name_not_blank(cls, v):
+        """A name may be left out of the payload, but never emptied.
+
+        first_name is NOT NULL on the model, but "" satisfies that in MySQL, so an edit
+        form that posted an empty field permanently erased the person's name. Whitespace
+        is stripped first so "   " is not a loophole.
+        """
+        if v is None:
+            return v
+        v = v.strip()
+        if not v:
+            raise ValueError("Name cannot be blank")
+        return v
+
     nationality: Optional[str] = None
     marital_status: Optional[str] = None
     languages: Optional[List[str]] = None

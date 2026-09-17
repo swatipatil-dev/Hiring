@@ -5,10 +5,12 @@ Advanced interviewer features with AI question generation and comprehensive inte
 
 from fastapi import APIRouter, HTTPException, status, Depends, Query
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from typing import List, Optional, Dict, Any, Union
 from src.config.database_config_mysql import get_db
 from src.auth import get_current_user, AuthMiddleware, require_role
 from src.models.models import Interview, User, Candidate, InterviewerProfile, JobPosting, Department, CandidateRequest, JDTemplate, HRProfile
+from src.services.staff_directory import active_hr_query
 from src.services.job_dedup import (
     find_open_duplicate_job, find_open_duplicate_request, duplicate_request_detail,
 )
@@ -239,6 +241,18 @@ class InterviewCreate(BaseModel):
     interviewer_details: InterviewerDetails
     notes: Optional[str] = None
 
+def _coerce_status(raw) -> "InterviewStatus":
+    """Map a stored status onto the enum without raising.
+
+    The enum's values are uppercase but lowercase rows exist in older data, so a bare
+    ``InterviewStatus(raw)`` raised ValueError and 500'd the whole response.
+    """
+    try:
+        return InterviewStatus((raw or "").upper())
+    except ValueError:
+        return InterviewStatus.SCHEDULED
+
+
 class InterviewUpdate(BaseModel):
     model_config = ConfigDict(use_enum_values=True)
     title: Optional[str] = None
@@ -391,24 +405,15 @@ async def auto_create_job_from_request(
     # The bare `.first()` previously would pick any HR from any tenant when
     # the department had no HR — a cross-tenant leak. Scope every fallback
     # path to the caller's company.
+    # Active only on both paths: handing the job to a deactivated HR routes it to someone
+    # who cannot log in to act on it.
     hr_profile = None
     if dept_id:
-        hr_profile = (
-            db.query(HRProfile)
-            .join(User, HRProfile.user_id == User.id)
-            .filter(
-                HRProfile.department_id == dept_id,
-                User.company_id == current_user.company_id,
-            )
-            .first()
-        )
+        hr_profile = active_hr_query(db, current_user.company_id).filter(
+            HRProfile.department_id == dept_id,
+        ).first()
     if not hr_profile:
-        hr_profile = (
-            db.query(HRProfile)
-            .join(User, HRProfile.user_id == User.id)
-            .filter(User.company_id == current_user.company_id)
-            .first()
-        )
+        hr_profile = active_hr_query(db, current_user.company_id).first()
 
     job = JobPosting(
         company_id=current_user.company_id,
@@ -873,13 +878,20 @@ def _build_interview_response(interview) -> "InterviewResponse":
         copy_paste_allowed=False
     )
 
-    interviewer_details = InterviewerDetails(
-        **json.loads(interview.interviewer_details_data)
-    ) if interview.interviewer_details_data else InterviewerDetails(
-        name=interview.interviewer_name or "Interviewer",
-        email=interview.interviewer_email or "interviewer@example.com",
-        meeting_link=interview.meeting_link
-    )
+    # meeting_link is a required str on InterviewerDetails, but it is legitimately NULL on
+    # every offline interview and every draft — passing None raised a pydantic
+    # ValidationError that surfaced as a 500, and because this builder also serves the
+    # interviews LIST, a single link-less row broke the whole page. Coerce on both paths.
+    if interview.interviewer_details_data:
+        _details = json.loads(interview.interviewer_details_data)
+        _details["meeting_link"] = _details.get("meeting_link") or ""
+        interviewer_details = InterviewerDetails(**_details)
+    else:
+        interviewer_details = InterviewerDetails(
+            name=interview.interviewer_name or "Interviewer",
+            email=interview.interviewer_email or "interviewer@example.com",
+            meeting_link=interview.meeting_link or "",
+        )
 
     feedback_val = None
     if hasattr(interview, '_feedback_text'):
@@ -900,7 +912,7 @@ def _build_interview_response(interview) -> "InterviewResponse":
         security_settings=security,
         interviewer_details=interviewer_details,
         notes=interview.notes,
-        status=InterviewStatus(interview.status) if interview.status else InterviewStatus.SCHEDULED,
+        status=_coerce_status(interview.status),
         feedback=feedback_val,
         rating=interview.rating,
         created_by=interview.created_by or "",
@@ -1106,8 +1118,15 @@ async def publish_interview(
         raise HTTPException(status_code=404, detail="Linked job not found")
 
     # Validate selected HR
-    hr_profile = db.query(HRProfile).filter(HRProfile.id == body.hr_id).first()
+    hr_profile = active_hr_query(db, current_user.company_id).filter(
+        HRProfile.id == body.hr_id
+    ).first()
     if not hr_profile:
+        if db.query(HRProfile).filter(HRProfile.id == body.hr_id).first():
+            raise HTTPException(
+                status_code=400,
+                detail="That HR user has been deactivated - pick someone else."
+            )
         raise HTTPException(status_code=404, detail="Selected HR profile not found")
 
     # Check approved questions
@@ -1254,12 +1273,9 @@ async def get_hr_list_for_assignment(
     (src/tenancy/events.py) also injects HRProfile.company_id == <bound>
     because HRProfile is TenantScoped — belt and braces.
     """
-    profiles = (
-        db.query(HRProfile)
-        .join(User, HRProfile.user_id == User.id)
-        .filter(User.company_id == current_user.company_id)
-        .all()
-    )
+    profiles = active_hr_query(db, current_user.company_id).filter(
+        User.company_id == current_user.company_id
+    ).all()
     return [
         {
             "id": str(p.id),
@@ -1286,7 +1302,8 @@ async def get_interviews(
         query = db.query(Interview)
         
         if status_filter:
-            query = query.filter(Interview.status == status_filter)
+            # Stored uppercase; normalise so a lowercase filter is not silently empty.
+            query = query.filter(func.upper(Interview.status) == status_filter.upper())
         
         # Get total count
         total = query.count()
@@ -1362,25 +1379,101 @@ async def get_interview(
             detail=f"Failed to get interview: {str(e)}"
         )
 
+# Config blobs that decide how a test is run and marked. Editable while a test is still a
+# template; never on a live row, because "security_settings" is the proctoring switchboard
+# (webcam, fullscreen, tab-switch) and "evaluation_rules" holds the cutoffs.
+_TEMPLATE_ONLY_FIELDS = (
+    "job_details", "interview_configuration", "skills_configuration", "question_format",
+    "evaluation_rules", "ai_generation_rules", "security_settings", "interviewer_details",
+    "job_id", "num_sets", "title", "description",
+)
+
+# What may still change once an interview is a scheduled, real-world meeting.
+_SCHEDULED_EDITABLE_FIELDS = ("status", "notes", "rating")
+
+
+def _may_edit_scheduled(interview, current_user) -> bool:
+    """HR/admin, the creator, or someone on the panel."""
+    if current_user.role in ("hr", "admin", "superadmin"):
+        return True
+    email = (current_user.email or "").strip().lower()
+    if (interview.created_by or "").strip().lower() == email:
+        return True
+    if (interview.interviewer_email or "").strip().lower() == email:
+        return True
+    try:
+        panel = json.loads(interview.panel_members) if interview.panel_members else []
+    except (ValueError, TypeError):
+        panel = []
+    return any((m.get("email") or "").strip().lower() == email for m in panel)
+
+
 @router.put("/interviews/{interview_id}", response_model=InterviewResponse)
 async def update_interview(
     interview_id: int,
     interview_update: InterviewUpdate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_role(["interviewer", "hr", "admin", "superadmin"]))
 ):
-    """Update an existing interview"""
+    """Update an existing interview.
+
+    Same three guards as delete_interview below, which documents why each is load-bearing.
+    This endpoint had none of them: it took only ``get_current_user`` and looked the row up
+    by id alone.
+
+    * Role. Any authenticated user - a CANDIDATE included - could rewrite any interview.
+      The sharp edge was ``security_settings_data``: a candidate could disable webcam
+      monitoring, tab-switch detection and fullscreen enforcement on their own in-flight
+      attempt, then sit the exam unproctored. ``evaluation_rules_data`` (cutoffs, total
+      marks) was equally open.
+    * Company, explicitly via _company_scope. Interview is TenantScoped but the auto-filter
+      does NOT reach this handler - the same reason delete_interview scopes by hand - and
+      interview ids are sequential integers, so enumeration was trivial.
+    * State. What may be edited depends on what the row IS. The three callers are not
+      equivalent: the create-test wizard (both the interviewer copy and the shared one HR
+      uses) saves whole configs onto DRAFT templates, while submitMeetingFeedback flips a
+      scheduled meeting to COMPLETED. Gating on templates alone would 404 the latter and
+      silently break "submit feedback -> mark completed", so the two are split rather than
+      locked to one shape.
+    """
     try:
-        interview = db.query(Interview).filter(Interview.id == interview_id).first()
-        
+        interview = _company_scope(
+            db.query(Interview).filter(Interview.id == interview_id),
+            Interview,
+            current_user,
+        ).first()
+
         if not interview:
             raise HTTPException(
                 status_code=404,
                 detail="Interview not found"
             )
-        
-        # Update basic fields
+
         update_data = interview_update.model_dump(exclude_unset=True)
+
+        is_template = interview.candidate_id is None and not interview.is_scheduled_interview
+        if not is_template:
+            if not interview.is_scheduled_interview:
+                # A candidate's test attempt, with their answers and proctoring settings.
+                # Not editable here by anyone; it needs a deliberate flow, not this endpoint.
+                raise HTTPException(
+                    status_code=409,
+                    detail="This is a candidate's test attempt and cannot be edited here.",
+                )
+            if not _may_edit_scheduled(interview, current_user):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Only HR, the organiser, or a panel member can edit this interview.",
+                )
+            blocked = [f for f in _TEMPLATE_ONLY_FIELDS if update_data.get(f) is not None]
+            if blocked:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "A scheduled interview only accepts "
+                        f"{', '.join(_SCHEDULED_EDITABLE_FIELDS)}; refused: {', '.join(blocked)}."
+                    ),
+                )
 
         if "title" in update_data:
             interview.title = update_data["title"]
@@ -1392,8 +1485,6 @@ async def update_interview(
             interview.notes = update_data["notes"]
         if "status" in update_data:
             interview.status = update_data["status"]
-        if "feedback" in update_data:
-            interview.notes = interview.notes  # keep notes; feedback is a relationship
         if "rating" in update_data:
             interview.rating = update_data["rating"]
 
@@ -1410,7 +1501,6 @@ async def update_interview(
             interview.interview_type = cfg.interview_type
             interview.difficulty_level = cfg.difficulty_level
             interview.duration_minutes = cfg.duration_minutes
-            interview.scheduled_datetime = cfg.scheduled_datetime
             interview.scheduled_datetime = cfg.scheduled_datetime
             interview.interview_config_data = json.dumps(cfg.model_dump(), default=str)
 
@@ -1438,10 +1528,12 @@ async def update_interview(
         db.refresh(interview)
 
         return _build_interview_response(interview)
-        
+
     except HTTPException:
+        db.rollback()
         raise
     except Exception as e:
+        db.rollback()
         raise HTTPException(
             status_code=500,
             detail=f"Failed to update interview: {str(e)}"

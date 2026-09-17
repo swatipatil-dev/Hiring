@@ -179,6 +179,28 @@ function History({ applications }) {
                 {stageLabel(a.stage)}
               </span>
               <span className="rm-hist__when">{fmtDate(a.applied_at) || '—'}</span>
+              {/* Only archived rows carry these. The job is gone, so the Interview and
+                  InterviewFeedback rows went with it — this snapshot is the only place
+                  that still says who interviewed this person and what they concluded. */}
+              {(a.interviews || []).length > 0 && (
+                <div className="rm-hist__ivs">
+                  {a.interviews.map((iv, i) => (
+                    <div key={iv.interview_id || i} className="rm-hist__iv">
+                      <span className="rm-hist__iv-who">
+                        {(iv.interviewers || []).join(', ') || 'Interviewer not recorded'}
+                      </span>
+                      {iv.interview_type && <span className="rm-hist__iv-type">{iv.interview_type}</span>}
+                      {iv.held_at && <span className="rm-hist__iv-when">{fmtDate(iv.held_at)}</span>}
+                      {iv.hire_recommendation && (
+                        <span className="rm-hist__iv-rec">{iv.hire_recommendation.replace(/_/g, ' ')}</span>
+                      )}
+                      {iv.overall_score != null && (
+                        <span className="rm-hist__iv-score">{Math.round(iv.overall_score)}%</span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           ))}
         </div>

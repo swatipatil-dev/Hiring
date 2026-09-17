@@ -139,13 +139,15 @@ async def get_my_interviews(
         (Interview.panel_members.like(f'%"{current_user.email}"%'))
     )
     
+    # Statuses are stored uppercase, but both casings exist in older rows and the query
+    # param arrives however the client typed it. Compare on UPPER() throughout.
     if status:
-        query = query.filter(Interview.status == status)
-    
+        query = query.filter(func.upper(Interview.status) == status.upper())
+
     if upcoming_only:
         query = query.filter(
             Interview.scheduled_datetime >= datetime.utcnow(),
-            Interview.status == "scheduled"
+            func.upper(Interview.status) == "SCHEDULED"
         )
     
     interviews = query.order_by(Interview.scheduled_datetime.asc()).offset(skip).limit(limit).all()
@@ -169,7 +171,7 @@ async def get_interview_history(
     interviews = db.query(Interview).join(InterviewFeedback).filter(
         Interview.company_id == current_user.company_id,
         (Interview.interviewer_email == current_user.email) | (Interview.created_by == current_user.email),
-        Interview.status == "COMPLETED"
+        func.upper(Interview.status) == "COMPLETED"
     ).order_by(Interview.scheduled_datetime.desc()).offset(skip).limit(limit).all()
 
     result = []
@@ -220,12 +222,14 @@ async def get_interview_counts(
     """
     get_interviewer_profile(db, current_user)
 
-    rows = db.query(Interview.status, func.count(Interview.id)).filter(
+    # Group on UPPER(status): grouping on the raw column put "completed" and "COMPLETED"
+    # in separate buckets, and only the uppercase one was ever surfaced below.
+    rows = db.query(func.upper(Interview.status), func.count(Interview.id)).filter(
         Interview.company_id == current_user.company_id,
         (Interview.interviewer_email == current_user.email) |
         (Interview.created_by == current_user.email) |
         (Interview.panel_members.like(f'%"{current_user.email}"%'))
-    ).group_by(Interview.status).all()
+    ).group_by(func.upper(Interview.status)).all()
 
     by_status = {(status or "UNKNOWN"): count for status, count in rows}
     return {
@@ -395,7 +399,7 @@ async def submit_interview_feedback(
     db.add(db_feedback)
 
     # Update interview status
-    interview.status = "completed"
+    interview.status = "COMPLETED"
 
     # Update candidate stage
     from src.models.models import CandidateStageHistory, Candidate
@@ -482,9 +486,9 @@ async def get_my_profile(
         (Interview.interviewer_email == current_user.email) | (Interview.created_by == current_user.email)
     )
     total_interviews = _base.count()
-    completed_interviews = _base.filter(Interview.status == "completed").count()
+    completed_interviews = _base.filter(func.upper(Interview.status) == "COMPLETED").count()
     upcoming_interviews = _base.filter(
-        Interview.status == "scheduled",
+        func.upper(Interview.status) == "SCHEDULED",
         Interview.scheduled_datetime >= datetime.utcnow()
     ).count()
     

@@ -29,8 +29,11 @@ pytest
 pytest --cov=.
 pytest test/test_ats_scoring.py  # single test file
 
-# Backend: setup database (from backend/)
+# Backend: setup database (from backend/) — creates missing tables, destroys nothing
 python setup_db.py
+
+# Backend: rebuild from scratch (DEV/TEST ONLY — drops interviews, feedback, candidates)
+python setup_db.py --drop
 
 # Backend: install dependencies (from backend/)
 pip install -r requirements.txt

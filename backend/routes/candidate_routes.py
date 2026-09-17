@@ -20,7 +20,7 @@ from .candidate_profile_routes import (
     _get_or_create_profile, _serialize_profile, build_profile_text
 )
 from src.services.enhanced_ats_service import EnhancedATSScoringService
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from datetime import datetime
 from pathlib import Path
 import uuid
@@ -1501,6 +1501,23 @@ class ProfileUpdate(BaseModel):
     phone: Optional[str] = None
     gender: Optional[str] = None
     date_of_birth: Optional[str] = None
+
+    @field_validator("first_name", "last_name")
+    @classmethod
+    def _name_not_blank(cls, v):
+        """A name may be left out of the payload, but never emptied.
+
+        first_name is NOT NULL on the model, but "" satisfies that in MySQL, so an edit
+        form that posted an empty field permanently erased the person's name. Whitespace
+        is stripped first so "   " is not a loophole.
+        """
+        if v is None:
+            return v
+        v = v.strip()
+        if not v:
+            raise ValueError("Name cannot be blank")
+        return v
+
     # Extended personal
     alternate_phone: Optional[str] = None
     nationality: Optional[str] = None

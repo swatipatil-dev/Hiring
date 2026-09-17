@@ -293,6 +293,50 @@ export default function HRDashboard() {
   }, [schedOpen])
 
   // Add a typed panelist (name + email) to the panel, deduped by email.
+  // ── Edit panel on an already-scheduled interview ──
+  const [panelModal, setPanelModal] = useState(null)   // the interview being re-panelled
+  const [panelIds, setPanelIds] = useState([])
+  const [panelManual, setPanelManual] = useState([])
+  const [panelSaving, setPanelSaving] = useState(false)
+
+  const openPanelEditor = async (iv) => {
+    // The pickers are normally loaded by the schedule modal; fetch them here too so the
+    // editor works when Interviews is the first tab the user opens.
+    let list = interviewers
+    if (!list.length) {
+      try { const r = await api.get('/hr/interviewers'); list = r.data || []; setInterviewers(list) } catch (e) { list = [] }
+    }
+    api.get('/hr/panel-staff').then(r => setPanelStaff(r.data || [])).catch(() => {})
+    // Pre-tick current members. Interviewer picks carry an InterviewerProfile id;
+    // ad-hoc panelists don't, so they come back as manual entries.
+    const current = Array.isArray(iv.panel_members) ? iv.panel_members : []
+    const known = new Set(list.map(x => x.id))
+    setPanelIds(current.filter(m => m.id && known.has(m.id)).map(m => m.id))
+    setPanelManual(current.filter(m => !m.id || !known.has(m.id)).map(m => ({ name: m.name, email: m.email })))
+    setPanelModal(iv)
+  }
+
+  const savePanel = async () => {
+    if (!panelModal) return
+    setPanelSaving(true)
+    try {
+      const { data } = await api.put(`/hr/interviews/${panelModal.id}/panel`, {
+        interviewer_ids: panelIds,
+        manual_panelists: panelManual,
+      })
+      const bits = []
+      if (data.added?.length) bits.push(`added ${data.added.join(', ')}`)
+      if (data.removed?.length) bits.push(`removed ${data.removed.join(', ')}`)
+      if (data.needs_interviewer) bits.push('no one is on the panel now')
+      alert(bits.length ? `Panel updated — ${bits.join('; ')}.` : 'Panel unchanged.')
+      setPanelModal(null)
+      api.get('/hr/interviews').then(r => setInterviews(r.data)).catch(() => {})
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Failed to update panel')
+    }
+    setPanelSaving(false)
+  }
+
   const addManualPanelist = () => {
     const name = manualName.trim()
     const email = manualEmail.trim()
@@ -787,22 +831,46 @@ HR Team`,
   // offer the dashboard kept showing the old numbers until a full page reload —
   // which reads to a user as "my action didn't save".
   const [counts, setCounts] = useState(null)
+  // Null counts used to mean both "still loading" and "the request failed", and both
+  // rendered as an em dash — which reads as "you have no jobs" when it actually means
+  // the call errored. Tracking the failure separately lets the cards say so and offer
+  // a retry, instead of a broken deploy looking like an empty pipeline.
+  const [countsError, setCountsError] = useState(null)
+
+  // Named the likely causes rather than showing a bare "failed": a 404 here means the
+  // running API predates the endpoint, which is exactly what a half-finished deploy
+  // looks like from the browser.
+  const countsErrorText = (err) => {
+    const status = err?.response?.status
+    if (status === 404) return 'The server does not have this endpoint — the backend may be out of date.'
+    if (status === 401 || status === 403) return 'You are not authorised to see these totals.'
+    if (status >= 500) return `The server failed to calculate them (HTTP ${status}).`
+    if (!err?.response) return 'Could not reach the server.'
+    return `The request failed (HTTP ${status}).`
+  }
+
+  const fetchCounts = useCallback(() => {
+    setCountsError(null)
+    return api.get('/hr/dashboard/counts')
+      .then(r => { setCounts(r.data); setCountsError(null) })
+      .catch(err => { setCounts(null); setCountsError(countsErrorText(err)) })
+  }, [])
 
   const refreshOverview = useCallback(() => {
     // The overview cards read this, not the arrays below. /hr/jobs, /hr/interviews and
     // /hr/offers all cap at limit=50, so counting what came back reported "50" for any
     // HR with more than fifty of anything, and the number stopped moving there.
     //
-    // Left at null on failure rather than 0: the cards render "—" for null, and a flash
-    // of zero reads as "you have no jobs" instead of "not loaded yet". Same rule the
-    // admin role cards follow (AdminDashboard.jsx:1305).
-    api.get('/hr/dashboard/counts').then(r => setCounts(r.data)).catch(() => setCounts(null))
+    // Left at null on failure rather than 0: a flash of zero reads as "you have no
+    // jobs" instead of "not loaded yet". Same rule the admin role cards follow
+    // (AdminDashboard.jsx:1305). countsError carries the reason so the UI can say it.
+    fetchCounts()
     api.get('/hr/departments').then(r => setDepartments(r.data || [])).catch(() => {})
     api.get('/hr/interviews').then(r => setInterviews(r.data || [])).catch(() => {})
     api.get('/hr/offers').then(r => setOffers(r.data || [])).catch(() => {})
     api.get('/hr/test-results').then(r => setTestResults(r.data || [])).catch(() => {})
     api.get('/hr/feedback').then(r => setFeedbackData(r.data || [])).catch(() => {})
-  }, [])
+  }, [fetchCounts])
 
   useEffect(() => {
     fetchRequirements()
@@ -902,13 +970,22 @@ HR Team`,
     }
   }
 
+  // Deleted jobs keep a record: the candidates go to the talent pool, but a test template
+  // has no candidate to attach to, so its author survives only here.
+  const [deletedJobs, setDeletedJobs] = useState([])
+  const [showDeletedJobs, setShowDeletedJobs] = useState(false)
+  const fetchDeletedJobs = () =>
+    api.get('/hr/deleted-jobs').then(r => setDeletedJobs(r.data?.results || [])).catch(() => {})
+  useEffect(() => { if (tab === 'jobs') fetchDeletedJobs() }, [tab])
+
   const handleDeleteJobPermanent = async (jobId) => {
-    if (!confirm('Permanently DELETE this job and ALL of its data — candidates, ATS scores, interviews, tests and offers?\n\nThis cannot be undone.')) return
+    if (!confirm('Permanently DELETE this job and ALL of its data — candidates, ATS scores, interviews, tests and offers?\n\nThis cannot be undone.\n\nCandidates and their completed interview records are kept in the talent pool, and the authors of its tests stay listed under Deleted Jobs.')) return
     try {
       const res = await api.delete(`/hr/jobs/${jobId}/permanent`)
       alert(res.data?.message || 'Job deleted')
       setViewJob(null)
       fetchJobs()
+      fetchDeletedJobs()
     } catch (err) {
       alert(err.response?.data?.detail || 'Failed to delete job')
     }
@@ -1316,6 +1393,17 @@ HR Team`,
             {/* Stats Cards — each one is a drill-down into the tab it summarises.
                 These used to be plain <div>s that lifted on hover, so they read as
                 buttons and did nothing when clicked. */}
+            {countsError && (
+              <div role="alert"
+                style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 12, marginBottom: 16, padding: '10px 14px', borderRadius: 10, background: '#fef2f2', border: '1px solid #fecaca', color: '#991b1b', fontSize: '0.84rem' }}>
+                <span style={{ fontWeight: 600 }}>Totals unavailable.</span>
+                <span style={{ color: '#b91c1c' }}>{countsError}</span>
+                <button type="button" onClick={fetchCounts}
+                  style={{ marginLeft: 'auto', padding: '5px 14px', borderRadius: 8, border: '1px solid #fecaca', background: '#fff', color: '#991b1b', fontWeight: 600, fontSize: '0.8rem', cursor: 'pointer' }}>
+                  Retry
+                </button>
+              </div>
+            )}
             <div className="stats-grid">
               {[
                 {
@@ -1344,12 +1432,19 @@ HR Team`,
                   type="button"
                   className={`stat-card ${s.cls}`}
                   onClick={s.onSelect}
-                  aria-label={s.value == null
-                    ? `${s.label}, loading count. ${s.hint}`
-                    : `${s.label}: ${s.value.toLocaleString()}. ${s.hint}`}
+                  aria-label={s.value != null
+                    ? `${s.label}: ${s.value.toLocaleString()}. ${s.hint}`
+                    : countsError
+                      ? `${s.label}, count unavailable: ${countsError} ${s.hint}`
+                      : `${s.label}, loading count. ${s.hint}`}
                 >
                   <div className="stat-label">{s.label}</div>
-                  <div className="stat-value">{s.value == null ? '—' : s.value.toLocaleString()}</div>
+                  {/* Three states, not two: a failed load must not look like a real zero. */}
+                  <div className="stat-value"
+                    title={s.value == null && countsError ? countsError : undefined}
+                    style={s.value == null && countsError ? { color: '#b91c1c' } : undefined}>
+                    {s.value != null ? s.value.toLocaleString() : countsError ? '!' : '—'}
+                  </div>
                   <ChevronRight size={16} className="stat-affordance" aria-hidden="true" />
                 </button>
               ))}
@@ -1673,6 +1768,56 @@ HR Team`,
                 })}
               </div>
             )}
+
+            {/* Deleted jobs. The job is gone, but the people are not: candidates live on
+                in the talent pool, and this is the only remaining record of who authored
+                the tests written for it. */}
+            {deletedJobs.length > 0 && (
+              <div style={{ marginTop: 32, paddingTop: 20, borderTop: '1px solid #e5e7eb' }}>
+                <button type="button" onClick={() => setShowDeletedJobs(o => !o)}
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: 6, background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)', fontSize: '0.86rem', fontWeight: 600, padding: 0 }}>
+                  {showDeletedJobs ? '▾' : '▸'}
+                  {deletedJobs.length} deleted job{deletedJobs.length === 1 ? '' : 's'}
+                </button>
+                {showDeletedJobs && (
+                  <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 10 }}>
+                    {deletedJobs.map(d => (
+                      <div key={d.id} style={{ padding: '12px 14px', background: '#f9fafb', borderRadius: 10, border: '1px solid #e5e7eb' }}>
+                        <div className="flex-between" style={{ alignItems: 'baseline', gap: 12 }}>
+                          <div style={{ fontWeight: 600 }}>
+                            {d.job_title}
+                            {d.department && <span style={{ color: '#9ca3af', fontWeight: 400 }}> · {d.department}</span>}
+                          </div>
+                          <div style={{ fontSize: '0.72rem', color: '#9ca3af', fontFamily: 'var(--font-mono)' }}>
+                            {d.deleted_at ? new Date(d.deleted_at).toLocaleDateString() : ''}
+                            {d.deleted_by ? ` · by ${d.deleted_by}` : ''}
+                          </div>
+                        </div>
+                        <div style={{ fontSize: '0.76rem', color: 'var(--text-secondary)', marginTop: 4 }}>
+                          {d.candidates_archived} candidate(s) kept in the talent pool
+                          {d.interviews_archived > 0 && ` · ${d.interviews_archived} completed interview(s) preserved`}
+                        </div>
+                        {(d.tests || []).length > 0 && (
+                          <div style={{ marginTop: 8, paddingLeft: 10, borderLeft: '2px solid #e5e7eb', display: 'flex', flexDirection: 'column', gap: 3 }}>
+                            {d.tests.map((t, i) => (
+                              <div key={t.interview_id || i} style={{ fontSize: '0.76rem', display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'baseline' }}>
+                                <span style={{ fontWeight: 600 }}>{t.author_name || t.created_by || 'Author not recorded'}</span>
+                                <span style={{ color: '#6b7280' }}>{t.title || 'Untitled test'}</span>
+                                {t.question_count > 0 && (
+                                  <span style={{ color: '#9ca3af', fontFamily: 'var(--font-mono)', fontSize: '0.68rem' }}>
+                                    {t.question_count} question(s)
+                                  </span>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         )
       })()}
@@ -1934,6 +2079,12 @@ HR Team`,
                       <span style={{ padding: '4px 10px', borderRadius: 6, fontSize: '0.75rem', fontWeight: 600, background: isOnline ? '#dbeafe' : '#fef3c7', color: isOnline ? '#1d4ed8' : '#92400e' }}>
                         {isOnline ? '🖥 Online' : '🏢 Offline'}
                       </span>
+                      {iv.needs_interviewer && (
+                        <span title="This interview has no interviewer — its assigned interviewer was deactivated."
+                          style={{ padding: '4px 10px', borderRadius: 6, fontSize: '0.75rem', fontWeight: 700, background: '#fee2e2', color: '#b91c1c', border: '1px solid #fca5a5' }}>
+                          ⚠ Needs interviewer
+                        </span>
+                      )}
                       <span style={{ padding: '5px 14px', borderRadius: 8, fontSize: '0.76rem', fontWeight: 700, color: statusColor, background: statusBg, border: `1px solid ${statusColor}25`, textTransform: 'uppercase' }}>
                         {iv.status}
                       </span>
@@ -1949,9 +2100,17 @@ HR Team`,
                       <div style={{ fontSize: '0.82rem', fontFamily: 'var(--font-mono)' }}>{iv.candidate_phone || '—'}</div>
                     </div>
                     <div style={{ padding: '8px 12px', background: '#f9fafb', borderRadius: 8 }}>
-                      <div style={{ fontSize: '0.65rem', fontWeight: 700, textTransform: 'uppercase', color: '#9ca3af', marginBottom: 2 }}>Interviewer</div>
-                      <div style={{ fontSize: '0.82rem' }}>{iv.interviewer_name}</div>
-                      <div style={{ fontSize: '0.72rem', color: '#9ca3af' }}>{iv.interviewer_email}</div>
+                      <div style={{ fontSize: '0.65rem', fontWeight: 700, textTransform: 'uppercase', color: '#9ca3af', marginBottom: 2 }}>
+                        {(iv.panel_members?.length || 0) > 1 ? `Panel (${iv.panel_members.length})` : 'Interviewer'}
+                      </div>
+                      {(iv.panel_members?.length || 0) > 0 ? (
+                        <div style={{ fontSize: '0.82rem' }}>{iv.panel_members.map(p => p.name).join(', ')}</div>
+                      ) : (
+                        <>
+                          <div style={{ fontSize: '0.82rem' }}>{iv.interviewer_name || '—'}</div>
+                          <div style={{ fontSize: '0.72rem', color: '#9ca3af' }}>{iv.interviewer_email}</div>
+                        </>
+                      )}
                     </div>
                     <div style={{ padding: '8px 12px', background: '#f9fafb', borderRadius: 8 }}>
                       <div style={{ fontSize: '0.65rem', fontWeight: 700, textTransform: 'uppercase', color: '#9ca3af', marginBottom: 2 }}>Schedule</div>
@@ -1974,6 +2133,12 @@ HR Team`,
                       <a href={`/${iv.resume_path}`} target="_blank" rel="noreferrer" style={{ padding: '6px 14px', borderRadius: 8, background: '#f0fdf4', color: '#15803d', fontSize: '0.8rem', fontWeight: 600, textDecoration: 'none', border: '1px solid #bbf7d0' }}>
                         📄 View Resume
                       </a>
+                    )}
+                    {['SCHEDULED', 'RESCHEDULED'].includes(String(iv.status || '').toUpperCase()) && (
+                      <button type="button" onClick={() => openPanelEditor(iv)}
+                        style={{ padding: '6px 14px', borderRadius: 8, background: '#eff6ff', color: '#1d4ed8', fontSize: '0.8rem', fontWeight: 600, border: '1px solid #bfdbfe', cursor: 'pointer' }}>
+                        👥 Edit Panel
+                      </button>
                     )}
                     {/* Give / edit interview feedback — works for online AND offline */}
                     {(() => {
@@ -3147,6 +3312,81 @@ HR Team`,
       )}
 
       {/* ═══════════ SCHEDULE INTERVIEW MODAL ═══════════ */}
+      {panelModal && (
+        <div className="modal-overlay" onClick={() => !panelSaving && setPanelModal(null)}>
+          <div className="modal" style={{ maxWidth: 620 }} onClick={e => e.stopPropagation()}>
+            <h3 style={{ marginTop: 0 }}>Edit Panel</h3>
+            <div style={{ fontSize: '0.84rem', color: 'var(--text-secondary)', marginBottom: 16 }}>
+              {panelModal.candidate_name} — {panelModal.job_title}
+            </div>
+
+            {interviewers.length > 0 && (
+              <div style={{ marginBottom: 10 }}>
+                <div style={{ fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.04em', color: '#6b7280', marginBottom: 4 }}>Interviewers</div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                  {interviewers.map(iv => {
+                    const checked = panelIds.includes(iv.id)
+                    return (
+                      <label key={iv.id} style={{ display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer', padding: '6px 10px', borderRadius: 8, border: checked ? '2px solid #2b7cba' : '1px solid #d1d5db', background: checked ? '#e0efff' : '#fff', fontSize: '0.82rem' }}>
+                        <input type="checkbox" checked={checked}
+                          onChange={() => setPanelIds(ids => checked ? ids.filter(x => x !== iv.id) : [...ids, iv.id])} />
+                        <span style={{ fontWeight: 600 }}>{iv.name}</span>
+                        <span style={{ color: '#6b7280' }}>{iv.department && iv.department !== '—' ? `· ${iv.department}` : ''}</span>
+                      </label>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+
+            {panelStaff.length > 0 && (
+              <div style={{ marginBottom: 10 }}>
+                <div style={{ fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.04em', color: '#6b7280', marginBottom: 4 }}>Other staff (HR / Admin)</div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                  {panelStaff.map(st => {
+                    const checked = panelManual.some(m => m.email === st.email)
+                    return (
+                      <label key={st.email} style={{ display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer', padding: '6px 10px', borderRadius: 8, border: checked ? '2px solid #2b7cba' : '1px solid #d1d5db', background: checked ? '#e0efff' : '#fff', fontSize: '0.82rem' }}>
+                        <input type="checkbox" checked={checked}
+                          onChange={() => setPanelManual(ms => checked
+                            ? ms.filter(m => m.email !== st.email)
+                            : [...ms, { name: st.name, email: st.email }])} />
+                        <span style={{ fontWeight: 600 }}>{st.name}</span>
+                        <span style={{ color: '#6b7280' }}>· {st.role}</span>
+                      </label>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+
+            {panelManual.length > 0 && (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
+                {panelManual.map(m => (
+                  <span key={m.email} style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 10px', borderRadius: 999, background: '#f3f4f6', fontSize: '0.78rem' }}>
+                    {m.name} <span style={{ color: '#9ca3af' }}>{m.email}</span>
+                    <button type="button" onClick={() => setPanelManual(ms => ms.filter(x => x.email !== m.email))}
+                      style={{ border: 'none', background: 'none', cursor: 'pointer', color: '#6b7280' }}>×</button>
+                  </span>
+                ))}
+              </div>
+            )}
+
+            <div style={{ fontSize: '0.78rem', color: 'var(--text-tertiary)', marginBottom: 16 }}>
+              {panelIds.length + panelManual.length} panelist(s) selected.
+              Only people you add or remove are emailed — the rest already have the invite.
+            </div>
+
+            <div className="flex gap-12" style={{ justifyContent: 'flex-end' }}>
+              <button type="button" className="btn btn-secondary" disabled={panelSaving}
+                onClick={() => setPanelModal(null)}>Cancel</button>
+              <button type="button" className="btn btn-primary" disabled={panelSaving}
+                onClick={savePanel}>{panelSaving ? 'Saving...' : 'Save Panel'}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {scheduleModal && (
         <div className="modal-overlay" onClick={() => setScheduleModal(null)} style={{ alignItems: 'flex-start', paddingTop: 30, overflowY: 'auto' }}>
           <div onClick={e => e.stopPropagation()} style={{ background: '#fff', borderRadius: 16, width: '95%', maxWidth: 520, padding: '28px 32px', boxShadow: '0 24px 80px rgba(0,0,0,0.15)', maxHeight: '90vh', overflowY: 'auto', marginBottom: 30 }}>
@@ -4231,12 +4471,16 @@ HR Team`,
               </div>
             </div>
 
-            {viewJob.assigned_interviewer_name && (
-              <div style={{ padding: '12px 16px', background: 'var(--surface-input)', borderRadius: 10, marginBottom: 20 }}>
-                <div style={{ fontSize: '0.72rem', fontWeight: 700, textTransform: 'uppercase', color: 'var(--text-tertiary)', marginBottom: 4, fontFamily: 'var(--font-display)' }}>Assigned Interviewer</div>
+            <div style={{ padding: '12px 16px', background: 'var(--surface-input)', borderRadius: 10, marginBottom: 20 }}>
+              <div style={{ fontSize: '0.72rem', fontWeight: 700, textTransform: 'uppercase', color: 'var(--text-tertiary)', marginBottom: 4, fontFamily: 'var(--font-display)' }}>Assigned Interviewer</div>
+              {viewJob.assigned_interviewer_name ? (
                 <div style={{ fontWeight: 500 }}>{viewJob.assigned_interviewer_name} ({viewJob.assigned_interviewer_email})</div>
-              </div>
-            )}
+              ) : (
+                <div style={{ fontWeight: 600, color: '#b91c1c' }}>
+                  ⚠ Unassigned — pick an interviewer before scheduling.
+                </div>
+              )}
+            </div>
 
             <div style={{ fontSize: '0.78rem', color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono)', marginBottom: 20 }}>
               Created: {viewJob.created_at ? new Date(viewJob.created_at).toLocaleString() : '—'}
