@@ -435,7 +435,11 @@ jobs:
         id: publish
         if: steps.pull.outputs.frontend == 'true' && !inputs.dry_run
         run: |
-          rsync -az --delete -e "ssh -F ~/.ssh/config" dist/ target:/tmp/hireflow-dist/
+          # $HOME, not ~: bash does not tilde-expand inside double quotes, so rsync
+          # handed ssh a literal "~/.ssh/config", ssh failed to open it, and the
+          # step died with "unexplained error (code 255)". The plain `ssh target`
+          # lines below work because ssh reads the config itself by default.
+          rsync -az --delete -e "ssh -F $HOME/.ssh/config" dist/ target:/tmp/hireflow-dist/
           ssh target "sudo rsync -a --delete /tmp/hireflow-dist/ $WEB_ROOT/"
           ssh target "sudo cp -f $APP_DIR/deploy/cpanel/htaccess-spa $WEB_ROOT/.htaccess"
           ssh target "sudo chown -R innomaxskills:innomaxskills $WEB_ROOT"
