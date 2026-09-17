@@ -2,11 +2,14 @@ import { useEffect, useMemo, useState, useCallback } from 'react'
 import { Link } from 'react-router-dom'
 import {
   AlertTriangle, BadgeCheck, Building2, Check, Minus, RefreshCw, Search,
-  UserCircle,
 } from 'lucide-react'
 import api from '../../api/client'
 import { useAuth } from '../../context/AuthContext'
 import Header from '../../components/Header'
+import { Card } from './profile/ProfileFields'
+import AccountDetailsCard from './profile/AccountDetailsCard'
+import ChangePasswordCard from './profile/ChangePasswordCard'
+import HRActivitySections from './profile/HRActivitySections'
 
 const ROLE_LABELS = {
   superadmin: 'Super Admin', admin: 'Admin', hr: 'HR',
@@ -30,41 +33,6 @@ const ROLE_NOTES = {
 }
 
 const slugifyGroup = (g) => 'mp-g-' + g.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
-
-const fmtDate = (iso) => {
-  if (!iso) return null
-  const d = new Date(iso)
-  return isNaN(d) ? null : d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
-}
-
-/** A labelled value. Renders an em dash rather than a blank cell when empty. */
-function Field({ label, value, mono }) {
-  const empty = value === null || value === undefined || value === ''
-  return (
-    <div>
-      <div style={{ fontSize: '0.7rem', fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--text-tertiary)', marginBottom: 4 }}>
-        {label}
-      </div>
-      <div style={{
-        fontSize: '0.88rem',
-        color: empty ? 'var(--text-tertiary)' : 'var(--text-primary)',
-        fontFamily: mono ? 'var(--font-mono)' : 'inherit',
-        wordBreak: 'break-word',
-      }}>
-        {empty ? '—' : value}
-      </div>
-    </div>
-  )
-}
-
-function Card({ children, style }) {
-  return (
-    <div style={{
-      background: 'var(--surface-card)', border: '1px solid var(--border-subtle)',
-      borderRadius: 14, padding: 20, marginBottom: 18, ...style,
-    }}>{children}</div>
-  )
-}
 
 export default function MyProfile() {
   const { user, setUserFromServer } = useAuth()
@@ -116,7 +84,9 @@ export default function MyProfile() {
   const displayName = [identity.first_name, identity.last_name].filter(Boolean).join(' ')
     || identity.email?.split('@')[0] || 'User'
   const initial = (identity.first_name?.[0] || identity.email?.[0] || '?').toUpperCase()
-  const profile = me?.profile
+  // Server role decides. A stale cached role would otherwise keep showing HR
+  // sections to someone who was just demoted.
+  const isHR = (me?.role || user?.role || '').toLowerCase() === 'hr'
 
   const visibleGroups = useMemo(() => {
     if (!perms) return []
@@ -204,37 +174,15 @@ export default function MyProfile() {
         )}
       </Card>
 
-      {/* B — account details */}
-      {me && (
-        <Card>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16 }}>
-            <UserCircle size={16} style={{ color: 'var(--accent-primary)' }} />
-            <span style={{ fontWeight: 700, fontSize: '0.92rem', color: 'var(--text-primary)' }}>Account details</span>
-          </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 18 }}>
-            <Field label="Phone" value={me.phone} />
-            <Field label="Gender" value={me.gender} />
-            <Field label="Date of birth" value={fmtDate(me.date_of_birth)} />
-            <Field label="Member since" value={fmtDate(me.created_at)} />
-            <Field label="Last updated" value={fmtDate(me.updated_at)} />
-            {profile && <Field label="Employee ID" value={profile.employee_id} mono />}
-            {profile && <Field label="Department" value={profile.department_name} />}
-            {profile?.kind === 'interviewer' && (
-              <Field label="Years of experience" value={profile.years_experience} />
-            )}
-            {profile?.kind === 'interviewer' && (
-              <Field label="Expertise" value={
-                profile.expertise_areas?.length
-                  ? <span style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
-                      {profile.expertise_areas.map(a => <span key={a} className="badge badge-neutral">{a}</span>)}
-                    </span>
-                  : null
-              } />
-            )}
-            <Field label="User ID" value={me.id} mono />
-          </div>
-        </Card>
-      )}
+      {/* HR-only: their own work. Requested on the cached role (available
+          synchronously, so this stays one batch), rendered on the server role. */}
+      <HRActivitySections enabled={isHR} />
+
+      {/* B — account details, editable */}
+      {me && <AccountDetailsCard me={me} onUpdated={setMe} />}
+
+      {/* B3 — security */}
+      {me && <ChangePasswordCard />}
 
       {/* C/D/E — permissions */}
       {permError && (
@@ -393,6 +341,20 @@ export default function MyProfile() {
       )}
 
       <style>{`
+        /* Used by the account + password cards; kept here because this page
+           deliberately has exactly one <style> block. */
+        .mp-edit-field {
+          display: flex;
+          flex-direction: column;
+          gap: 5px;
+        }
+        .mp-edit-field > span {
+          font-size: 0.7rem;
+          font-weight: 600;
+          letter-spacing: 0.04em;
+          text-transform: uppercase;
+          color: var(--text-tertiary);
+        }
         .mp-rail-item {
           display: flex;
           align-items: center;
