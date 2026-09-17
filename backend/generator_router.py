@@ -641,7 +641,7 @@ def _create_manual_pool_questions(db, interview_id, skill_name, question_type, d
     }
     q_type = question_type or "multiple_choice"
     diff = _DIFFICULTY_MAP.get(str(difficulty or "").strip().lower(), "Medium")
-    created, skipped, errors = [], 0, []
+    created, skipped, errors = [], [], []
 
     for i, it in enumerate(items):
         row = i + 1
@@ -660,7 +660,7 @@ def _create_manual_pool_questions(db, interview_id, skill_name, question_type, d
 
         key = _normalize_text(qtext)
         if key in existing:
-            skipped += 1
+            skipped.append(qtext)
             continue
         existing.add(key)
 
@@ -689,15 +689,53 @@ def _create_manual_pool_questions(db, interview_id, skill_name, question_type, d
     return created, skipped, errors
 
 
+# Row-numbering columns. These must never be mistaken for the question itself:
+# "Question No." normalises to "questionno", which contains "question", so a
+# substring match picks the serial number and silently discards the real
+# question text. That shipped, and produced a pool of questions named "1".."30".
+_SERIAL_HEADERS = {
+    "questionno", "questionnos", "questionnumber", "questionnum", "qno", "qnum",
+    "sno", "srno", "slno", "sl", "serial", "serialno", "no", "num", "number",
+    "index", "id", "rowno", "row",
+}
+
+# Header spellings for the answer column, after _norm.
+_CORRECT_HEADERS = (
+    "correct", "correctoption", "correctanswer", "answer", "correctopt",
+    "correctans", "ans", "answerkey", "key",
+)
+
+_DELIMITERS = (",", ";", "\t", "|")
+
+
+def _sniff_delimiter(text: str) -> str:
+    """Pick the delimiter by counting candidates in the first non-empty line.
+
+    Not csv.Sniffer: it guesses badly on two-line files and on prose cells full
+    of commas, and a wrong guess here turns the whole row into one cell. Counting
+    is dumber and right more often. Excel hands out tab-separated data whenever
+    someone copies cells, and semicolons in several European locales.
+    """
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        best = max(_DELIMITERS, key=line.count)
+        return best if line.count(best) else ","
+    return ","
+
+
 def _parse_mcq_csv(text):
     """Parse an MCQ CSV into ManualMCQItem list. Returns (items, errors).
 
     Accepts an optional header row (auto-detected by a 'question' cell). With a
     header, columns are matched by fuzzy names; otherwise positional:
     col0 = question, middle cols = options, last col = correct option.
+
+    Comma, semicolon, tab and pipe delimited files are all accepted.
     """
     items, errors = [], []
-    rows = [r for r in csv.reader(io.StringIO(text)) if any((c or "").strip() for c in r)]
+    reader = csv.reader(io.StringIO(text), delimiter=_sniff_delimiter(text))
+    rows = [r for r in reader if any((c or "").strip() for c in r)]
     if not rows:
         return items, errors
 
@@ -705,19 +743,29 @@ def _parse_mcq_csv(text):
         return "".join(ch for ch in str(h).strip().lower() if ch.isalnum())
 
     first = [_norm(c) for c in rows[0]]
-    has_header = any("question" in c for c in first)
+    has_header = any("question" in c and c not in _SERIAL_HEADERS for c in first)
 
     if has_header:
         header = first
-        q_idx = next((i for i, c in enumerate(header) if "question" in c), 0)
+        # Exact match first, so "Question" beats "Question No." regardless of
+        # column order. Only then fall back to a substring match, and never onto
+        # a serial-number column.
+        q_idx = next((i for i, c in enumerate(header) if c in ("question", "questiontext", "questions")), None)
+        if q_idx is None:
+            q_idx = next((i for i, c in enumerate(header) if "question" in c and c not in _SERIAL_HEADERS), 0)
         corr_idx = next(
-            (i for i, c in enumerate(header) if c in ("correct", "correctoption", "correctanswer", "answer", "correctopt")),
+            (i for i, c in enumerate(header) if c in _CORRECT_HEADERS),
             len(header) - 1,
         )
         opt_idxs = [i for i, c in enumerate(header) if c.startswith("option") or (len(c) == 1 and "a" <= c <= "h")]
         opt_idxs = [i for i in opt_idxs if i not in (q_idx, corr_idx)]
         if not opt_idxs:
-            opt_idxs = [i for i in range(len(header)) if i not in (q_idx, corr_idx)]
+            # Everything that is left, minus the serial columns — otherwise a
+            # stray "S.No" becomes option A.
+            opt_idxs = [
+                i for i in range(len(header))
+                if i not in (q_idx, corr_idx) and header[i] not in _SERIAL_HEADERS
+            ]
         data_rows = rows[1:]
     else:
         q_idx, corr_idx = 0, len(rows[0]) - 1
@@ -731,6 +779,15 @@ def _parse_mcq_csv(text):
         opts = [cell(i) for i in opt_idxs if cell(i)]
         correct = cell(corr_idx)
         if not qtext and not opts:
+            continue
+        # A bare number is never a question. It is what the serial column looks
+        # like when the wrong column was read, so refuse it rather than import
+        # another pool of questions called "1", "2", "3".
+        if qtext.isdigit() and opts:
+            errors.append(
+                f"Row {n}: question text is just the number '{qtext}'. "
+                "Check the column order — a row-number column should not be the question."
+            )
             continue
         items.append(ManualMCQItem(question_text=qtext, options=opts, correct_answer=correct))
     return items, errors
@@ -756,7 +813,7 @@ def add_manual_questions(
 
     msg = f"Added {len(created)} question(s)"
     if skipped:
-        msg += f", skipped {skipped} duplicate(s)"
+        msg += f", skipped {len(skipped)} duplicate(s)"
     if errors:
         msg += f", {len(errors)} row(s) had errors"
     return QuestionGenerationResponse(
@@ -804,9 +861,18 @@ async def add_manual_questions_csv(
 
     msg = f"Imported {len(created)} question(s) from CSV"
     if skipped:
-        msg += f", skipped {skipped} duplicate(s)"
+        sample = "; ".join(f'"{t[:40]}"' for t in skipped[:3])
+        msg += f", skipped {len(skipped)} already in this test (e.g. {sample})"
+        if not created:
+            # An all-duplicates import reads as "nothing happened". Say why, and
+            # point at the two things that actually cause it.
+            msg += (
+                ". Nothing was imported because every row already exists on this test — "
+                "either it was uploaded before, or a previous upload read the wrong "
+                "column and stored row numbers as the question text."
+            )
     if all_errors:
-        msg += f", {len(all_errors)} row(s) had errors"
+        msg += f", {len(all_errors)} row(s) had errors: " + "; ".join(all_errors[:3])
     return QuestionGenerationResponse(
         success=True,
         message=msg,
