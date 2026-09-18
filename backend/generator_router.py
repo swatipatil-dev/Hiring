@@ -696,7 +696,8 @@ def _create_manual_pool_questions(db, interview_id, skill_name, question_type, d
 _SERIAL_HEADERS = {
     "questionno", "questionnos", "questionnumber", "questionnum", "qno", "qnum",
     "sno", "srno", "slno", "sl", "serial", "serialno", "no", "num", "number",
-    "index", "id", "rowno", "row",
+    "index", "id", "rowno", "row", "questionid", "questionsrno", "questionslno",
+    "qid", "slno", "srlno",
 }
 
 # Header spellings for the answer column, after _norm.
@@ -707,21 +708,83 @@ _CORRECT_HEADERS = (
 
 _DELIMITERS = (",", ";", "\t", "|")
 
+# Raw-header fragments that mark a row-number column. Checked against the header
+# BEFORE normalisation, because _norm deletes punctuation: "Question #" becomes
+# "question" and would otherwise win an exact match for the question column,
+# which is the original bug wearing a different hat.
+_SERIAL_RAW_MARKERS = ("#", "no.", "no ", "s.no", "sr", "sl.", "sl ", "serial", "index")
+
+
+def is_serial_like(text) -> bool:
+    """True when the text is a row number rather than a question.
+
+    Shared with scripts/purge_numeric_questions.py so the importer and the
+    cleanup agree on what junk looks like — if they drift, the parser starts
+    refusing rows the cleanup script cannot find.
+
+    Covers "1", "1.", "01.", "1.0" (what a float-typed serial column exports as)
+    and "Q1"/"#1", not just str.isdigit().
+    """
+    if text is None:
+        return False
+    s = str(text).strip().lstrip("#").strip()
+    if not s:
+        return False
+    if s[:1].lower() == "q":
+        s = s[1:].strip()
+    s = s.rstrip(".").strip()
+    if not s:
+        return False
+    try:
+        float(s)
+    except ValueError:
+        return False
+    # "1e5" parses as a float but is not a row number anyone typed.
+    return all(ch.isdigit() or ch in ".," for ch in s)
+
+
+def _is_serial_header(raw, normalised) -> bool:
+    """Does this header name a row-number column?"""
+    if normalised in _SERIAL_HEADERS:
+        return True
+    if not normalised:
+        return True  # "#" and blank trailing columns normalise to ""
+    low = f" {str(raw).strip().lower()} "
+    return any(m in low for m in _SERIAL_RAW_MARKERS)
+
 
 def _sniff_delimiter(text: str) -> str:
-    """Pick the delimiter by counting candidates in the first non-empty line.
+    """Pick the delimiter that actually parses the file into the most columns.
 
     Not csv.Sniffer: it guesses badly on two-line files and on prose cells full
-    of commas, and a wrong guess here turns the whole row into one cell. Counting
-    is dumber and right more often. Excel hands out tab-separated data whenever
-    someone copies cells, and semicolons in several European locales.
+    of commas, and a wrong guess turns the whole row into one cell. Excel hands
+    out tab-separated data whenever someone copies cells, and semicolons in
+    several European locales.
+
+    Parses a sample with each candidate rather than counting raw characters,
+    because a question like "Which are HR functions: hiring, onboarding, payroll?"
+    carries more commas than a tab-separated row has tabs — counting alone would
+    pick the comma and shred the row. Ties keep the earlier candidate, so a plain
+    comma CSV still resolves to comma.
     """
-    for line in text.splitlines():
-        if not line.strip():
+    sample = [ln for ln in text.splitlines() if ln.strip()][:5]
+    if not sample:
+        return ","
+
+    best, best_cols = ",", 0
+    for d in _DELIMITERS:
+        try:
+            rows = list(csv.reader(io.StringIO("\n".join(sample)), delimiter=d))
+        except csv.Error:
             continue
-        best = max(_DELIMITERS, key=line.count)
-        return best if line.count(best) else ","
-    return ","
+        if not rows:
+            continue
+        # The header (or first row) decides the width; a delimiter that does not
+        # appear yields exactly one column.
+        cols = max(len(r) for r in rows)
+        if cols > best_cols:
+            best, best_cols = d, cols
+    return best
 
 
 def _parse_mcq_csv(text):
@@ -742,19 +805,56 @@ def _parse_mcq_csv(text):
     def _norm(h):
         return "".join(ch for ch in str(h).strip().lower() if ch.isalnum())
 
+    raw_header = [str(c or "") for c in rows[0]]
     first = [_norm(c) for c in rows[0]]
-    has_header = any("question" in c and c not in _SERIAL_HEADERS for c in first)
+    # Serial-ness is decided on the RAW header, so "Question #" is a row number
+    # even though it normalises to exactly "question".
+    is_serial = [_is_serial_header(raw_header[i], c) for i, c in enumerate(first)]
+    # A question column is the usual tell, but not the only one: a sheet headed
+    # "Question ID, Description, Option A, ..." has no non-serial "question"
+    # cell, and treating that row as data put the literal text "Question ID"
+    # into the pool as a question. Recognising the option/answer headers too
+    # keeps the header row a header.
+    has_header = (
+        any("question" in c and not is_serial[i] for i, c in enumerate(first))
+        or any(c.startswith("option") for c in first)
+        or any(c in _CORRECT_HEADERS for c in first)
+    )
 
     if has_header:
         header = first
         # Exact match first, so "Question" beats "Question No." regardless of
-        # column order. Only then fall back to a substring match, and never onto
-        # a serial-number column.
-        q_idx = next((i for i, c in enumerate(header) if c in ("question", "questiontext", "questions")), None)
+        # column order. Only then fall back to a substring match. Neither pass
+        # may land on a serial-number column.
+        q_idx = next(
+            (i for i, c in enumerate(header)
+             if c in ("question", "questiontext", "questions") and not is_serial[i]),
+            None,
+        )
         if q_idx is None:
-            q_idx = next((i for i, c in enumerate(header) if "question" in c and c not in _SERIAL_HEADERS), 0)
+            q_idx = next(
+                (i for i, c in enumerate(header) if "question" in c and not is_serial[i]),
+                None,
+            )
+        if q_idx is None:
+            # Last resort: the first column that is not a row number, an option
+            # or the answer key. Excluding those matters — a sheet of
+            # "Question No., Option A, Option B, Correct Answer" has no question
+            # column at all, and without this the fallback silently promoted
+            # option A to be the question.
+            q_idx = next(
+                (i for i, c in enumerate(header)
+                 if not is_serial[i] and not c.startswith("option") and c not in _CORRECT_HEADERS),
+                None,
+            )
+        if q_idx is None:
+            errors.append(
+                "Could not find a question column. Expected a column headed "
+                "'Question' (a 'Question No.' row-number column is not one)."
+            )
+            return items, errors
         corr_idx = next(
-            (i for i, c in enumerate(header) if c in _CORRECT_HEADERS),
+            (i for i, c in enumerate(header) if c in _CORRECT_HEADERS and not is_serial[i]),
             len(header) - 1,
         )
         opt_idxs = [i for i, c in enumerate(header) if c.startswith("option") or (len(c) == 1 and "a" <= c <= "h")]
@@ -764,7 +864,7 @@ def _parse_mcq_csv(text):
             # stray "S.No" becomes option A.
             opt_idxs = [
                 i for i in range(len(header))
-                if i not in (q_idx, corr_idx) and header[i] not in _SERIAL_HEADERS
+                if i not in (q_idx, corr_idx) and not is_serial[i]
             ]
         data_rows = rows[1:]
     else:
@@ -783,9 +883,9 @@ def _parse_mcq_csv(text):
         # A bare number is never a question. It is what the serial column looks
         # like when the wrong column was read, so refuse it rather than import
         # another pool of questions called "1", "2", "3".
-        if qtext.isdigit() and opts:
+        if is_serial_like(qtext) and opts:
             errors.append(
-                f"Row {n}: question text is just the number '{qtext}'. "
+                f"Row {n}: question text is just the row number '{qtext}'. "
                 "Check the column order — a row-number column should not be the question."
             )
             continue
@@ -847,10 +947,13 @@ async def add_manual_questions_csv(
 
     items, parse_errors = _parse_mcq_csv(text)
     if not items:
-        raise HTTPException(
-            status_code=400,
-            detail="No valid rows found. Expected columns: question, option_a, option_b, option_c, option_d, correct_option",
-        )
+        # The per-row reasons matter most in exactly this case: when EVERY row
+        # was rejected (e.g. a row-number column read as the question), the
+        # generic sentence below is the one thing that cannot explain it.
+        detail = "No valid rows found. Expected columns: question, option_a, option_b, option_c, option_d, correct_option"
+        if parse_errors:
+            detail += ". " + "; ".join(parse_errors[:3])
+        raise HTTPException(status_code=400, detail=detail)
 
     created, skipped, errors = _create_manual_pool_questions(
         db, interview_id, skill_name, question_type, difficulty, marks_per_question, items,
