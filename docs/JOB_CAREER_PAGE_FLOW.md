@@ -91,10 +91,12 @@ Authorization: Bearer <candidate_token>
 8. ✅ **Email Notification**: Ready for email integration
 
 **ATS Scoring Breakdown:**
-- **Skills Match (35%)**: Resume skills vs required skills
-- **Semantic Score (35%)**: TF-IDF cosine similarity
-- **Experience Score (20%)**: Years experience alignment
-- **Keyword Score (10%)**: JD keyword matching
+- **Education (35%)**: Degree + college tier + CGPA
+- **Skills Match (25%)**: Required + preferred, scaled by where each skill is evidenced
+- **Experience (20%)**: Relevant years + internships + GitHub/OSS/hackathons
+- **Certifications (10%)** · **Projects (8%)** · **Semantic (1%)** · **Keyword (1%)**
+
+See `DEFAULT_ATS_WEIGHTS` in `backend/src/services/enhanced_ats_service.py`.
 
 ---
 

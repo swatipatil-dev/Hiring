@@ -611,34 +611,24 @@ Setup    Creates   Applies    Screens   Calls    Interviews  Assesses  Schedules
 
 ## 🤖 AI/ML ATS Scoring
 
-### 4-Factor Scoring Algorithm
+### 7-Factor Scoring Algorithm
 
-The ATS score is calculated using a weighted average of 4 factors:
+| Factor | Weight | Description |
+|---------|--------|-------------|
+| Education | 35% | Degree match (40) + college tier (30) + CGPA (30) |
+| Skills Match | 25% | Required (70) + preferred (30), **each scaled by where the resume evidences it** |
+| Experience | 20% | Relevant years (50) + internships (25) + GitHub/OSS/hackathons (25) |
+| Certifications | 10% | Count and relevance of professional certifications |
+| Projects | 8% | Relevance of projects to the JD |
+| Semantic | 1% | Meaning-level similarity of resume to JD |
+| Keyword | 1% | JD keyword coverage, wherever in the resume it appears |
 
-```
-ATS_Score = (Skills_Match × 0.35) + (Semantic_Score × 0.35) + (Experience_Score × 0.20) + (Keyword_Score × 0.10)
-```
+Source of truth: `DEFAULT_ATS_WEIGHTS` in `backend/src/services/enhanced_ats_service.py`.
 
-### Factor Breakdown
-
-#### 1. Skills Match Score (35%)
-- **Calculation**: `(matched_skills / required_skills) × 100`
-- **Example**: 4 matched out of 5 required = 80%
-
-#### 2. Semantic Score (35%)
-- **Calculation**: Cosine similarity between resume and JD embeddings
-- **Technology**: TF-IDF vectorization + cosine similarity
-- **Range**: 0-100
-
-#### 3. Experience Score (20%)
-- **Calculation**: 
-  - If candidate_years >= required_years: `90 + (excess_years × 5)`
-  - Else: `max(20, 70 - (gap_years × 10))`
-- **Max**: 100 points
-
-#### 4. Keyword Score (10%)
-- **Calculation**: `(jd_keywords_in_resume / total_jd_keywords) × 100`
-- **Common words filtered out**
+**Skills are evidence-weighted.** A required skill used inside a job or a project
+counts in full; the same skill sitting in a comma-separated list is discounted
+(`SKILL_EVIDENCE_WEIGHTS`). A resume whose sections cannot be detected falls back
+to a flat, position-blind match, so unusual formatting is never itself a penalty.
 
 ### Example ATS Result
 ```json

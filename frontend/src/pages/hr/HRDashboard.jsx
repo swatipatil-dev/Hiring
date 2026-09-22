@@ -4876,19 +4876,26 @@ HR Team`,
                                         const strengths = c.strengths || (bd && bd.strengths) || []
                                         const weaknesses = c.weaknesses || (bd && bd.weaknesses) || []
                                         const missingPreferred = c.missing_preferred_skills || (bd && bd.missing_preferred_skills) || []
+                                        // `fallbackWeight` only applies to rows scored before the backend
+                                        // began reporting `weights_used`. Preferring the stored weights
+                                        // means a candidate who hasn't been re-scored yet is shown the
+                                        // rubric they were ACTUALLY scored under — which is the honest
+                                        // answer to "why is this one 62 and that one 68" mid-backfill.
                                         const FACTORS = [
-                                          { key:'education', label:'Education', weight:35, color:'#6366f1', icon:'🎓', desc:'Degree match (40) + College tier (30) + CGPA (30)' },
-                                          { key:'skills_match', label:'Skills', weight:25, color:'#3b82f6', icon:'🎯', desc:'Required skills (70) + Preferred skills (30)' },
-                                          { key:'experience', label:'Experience', weight:15, color:'#22c55e', icon:'📈', desc:'Relevant exp (50) + Internships (25) + GitHub/OSS/Hackathons (25)' },
-                                          { key:'certification', label:'Certifications', weight:10, color:'#f59e0b', icon:'📜', desc:'Count + relevance of professional certifications' },
-                                          { key:'semantic', label:'Semantic Match', weight:5, color:'#8b5cf6', icon:'🧠', desc:'Meaning-level similarity of the resume to the JD' },
-                                          { key:'project', label:'Projects', weight:5, color:'#ec4899', icon:'🧩', desc:'Relevance of projects to the JD' },
-                                          { key:'keyword', label:'Keywords', weight:5, color:'#0ea5e9', icon:'🔑', desc:'JD keyword coverage in the resume' },
+                                          { key:'education', label:'Education', fallbackWeight:35, color:'#6366f1', icon:'🎓', desc:'Degree match (40) + College tier (30) + CGPA (30)' },
+                                          { key:'skills_match', label:'Skills', fallbackWeight:25, color:'#3b82f6', icon:'🎯', desc:'Required (70) + Preferred (30), each scaled by where the resume evidences it' },
+                                          { key:'experience', label:'Experience', fallbackWeight:15, color:'#22c55e', icon:'📈', desc:'Relevant exp (50) + Internships (25) + GitHub/OSS/Hackathons (25)' },
+                                          { key:'certification', label:'Certifications', fallbackWeight:10, color:'#f59e0b', icon:'📜', desc:'Count + relevance of professional certifications' },
+                                          { key:'semantic', label:'Semantic Match', fallbackWeight:5, color:'#8b5cf6', icon:'🧠', desc:'Meaning-level similarity of the resume to the JD' },
+                                          { key:'project', label:'Projects', fallbackWeight:5, color:'#ec4899', icon:'🧩', desc:'Relevance of projects to the JD' },
+                                          { key:'keyword', label:'Keywords', fallbackWeight:5, color:'#0ea5e9', icon:'🔑', desc:'JD keyword coverage, wherever it appears' },
                                         ]
+                                        const W = (bd && bd.weights_used) || {}
+                                        const weightPct = (f) => (W[f.key] != null ? Math.round(W[f.key] * 100) : f.fallbackWeight)
                                         const ratingColors = { 'Excellent':'#16a34a','Very Good':'#0d9488','Good':'#d97706','Average':'#ea580c','Poor':'#dc2626' }
                                         const rColor = ratingColors[rating] || scoreColor
                                         const secHeader = { fontSize:'0.72rem', fontWeight:700, textTransform:'uppercase', color:'#9ca3af', marginBottom:8, fontFamily:'var(--font-display)' }
-                                        const contrib = (f) => (wc[f.key] != null ? wc[f.key] : ((ind[f.key]||0) * f.weight / 100))
+                                        const contrib = (f) => (wc[f.key] != null ? wc[f.key] : ((ind[f.key]||0) * weightPct(f) / 100))
                                         const SubBar = ({ label, val, max, color }) => (
                                           <div style={{ marginBottom: 7 }}>
                                             <div style={{ display:'flex', justifyContent:'space-between', fontSize:'0.76rem', marginBottom:3 }}>
@@ -4940,7 +4947,7 @@ HR Team`,
                                                     <div style={{ width:`${Math.min(v,100)}%`, height:'100%', background:f.color, transition:'width 0.6s ease' }} />
                                                   </div>
                                                   <div style={{ fontSize:'0.7rem', color:'#6b7280', lineHeight:1.45 }}>{f.desc}</div>
-                                                  <div style={{ fontSize:'0.66rem', color:'#9ca3af', marginTop:4, fontFamily:'var(--font-mono)' }}>Weight {f.weight}% → contributes {contrib(f).toFixed(1)} pts</div>
+                                                  <div style={{ fontSize:'0.66rem', color:'#9ca3af', marginTop:4, fontFamily:'var(--font-mono)' }}>Weight {weightPct(f)}% → contributes {contrib(f).toFixed(1)} pts</div>
                                                 </div>
                                               )})}
                                             </div>
@@ -5011,6 +5018,23 @@ HR Team`,
                                                 <div style={{ ...secHeader, marginTop:12 }}>🎯 Skills — {Math.round(ind.skills_match||0)}/100</div>
                                                 <SubBar label="Required skills" val={skl.required_skills} max={70} color="#3b82f6" />
                                                 <SubBar label={`Preferred skills${skl.has_preferred ? '' : ' (none listed)'}`} val={skl.preferred_skills} max={30} color="#0ea5e9" />
+                                                {skl.evidence_weighted === true && (
+                                                  <div style={{ marginTop:6, fontSize:'0.72rem', color:'#6b7280', lineHeight:1.55 }}>
+                                                    <span style={{ color:'#16a34a', fontWeight:700 }}>{skl.demonstrated_count || 0}</span> proven in experience/projects
+                                                    {' · '}
+                                                    <span style={{ color:'#d97706', fontWeight:700 }}>{skl.listed_only_count || 0}</span> listed only
+                                                    {skl.required_flat_pct != null && skl.required_flat_pct > 0 && (
+                                                      <div style={{ color:'#9ca3af', marginTop:2 }}>
+                                                        Unweighted match would be {Math.round(skl.required_flat_pct)}% — skills claimed but not evidenced score lower.
+                                                      </div>
+                                                    )}
+                                                  </div>
+                                                )}
+                                                {skl.evidence_weighted === false && (
+                                                  <div style={{ marginTop:6, padding:'7px 10px', background:'#f9fafb', border:'1px solid #e5e7eb', borderRadius:6, fontSize:'0.71rem', color:'#6b7280', lineHeight:1.5 }}>
+                                                    No recognisable sections in this resume, so skills were scored without evidence weighting — not a mark against the candidate.
+                                                  </div>
+                                                )}
                                               </div>
                                               <div>
                                                 <div style={secHeader}>Factor Scores (out of 100)</div>
@@ -5045,7 +5069,7 @@ HR Team`,
                                                     <tr key={f.key} style={{ borderTop:'1px solid #f1f5f9' }}>
                                                       <td style={{ padding:'7px 12px' }}>{f.icon} {f.label}</td>
                                                       <td style={{ padding:'7px 12px', fontFamily:'var(--font-mono)' }}>{Math.round(ind[f.key]||0)}</td>
-                                                      <td style={{ padding:'7px 12px', fontFamily:'var(--font-mono)' }}>{f.weight}%</td>
+                                                      <td style={{ padding:'7px 12px', fontFamily:'var(--font-mono)' }}>{weightPct(f)}%</td>
                                                       <td style={{ padding:'7px 12px', fontFamily:'var(--font-mono)', fontWeight:700 }}>{contrib(f).toFixed(2)}</td>
                                                     </tr>
                                                   ))}

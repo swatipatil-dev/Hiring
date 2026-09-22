@@ -20,6 +20,8 @@ from __future__ import annotations
 import re
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from src.services.ats_text import whole_word_pattern
+
 # A factor shows at most this many excerpts. Recruiters skim, so the first few
 # lines of proof are the ones that get read; uncapped, a skills-heavy resume
 # turns the dashboard expander into a wall of text.
@@ -87,7 +89,11 @@ def _find_line(lines: Sequence[str], needle: str, *, whole_word: bool = False) -
     if not term:
         return None
     if whole_word:
-        pattern = re.compile(r"(?<!\w)" + re.escape(term) + r"(?!\w)", re.IGNORECASE)
+        # Shared with the scorer, so a credited skill and a quoted skill are
+        # always decided by the same rule (src/services/ats_text.py).
+        pattern = whole_word_pattern(term)
+        if pattern is None:
+            return None
         hits = [ln for ln in lines if pattern.search(ln)]
     else:
         lowered = term.lower()
