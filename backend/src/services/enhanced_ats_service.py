@@ -23,6 +23,7 @@ from pydantic import BaseModel
 from src.services.institution_tiers import best_tier
 from src.services.pincode_region import is_rural
 from src.services.jd_overlap import jd_copy_overlap
+from src.services.ats_evidence import collect_evidence
 
 # Resume<->JD verbatim-copy handling. Default is flag-only (no score change);
 # set > 0 to subtract points from flagged candidates.
@@ -1956,8 +1957,31 @@ class EnhancedATSScoringService:
                 if normalize_skill(s).lower() not in res_norm:
                     missing_preferred.append(s)
 
+        # Supporting resume excerpts per factor. Presentation only — it reads
+        # values already computed above and cannot change a score, so a failure
+        # here costs the excerpts, never the scoring run.
+        try:
+            evidence = collect_evidence(
+                resume_text=resume_text,
+                sections=sections,
+                job_description=job_description,
+                matched_skills=matched_skills,
+                cluster_matched_skills=cluster_matched_skills,
+                preferred_skills=preferred_skills or [],
+                resume_skills=resume_result.skills,
+                education=resume_result.education,
+                work_experience=resume_result.work_experience,
+                certifications=resume_result.certifications,
+                projects=resume_result.projects,
+                normalize=normalize_skill,
+            )
+        except Exception as e:
+            logger.warning(f"ATS evidence collection failed, scoring unaffected: {e}")
+            evidence = {}
+
         scoring_breakdown = {
             'weights_used': weights,
+            'evidence': evidence,
             'individual_scores': {
                 'education': education_score,
                 'skills_match': skills_score,

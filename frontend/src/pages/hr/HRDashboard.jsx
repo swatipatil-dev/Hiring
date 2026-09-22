@@ -4945,6 +4945,58 @@ HR Team`,
                                               )})}
                                             </div>
 
+                                            {/* Supporting resume excerpts — the candidate's own words behind each factor.
+                                                Sits full-width rather than inside the factor cards because a quote needs
+                                                more than the ~230px a card gets. */}
+                                            {(() => {
+                                              const ev = (bd && bd.evidence) || null
+                                              if (!ev) {
+                                                return (
+                                                  <div style={{ padding:'10px 14px', marginBottom:16, background:'#f9fafb', border:'1px solid #e5e7eb', borderRadius:8, fontSize:'0.78rem', color:'#6b7280' }}>
+                                                    Supporting resume excerpts aren't stored for this candidate — re-score them to see the lines behind each factor.
+                                                  </div>
+                                                )
+                                              }
+                                              const proven = FACTORS.filter(f => (ev[f.key] || []).length > 0)
+                                              // A factor that scored but quotes nothing is worth surfacing, not hiding:
+                                              // it usually means the parser matched something the resume never says.
+                                              const unproven = FACTORS.filter(f => !(ev[f.key] || []).length && (ind[f.key] || 0) > 0)
+                                              if (!proven.length && !unproven.length) return null
+                                              return (
+                                                <>
+                                                  <div style={secHeader}>Supporting Resume Excerpts</div>
+                                                  <div style={{ marginBottom:16 }}>
+                                                    {proven.map(f => (
+                                                      <div key={f.key} style={{ marginBottom:12, padding:12, background:'#fff', border:'1px solid #e5e7eb', borderRadius:8 }}>
+                                                        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:8 }}>
+                                                          <span style={{ fontWeight:700, fontSize:'0.8rem', fontFamily:'var(--font-display)' }}>{f.icon} {f.label}</span>
+                                                          <span style={{ fontFamily:'var(--font-mono)', fontWeight:800, fontSize:'0.8rem', color:f.color }}>{Math.round(ind[f.key]||0)}<span style={{ fontSize:'0.68rem', color:'#9ca3af' }}>/100</span></span>
+                                                        </div>
+                                                        {(ev[f.key] || []).map((x, i) => (
+                                                          <div key={i} style={{ borderLeft:`3px solid ${f.color}`, padding:'6px 10px', background:'#fbfcfd', borderRadius:'0 6px 6px 0', marginBottom:6 }}>
+                                                            <div style={{ fontSize:'0.78rem', color:'#374151', lineHeight:1.5 }}>&ldquo;{x.quote}&rdquo;</div>
+                                                            <div style={{ fontSize:'0.66rem', color:'#9ca3af', marginTop:3 }}>
+                                                              {x.supports}{x.section ? ` · from ${x.section}` : ''}
+                                                            </div>
+                                                          </div>
+                                                        ))}
+                                                        {f.key === 'semantic' && (
+                                                          <div style={{ fontSize:'0.66rem', color:'#9ca3af', marginTop:2, fontStyle:'italic' }}>
+                                                            Closest-overlapping lines. The semantic score itself is computed from sentence embeddings, which can't be traced back to individual lines.
+                                                          </div>
+                                                        )}
+                                                      </div>
+                                                    ))}
+                                                    {unproven.length > 0 && (
+                                                      <div style={{ padding:'10px 14px', background:'#fffbeb', border:'1px solid #fde68a', borderRadius:8, fontSize:'0.76rem', color:'#92400e', lineHeight:1.5 }}>
+                                                        <strong>Scored with nothing quotable:</strong> {unproven.map(f => f.label).join(', ')}. The resume has no line supporting {unproven.length > 1 ? 'these factors' : 'this factor'} — check it before relying on {unproven.length > 1 ? 'those scores' : 'that score'}.
+                                                      </div>
+                                                    )}
+                                                  </div>
+                                                </>
+                                              )
+                                            })()}
+
                                             {/* Sub-scores + factor chart */}
                                             <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:16, marginBottom:16 }}>
                                               <div>
