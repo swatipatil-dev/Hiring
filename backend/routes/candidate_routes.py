@@ -27,19 +27,9 @@ import uuid
 import os
 import json
 
-def _parse_skills(raw_skills):
-    """Parse required_skills from various formats (JSON array, comma-separated, list, None)"""
-    if isinstance(raw_skills, list):
-        return raw_skills
-    if isinstance(raw_skills, str) and raw_skills.strip():
-        try:
-            parsed = json.loads(raw_skills)
-            if isinstance(parsed, list):
-                return parsed
-        except (json.JSONDecodeError, TypeError):
-            pass
-        return [s.strip() for s in raw_skills.split(",") if s.strip()]
-    return []
+# Shared with every other reader of these columns, so a Python-repr row parses
+# the same way everywhere. See src/services/skills_parsing.py.
+from src.services.skills_parsing import parse_skills as _parse_skills
 
 # Import shared utilities
 from src.utils import (

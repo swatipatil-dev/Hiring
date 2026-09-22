@@ -3,6 +3,8 @@
 Advanced HR dashboard with ATS ranking, candidate selection, and detailed analytics
 """
 
+import json
+
 from fastapi import APIRouter, HTTPException, status, Depends, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func, desc, and_, or_
@@ -293,7 +295,9 @@ async def create_job_enhanced(
         salary_min=job_data.salary_min,
         salary_max=job_data.salary_max,
         experience_years=job_data.experience_years,
-        required_skills=job_data.required_skills,
+        # Text column: a raw list would be stored as a Python repr that no
+        # reader parses back into skills. See src/services/skills_parsing.py.
+        required_skills=json.dumps(job_data.required_skills or []),
         status="active"
     )
     

@@ -58,19 +58,9 @@ from src.services.enhanced_ats_service import (
 )
 
 
-def _parse_skills(raw):
-    """Job.required_skills is JSON in some rows and comma-separated in others."""
-    if not raw:
-        return []
-    if isinstance(raw, list):
-        return [str(s).strip() for s in raw if str(s).strip()]
-    try:
-        parsed = json.loads(raw)
-        if isinstance(parsed, list):
-            return [str(s).strip() for s in parsed if str(s).strip()]
-    except (ValueError, TypeError):
-        pass
-    return [s.strip() for s in str(raw).split(",") if s.strip()]
+# The same reader the live scoring path uses, so a backfilled score cannot
+# differ from a live one merely because the two parsed the column differently.
+from src.services.skills_parsing import parse_skills as _parse_skills
 
 
 def _profile_inputs(profile):

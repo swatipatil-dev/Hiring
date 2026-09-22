@@ -789,7 +789,9 @@ async def admin_create_job(
         salary_min=job_data.salary_min,
         salary_max=job_data.salary_max,
         experience_years=job_data.experience_years,
-        required_skills=job_data.required_skills,
+        # Text column: a raw list would be stored as a Python repr that no
+        # reader parses back into skills. See src/services/skills_parsing.py.
+        required_skills=json.dumps(job_data.required_skills or []),
         company_id=current_user.company_id,
         status="active"
     )

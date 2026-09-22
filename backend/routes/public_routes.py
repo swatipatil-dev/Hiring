@@ -11,6 +11,7 @@ from fastapi import Depends
 from src.config.database_config_mysql import get_db
 from src.models.models import Company, JobPosting
 from src.dependencies import require_request_company
+from src.services.skills_parsing import parse_skills
 
 router = APIRouter(prefix="/api/v1/public", tags=["Public"])
 
@@ -64,7 +65,7 @@ async def get_public_jobs(
                 "salary_max": float(j.salary_max) if j.salary_max else None,
                 "experience_years": j.experience_years,
                 "description": (j.description or "")[:200],
-                "required_skills": j.required_skills or [],
+                "required_skills": parse_skills(j.required_skills),
                 "created_at": j.created_at,
             }
             for j in jobs
@@ -135,7 +136,7 @@ async def get_careers_page(
                 "salary_max": float(j.salary_max) if j.salary_max else None,
                 "experience_years": j.experience_years,
                 "description": (j.description or "")[:300],
-                "required_skills": j.required_skills or [],
+                "required_skills": parse_skills(j.required_skills),
                 "created_at": j.created_at,
             }
             for j in jobs
@@ -178,7 +179,7 @@ async def get_careers_job_detail(
             "salary_min": float(job.salary_min) if job.salary_min else None,
             "salary_max": float(job.salary_max) if job.salary_max else None,
             "experience_years": job.experience_years,
-            "required_skills": job.required_skills or [],
+            "required_skills": parse_skills(job.required_skills),
             "created_at": job.created_at,
         },
     }

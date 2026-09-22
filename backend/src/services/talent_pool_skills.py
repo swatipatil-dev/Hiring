@@ -103,10 +103,10 @@ def _skill_set(raw_value, display: Dict[str, str]) -> set:
     ``_parse_skills`` — ``admin_routes.py:751`` can land a Python ``repr()`` in these
     columns, and one bad row must not take out the whole tab.
     """
-    from routes.hr_routes import _parse_skills
+    from src.services.skills_parsing import parse_skills
 
     keys = set()
-    for raw in _parse_skills(raw_value)[:MAX_SKILLS_PER_PERSON]:
+    for raw in parse_skills(raw_value)[:MAX_SKILLS_PER_PERSON]:
         pair = _norm(raw)
         if pair is None:
             continue
