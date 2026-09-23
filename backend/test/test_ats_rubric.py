@@ -3,7 +3,7 @@ Tests for the recruiter-rubric ATS scoring:
   weights: education 35 / skills 25 / experience 20 / certification 10 / project 8 / semantic 1 / keyword 1
   education  = degree(40) + tier(30) + cgpa(30)
   experience = relevant(50) + internships(25) + github/oss/hackathon(25)
-  skills     = required(70) + preferred(30)
+  skills     = 100 x required-coverage + up to 15 preferred bonus, capped at 100
 
 Run with:
     pytest test/test_ats_rubric.py -v
@@ -94,16 +94,40 @@ def test_experience_subscore_components():
     assert d["github_oss_hackathons"] == 20.0  # 15 github + 5 hackathon
 
 
-def test_skills_required_and_preferred_split():
-    # Has both required, neither preferred.
+def test_preferred_skills_do_not_reduce_the_score():
+    """A candidate holding every requirement must not be marked down because
+    the job also listed nice-to-haves.
+
+    This previously asserted 70.0: the old 70/30 split meant naming one
+    preferred skill cost a fully-qualified candidate 30 skills points — 7.5 of
+    the final score — and the JD scraper handed out that penalty for the word
+    "plus" appearing anywhere, including "joining bonus".
+    """
     score, d = svc.score_skills_v2(
         resume_skills=["python", "django"],
         required_skills=["python", "django"],
         preferred_skills=["kubernetes", "aws"],
     )
-    assert d["required_skills"] == 70.0
-    assert d["preferred_skills"] == 0.0
-    assert score == 70.0
+    assert d["required_skills"] == 100.0
+    assert d["preferred_skills"] == 0.0   # holds neither preferred skill
+    assert score == 100.0
+
+
+def test_preferred_is_a_bonus_for_a_partially_qualified_candidate():
+    """Where preferred skills should actually matter: breaking ties among
+    candidates who do not meet every requirement."""
+    without = svc.score_skills_v2(["python"], ["python", "django"], [])[0]
+    with_pref = svc.score_skills_v2(["python", "aws"], ["python", "django"], ["aws"])[0]
+    assert with_pref > without
+
+
+def test_preferred_bonus_cannot_push_past_100():
+    score, _ = svc.score_skills_v2(
+        resume_skills=["python", "django", "aws"],
+        required_skills=["python", "django"],
+        preferred_skills=["aws"],
+    )
+    assert score == 100.0
 
 
 def test_skills_no_preferred_means_required_carries_full_100():
@@ -132,6 +156,7 @@ def test_end_to_end_breakdown_shape():
                      "institution_name": "IIT Bombay", "grade": "8.5"}],
         work_experiences=[{"employment_type": "Internship", "job_title": "Intern"}],
         links_text="github.com/foo",
+        preferred_skills=["kubernetes", "aws"],
     )
     sb = res.scoring_breakdown
     assert set(sb["individual_scores"]) == {
@@ -143,6 +168,7 @@ def test_end_to_end_breakdown_shape():
     assert res.rating in {"Excellent", "Very Good", "Good", "Average", "Poor"}
     assert res.hiring_recommendation
     assert isinstance(res.strengths, list) and isinstance(res.weaknesses, list)
-    # Preferred skills auto-extracted from the JD ("Preferred: Kubernetes, AWS").
+    # Passed explicitly. The JD scraper that used to infer these is retired —
+    # it matched "plus"/"bonus" as bare substrings anywhere in the prose.
     assert "kubernetes" in [s.lower() for s in sb["missing_preferred_skills"]]
     assert 0.0 <= res.ats_score <= 100.0

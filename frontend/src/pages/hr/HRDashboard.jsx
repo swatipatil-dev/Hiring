@@ -4916,7 +4916,7 @@ HR Team`,
                                         // answer to "why is this one 62 and that one 68" mid-backfill.
                                         const FACTORS = [
                                           { key:'education', label:'Education', fallbackWeight:35, color:'#6366f1', icon:'🎓', desc:'Degree match (40) + College tier (30) + CGPA (30)' },
-                                          { key:'skills_match', label:'Skills', fallbackWeight:25, color:'#3b82f6', icon:'🎯', desc:'Required (70) + Preferred (30), each scaled by where the resume evidences it' },
+                                          { key:'skills_match', label:'Skills', fallbackWeight:25, color:'#3b82f6', icon:'🎯', desc:'Mandatory coverage, plus a bonus for preferred skills. Missing must-haves also reduce the overall score.' },
                                           { key:'experience', label:'Experience', fallbackWeight:15, color:'#22c55e', icon:'📈', desc:'Relevant exp (50) + Internships (25) + GitHub/OSS/Hackathons (25)' },
                                           { key:'certification', label:'Certifications', fallbackWeight:10, color:'#f59e0b', icon:'📜', desc:'Count + relevance of professional certifications' },
                                           { key:'semantic', label:'Semantic Match', fallbackWeight:5, color:'#8b5cf6', icon:'🧠', desc:'Meaning-level similarity of the resume to the JD' },
@@ -5049,8 +5049,8 @@ HR Team`,
                                                 <SubBar label={`Internships (${exp.internship_count||0})`} val={exp.internships} max={25} color="#16a34a" />
                                                 <SubBar label="GitHub / OSS / Hackathons" val={exp.github_oss_hackathons} max={25} color="#15803d" />
                                                 <div style={{ ...secHeader, marginTop:12 }}>🎯 Skills — {Math.round(ind.skills_match||0)}/100</div>
-                                                <SubBar label="Required skills" val={skl.required_skills} max={70} color="#3b82f6" />
-                                                <SubBar label={`Preferred skills${skl.has_preferred ? '' : ' (none listed)'}`} val={skl.preferred_skills} max={30} color="#0ea5e9" />
+                                                <SubBar label="Required skills" val={skl.required_skills} max={skl.required_max || 100} color="#3b82f6" />
+                                                <SubBar label={`Preferred bonus${skl.has_preferred ? '' : ' (none listed)'}`} val={skl.preferred_skills} max={skl.preferred_max || 15} color="#0ea5e9" />
                                                 {skl.evidence_weighted === true && (
                                                   <div style={{ marginTop:6, fontSize:'0.72rem', color:'#6b7280', lineHeight:1.55 }}>
                                                     <span style={{ color:'#16a34a', fontWeight:700 }}>{skl.demonstrated_count || 0}</span> proven in experience/projects

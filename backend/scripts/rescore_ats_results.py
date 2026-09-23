@@ -60,7 +60,7 @@ from src.services.enhanced_ats_service import (
 
 # The same reader the live scoring path uses, so a backfilled score cannot
 # differ from a live one merely because the two parsed the column differently.
-from src.services.skills_parsing import parse_skills as _parse_skills
+from src.services.skills_parsing import parse_skills as _parse_skills, parse_skills_or_none
 
 
 def _profile_inputs(profile):
@@ -169,6 +169,10 @@ def rescore(session, args):
                 job_description=(job.description or "") + " " + (job.requirements or ""),
                 required_skills=_parse_skills(job.required_skills),
                 required_experience=job.experience_years or 0,
+                # Must match the live path exactly, including the None sentinel
+                # — flattening it to [] would opt every legacy job into the new
+                # scoring and make the report measure the wrong thing.
+                preferred_skills=parse_skills_or_none(job.preferred_skills),
                 prepared=prepared,
                 **_profile_inputs(profile),
             )

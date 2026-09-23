@@ -29,7 +29,7 @@ import json
 
 # Shared with every other reader of these columns, so a Python-repr row parses
 # the same way everywhere. See src/services/skills_parsing.py.
-from src.services.skills_parsing import parse_skills as _parse_skills
+from src.services.skills_parsing import parse_skills as _parse_skills, parse_skills_or_none
 
 # Import shared utilities
 from src.utils import (
@@ -477,6 +477,9 @@ async def apply_for_job_enhanced(
                 job_description=job.description + " " + job.requirements,
                 required_skills=_parse_skills(job.required_skills),
                 required_experience=job.experience_years or 0,
+                # None when the job predates the mandatory/preferred split,
+                # which is the sentinel that leaves its scoring unchanged.
+                preferred_skills=parse_skills_or_none(job.preferred_skills),
                 institution_names=institution_names,
                 permanent_pincode=permanent_pincode,
                 educations=educations,
@@ -726,6 +729,7 @@ async def quick_apply_for_job(
             job_description=job.description + " " + job.requirements,
             required_skills=_parse_skills(job.required_skills),
             required_experience=job.experience_years or 0,
+            preferred_skills=parse_skills_or_none(job.preferred_skills),
             institution_names=[e['institution_name'] for e in educations if e['institution_name']],
             permanent_pincode=(profile.permanent_pincode or profile.pincode),
             educations=educations,

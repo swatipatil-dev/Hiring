@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import ast
 import json
-from typing import Any, List
+from typing import Any, List, Optional
 
 
 def parse_skills(raw_skills: Any) -> List[str]:
@@ -81,3 +81,18 @@ def dump_skills(skills: Any) -> str | None:
     if isinstance(skills, str):
         skills = parse_skills(skills)
     return json.dumps([str(s).strip() for s in skills if str(s).strip()])
+
+
+def parse_skills_or_none(raw_skills: Any) -> Optional[List[str]]:
+    """Skills as a list, or None when the column is NULL.
+
+    The distinction is load-bearing for job postings: NULL means nobody has
+    separated mandatory from preferred on this job, and the scorer leaves such
+    jobs alone. An empty list means someone looked and left it empty. Callers
+    that flatten NULL to [] silently opt every legacy job into the new scoring.
+    """
+    if raw_skills is None:
+        return None
+    if isinstance(raw_skills, str) and not raw_skills.strip():
+        return None
+    return parse_skills(raw_skills)
