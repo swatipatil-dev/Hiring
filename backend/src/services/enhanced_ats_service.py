@@ -329,12 +329,19 @@ PREFERRED_BONUS_MAX = 15.0
 # is 0.75, which means a candidate matching ZERO requirements still reached 75 —
 # reported as "Very Good - Recommended, shortlist for interview".
 #
-# A multiplier, not a gate. At 0.55 the worst case lands near 41 (44 with the
-# rural bonus): below the >=50 auto-promote threshold and out of the "Good"
-# band, but still scored, still ranked, still carrying a full breakdown. A
-# parser miss costs a candidate their place in the ordering, never their
-# existence in it. (0.50 -> ~40; 0.60 -> ~48, which is uncomfortably close to
-# the promote threshold.)
+# A multiplier, not a gate. At 0.55 a candidate whose skills we READ and who does
+# not have them lands near 41 (44 with the rural bonus): below the >=50
+# auto-promote threshold and out of the "Good" band, but still scored, still
+# ranked, still carrying a full breakdown. (0.50 -> ~40; 0.60 -> ~48, which is
+# uncomfortably close to the promote threshold.)
+#
+# That calibration assumes the other 0.75 of weight survives to catch the fall,
+# which is true only when the resume parsed. It does not apply when we read no
+# skills at all: a parse failure suppresses education, experience, certification
+# and project simultaneously, so there is nothing left to catch it. Hence the
+# 'no_skills_read' exemption at the gate — without it the worst case was not 41
+# but near zero, and an unreadable resume scored below a candidate who
+# demonstrably lacked nine of ten requirements.
 MANDATORY_COVERAGE_FLOOR = 0.55
 
 # Factor weights, summing to 1.0. Single source of truth — tests and docs read
@@ -2244,7 +2251,19 @@ class EnhancedATSScoringService:
         # would penalise a candidate twice over for the same thin evidence.
         mandatory_factor = 1.0
         coverage = 1.0
-        if preferred_skills is not None and required_skills:
+        mandatory_exempt_reason = None
+        if preferred_skills is None:
+            mandatory_exempt_reason = 'legacy_job'
+        elif not required_skills:
+            mandatory_exempt_reason = 'no_required_skills'
+        elif not resume_result.skills:
+            # We read NO skills from this resume at all. A coverage of zero
+            # computed from an empty list is not a measurement of the candidate —
+            # it is a measurement of the parser, and marking them down for it
+            # inverts the ordering: a resume whose skills sat in an image scored
+            # BELOW one that demonstrably matched a single requirement.
+            mandatory_exempt_reason = 'no_skills_read'
+        else:
             coverage = skills_detail['required_flat_pct'] / 100.0
             mandatory_factor = MANDATORY_COVERAGE_FLOOR + (1.0 - MANDATORY_COVERAGE_FLOOR) * coverage
             ats_score *= mandatory_factor
@@ -2352,6 +2371,9 @@ class EnhancedATSScoringService:
                 # mystery. mandatory_factor of 1.0 means it did not apply.
                 'mandatory_coverage': round(coverage, 4),
                 'mandatory_factor': round(mandatory_factor, 4),
+                # Why the markdown did not apply, so an exemption is as auditable
+                # as the markdown itself. None means it did apply.
+                'mandatory_exempt_reason': mandatory_exempt_reason,
             },
             'plagiarism': plagiarism,
         }

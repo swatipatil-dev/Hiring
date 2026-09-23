@@ -335,3 +335,85 @@ class TestMissingSkillsAgreesWithScoring:
             "SKILLS\nExcel\n\nEXPERIENCE\nReporting.\n",
             "Rust engineer.", ["rust"], 0, "bachelor", preferred_skills=[])
         assert "rust" in r.missing_skills
+
+
+class TestUnreadableResumeIsNotUnqualified:
+    """A resume we could not read is not a candidate who lacks the skills.
+
+    The coverage multiplier computes coverage from `required_flat_pct`. When
+    `extract_skills` returns [] — skills in an image, a scanned PDF, an OCR
+    failure — that percentage is 0, and the candidate took the maximum penalty:
+    harsher than someone who demonstrably matched one requirement in ten.
+
+    The damage is not at the empty extreme (a blank resume scores ~0 anyway, so
+    the multiplier is moot there). It lands on a resume that parses well EXCEPT
+    for skills, which is exactly the common failure.
+    """
+
+    JD = "Backend engineer. Python, FastAPI, PostgreSQL, Docker, AWS."
+    REQ = ["python", "fastapi", "postgresql", "docker", "aws"]
+
+    # Strong on every channel the parser CAN read, but no skill token survives
+    # extraction — the shape of a resume whose skills sat in an image. Kept free
+    # of incidental technology words on purpose: an earlier draft of this fixture
+    # ended "AWS Certified Solutions Architect", and extract_skills duly found
+    # "aws", so the case under test never arose and the test failed against
+    # correct code.
+    SKILLS_UNREADABLE = """PROFESSIONAL SUMMARY
+Experienced professional with eight years in the sector.
+
+EXPERIENCE
+Senior Associate at Acme Corp, 2016 - 2024
+Led the regional team and owned the annual planning programme.
+Mentored four colleagues and ran the weekly review meeting.
+
+EDUCATION
+B.Tech Computer Science, IIT Kanpur, CGPA 8.5
+"""
+
+    # Same body, but one requirement genuinely present.
+    ONE_SKILL_MATCHED = SKILLS_UNREADABLE.replace(
+        "PROFESSIONAL SUMMARY", "SKILLS\nPython\n\nPROFESSIONAL SUMMARY")
+
+    def score(self, resume):
+        return svc.enhanced_score_candidate(
+            resume, self.JD, self.REQ, 3, "bachelor", preferred_skills=[])
+
+    def test_no_skills_read_is_exempt_from_the_markdown(self):
+        r = self.score(self.SKILLS_UNREADABLE)
+        b = r.scoring_breakdown["bonus"]
+        assert b["mandatory_factor"] == 1.0
+        assert b["mandatory_exempt_reason"] == "no_skills_read"
+
+    def test_unreadable_does_not_score_below_one_genuine_match(self):
+        """The ordering inversion — the test that would have caught this.
+
+        Before the fix the unreadable resume took factor 0.55 while the resume
+        matching a single requirement took 0.595, so being unreadable was worse
+        than being unqualified.
+        """
+        unreadable = self.score(self.SKILLS_UNREADABLE).ats_score
+        one_match = self.score(self.ONE_SKILL_MATCHED).ats_score
+        assert unreadable >= one_match
+
+    def test_wrong_skills_are_still_penalised(self):
+        """The guard against over-correcting.
+
+        This resume's skills WERE read — they are simply the wrong ones. That is
+        a finding about the candidate, so the markdown must still apply. Without
+        this, the fix would become an exemption for anyone missing every
+        requirement.
+        """
+        wrong = self.SKILLS_UNREADABLE.replace(
+            "PROFESSIONAL SUMMARY", "SKILLS\nExcel, PowerPoint\n\nPROFESSIONAL SUMMARY")
+        b = self.score(wrong).scoring_breakdown["bonus"]
+        assert b["mandatory_factor"] < 1.0
+        assert b["mandatory_exempt_reason"] is None
+
+    def test_legacy_and_no_requirement_exemptions_are_named(self):
+        legacy = svc.enhanced_score_candidate(
+            self.SKILLS_UNREADABLE, self.JD, self.REQ, 3, "bachelor", preferred_skills=None)
+        assert legacy.scoring_breakdown["bonus"]["mandatory_exempt_reason"] == "legacy_job"
+        no_req = svc.enhanced_score_candidate(
+            self.SKILLS_UNREADABLE, self.JD, [], 3, "bachelor", preferred_skills=[])
+        assert no_req.scoring_breakdown["bonus"]["mandatory_exempt_reason"] == "no_required_skills"
