@@ -1903,6 +1903,7 @@ def clone_job(
         salary_max=src.salary_max,
         experience_years=src.experience_years,
         required_skills=src.required_skills,
+        preferred_skills=src.preferred_skills,
         status=req.status,
     )
     db.add(new_job)

@@ -150,7 +150,7 @@ export default function HRDashboard() {
   const [jobForm, setJobForm] = useState({
     title: '', description: '', requirements: '', department_id: '',
     location: '', employment_type: 'full-time', salary_min: '', salary_max: '',
-    experience_years: 0, required_skills: ''
+    experience_years: 0, required_skills: '', preferred_skills: ''
   })
   const [submitting, setSubmitting] = useState(false)
   const [editJob, setEditJob] = useState(null)
@@ -742,7 +742,11 @@ HR Team`,
       salary_min: '',
       salary_max: '',
       experience_years: req.min_experience_years || 0,
-      required_skills: [...(req.required_skills || []), ...(req.preferred_skills || [])].join(', ') || (job.required_skills || []).join(', '),
+      // Kept apart. Concatenating these was the point where the interviewer's
+      // nice-to-haves became hard requirements: the request carries two lists,
+      // and everything downstream then scored them identically.
+      required_skills: (req.required_skills || []).join(', ') || (job.required_skills || []).join(', '),
+      preferred_skills: (req.preferred_skills || []).join(', ') || (job.preferred_skills || []).join(', '),
     }
     setJobForm(formData)
 
@@ -925,6 +929,7 @@ HR Team`,
         salary_max: jobForm.salary_max ? parseFloat(jobForm.salary_max) : null,
         experience_years: parseInt(jobForm.experience_years) || 0,
         required_skills: jobForm.required_skills.split(',').map(s => s.trim()).filter(Boolean),
+        preferred_skills: jobForm.preferred_skills.split(',').map(s => s.trim()).filter(Boolean),
       })
       // If this was from a candidate request approval, approve the request now
       if (pendingApprovalReqId) {
@@ -935,7 +940,7 @@ HR Team`,
         fetchRequirements()
       }
       setShowModal(false)
-      setJobForm({ title: '', description: '', requirements: '', department_id: '', location: '', employment_type: 'full-time', salary_min: '', salary_max: '', experience_years: 0, required_skills: '' })
+      setJobForm({ title: '', description: '', requirements: '', department_id: '', location: '', employment_type: 'full-time', salary_min: '', salary_max: '', experience_years: 0, required_skills: '', preferred_skills: '' })
       fetchJobs()
     } catch (err) {
       alert(err.response?.data?.detail || 'Failed to create job')
@@ -1000,7 +1005,8 @@ HR Team`,
       employment_type: j.employment_type || 'full-time',
       salary_min: j.salary_min || '', salary_max: j.salary_max || '',
       experience_years: j.experience_years || 0,
-      required_skills: Array.isArray(j.required_skills) ? j.required_skills.join(', ') : (j.required_skills || '')
+      required_skills: Array.isArray(j.required_skills) ? j.required_skills.join(', ') : (j.required_skills || ''),
+      preferred_skills: Array.isArray(j.preferred_skills) ? j.preferred_skills.join(', ') : (j.preferred_skills || '')
     })
     setShowModal(true)
   }
@@ -1036,6 +1042,7 @@ HR Team`,
           salary_max: jobForm.salary_max ? parseFloat(jobForm.salary_max) : null,
           experience_years: parseInt(jobForm.experience_years) || 0,
           required_skills: jobForm.required_skills.split(',').map(s => s.trim()).filter(Boolean),
+          preferred_skills: jobForm.preferred_skills.split(',').map(s => s.trim()).filter(Boolean),
         })
       }
       // If this was from a candidate request approval, approve the request now
@@ -1049,7 +1056,7 @@ HR Team`,
       setEditJob(null)
       setIsApprovalMode(false)
       setPendingApprovalReqId(null)
-      setJobForm({ title: '', description: '', requirements: '', department_id: '', location: '', employment_type: 'full-time', salary_min: '', salary_max: '', experience_years: 0, required_skills: '' })
+      setJobForm({ title: '', description: '', requirements: '', department_id: '', location: '', employment_type: 'full-time', salary_min: '', salary_max: '', experience_years: 0, required_skills: '', preferred_skills: '' })
       fetchJobs()
     } catch (err) {
       alert(err.response?.data?.detail || 'Failed to update job')
@@ -1295,7 +1302,8 @@ HR Team`,
       employment_type: j.employment_type || 'full-time',
       salary_min: j.salary_min || '', salary_max: j.salary_max || '',
       experience_years: j.experience_years || 0,
-      required_skills: Array.isArray(j.required_skills) ? j.required_skills.join(', ') : (j.required_skills || '')
+      required_skills: Array.isArray(j.required_skills) ? j.required_skills.join(', ') : (j.required_skills || ''),
+      preferred_skills: Array.isArray(j.preferred_skills) ? j.preferred_skills.join(', ') : (j.preferred_skills || '')
     })
     setEditJob(null)
     setShowModal(true)
@@ -1515,7 +1523,7 @@ HR Team`,
             <div className="card">
               <div className="flex-between mb-16">
                 <h3>Recent Job Postings</h3>
-                <button className="btn btn-primary btn-sm" onClick={() => { setEditJob(null); setJobForm({ title: '', description: '', requirements: '', department_id: '', location: '', employment_type: 'full-time', salary_min: '', salary_max: '', experience_years: 0, required_skills: '' }); setShowModal(true) }}>
+                <button className="btn btn-primary btn-sm" onClick={() => { setEditJob(null); setJobForm({ title: '', description: '', requirements: '', department_id: '', location: '', employment_type: 'full-time', salary_min: '', salary_max: '', experience_years: 0, required_skills: '', preferred_skills: '' }); setShowModal(true) }}>
                   <Plus size={14} /> New Job
                 </button>
               </div>
@@ -1558,7 +1566,7 @@ HR Team`,
       })()}
 
       {tab === 'jobs' && (() => {
-        const openCreateJob = () => { setEditJob(null); setJobForm({ title: '', description: '', requirements: '', department_id: '', location: '', employment_type: 'full-time', salary_min: '', salary_max: '', experience_years: 0, required_skills: '' }); setShowModal(true) }
+        const openCreateJob = () => { setEditJob(null); setJobForm({ title: '', description: '', requirements: '', department_id: '', location: '', employment_type: 'full-time', salary_min: '', salary_max: '', experience_years: 0, required_skills: '', preferred_skills: '' }); setShowModal(true) }
         const openCreateTest = (jobId = null) => { setCreateTestJobId(jobId); setShowCreateTest(true) }
 
         // Full-screen Create Test wizard, rendered inside the Job Postings area.
@@ -4062,6 +4070,19 @@ HR Team`,
                 <label>Required Skills * (comma-separated)</label>
                 <input className="input" placeholder="React, TypeScript, Node.js..." required
                   value={jobForm.required_skills} onChange={e => setJobForm({ ...jobForm, required_skills: e.target.value })} />
+                <span style={{ fontSize: '0.72rem', color: '#6b7280' }}>
+                  Must-haves — missing these significantly lowers a candidate's score.
+                </span>
+              </div>
+              {/* The helper text is load-bearing: this is the only place the scoring
+                  asymmetry between the two lists is explained to the person entering them. */}
+              <div className="input-group">
+                <label>Preferred / Nice-to-have Skills (comma-separated)</label>
+                <input className="input" placeholder="AWS, Docker, GraphQL..."
+                  value={jobForm.preferred_skills} onChange={e => setJobForm({ ...jobForm, preferred_skills: e.target.value })} />
+                <span style={{ fontSize: '0.72rem', color: '#6b7280' }}>
+                  Bonus only — never counts against a candidate who lacks them.
+                </span>
               </div>
               <div className="flex gap-12" style={{ justifyContent: 'flex-end', marginTop: 8 }}>
                 <button type="button" className="btn btn-secondary" onClick={() => { setShowModal(false); setEditJob(null); setIsApprovalMode(false); setPendingApprovalReqId(null) }}>Cancel</button>
@@ -4469,6 +4490,18 @@ HR Team`,
                 ))}
                 {(!viewJob.required_skills || viewJob.required_skills.length === 0) && <span className="text-muted text-sm">No skills listed</span>}
               </div>
+              {/* Indigo, matching how the candidate request already renders its
+                  preferred skills, so the two surfaces read as one concept. */}
+              {Array.isArray(viewJob.preferred_skills) && viewJob.preferred_skills.length > 0 && (
+                <>
+                  <div style={{ fontSize: '0.72rem', fontWeight: 700, textTransform: 'uppercase', color: 'var(--text-tertiary)', margin: '14px 0 8px', fontFamily: 'var(--font-display)' }}>Preferred Skills</div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                    {viewJob.preferred_skills.map((s, i) => (
+                      <span key={i} style={{ padding: '4px 12px', background: '#e0e7ff', color: '#3730a3', borderRadius: 6, fontSize: '0.82rem', fontWeight: 600 }}>{s}</span>
+                    ))}
+                  </div>
+                </>
+              )}
             </div>
 
             <div style={{ padding: '12px 16px', background: 'var(--surface-input)', borderRadius: 10, marginBottom: 20 }}>

@@ -33,7 +33,7 @@ import logging
 
 # Shared with every other reader of these columns, so a Python-repr row parses
 # the same way everywhere. See src/services/skills_parsing.py.
-from src.services.skills_parsing import parse_skills as _parse_skills
+from src.services.skills_parsing import parse_skills as _parse_skills, dump_skills
 
 # Enums for better type safety
 class BloomTaxonomyLevel(str, Enum):
@@ -340,6 +340,7 @@ class AutoCreateJobRequest(BaseModel):
     employment_type: str = "full-time"
     experience_years: int = 0
     required_skills: List[str] = []
+    preferred_skills: Optional[List[str]] = None
 
 
 @router.post("/auto-create-job")
@@ -417,6 +418,7 @@ async def auto_create_job_from_request(
         employment_type=data.employment_type,
         experience_years=data.experience_years,
         required_skills=json.dumps(data.required_skills) if data.required_skills else None,
+        preferred_skills=dump_skills(data.preferred_skills),
         status="draft"
     )
     db.add(job)
@@ -1175,6 +1177,7 @@ async def publish_interview(
             employment_type=job.employment_type,
             num_candidates=1,
             required_skills=json.dumps(_parse_skills(job.required_skills)),
+            preferred_skills=json.dumps(_parse_skills(job.preferred_skills)),
             min_experience_years=job.experience_years or 0,
             job_description=job.description,
             job_category=job.job_category or "technical",

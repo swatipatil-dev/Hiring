@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 
 # Shared with every other reader of these columns, so a Python-repr row parses
 # the same way everywhere. See src/services/skills_parsing.py.
-from src.services.skills_parsing import parse_skills as _parse_skills
+from src.services.skills_parsing import parse_skills as _parse_skills, dump_skills
 
 # The three proctoring flags HR can see and override at send time. They live as keys
 # inside Interview.security_settings_data (a JSON TEXT blob), not as real columns.
@@ -184,6 +184,10 @@ class JobPostingCreate(BaseModel):
     salary_max: Optional[float] = None
     experience_years: int
     required_skills: List[str]
+    # Optional on purpose: absent means "this client does not know about the
+    # split", which stores NULL and scores exactly as before. An explicit []
+    # means someone saw the two fields and chose to leave preferred empty.
+    preferred_skills: Optional[List[str]] = None
     job_category: Optional[str] = "technical"   # technical | non_technical | mixed
 
 class JobApprovalRequest(BaseModel):
@@ -193,6 +197,12 @@ class JobApprovalRequest(BaseModel):
     employment_type: Optional[str] = None
     description: Optional[str] = None
     requirements: Optional[str] = None
+    # The approval form shows skills carried over from the candidate request,
+    # and until now had nowhere to send them — so editing them there silently
+    # did nothing. Written only when present, so an approval that omits them
+    # leaves the draft's own skills alone.
+    required_skills: Optional[List[str]] = None
+    preferred_skills: Optional[List[str]] = None
 
 class JobPostingResponse(BaseModel):
     id: str
@@ -207,6 +217,7 @@ class JobPostingResponse(BaseModel):
     salary_max: Optional[float] = None
     experience_years: Optional[int] = 0
     required_skills: List[str] = []
+    preferred_skills: List[str] = []
     status: str
     created_at: datetime
     assigned_interviewer_email: Optional[str] = None
@@ -405,6 +416,7 @@ def create_job_response(job: JobPosting, test: Optional[Interview] = None) -> Jo
         salary_max=float(job.salary_max) if job.salary_max else None,
         experience_years=job.experience_years or 0,
         required_skills=_parse_skills(job.required_skills),
+        preferred_skills=_parse_skills(job.preferred_skills),
         status=job.status,
         created_at=job.created_at,
         assigned_interviewer_email=interviewer_email,
@@ -566,6 +578,9 @@ async def create_job(
         salary_max=job_data.salary_max,
         experience_years=job_data.experience_years,
         required_skills=json.dumps(job_data.required_skills) if job_data.required_skills else None,
+        # None (field absent) stores NULL, the "never split" sentinel. An
+        # explicit [] stores '[]', meaning the split was considered.
+        preferred_skills=dump_skills(job_data.preferred_skills),
         job_category=job_data.job_category or "technical",
         company_id=job_company_id,
         status="active"
@@ -2760,6 +2775,13 @@ async def approve_job(
         job.description = approval.description
     if approval.requirements:
         job.requirements = approval.requirements
+    # Only when supplied: an approval that omits them must not wipe the draft's
+    # own skills. This is the requirement-to-job path, where the two lists
+    # previously collapsed into one.
+    if approval.required_skills is not None:
+        job.required_skills = json.dumps(approval.required_skills) if approval.required_skills else None
+    if approval.preferred_skills is not None:
+        job.preferred_skills = dump_skills(approval.preferred_skills)
     job.status = "active"
     job.updated_at = datetime.utcnow()
 
@@ -2891,7 +2913,11 @@ async def update_job(
     job.salary_min = job_data.salary_min
     job.salary_max = job_data.salary_max
     job.experience_years = job_data.experience_years
-    job.required_skills = json.dumps(job_data.required_skills)
+    # `if ... else None` matches create, which stored NULL for an empty list.
+    # Update previously wrote "[]", so the same empty job meant two different
+    # things depending on which endpoint last touched it.
+    job.required_skills = json.dumps(job_data.required_skills) if job_data.required_skills else None
+    job.preferred_skills = dump_skills(job_data.preferred_skills)
     job.updated_at = datetime.utcnow()
     db.commit()
     return create_job_response(job)
