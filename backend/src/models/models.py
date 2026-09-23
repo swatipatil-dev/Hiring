@@ -328,7 +328,10 @@ class JobPosting(Base, TenantScoped):
     salary_min      = Column(DECIMAL(12, 2))
     salary_max      = Column(DECIMAL(12, 2))
     experience_years= Column(Integer)
-    required_skills = Column(Text)    # JSON
+    required_skills = Column(Text)    # JSON — must-haves
+    # JSON — nice-to-haves. NULL means this job predates the split and is
+    # scored exactly as before; '[]' means someone chose to leave it empty.
+    preferred_skills= Column(Text)
     jd_embedding    = Column(Text)    # JSON
     job_category    = Column(String(20), default="technical")  # technical | non_technical | mixed
     status          = Column(String(20), default="draft")   # draft | pending_approval | active | closed

@@ -464,6 +464,7 @@ CREATE TABLE IF NOT EXISTS job_postings (
 	salary_max DECIMAL(12, 2), 
 	experience_years INTEGER, 
 	required_skills TEXT, 
+	preferred_skills TEXT, 
 	jd_embedding TEXT, 
 	job_category VARCHAR(20), 
 	status VARCHAR(20), 
