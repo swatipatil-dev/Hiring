@@ -123,15 +123,16 @@ export default function MailboxManager() {
         <div style={{ display: 'grid', gap: 8, marginBottom: form ? 16 : 0 }}>
           {list.map(m => (
             <div key={m.id} style={{
-              display: 'flex', alignItems: 'center', gap: 12, padding: '10px 14px',
+              display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 12, padding: '10px 14px',
               border: '1px solid var(--border, #e5e7eb)', borderRadius: 8,
               opacity: m.is_active ? 1 : 0.55,
             }}>
-              <div style={{ flex: 1 }}>
+              {/* The buttons drop below the details when the row is too narrow. */}
+              <div style={{ flex: '1 1 220px', minWidth: 0 }}>
                 <div style={{ fontWeight: 600, fontSize: '0.9rem' }}>
                   {m.name}{!m.is_active && <span style={{ color: 'var(--text-tertiary)', fontWeight: 400 }}> (inactive)</span>}
                 </div>
-                <div style={{ fontSize: '0.78rem', color: 'var(--text-tertiary)' }}>
+                <div style={{ fontSize: '0.78rem', color: 'var(--text-tertiary)', wordBreak: 'break-word' }}>
                   {m.smtp_from_email || m.smtp_user} · {m.smtp_host}:{m.smtp_port}
                   {!m.has_password && <span style={{ color: '#f59e0b' }}> · no password set</span>}
                 </div>

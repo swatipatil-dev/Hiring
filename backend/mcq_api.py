@@ -6,6 +6,10 @@ Tenant isolation: every endpoint requires authentication, and any lookup by
 interview_id or question_id verifies the target row belongs to the caller's
 company before touching the underlying ``interview_questions`` table (raw
 SQL — the SQLAlchemy auto-filter does not apply).
+
+Answer keys: a candidate only ever gets their own interview's paper, with
+``correct_answer`` blanked and only sample test cases. Every other endpoint that
+returns or changes answer keys is staff-only.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -15,13 +19,15 @@ from pydantic import BaseModel
 import json
 
 from src.config.database_config_mysql import get_db
-from src.auth import get_current_user
+from src.auth import get_current_user, require_role
 from src.models.models import User, Interview
 from src.judge.starter_sanitizer import sanitize_starter
 from src.mcq_options import normalize_mcq_options
+from src.services.interview_access import STAFF_ROLES, candidate_owns_interview, is_candidate
 from sqlalchemy import text
 
 router = APIRouter(prefix="/mcq", tags=["MCQ Questions"])
+_staff_user = require_role(list(STAFF_ROLES))
 
 # Pydantic Models
 class MCQQuestion(BaseModel):
@@ -112,8 +118,15 @@ def get_interview_mcq_questions(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Get all MCQ questions for a specific interview (tenant-scoped)."""
+    """Get all MCQ questions for a specific interview (tenant-scoped).
+
+    Candidates: only their own interview, only approved questions, and never the
+    answer key — ``correct_answer`` is always empty for them.
+    """
     _assert_interview_in_tenant(db, interview_id, current_user)
+    candidate_view = is_candidate(current_user)
+    if candidate_view and not candidate_owns_interview(db, current_user, interview_id):
+        raise HTTPException(status_code=404, detail="Interview not found")
 
     # A candidate must not be able to pull the paper again after submitting. The sibling
     # endpoint (candidate_routes /interviews/{id}/questions) already blocks this, but the
@@ -136,6 +149,8 @@ def get_interview_mcq_questions(
     try:
         query = "SELECT id, interview_id, question_text, question_type, difficulty_level, category, options, correct_answer, time_limit_minutes, points, status, created_at, updated_at, code_template, test_cases, language FROM interview_questions WHERE interview_id = :interview_id"
         params = {"interview_id": interview_id}
+        if candidate_view:
+            query += " AND is_approved = 1"
 
         if difficulty:
             query += " AND difficulty_level = :difficulty"
@@ -216,7 +231,7 @@ def get_interview_mcq_questions(
                 question_type=qtype,
                 difficulty_level=str(q[4]) if q[4] else 'Medium',
                 options=options,
-                correct_answer=str(q[7]) if q[7] else '',
+                correct_answer='' if candidate_view else (str(q[7]) if q[7] else ''),
                 explanation=None,
                 time_limit_minutes=int(q[8]) if q[8] else 5,
                 points=int(q[9]) if q[9] else 1,
@@ -247,7 +262,7 @@ def get_interview_mcq_questions(
 def get_mcq_question(
     question_id: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(_staff_user),
 ):
     """Get a specific MCQ question by ID (tenant-scoped)."""
     _assert_question_in_tenant(db, question_id, current_user)
@@ -299,7 +314,7 @@ def get_mcq_question(
 def create_mcq_question(
     question: MCQQuestionCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(_staff_user),
 ):
     """Create a new MCQ question (tenant-scoped — only on caller's interviews)."""
     interview = _assert_interview_in_tenant(db, question.interview_id, current_user)
@@ -415,7 +430,7 @@ def get_mcq_categories(
 @router.get("/sample")
 def get_sample_mcq_questions(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(_staff_user),
 ):
     """Sample MCQ questions — limited to the caller's company."""
     try:
@@ -457,7 +472,7 @@ def get_sample_mcq_questions(
 def delete_mcq_question(
     question_id: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(_staff_user),
 ):
     """Delete a MCQ question (tenant-scoped)."""
     _assert_question_in_tenant(db, question_id, current_user)

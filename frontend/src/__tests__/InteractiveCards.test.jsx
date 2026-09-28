@@ -16,6 +16,9 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 
+// HRDashboard reads the signed-in user (to tell owner / co-HR apart); in the app it
+// always sits inside AuthProvider, which these isolated renders don't mount.
+vi.mock('../context/AuthContext', () => ({ useAuth: () => ({ user: { role: 'hr' } }) }))
 vi.mock('../api/client', () => ({
   default: { get: vi.fn(), post: vi.fn(), put: vi.fn(), patch: vi.fn(), delete: vi.fn() },
 }))

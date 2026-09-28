@@ -1,11 +1,12 @@
 """
 Company slug rules — the server-side source of truth.
 
-A company's slug is not a cosmetic identifier: it becomes a subdomain
-(``acme.hireflow.io``) that tenant_domain.py resolves tenants by. So it has to be a
-valid DNS label, and it must not be allowed to shadow a hostname the platform itself
-needs. `frontend/src/utils/slugify.js` mirrors slugify() so the UI previews exactly what
-the API will store; this module is what actually decides.
+A company's slug is not a cosmetic identifier. It is both the tenant's public URL path
+(``career.innomaxskills.com/acme-corp``) and a subdomain (``acme.hireflow.io``) that
+tenant_domain.py resolves tenants by. So it has to be a valid DNS label, and it must not
+be allowed to shadow a hostname or a route the platform itself needs.
+`frontend/src/utils/slugify.js` mirrors slugify() so the UI previews exactly what the API
+will store; this module is what actually decides, including the reserved-name check.
 """
 import re
 import unicodedata
@@ -14,16 +15,29 @@ import unicodedata
 # constraint is the tighter one, so it wins.
 MAX_SLUG_LENGTH = 63
 
-# Hostnames the platform routes on, serves from, or is likely to want. A tenant that
-# claimed one of these would either break routing or intercept traffic meant elsewhere —
-# "api" being the obvious case, since api.hireflow.io must never resolve to a tenant.
+# Hostnames and URL paths the platform routes on, serves from, or is likely to want. A
+# tenant that claimed one of these would either break routing or intercept traffic meant
+# elsewhere — "api" being the obvious case, since api.hireflow.io must never resolve to a
+# tenant.
+#
+# A slug is also the company's public URL path (career.innomaxskills.com/<slug>), so every
+# top-level route in frontend/src/App.jsx and every ProxyPass prefix in
+# deploy/cpanel/hireflow.conf has to be here too — a company called "Jobs" would otherwise
+# shadow the job board for everyone. test/test_reserved_slugs.py keeps this in step.
 RESERVED_SLUGS = frozenset({
+    # Platform hostnames and generic infrastructure names.
     "admin", "api", "app", "apps", "assets", "auth", "billing", "blog", "cdn",
     "dashboard", "dev", "developer", "docs", "files", "ftp", "help", "hireflow",
     "images", "internal", "login", "logout", "mail", "media", "monitoring", "news",
     "portal", "preview", "public", "root", "security", "signup", "smtp", "staging",
     "static", "status", "superadmin", "support", "system", "test", "testing",
     "uploads", "webhook", "webhooks", "www",
+    # Top-level SPA routes (frontend/src/App.jsx).
+    "c", "candidate", "forgot-password", "hr", "interviewer", "jobs", "profile",
+    "register",
+    # Apache ProxyPass prefixes (deploy/cpanel/hireflow.conf). These never reach the SPA,
+    # so a company holding one would simply be unreachable.
+    "health", "interviews", "logos", "mcq", "proctor", "redoc", "resumes",
 })
 
 _INVALID_CHARS = re.compile(r"[^a-z0-9]+")

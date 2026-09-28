@@ -6,6 +6,7 @@ import {
 } from 'lucide-react'
 import api from '../../api/client'
 import MoveToATSModal from './MoveToATSModal'
+import ATSExplanation from '../../components/ats/ATSExplanation'
 import CandidateForm from './CandidateForm'
 import { DashboardPanel, SettingsPanel } from './TalentPoolPanels'
 import { SkillsPanel } from './TalentPoolSkills'
@@ -487,6 +488,11 @@ function Record({ result, index, activeJobCount, onMove, onRematch, onDelete, bu
               <div className="rm-verdict__meta">
                 {best.department || 'General'}{best.rating ? ` · ${best.rating}` : ''}
               </div>
+              {result.parse_status === 'needs_review' && (
+                <div className="rm-verdict__meta" style={{ marginTop: 4, color: '#92400e', fontWeight: 600 }}>
+                  The resume text could not be read reliably, so this match may be wrong. Open the resume.
+                </div>
+              )}
             </div>
 
             {best.skills_match_score != null && (
@@ -497,13 +503,20 @@ function Record({ result, index, activeJobCount, onMove, onRematch, onDelete, bu
                   How this scored
                 </button>
                 {showFactors && (
-                  <div className="rm-factors">
-                    <Factor label="Skills" value={best.skills_match_score} />
-                    <Factor label="Semantic" value={best.semantic_score} />
-                    <Factor label="Experience" value={best.experience_score} />
-                    <Factor label="Keywords" value={best.keyword_score} />
-                    <Factor label="Education" value={best.education_score} />
-                  </div>
+                  result.id && best.job_id ? (
+                    // The evidence, computed against the job as it is now (not stored per job).
+                    <div style={{ marginTop: 8 }}>
+                      <ATSExplanation compact loadUrl={`/hr/resume-pool/${result.id}/matches/${best.job_id}/explanation`} />
+                    </div>
+                  ) : (
+                    <div className="rm-factors">
+                      <Factor label="Skills" value={best.skills_match_score} />
+                      <Factor label="Semantic" value={best.semantic_score} />
+                      <Factor label="Experience" value={best.experience_score} />
+                      <Factor label="Keywords" value={best.keyword_score} />
+                      <Factor label="Education" value={best.education_score} />
+                    </div>
+                  )
                 )}
               </div>
             )}

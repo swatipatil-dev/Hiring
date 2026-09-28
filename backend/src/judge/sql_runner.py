@@ -1,19 +1,16 @@
 """
 In-process SQL judge (SQLite).
 
-NOTE: candidate-code GRADING now runs inside the Docker sandbox via
-``sql_sandbox.py`` + ``sql_harness.py`` (for CPU/memory/time isolation). The pure
-helpers here (``_query_result``, ``_format_rows``, …) are still used in-process for
-TRUSTED test-case generation/repair (``sql_testgen.py``), which runs the reference
-query — never candidate input. ``judge_sql`` / ``run_sql_once`` remain as the
-reference implementation the harness mirrors (see ``test_judge_sql.py``).
+NOTE: candidate-code GRADING runs inside the Docker sandbox via ``sql_sandbox.py`` +
+``sql_harness.py`` (for CPU/memory/time isolation). This module runs the SAME
+harness in-process — it is imported, not copied — for test-case generation
+(``sql_testgen.py``), which executes LLM-written seed SQL and the reference query in
+the API process, and for tests.
 
-SQL submissions don't fit the stdin/stdout Docker sandbox: there's no program to
-compile, just a query to run against a seeded schema. So this runner executes the
-candidate's SQL in an ephemeral in-memory SQLite database — created fresh per test
-case, seeded from the case's setup script, and discarded immediately after. The DB
-never touches disk and is unreachable outside the process, so a destructive query
-(DROP/DELETE) only wrecks the candidate's own throwaway copy.
+The rules live in ``sql_harness.py`` (one implementation, used both here and in the
+container): every case gets a fresh in-memory SQLite database; the setup script can
+build it but not ATTACH files or load extensions; the graded query is read-only, and
+both have time and row limits. See that module's docstring.
 
 Per test case:
   * ``input``           — setup SQL (CREATE TABLE + INSERT …) seeding the schema/data.
@@ -27,90 +24,60 @@ reference is available we fall back to comparing formatted output to ``expected_
 """
 from __future__ import annotations
 
-import sqlite3
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
+from . import sql_harness as H
 from . import verdict as V
 from .runner import JudgeResult, CaseResult, TestCaseInput, RunOnceResult
 
-
-def _split_statements(sql: str) -> List[str]:
-    """Split a SQL script into individual statements on top-level semicolons.
-
-    Quote-aware (single quotes, double quotes) so semicolons inside string
-    literals don't split a statement. Good enough for interview-grade SQL.
-    """
-    statements: List[str] = []
-    buf: List[str] = []
-    quote: Optional[str] = None
-    for ch in sql or "":
-        if quote:
-            buf.append(ch)
-            if ch == quote:
-                quote = None
-            continue
-        if ch in ("'", '"'):
-            quote = ch
-            buf.append(ch)
-        elif ch == ";":
-            stmt = "".join(buf).strip()
-            if stmt:
-                statements.append(stmt)
-            buf = []
-        else:
-            buf.append(ch)
-    tail = "".join(buf).strip()
-    if tail:
-        statements.append(tail)
-    return statements
+# The harness's helpers, re-exported under the names sql_testgen and the tests use.
+_split_statements = H._split_statements
+_query_result = H._query_result
+_format_rows = H._format_rows
+_rows_equal = H._rows_equal
 
 
-def _run_script(conn: sqlite3.Connection, sql: str) -> Tuple[Optional[List[str]], List[tuple]]:
-    """Execute every statement in ``sql``; return (columns, rows) of the LAST
-    statement that produced a result set (e.g. the trailing SELECT)."""
-    cols: Optional[List[str]] = None
-    rows: List[tuple] = []
-    cur = conn.cursor()
-    for stmt in _split_statements(sql):
-        cur.execute(stmt)
-        if cur.description is not None:
-            cols = [d[0] for d in cur.description]
-            rows = cur.fetchall()
-    return cols, rows
+def harness_job(candidate_sql: str, test_cases: List[TestCaseInput],
+                reference_sql: Optional[str] = None) -> dict:
+    """The JSON job ``sql_harness.judge`` takes (in-process or on the sandbox's stdin)."""
+    return {
+        "candidate_sql": candidate_sql or "",
+        "reference_sql": reference_sql,
+        "cases": [
+            {
+                "id": tc.id, "input": tc.input or "",
+                "expected_output": tc.expected_output or "",
+                "weight": int(tc.weight or 1), "ordinal": tc.ordinal,
+                "is_sample": bool(tc.is_sample), "is_hidden": bool(tc.is_hidden),
+            }
+            for tc in test_cases
+        ],
+    }
 
 
-def _query_result(setup_sql: str, query_sql: str) -> Tuple[Optional[List[str]], List[tuple]]:
-    """Seed a fresh in-memory DB with ``setup_sql`` then run ``query_sql``."""
-    conn = sqlite3.connect(":memory:")
-    try:
-        if (setup_sql or "").strip():
-            conn.executescript(setup_sql)
-        return _run_script(conn, query_sql)
-    finally:
-        conn.close()
-
-
-def _format_rows(cols: Optional[List[str]], rows: List[tuple]) -> str:
-    """Render a result set as comma-separated columns, one row per line."""
-    if not rows:
-        return ""
-    return "\n".join(
-        ",".join("" if v is None else str(v) for v in row) for row in rows
-    )
-
-
-def _rows_equal(a: List[tuple], b: List[tuple]) -> bool:
-    """Compare two result sets order-independently (multiset of stringified rows).
-
-    Interview SQL rarely pins row order, so an order-independent match avoids
-    false WAs while still catching genuinely different result sets.
-    """
-    def norm(rows: List[tuple]):
-        return sorted(
-            tuple("" if v is None else str(v) for v in row) for row in rows
+def result_from_harness(data: dict, test_cases: List[TestCaseInput],
+                        wall_ms: int = 0) -> JudgeResult:
+    """Map the harness's JSON result onto the judge's JudgeResult."""
+    max_score = float(sum(max(1, tc.weight) for tc in test_cases)) or 0.0
+    cases = [
+        CaseResult(
+            test_case_id=c.get("test_case_id"), verdict=c.get("verdict", V.RE),
+            time_ms=int(c.get("time_ms", 0) or 0), memory_kb=None,
+            exit_code=0 if c.get("verdict") != V.RE else 1,
+            stdout=c.get("stdout", "") or "", stderr=c.get("stderr", "") or "",
+            ordinal=int(c.get("ordinal", 0) or 0), is_hidden=bool(c.get("is_hidden")),
         )
-    return norm(a) == norm(b)
+        for c in (data.get("cases") or [])
+    ]
+    return JudgeResult(
+        verdict=data.get("verdict", V.PENDING),
+        score=float(data.get("score", 0.0) or 0.0), max_score=max_score,
+        passed_count=int(data.get("passed_count", 0) or 0),
+        total_count=int(data.get("total_count", len(test_cases)) or len(test_cases)),
+        total_time_ms=int(data.get("total_time_ms", wall_ms) or 0),
+        max_memory_kb=None, compile_output=None, error_message=None, cases=cases,
+    )
 
 
 def judge_sql(
@@ -119,58 +86,9 @@ def judge_sql(
     *,
     reference_sql: Optional[str] = None,
 ) -> JudgeResult:
-    """Grade a SQL submission against its test cases. Never raises."""
-    max_score = float(sum(max(1, tc.weight) for tc in test_cases)) or 0.0
-    cases: List[CaseResult] = []
-    score = 0.0
-    passed = 0
-    total_time = 0
-
-    for tc in sorted(test_cases, key=lambda t: t.ordinal):
-        setup = tc.input or ""
-        t0 = time.perf_counter()
-        try:
-            cand_cols, cand_rows = _query_result(setup, candidate_sql)
-        except Exception as e:
-            elapsed = int((time.perf_counter() - t0) * 1000)
-            cases.append(CaseResult(
-                test_case_id=tc.id, verdict=V.RE, time_ms=elapsed, memory_kb=None,
-                exit_code=1, stdout="", stderr=str(e)[:10000],
-                ordinal=tc.ordinal, is_hidden=tc.is_hidden,
-            ))
-            continue
-
-        ref_rows: Optional[List[tuple]] = None
-        if (reference_sql or "").strip():
-            try:
-                _, ref_rows = _query_result(setup, reference_sql)
-            except Exception:
-                ref_rows = None
-
-        if ref_rows is not None:
-            ok = _rows_equal(cand_rows, ref_rows)
-        else:
-            ok = V.outputs_match(_format_rows(cand_cols, cand_rows), tc.expected_output or "")
-
-        elapsed = int((time.perf_counter() - t0) * 1000)
-        total_time = max(total_time, elapsed)
-        vd = V.AC if ok else V.WA
-        if vd == V.AC:
-            passed += 1
-            score += max(1, tc.weight)
-        cases.append(CaseResult(
-            test_case_id=tc.id, verdict=vd, time_ms=elapsed, memory_kb=None,
-            exit_code=0, stdout=_format_rows(cand_cols, cand_rows)[:10000], stderr="",
-            ordinal=tc.ordinal, is_hidden=tc.is_hidden,
-        ))
-
-    overall = V.aggregate_verdict([c.verdict for c in cases])
-    return JudgeResult(
-        verdict=overall, score=score, max_score=max_score,
-        passed_count=passed, total_count=len(test_cases),
-        total_time_ms=total_time, max_memory_kb=None,
-        compile_output=None, error_message=None, cases=cases,
-    )
+    """Grade a SQL submission against its test cases, in-process. Never raises."""
+    data = H.judge(harness_job(candidate_sql, test_cases, reference_sql))
+    return result_from_harness(data, test_cases)
 
 
 def run_sql_once(query_sql: str, setup_sql: str = "") -> RunOnceResult:
@@ -187,6 +105,7 @@ def run_sql_once(query_sql: str, setup_sql: str = "") -> RunOnceResult:
     except Exception as e:
         return RunOnceResult(
             status="ok", stdout="", stderr=str(e), exit_code=1,
-            time_ms=int((time.perf_counter() - t0) * 1000), timed_out=False,
+            time_ms=int((time.perf_counter() - t0) * 1000),
+            timed_out=isinstance(e, H.QueryTimeout),
             compile_error=None, error_message=None,
         )

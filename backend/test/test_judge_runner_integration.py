@@ -145,3 +145,57 @@ def test_network_is_disabled():
     cases = [TestCaseInput(id="n", input="", expected_output="NET_BLOCKED", ordinal=0, is_hidden=False)]
     r = judge_submission("python", code, cases, time_limit_ms=4000, memory_limit_mb=128)
     assert r.verdict == V.AC, "network should be blocked inside the sandbox"
+
+
+def _probe(code, expected, time_limit_ms=4000):
+    cases = [TestCaseInput(id="p", input="", expected_output=expected, ordinal=0, is_hidden=False)]
+    return judge_submission("python", code, cases, time_limit_ms=time_limit_ms, memory_limit_mb=128)
+
+
+def test_no_app_secrets_in_the_environment(monkeypatch):
+    # The worker's own environment carries DATABASE_URL etc.; none of it may reach
+    # candidate code (docker run does not inherit the caller's environment).
+    monkeypatch.setenv("SECRET_KEY", "must-not-leak")
+    monkeypatch.setenv("DATABASE_URL", "mysql://must-not-leak")
+    code = ("import os\n"
+            "blob = repr(dict(os.environ)) + open('/proc/1/environ', 'rb').read().decode('latin1')\n"
+            "print('LEAK' if 'must-not-leak' in blob else 'CLEAN')\n")
+    assert _probe(code, "CLEAN").verdict == V.AC
+
+
+def test_no_host_files_visible():
+    code = ("import os\n"
+            "paths = ['/opt/hireflow', '/srv/judge_work', '/var/run/docker.sock',\n"
+            "         '/app/.env', '/backend/.env']\n"
+            "print('SEEN ' + ' '.join(p for p in paths if os.path.exists(p)) if any(os.path.exists(p) for p in paths) else 'NONE')\n")
+    assert _probe(code, "NONE").verdict == V.AC
+
+
+def test_filesystem_is_read_only_outside_tmp():
+    code = ("def w(p):\n"
+            "    try:\n"
+            "        open(p, 'w').write('x'); return 'W'\n"
+            "    except OSError:\n"
+            "        return 'R'\n"
+            "print(w('/work/x') + w('/etc/x') + w('/tmp/x'))\n")
+    assert _probe(code, "RRW").verdict == V.AC
+
+
+def test_fork_bomb_is_contained():
+    code = ("import os\n"
+            "while True:\n"
+            "    try:\n"
+            "        os.fork()\n"
+            "    except OSError:\n"
+            "        pass\n")
+    r = _probe(code, "", time_limit_ms=2000)
+    assert r.verdict in (V.TLE, V.RE, V.MLE)
+    # And the host still runs the next submission normally.
+    assert judge_submission("python", PY_CORRECT, SUM_CASES, time_limit_ms=2000,
+                            memory_limit_mb=256).verdict == V.AC
+
+
+def test_output_flood_is_truncated_not_fatal():
+    r = _probe("import sys\nwhile True: sys.stdout.write('x' * 65536)\n", "", time_limit_ms=1500)
+    assert r.verdict == V.TLE
+    assert len(r.cases[0].stdout) <= 256 * 1024

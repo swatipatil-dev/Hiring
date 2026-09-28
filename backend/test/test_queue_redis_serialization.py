@@ -81,7 +81,7 @@ class _Recorder:
 
         class FakeJobCls:
             @staticmethod
-            def fetch(job_id, connection=None):
+            def fetch(job_id, connection=None, **kw):
                 rec.connections.append(connection)
                 return FakeJob()
 

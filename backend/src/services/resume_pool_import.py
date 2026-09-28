@@ -42,6 +42,21 @@ from src.models.models import (
     User,
 )
 
+
+# Every pool entry carries a parse status, set whenever it is saved, so an unreadable
+# resume in the pool is flagged the same way an unreadable application is. One listener
+# instead of a line at each of the half-dozen places that write entries.
+from sqlalchemy import event as _sa_event  # noqa: E402
+from src.services import parse_quality as _parse_quality  # noqa: E402
+
+
+@_sa_event.listens_for(ResumePoolEntry, "before_insert")
+@_sa_event.listens_for(ResumePoolEntry, "before_update")
+def _set_pool_parse_status(mapper, connection, target):
+    # Registered/applied entries are built from the candidate's profile, not a parsed file.
+    source = "profile" if (getattr(target, "source", None) in ("registered", "applied")) else "resume"
+    target.parse_status = _parse_quality.assess(target.resume_text or "", source=source)["status"]
+
 logger = logging.getLogger(__name__)
 
 # Hard ceiling on one import call. Scoring is N people x M jobs of sentence-transformer

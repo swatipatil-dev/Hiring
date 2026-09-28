@@ -13,6 +13,7 @@ from .admin_routes import router as admin_router
 from .ats_routes import router as ats_router
 from .database_management_routes import router as database_management_router
 from .advanced_features_routes import router as advanced_router
+from .ats_explain_routes import router as ats_explain_router
 
 __all__ = [
     "auth_router",
@@ -25,4 +26,5 @@ __all__ = [
     "ats_router",
     "database_management_router",
     "advanced_router",
+    "ats_explain_router",
 ]

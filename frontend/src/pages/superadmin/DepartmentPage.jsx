@@ -73,6 +73,16 @@ const STYLES = `
   .dp-co-tag { padding: 3px 9px; border-radius: 20px; font-family: 'DM Mono', monospace; font-size: 0.63rem; background: #f3f4f6; border: 1px solid #e5e7eb; color: #6b7280; }
 
   .dp-loading { padding: 48px; text-align: center; font-family: 'DM Mono', monospace; font-size: 0.72rem; color: #c4c9d4; letter-spacing: 0.1em; text-transform: uppercase; }
+
+  /* Form and chart stack once the fixed 380px form column no longer leaves room. */
+  @media (max-width: 1024px) {
+    .dp-grid { grid-template-columns: 1fr; }
+    .dp-grid > * { min-width: 0; }
+  }
+  @media (max-width: 640px) {
+    .dp-root { padding: 0 0 40px; }
+    .dp-stats, .dp-co-grid { grid-template-columns: 1fr; }
+  }
 `
 
 const CustomTooltip = ({ active, payload }) => {

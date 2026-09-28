@@ -90,6 +90,36 @@ sudo -u hireflow /opt/hireflow/venv/bin/python scripts/schema_diff.py
 is present.`** Anything else, stop — do not restart the services. A partially
 migrated database serving traffic is worse than an old one.
 
+> **Release with `j6z7a8b9c0d1_ats_explainability`:** it widens
+> `resume_pool.match_results` to MEDIUMTEXT, which rebuilds that table. Run it
+> off-hours on a large Talent Pool. Existing resume scores are **not** rescored by the
+> deploy: they keep their score and show "Scoring rules updated" until HR presses
+> *Rescore* on a job. To preview what a rescore would do to a job's ranking first
+> (saves nothing):
+>
+> ```bash
+> sudo -u hireflow /opt/hireflow/venv/bin/python scripts/ats_rules_dry_run.py --job <job_id>
+> ```
+
+> **Release with the code-execution security changes** (judge jobs as JSON, the
+> worker's allow-list, a hardened worker unit). Four one-time steps, in this order:
+>
+> 1. **Redis password**, if `curl -s localhost:8000/health` shows
+>    `"judge_queue_auth":false`: follow Step 2.4 of
+>    [CPANEL_DEPLOYMENT.md](CPANEL_DEPLOYMENT.md) (it checks first that no other
+>    account uses Redis), then put the printed `REDIS_URL=` into `backend/.env`.
+> 2. `chmod 700 /srv/judge_work`.
+> 3. **Step 5 below is required** — the worker unit changed (`ProtectSystem=strict`,
+>    `NoNewPrivileges=true`), and so did how the worker is started (`entrypoint.sh`).
+> 4. Restart **all four services together** (Step 8). The API and the worker must
+>    agree on the job format: a job queued by the old API is refused by the new
+>    worker, once, and shows the candidate "temporarily unavailable" — it is not
+>    lost, the answer is regraded later.
+>
+> Then press **Run Code** with `print("hello")` (Step 9). If it fails,
+> `journalctl -u hireflow-judge-worker -n 50` names the path or permission the new
+> unit took away. Optional but recommended: gVisor (Step 2.5 of CPANEL_DEPLOYMENT.md).
+
 Two failures worth recognising:
 
 - **`(3780, "Referencing column … are incompatible")`** — a charset mismatch. The
@@ -186,8 +216,13 @@ Code and frontend:
 ```bash
 cd /opt/hireflow && git reset --hard $BEFORE
 cd frontend && npm install && npm run build && rsync -a --delete dist/ /home/innomaxskills/public_html/career/
+\cp -f /opt/hireflow/deploy/cpanel/htaccess-spa /home/innomaxskills/public_html/career/.htaccess
 systemctl restart hireflow-api hireflow-proctor hireflow-judge-worker hireflow-email-worker
 ```
+
+`--delete` removes `.htaccess` along with the old bundle — it lives in the document root
+but not in `dist/`. Step 7 re-copies it; a rollback has to as well, or the SPA loses its
+history fallback (every deep link 404s) and its `Referrer-Policy` header.
 
 Schema is the part that does not roll back cleanly. Most migrations here are
 additive and guarded, so an older codebase tolerates the newer schema — prefer

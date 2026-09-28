@@ -111,6 +111,46 @@ def save_file_securely(file: Any, upload_dir: str = "uploads") -> str:
     key = f"{upload_dir.strip('/')}/{generate_uuid()}{file_ext}"
     return storage.save_fileobj(file.file, key)
 
+def extract_text_with_diagnostics(file_path: str) -> dict:
+    """Like extract_text_from_file, but also reports what happened.
+
+    Returns {text, confidence, method, pages, error}. `pages` lets the parse-quality check
+    spot a scanned PDF (pages but almost no text), and `error` separates "the file could
+    not be read" from "the file had no words in it". Both used to surface as an empty
+    string and a silent ATS score of 0.
+    """
+    from src.services.storage import as_local_path
+    out = {"text": "", "confidence": 0.0, "method": None, "pages": None, "error": None}
+    try:
+        file_ext = Path(file_path).suffix.lower()
+        with as_local_path(file_path) as local_path:
+            if file_ext == '.pdf':
+                import pdfplumber
+                with pdfplumber.open(local_path) as pdf:
+                    out["pages"] = len(pdf.pages)
+                    out["text"] = "".join((page.extract_text() or "") for page in pdf.pages)
+                out["method"] = "pdfplumber"
+                out["confidence"] = 0.9 if out["text"] else 0.0
+            elif file_ext in ('.doc', '.docx'):
+                import docx
+                doc = docx.Document(local_path)
+                out["text"] = "\n".join(p.text for p in doc.paragraphs)
+                out["method"] = "python-docx"
+                out["confidence"] = 0.9 if out["text"] else 0.0
+            elif file_ext == '.txt':
+                with open(local_path, "r", encoding="utf-8", errors="ignore") as f:
+                    out["text"] = f.read()
+                out["method"] = "text"
+                out["confidence"] = 0.8 if out["text"] else 0.0
+            else:
+                out["error"] = f"unsupported file type {file_ext or '(none)'}"
+    except Exception as e:
+        logger.error(f"Error extracting text from {file_path}: {e}")
+        out["error"] = str(e)[:300]
+        out["text"], out["confidence"] = "", 0.0
+    return out
+
+
 def extract_text_from_file(file_path: str) -> tuple[str, float]:
     """Extract text from a PDF/DOCX/TXT file referenced by a storage key or path."""
     from src.services.storage import as_local_path

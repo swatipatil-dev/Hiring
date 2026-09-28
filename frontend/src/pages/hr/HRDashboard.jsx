@@ -1,8 +1,9 @@
 ﻿import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
-import { Briefcase, Users, Calendar, Gift, Plus, Eye, Edit3, Trash2, Archive, RotateCcw, GripVertical, ChevronRight, FileText, ClipboardList, Mic, UserCheck, Award, Search, X } from 'lucide-react'
+import { Briefcase, Users, Calendar, Gift, Plus, Eye, Edit3, Trash2, Archive, RotateCcw, GripVertical, ChevronRight, FileText, ClipboardList, Mic, UserCheck, Award, Search, X, ArrowRightLeft } from 'lucide-react'
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, LabelList } from 'recharts'
 import api from '../../api/client'
+import { useAuth } from '../../context/AuthContext'
 import Header from '../../components/Header'
 import StageTimeline from '../../components/StageTimeline'
 import ProctoringReport from '../../components/ProctoringReport'
@@ -11,6 +12,10 @@ import MailFromPicker from './MailFromPicker'
 import CreateTestWizard from '../shared/CreateTestWizard'
 import ExamDrafts from '../../components/ExamDrafts'
 import ResumeMatcher from './ResumeMatcher'
+import { RetestModal, AdjustmentModal, AdjustmentRequestsModal } from './TestFairnessModals'
+import ATSOverridePanel from '../../components/ats/ATSOverridePanel'
+import ATSExplanation from '../../components/ats/ATSExplanation'
+import ScreeningReview from './ScreeningReview'
 
 const CHART_COLORS = ['#2b7cba', '#3b82f6', '#22c55e', '#8b5cf6', '#ef4444', '#06b6d4', '#f59e0b', '#ec4899']
 
@@ -113,6 +118,7 @@ const TAB_MAP = { jobs: 'jobs', pipeline: 'pipeline', interviews: 'interviews', 
 export default function HRDashboard() {
   const location = useLocation()
   const navigate = useNavigate()
+  const { user } = useAuth()
 
   const segment = location.pathname.split('/').pop()
   const tab = TAB_MAP[segment] || (segment === 'hr' ? 'overview' : 'overview')
@@ -150,12 +156,14 @@ export default function HRDashboard() {
   const [jobForm, setJobForm] = useState({
     title: '', description: '', requirements: '', department_id: '',
     location: '', employment_type: 'full-time', salary_min: '', salary_max: '',
-    experience_years: 0, required_skills: ''
+    experience_years: 0, required_skills: '', preferred_skills: ''
   })
   const [submitting, setSubmitting] = useState(false)
   const [editJob, setEditJob] = useState(null)
   const [jobPipelines, setJobPipelines] = useState({})
   const [jobFilters, setJobFilters] = useState({ status: '', department: '', employment_type: '', location: '' })
+  // Job Postings sub-tab: jobs this HR owns vs jobs another HR shared with them (co-HR).
+  const [jobScope, setJobScope] = useState('mine')
   const [pipelineCandidates, setPipelineCandidates] = useState({})
   const [pipelineStageFilter, setPipelineStageFilter] = useState(null)
   const [pipelineSearch, setPipelineSearch] = useState('')
@@ -168,6 +176,9 @@ export default function HRDashboard() {
   const [regrading, setRegrading] = useState(false)
   const [regradeError, setRegradeError] = useState('')
   const [proctorDetail, setProctorDetail] = useState(null) // the clicked test-result row `r`
+  const [retestRow, setRetestRow] = useState(null)          // row HR is granting a retest for
+  const [adjustRow, setAdjustRow] = useState(null)          // row whose adjustment request HR is deciding
+  const [adjustList, setAdjustList] = useState(null)        // open requests for one job (card button)
 
   const openAnswerDetail = async (r) => {
     setAnswerDetail({ loading: true, candidate_name: r.candidate_name, data: null })
@@ -235,6 +246,11 @@ export default function HRDashboard() {
   const [viewJob, setViewJob] = useState(null)
   const [atsJob, setAtsJob] = useState(null)
   const [atsCandidates, setAtsCandidates] = useState([])
+  // Response-level facts about the list: current rules/JD version, mixed versions, and
+  // how many resumes could not be read and are held for a person.
+  const [atsMeta, setAtsMeta] = useState(null)
+  const [rescoring, setRescoring] = useState(false)
+  const [screeningJob, setScreeningJob] = useState(null)   // 'Check this ranking' dialog
   const [atsLoading, setAtsLoading] = useState(false)
   const [atsSearch, setAtsSearch] = useState('')
   const [expandedCandidate, setExpandedCandidate] = useState(null)
@@ -596,7 +612,7 @@ HR Team`,
     setTestResults(data)
     // Also refresh the open sheet if showing
     if (testResultJob) {
-      const updated = data.filter(r => r.job_id === testResultJob.job_id)
+      const updated = data.filter(r => r.job_id === testResultJob.job_id && !r.pending)
       setTestResultCandidates(updated)
     }
   }
@@ -742,7 +758,10 @@ HR Team`,
       salary_min: '',
       salary_max: '',
       experience_years: req.min_experience_years || 0,
-      required_skills: [...(req.required_skills || []), ...(req.preferred_skills || [])].join(', ') || (job.required_skills || []).join(', '),
+      // Kept separate: mandatory requirements and nice-to-haves are scored and shown
+      // differently (they used to be merged into one mandatory list here).
+      required_skills: (req.required_skills || []).join(', ') || (job.required_skills || []).join(', '),
+      preferred_skills: (req.preferred_skills || []).join(', '),
     }
     setJobForm(formData)
 
@@ -925,6 +944,7 @@ HR Team`,
         salary_max: jobForm.salary_max ? parseFloat(jobForm.salary_max) : null,
         experience_years: parseInt(jobForm.experience_years) || 0,
         required_skills: jobForm.required_skills.split(',').map(s => s.trim()).filter(Boolean),
+        preferred_skills: (jobForm.preferred_skills || '').split(',').map(s => s.trim()).filter(Boolean),
       })
       // If this was from a candidate request approval, approve the request now
       if (pendingApprovalReqId) {
@@ -935,7 +955,7 @@ HR Team`,
         fetchRequirements()
       }
       setShowModal(false)
-      setJobForm({ title: '', description: '', requirements: '', department_id: '', location: '', employment_type: 'full-time', salary_min: '', salary_max: '', experience_years: 0, required_skills: '' })
+      setJobForm({ title: '', description: '', requirements: '', department_id: '', location: '', employment_type: 'full-time', salary_min: '', salary_max: '', experience_years: 0, required_skills: '', preferred_skills: '' })
       fetchJobs()
     } catch (err) {
       alert(err.response?.data?.detail || 'Failed to create job')
@@ -970,6 +990,106 @@ HR Team`,
     }
   }
 
+  // ── Job transfer (HR → HR) ──
+  // transferJob: the job being handed over, or 'bulk' for "transfer all my jobs".
+  const [transferJob, setTransferJob] = useState(null)
+  const [hrProfiles, setHrProfiles] = useState([])
+  const [transferTo, setTransferTo] = useState('')
+  const [transferReason, setTransferReason] = useState('')
+  const [transferIncludeClosed, setTransferIncludeClosed] = useState(false)
+  const [transferring, setTransferring] = useState(false)
+  const [transferHistory, setTransferHistory] = useState(null)   // null = not loaded
+
+  const openTransfer = (target) => {
+    setTransferJob(target)
+    setTransferTo('')
+    setTransferReason('')
+    setTransferIncludeClosed(false)
+    api.get('/hr/hr-profiles').then(r => setHrProfiles(r.data || [])).catch(() => setHrProfiles([]))
+  }
+
+  const handleTransfer = async () => {
+    if (!transferTo) return
+    const target = hrProfiles.find(h => h.id === transferTo)
+    const isBulk = transferJob === 'bulk'
+    const what = isBulk
+      ? `all of your ${transferIncludeClosed ? '' : 'open '}jobs`
+      : `"${transferJob.title}"`
+    if (!confirm(`Transfer ${what} to ${target?.name || 'the selected HR'}?\n\nCandidates, interviews and offers move with the job, and it will no longer appear in your list.`)) return
+    setTransferring(true)
+    try {
+      const res = isBulk
+        ? await api.post('/hr/jobs/transfer-bulk', {
+            to_hr_id: transferTo,
+            reason: transferReason || null,
+            statuses: transferIncludeClosed ? ['draft', 'pending_approval', 'active', 'closed'] : null,
+          })
+        : await api.post(`/hr/jobs/${transferJob.id}/transfer`, { to_hr_id: transferTo, reason: transferReason || null })
+      alert(res.data?.message || 'Job transferred')
+      setTransferJob(null)
+      fetchJobs()
+      fetchCounts()
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Failed to transfer job')
+    }
+    setTransferring(false)
+  }
+
+  // Transfer history is shown in the View Job modal; reload it whenever a job is opened.
+  useEffect(() => {
+    setTransferHistory(null)
+    if (!viewJob?.id) return
+    api.get(`/hr/jobs/${viewJob.id}/transfer-history`)
+      .then(r => setTransferHistory(r.data || []))
+      .catch(() => setTransferHistory([]))
+  }, [viewJob?.id])
+
+  // ── Co-HRs (shared jobs) ──
+  // A co-HR works the same job as its owner; nothing is copied. Only the owner or an
+  // admin manages the team (and transfers / deletes); a co-HR can only leave.
+  // People's names in the HR Team row: the badge class is all-caps, which is for statuses.
+  const teamChip = { textTransform: 'none', letterSpacing: 0, fontSize: '0.8rem', display: 'inline-flex', alignItems: 'center', gap: 6 }
+  const canManageJob = (job) => job?.my_role === 'owner' || job?.my_role === 'admin' || user?.role === 'admin'
+  const [coHrJob, setCoHrJob] = useState(null)     // job the "Add HR" modal is open for
+  const [coHrPick, setCoHrPick] = useState('')
+  const [coHrSaving, setCoHrSaving] = useState(false)
+
+  const openAddCoHr = (job) => {
+    setCoHrJob(job)
+    setCoHrPick('')
+    api.get('/hr/hr-profiles').then(r => setHrProfiles(r.data || [])).catch(() => setHrProfiles([]))
+  }
+
+  const handleAddCoHr = async () => {
+    if (!coHrPick) return
+    setCoHrSaving(true)
+    try {
+      const res = await api.post(`/hr/jobs/${coHrJob.id}/collaborators`, { hr_id: coHrPick })
+      alert(res.data?.message || 'HR added to the job')
+      setCoHrJob(null)
+      fetchJobs()
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Failed to add HR')
+    }
+    setCoHrSaving(false)
+  }
+
+  const handleRemoveCoHr = async (job, coHr, leaving = false) => {
+    const q = leaving
+      ? `Leave "${job.title}"?\n\nYou will lose access to this job and its candidates.`
+      : `Remove ${coHr.name || 'this HR'} from "${job.title}"?\n\nThey will lose access to this job.`
+    if (!confirm(q)) return
+    try {
+      const res = await api.delete(`/hr/jobs/${job.id}/collaborators/${coHr.hr_id}`)
+      alert(res.data?.message || 'Done')
+      if (leaving) setViewJob(null)
+      else setViewJob(v => v && ({ ...v, collaborators: (v.collaborators || []).filter(c => c.hr_id !== coHr.hr_id) }))
+      fetchJobs()
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Failed to update the job team')
+    }
+  }
+
   // Deleted jobs keep a record: the candidates go to the talent pool, but a test template
   // has no candidate to attach to, so its author survives only here.
   const [deletedJobs, setDeletedJobs] = useState([])
@@ -1000,7 +1120,10 @@ HR Team`,
       employment_type: j.employment_type || 'full-time',
       salary_min: j.salary_min || '', salary_max: j.salary_max || '',
       experience_years: j.experience_years || 0,
-      required_skills: Array.isArray(j.required_skills) ? j.required_skills.join(', ') : (j.required_skills || '')
+      required_skills: Array.isArray(j.required_skills) ? j.required_skills.join(', ') : (j.required_skills || ''),
+      // null = never specified: kept as null so saving an unrelated edit doesn't
+      // switch the job from inferred nice-to-haves to "none".
+      preferred_skills: Array.isArray(j.preferred_skills) ? j.preferred_skills.join(', ') : null,
     })
     setShowModal(true)
   }
@@ -1027,6 +1150,10 @@ HR Team`,
           employment_type: jobForm.employment_type || undefined,
           description: jobForm.description || undefined,
           requirements: jobForm.requirements || undefined,
+          required_skills: jobForm.required_skills ? jobForm.required_skills.split(',').map(s => s.trim()).filter(Boolean) : undefined,
+          preferred_skills: jobForm.preferred_skills == null
+            ? undefined
+            : jobForm.preferred_skills.split(',').map(s => s.trim()).filter(Boolean),
         })
       } else {
         // Regular update: just saves changes, doesn't change status
@@ -1036,6 +1163,9 @@ HR Team`,
           salary_max: jobForm.salary_max ? parseFloat(jobForm.salary_max) : null,
           experience_years: parseInt(jobForm.experience_years) || 0,
           required_skills: jobForm.required_skills.split(',').map(s => s.trim()).filter(Boolean),
+          preferred_skills: jobForm.preferred_skills == null
+            ? undefined
+            : jobForm.preferred_skills.split(',').map(s => s.trim()).filter(Boolean),
         })
       }
       // If this was from a candidate request approval, approve the request now
@@ -1049,7 +1179,7 @@ HR Team`,
       setEditJob(null)
       setIsApprovalMode(false)
       setPendingApprovalReqId(null)
-      setJobForm({ title: '', description: '', requirements: '', department_id: '', location: '', employment_type: 'full-time', salary_min: '', salary_max: '', experience_years: 0, required_skills: '' })
+      setJobForm({ title: '', description: '', requirements: '', department_id: '', location: '', employment_type: 'full-time', salary_min: '', salary_max: '', experience_years: 0, required_skills: '', preferred_skills: '' })
       fetchJobs()
     } catch (err) {
       alert(err.response?.data?.detail || 'Failed to update job')
@@ -1069,22 +1199,60 @@ HR Team`,
     try {
       const res = await api.get(`/hr/jobs/${job.id}/candidates?sort_by=ats_score&order=desc&per_page=100`)
       setAtsCandidates(res.data?.candidates || [])
+      setAtsMeta(res.data || null)
     } catch (err) {
       setAtsCandidates([])
+      setAtsMeta(null)
     }
     api.get('/hr/interviewers').then(r => setInterviewers(r.data || [])).catch(() => {})
     api.get(`/hr/jobs/${job.id}/tests`).then(r => setJobTests(r.data || [])).catch(() => setJobTests([]))
     setAtsLoading(false)
   }
 
+  // Refresh the list without resetting the sheet (after an override or rescore).
+  const reloadAtsCandidates = async () => {
+    if (!atsJob) return
+    try {
+      const res = await api.get(`/hr/jobs/${atsJob.id}/candidates?sort_by=ats_score&order=desc&per_page=100`)
+      setAtsCandidates(res.data?.candidates || [])
+      setAtsMeta(res.data || null)
+    } catch { /* keep what is shown */ }
+  }
+
+  // Rescore results measured against an older job description or older rules, in
+  // batches until none are left. Never automatic: rankings move only when HR asks.
+  const rescoreStale = async () => {
+    if (!atsJob) return
+    setRescoring(true)
+    try {
+      let remaining = 1, total = 0
+      while (remaining > 0) {
+        const r = await api.post(`/hr/jobs/${atsJob.id}/rescore-stale`, { limit: 25 })
+        total += r.data?.rescored || 0
+        remaining = r.data?.remaining || 0
+        if (!r.data?.rescored && !r.data?.failed) break
+      }
+      await reloadAtsCandidates()
+      alert(`Rescored ${total} candidate${total === 1 ? '' : 's'} against the current job description and rules.`)
+    } catch (e) {
+      alert(e?.response?.data?.detail || 'Rescoring failed')
+    } finally {
+      setRescoring(false)
+    }
+  }
+
+  // A resume that could not be read reliably is never ranked, so it never enters an
+  // automatic top-N / top-% pick (or the rejection that follows one).
+  const needsReview = (c) => c.parse_status === 'needs_review'
+
   const handleSelectTopN = () => {
-    const pool = atsCandidates.filter(c => !isMailSent(c))
+    const pool = atsCandidates.filter(c => !isMailSent(c) && !needsReview(c))
     const top = pool.slice(0, topN).map(c => c.candidate_id)
     setSelectedCandidates(new Set(top))
   }
 
   const handleSelectTopPercentile = () => {
-    const pool = atsCandidates.filter(c => !isMailSent(c))
+    const pool = atsCandidates.filter(c => !isMailSent(c) && !needsReview(c))
     if (!pool.length) return
     const count = Math.max(1, Math.ceil(pool.length * topPercentile / 100))
     const top = pool.slice(0, count).map(c => c.candidate_id)
@@ -1295,7 +1463,10 @@ HR Team`,
       employment_type: j.employment_type || 'full-time',
       salary_min: j.salary_min || '', salary_max: j.salary_max || '',
       experience_years: j.experience_years || 0,
-      required_skills: Array.isArray(j.required_skills) ? j.required_skills.join(', ') : (j.required_skills || '')
+      required_skills: Array.isArray(j.required_skills) ? j.required_skills.join(', ') : (j.required_skills || ''),
+      // null = never specified: kept as null so saving an unrelated edit doesn't
+      // switch the job from inferred nice-to-haves to "none".
+      preferred_skills: Array.isArray(j.preferred_skills) ? j.preferred_skills.join(', ') : null,
     })
     setEditJob(null)
     setShowModal(true)
@@ -1342,7 +1513,12 @@ HR Team`,
             notifications.map(n => (
               <div
                 key={n.id}
-                onClick={() => { markRead(n.id); if (n.type === 'test_published') setTab('ats'); if (n.type === 'candidate_request_new') setTab('requirements'); if (n.type === 'job_pending_approval') setTab('jobs') }}
+                onClick={() => { markRead(n.id); if (n.type === 'test_published') setTab('ats'); if (n.type === 'candidate_request_new') setTab('requirements'); if (n.type === 'job_pending_approval' || n.type === 'job_transferred' || n.type === 'job_shared') {
+                  // Open the sub-tab the job now lives in: shared-with-me for co-HR news, mine otherwise.
+                  const toShared = (n.type === 'job_shared' && n.title !== 'Removed from job') || n.title === 'Shared job has a new owner'
+                  setJobScope(toShared ? 'shared' : 'mine')
+                  setTab('jobs')
+                } }}
                 style={{
                   padding: '12px 16px', borderBottom: '1px solid #f9fafb', cursor: 'pointer',
                   background: n.is_read ? '#fff' : '#f0f7ff', transition: 'background 0.2s'
@@ -1515,7 +1691,7 @@ HR Team`,
             <div className="card">
               <div className="flex-between mb-16">
                 <h3>Recent Job Postings</h3>
-                <button className="btn btn-primary btn-sm" onClick={() => { setEditJob(null); setJobForm({ title: '', description: '', requirements: '', department_id: '', location: '', employment_type: 'full-time', salary_min: '', salary_max: '', experience_years: 0, required_skills: '' }); setShowModal(true) }}>
+                <button className="btn btn-primary btn-sm" onClick={() => { setEditJob(null); setJobForm({ title: '', description: '', requirements: '', department_id: '', location: '', employment_type: 'full-time', salary_min: '', salary_max: '', experience_years: 0, required_skills: '', preferred_skills: '' }); setShowModal(true) }}>
                   <Plus size={14} /> New Job
                 </button>
               </div>
@@ -1558,7 +1734,7 @@ HR Team`,
       })()}
 
       {tab === 'jobs' && (() => {
-        const openCreateJob = () => { setEditJob(null); setJobForm({ title: '', description: '', requirements: '', department_id: '', location: '', employment_type: 'full-time', salary_min: '', salary_max: '', experience_years: 0, required_skills: '' }); setShowModal(true) }
+        const openCreateJob = () => { setEditJob(null); setJobForm({ title: '', description: '', requirements: '', department_id: '', location: '', employment_type: 'full-time', salary_min: '', salary_max: '', experience_years: 0, required_skills: '', preferred_skills: '' }); setShowModal(true) }
         const openCreateTest = (jobId = null) => { setCreateTestJobId(jobId); setShowCreateTest(true) }
 
         // Full-screen Create Test wizard, rendered inside the Job Postings area.
@@ -1591,7 +1767,13 @@ HR Team`,
           )
         }
 
-        const filtered = jobs.filter(j => {
+        // Admins see every company job and own none of them, so the split only applies to HR.
+        const showScopeTabs = user?.role !== 'admin'
+        const sharedJobs = jobs.filter(j => j.my_role === 'collaborator')
+        const myJobs = jobs.filter(j => j.my_role !== 'collaborator')
+        const scope = showScopeTabs ? jobScope : 'all'
+        const scopedJobs = scope === 'shared' ? sharedJobs : scope === 'mine' ? myJobs : jobs
+        const filtered = scopedJobs.filter(j => {
           if (jobFilters.status && j.status !== jobFilters.status) return false
           if (jobFilters.department && j.department !== jobFilters.department) return false
           if (jobFilters.employment_type && j.employment_type !== jobFilters.employment_type) return false
@@ -1604,13 +1786,16 @@ HR Team`,
 
         return (
           <div>
-            {/* Header */}
-            <div className="flex-between mb-24">
-              <div>
+            {/* Header — wraps on narrow screens so the actions drop below the title. */}
+            <div className="flex-between mb-24" style={{ flexWrap: 'wrap', gap: 16 }}>
+              <div style={{ minWidth: 220, flex: '1 1 260px' }}>
                 <h3 style={{ fontSize: '1.2rem' }}>Job Postings ({jobs.length})</h3>
                 <span className="text-sm text-muted">Create jobs, build assessments, and track hiring progress</span>
               </div>
-              <div className="flex gap-10" style={{ alignItems: 'center' }}>
+              <div className="flex gap-10" style={{ alignItems: 'center', flexWrap: 'wrap', whiteSpace: 'nowrap' }}>
+                <button className="btn btn-secondary" onClick={() => openTransfer('bulk')} title="Hand all of your jobs over to another HR">
+                  <ArrowRightLeft size={16} /> Transfer All Jobs
+                </button>
                 <button className="btn btn-secondary" onClick={() => openCreateTest(null)} title="Build an AI-generated test for a job">
                   <ClipboardList size={16} /> Create Test
                 </button>
@@ -1620,13 +1805,34 @@ HR Team`,
               </div>
             </div>
 
+            {/* My jobs / Shared with me. Filters below apply within the chosen tab. */}
+            {showScopeTabs && (
+              <div className="tabs" role="tablist" aria-label="Which jobs to show" style={{ marginBottom: 20 }}>
+                {[
+                  { key: 'mine', label: 'My jobs', count: myJobs.length, hint: 'Jobs you own' },
+                  { key: 'shared', label: 'Shared with me', count: sharedJobs.length, hint: 'Jobs another HR added you to as co-HR' },
+                ].map(t => (
+                  <button key={t.key} type="button" role="tab" aria-selected={jobScope === t.key}
+                    className={`tab${jobScope === t.key ? ' active' : ''}`} title={t.hint}
+                    onClick={() => setJobScope(t.key)}
+                    style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                    {t.key === 'shared' ? <Users size={15} /> : <Briefcase size={15} />}
+                    {t.label}
+                    {/* Takes the tab's own colour, so the active count reads as part of the tab. */}
+                    <span style={{ fontSize: '0.74rem', fontWeight: 700, lineHeight: 1, padding: '3px 7px', minWidth: 20, textAlign: 'center',
+                      borderRadius: 999, background: 'var(--surface-input)', color: 'inherit' }}>{t.count}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+
             {/* Filters */}
             <div className="card mb-24" style={{ padding: 20 }}>
               <div className="flex-center gap-8 mb-16" style={{ color: 'var(--text-secondary)', fontWeight: 600, fontSize: '0.9rem' }}>
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
                 Filters
               </div>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 14 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 14 }}>
                 <div className="input-group" style={{ marginBottom: 0 }}>
                   <label>Status</label>
                   <select className="select" value={jobFilters.status} onChange={e => setJobFilters({ ...jobFilters, status: e.target.value })}>
@@ -1660,9 +1866,22 @@ HR Team`,
 
             {/* Job Cards Grid */}
             {filtered.length === 0 ? (
-              <div className="card" style={{ padding: 60, textAlign: 'center', color: 'var(--text-tertiary)' }}>No jobs match your filters</div>
+              <div className="card" style={{ padding: 60, textAlign: 'center', color: 'var(--text-tertiary)' }}>
+                {scopedJobs.length > 0 ? 'No jobs match your filters' : scope === 'shared' ? (<>
+                  <Users size={28} style={{ marginBottom: 10, opacity: 0.6 }} />
+                  <div style={{ color: 'var(--text-secondary)', fontWeight: 600, marginBottom: 4 }}>No shared jobs</div>
+                  <div className="text-sm">When another HR adds you to one of their jobs, it appears here.</div>
+                </>) : scope === 'mine' ? (<>
+                  <Briefcase size={28} style={{ marginBottom: 10, opacity: 0.6 }} />
+                  <div style={{ color: 'var(--text-secondary)', fontWeight: 600, marginBottom: 4 }}>You don't own any jobs yet</div>
+                  <div className="text-sm" style={{ marginBottom: 14 }}>
+                    {sharedJobs.length > 0 ? `${sharedJobs.length} job${sharedJobs.length > 1 ? 's are' : ' is'} shared with you — see Shared with me.` : 'Create a job to start hiring.'}
+                  </div>
+                  <button className="btn btn-primary btn-sm" onClick={openCreateJob}><Plus size={14} /> Create Job</button>
+                </>) : 'No jobs yet'}
+              </div>
             ) : (
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))', gap: 18 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(340px, 100%), 1fr))', gap: 18 }}>
                 {filtered.map(j => {
                   const pipeline = jobPipelines[j.id] || { total: 0, stages: {} }
                   const stageList = [
@@ -1723,6 +1942,20 @@ HR Team`,
                             Type:
                           </span>
                           <span style={{ fontWeight: 500 }}>{j.employment_type}</span>
+
+                          <span style={{ color: 'var(--text-tertiary)', display: 'flex', alignItems: 'center', gap: 6 }}>
+                            <UserCheck size={14} />
+                            Owner HR:
+                          </span>
+                          <span style={{ fontWeight: 500 }}>{j.my_role === 'owner' ? 'You' : (j.hr_name || 'Unassigned')}</span>
+
+                          {j.collaborators?.length > 0 && (<>
+                            <span style={{ color: 'var(--text-tertiary)', display: 'flex', alignItems: 'center', gap: 6 }}>
+                              <Users size={14} />
+                              Co-HR:
+                            </span>
+                            <span style={{ fontWeight: 500 }}>{j.collaborators.map(c => c.hr_id === j.my_hr_id ? 'You' : c.name).join(', ')}</span>
+                          </>)}
                         </div>
                       </div>
 
@@ -1740,10 +1973,8 @@ HR Team`,
                       </div>
 
                       {/* Card Footer */}
-                      <div style={{
-                        padding: '12px 22px', borderTop: '1px solid var(--border-subtle)',
-                        display: 'flex', gap: 10, alignItems: 'center'
-                      }}>
+                      <div style={{ padding: '12px 22px', borderTop: '1px solid var(--border-subtle)' }}>
+                      <div style={{ display: 'flex', gap: 10, alignItems: 'center', whiteSpace: 'nowrap' }}>
                         <button className="btn btn-primary btn-sm" style={{ flex: 1, justifyContent: 'center', borderRadius: 8 }}
                           onClick={() => setViewJob(j)}>
                           Open Job
@@ -1762,6 +1993,21 @@ HR Team`,
                             </button>
                           )
                         })()}
+                      </div>
+                      {/* Who works on the job — owner/admin only, same rule as the Open Job popup.
+                          Kept a step quieter than the hiring actions above it. */}
+                      {canManageJob(j) && (
+                        <div style={{ display: 'flex', gap: 4, marginTop: 8, marginLeft: -8, whiteSpace: 'nowrap' }}>
+                          <button className="btn btn-ghost btn-sm" style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}
+                            onClick={() => openAddCoHr(j)} title="Give another HR access to this same job">
+                            <Plus size={14} /> Add HR
+                          </button>
+                          <button className="btn btn-ghost btn-sm" style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}
+                            onClick={() => openTransfer(j)} title="Hand this job over to another HR">
+                            <ArrowRightLeft size={14} /> Transfer
+                          </button>
+                        </div>
+                      )}
                       </div>
                     </div>
                   )
@@ -1890,7 +2136,7 @@ HR Team`,
             </div>
 
             {/* Stage summary cards */}
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, 1fr)', gap: 14, marginBottom: 24 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(150px, 100%), 1fr))', gap: 14, marginBottom: 24 }}>
               {PIPELINE_STAGES.map(stage => {
                 const count = (pipelineCandidates[stage.key] || []).length
                 const isActive = pipelineStageFilter === stage.key
@@ -1926,8 +2172,8 @@ HR Team`,
 
             {/* Search + Filters */}
             <div className="card" style={{ padding: '14px 18px', marginBottom: 16 }}>
-              <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
-                <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 8, background: 'var(--surface-input)', border: '1px solid var(--border-subtle)', borderRadius: 10, padding: '0 14px' }}>
+              <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+                <div style={{ flex: '1 1 240px', display: 'flex', alignItems: 'center', gap: 8, background: 'var(--surface-input)', border: '1px solid var(--border-subtle)', borderRadius: 10, padding: '0 14px' }}>
                   <Search size={14} color="var(--text-tertiary)" />
                   <input
                     type="text"
@@ -1938,11 +2184,11 @@ HR Team`,
                   />
                   {pipelineSearch && <X size={14} color="var(--text-tertiary)" style={{ cursor: 'pointer', flexShrink: 0 }} onClick={() => setPipelineSearch('')} />}
                 </div>
-                <select className="select" value={pipelineJobFilter} onChange={e => setPipelineJobFilter(e.target.value)} style={{ minWidth: 170 }}>
+                <select className="select" value={pipelineJobFilter} onChange={e => setPipelineJobFilter(e.target.value)} style={{ minWidth: 150, flex: '1 1 150px' }}>
                   <option value="">All Jobs</option>
                   {uniqueJobs.map(j => <option key={j} value={j}>{j}</option>)}
                 </select>
-                <select className="select" value={pipelineExpFilter} onChange={e => setPipelineExpFilter(e.target.value)} style={{ minWidth: 140 }}>
+                <select className="select" value={pipelineExpFilter} onChange={e => setPipelineExpFilter(e.target.value)} style={{ minWidth: 130, flex: '1 1 130px' }}>
                   <option value="">All Experience</option>
                   {EXP_RANGES.map(r => <option key={r} value={r}>{r}</option>)}
                 </select>
@@ -2090,7 +2336,7 @@ HR Team`,
                       </span>
                     </div>
                   </div>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 12, marginBottom: 14 }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(150px, 100%), 1fr))', gap: 12, marginBottom: 14 }}>
                     <div style={{ padding: '8px 12px', background: '#f9fafb', borderRadius: 8 }}>
                       <div style={{ fontSize: '0.65rem', fontWeight: 700, textTransform: 'uppercase', color: '#9ca3af', marginBottom: 2 }}>Email</div>
                       <div style={{ fontSize: '0.82rem', wordBreak: 'break-all' }}>{iv.candidate_email || '—'}</div>
@@ -2313,7 +2559,7 @@ HR Team`,
                 {!templatesError && filteredTemplates.length === 0 && (
                   <div style={{ padding: '30px 0', textAlign: 'center', color: '#9ca3af', fontSize: '0.9rem' }}>No templates for this stage yet.</div>
                 )}
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 14 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(300px, 100%), 1fr))', gap: 14 }}>
                   {filteredTemplates.map(tpl => {
                     const sm = stageMeta[tpl.stage] || stageMeta.custom
                     return (
@@ -2373,7 +2619,7 @@ HR Team`,
                         </div>
 
                         {/* Contact + Offer details */}
-                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 16, marginBottom: 16 }}>
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(160px, 100%), 1fr))', gap: 16, marginBottom: 16 }}>
                           <div style={{ padding: '10px 14px', background: '#f9fafb', borderRadius: 8 }}>
                             <div style={{ fontSize: '0.68rem', fontWeight: 700, textTransform: 'uppercase', color: '#9ca3af', marginBottom: 3 }}>Email</div>
                             <div style={{ fontSize: '0.84rem', fontWeight: 500, wordBreak: 'break-all' }}>{o.candidate_email || o.candidate_name?.split(' ')[0]?.toLowerCase() + '@email.com'}</div>
@@ -2388,7 +2634,7 @@ HR Team`,
                           </div>
                         </div>
 
-                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 12, marginBottom: 16 }}>
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(150px, 100%), 1fr))', gap: 12, marginBottom: 16 }}>
                           <div style={{ textAlign: 'center', padding: '8px 0' }}>
                             <div style={{ fontSize: '1.15rem', fontWeight: 800, color: '#15803d', fontFamily: 'var(--font-display)' }}>₹{Number(o.salary || 0).toLocaleString()}</div>
                             <div style={{ fontSize: '0.68rem', color: '#9ca3af', fontWeight: 600, textTransform: 'uppercase' }}>Salary</div>
@@ -2669,7 +2915,7 @@ HR Team`,
           {jobs.filter(j => j.status === 'active').length === 0 ? (
             <div className="card" style={{ padding: 60, textAlign: 'center', color: 'var(--text-tertiary)' }}>No active jobs found. Jobs must be approved before ATS scores can be viewed.</div>
           ) : (
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 16 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(280px, 100%), 1fr))', gap: 16 }}>
               {jobs.filter(j => j.status === 'active').map(j => {
                 const pipeline = jobPipelines[j.id] || { total: 0 }
                 return (
@@ -2731,7 +2977,7 @@ HR Team`,
             {jobs.length === 0 ? (
               <div className="card" style={{ padding: 60, textAlign: 'center', color: 'var(--text-tertiary)' }}>No jobs found. Create a job posting first.</div>
             ) : (
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 16 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(280px, 100%), 1fr))', gap: 16 }}>
                 {(() => {
                   // Build unified card list: HR's known jobs first, then orphaned groups
                   const knownJobIds = new Set(jobs.map(j => j.id))
@@ -2769,6 +3015,15 @@ HR Team`,
                           <span>{j.location}</span>
                           <span className="mono">{pipeline.total || 0} candidates</span>
                         </div>
+                        {(() => {
+                          const requests = group ? group.results.filter(r => r.accommodation_status === 'requested') : []
+                          return requests.length > 0 && (
+                            <button className="btn btn-sm" onClick={() => setAdjustList(requests)}
+                              style={{ width: '100%', justifyContent: 'center', background: '#fef3c7', color: '#92400e', border: '1px solid #fcd34d' }}>
+                              {requests.length} adjustment request{requests.length === 1 ? '' : 's'} to decide
+                            </button>
+                          )
+                        })()}
                         {resultCount > 0 ? (
                           <button className="btn btn-primary btn-sm" style={{ width: '100%', justifyContent: 'center' }}
                             onClick={() => { setTestResultJob(group); setTestResultCandidates(completedResults); setRound2Sel(new Set()); setRound2Deadline('') }}>
@@ -2911,7 +3166,29 @@ HR Team`,
                       <td style={{ padding: '14px 16px', fontWeight: 600, fontSize: '0.92rem' }}>{r.candidate_name}</td>
                       <td style={{ padding: '14px 16px', fontSize: '0.84rem', color: 'var(--text-secondary)' }}>{r.candidate_email}</td>
                       <td style={{ padding: '14px 16px', fontSize: '0.82rem', fontFamily: 'var(--font-mono)', color: 'var(--text-tertiary)' }}>{r.candidate_phone || '—'}</td>
-                      <td style={{ padding: '14px 16px', fontWeight: 500, fontSize: '0.88rem' }}>{r.title}</td>
+                      <td style={{ padding: '14px 16px', fontWeight: 500, fontSize: '0.88rem' }}>
+                        {r.title}
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 4 }}>
+                          {r.attempt_number > 1 && (
+                            <span style={{ padding: '1px 7px', borderRadius: 8, fontSize: '0.7rem', fontWeight: 700, background: '#eef2ff', color: '#4338ca' }}>Attempt {r.attempt_number}</span>
+                          )}
+                          {r.retest_pending && (
+                            <span style={{ padding: '1px 7px', borderRadius: 8, fontSize: '0.7rem', fontWeight: 700, background: '#e0f2fe', color: '#0369a1' }}>Retest sent</span>
+                          )}
+                          {r.accommodation_status === 'requested' && (
+                            <button onClick={() => setAdjustRow(r)} style={{ padding: '1px 7px', borderRadius: 8, fontSize: '0.7rem', fontWeight: 700, border: 'none', cursor: 'pointer', background: '#fef3c7', color: '#92400e' }}>Adjustment requested</button>
+                          )}
+                          {r.accommodation_status === 'approved' && (r.accommodations_summary || []).length > 0 && (
+                            <span title={r.accommodations_summary.join(', ')} style={{ padding: '1px 7px', borderRadius: 8, fontSize: '0.7rem', fontWeight: 700, background: '#f0fdf4', color: '#166534' }}>Adjusted</span>
+                          )}
+                          {r.explanation_count > 0 && (
+                            <button onClick={() => setProctorDetail(r)} style={{ padding: '1px 7px', borderRadius: 8, fontSize: '0.7rem', fontWeight: 700, border: 'none', cursor: 'pointer', background: '#f0f7f5', color: '#0f5f53' }}>Candidate note</button>
+                          )}
+                          {!r.pending && !r.retest_pending && !['hired', 'offer_sent'].includes(r.candidate_stage) && (
+                            <button onClick={() => setRetestRow(r)} style={{ padding: '1px 7px', borderRadius: 8, fontSize: '0.7rem', fontWeight: 600, border: '1px solid #d1d5db', cursor: 'pointer', background: '#fff', color: '#374151' }}>Grant retest</button>
+                          )}
+                        </div>
+                      </td>
                       <td style={{ padding: '14px 16px', whiteSpace: 'nowrap' }}>
                         {r.two_round ? (
                           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
@@ -2963,9 +3240,18 @@ HR Team`,
                       </td>
                       <td style={{ padding: '14px 16px' }}>
                         {r.red_flags > 0 ? (
-                          <button onClick={() => setProctorDetail(r)} title="View flag types & evidence frames"
-                            style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '3px 10px', borderRadius: 12, fontSize: '0.78rem', fontWeight: 700, border: 'none', cursor: 'pointer', background: r.red_flags >= 5 ? '#fef2f2' : '#fffbeb', color: r.red_flags >= 5 ? '#dc2626' : '#d97706' }}>
-                            ⚑ {r.red_flags}
+                          // Coloured by review state, not by count: many flags is not the
+                          // same as serious ones, and what HR needs to know here is whether
+                          // someone still has to look.
+                          <button onClick={() => setProctorDetail(r)} title="Review flags and evidence"
+                            style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '3px 10px', borderRadius: 12, fontSize: '0.78rem', fontWeight: 700, border: 'none', cursor: 'pointer', background: r.unreviewed_flags > 0 ? '#fffbeb' : '#f3f4f6', color: r.unreviewed_flags > 0 ? '#b45309' : '#4b5563' }}>
+                            ⚑ {r.red_flags} flag{r.red_flags === 1 ? '' : 's'}
+                            {/* A state, not a count: the report folds repeated readings into one
+                                entry that a single review clears, so a number here would not
+                                match what the reviewer sees there. */}
+                            {r.unreviewed_flags === 0 ? ', reviewed'
+                              : r.unreviewed_flags < r.red_flags ? ', partly reviewed'
+                              : ', not reviewed'}
                           </button>
                         ) : (
                           <span style={{ padding: '3px 10px', borderRadius: 12, fontSize: '0.78rem', background: '#f0fdf4', color: '#15803d' }}>✓ Clean</span>
@@ -3051,7 +3337,7 @@ HR Team`,
             </div>
 
             {/* Deadline + Test link */}
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1.4fr', gap: 12, marginBottom: 16 }}>
+            <div className="stack-mobile" style={{ display: 'grid', gridTemplateColumns: '1fr 1.4fr', gap: 12, marginBottom: 16 }}>
               <div className="input-group">
                 <label>Deadline date</label>
                 <input className="input" type="date" value={round2Email.deadline}
@@ -3215,6 +3501,22 @@ HR Team`,
       )}
 
       {/* ═══════════ PROCTORING FLAGS MODAL ═══════════ */}
+      {screeningJob && <ScreeningReview job={screeningJob} onClose={() => setScreeningJob(null)} />}
+      {retestRow && (
+        <RetestModal row={retestRow} onClose={() => setRetestRow(null)}
+          onDone={(res) => {
+            setRetestRow(null)
+            refreshTestResults().catch(() => {})
+            alert(`Retest created (attempt ${res.attempt_number}).${res.email_sent ? ' The candidate has been emailed.' : ' The invitation email could not be sent; let the candidate know.'}`)
+          }} />
+      )}
+      {adjustRow && (
+        <AdjustmentModal row={adjustRow} onClose={() => setAdjustRow(null)}
+          onDone={() => { setAdjustRow(null); setAdjustList(null); refreshTestResults().catch(() => {}) }} />
+      )}
+      {adjustList && !adjustRow && (
+        <AdjustmentRequestsModal rows={adjustList} onClose={() => setAdjustList(null)} onPick={(r) => setAdjustRow(r)} />
+      )}
       {proctorDetail && (
         <div className="modal-overlay" onClick={() => setProctorDetail(null)} style={{ alignItems: 'flex-start', paddingTop: 40 }}>
           <div onClick={e => e.stopPropagation()} style={{
@@ -3699,7 +4001,7 @@ HR Team`,
             {jobs.length === 0 ? (
               <div className="card" style={{ padding: 60, textAlign: 'center', color: 'var(--text-tertiary)' }}>No jobs found</div>
             ) : (
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 16 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(280px, 100%), 1fr))', gap: 16 }}>
                 {jobs.map(j => {
                   // Match by job_id first, fall back to matching by title
                   const group = fbJobGroups[j.id] || fbTitleGroups[j.title?.toLowerCase().trim()]
@@ -3785,7 +4087,7 @@ HR Team`,
                     </div>
 
                     {/* Score bars */}
-                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 12, marginBottom: 12 }}>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(110px, 100%), 1fr))', gap: 12, marginBottom: 12 }}>
                       {[
                         { label: 'Technical', val: f.technical_score, color: '#3b82f6' },
                         { label: 'Communication', val: f.communication_score, color: '#8b5cf6' },
@@ -3962,7 +4264,7 @@ HR Team`,
                 </div>
 
                 {/* Offer Summary */}
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 10, marginBottom: 20 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(96px, 100%), 1fr))', gap: 10, marginBottom: 20 }}>
                   <div style={{ padding: '10px 14px', background: '#f0fdf4', borderRadius: 8, textAlign: 'center' }}>
                     <div style={{ fontSize: '0.68rem', fontWeight: 700, textTransform: 'uppercase', color: '#15803d' }}>Salary</div>
                     <div style={{ fontSize: '1.1rem', fontWeight: 800, color: '#166534' }}>₹{Number(offerForm.salary || 0).toLocaleString()}</div>
@@ -4059,9 +4361,22 @@ HR Team`,
                   value={jobForm.requirements} onChange={e => setJobForm({ ...jobForm, requirements: e.target.value })} />
               </div>
               <div className="input-group">
-                <label>Required Skills * (comma-separated)</label>
+                <label>Mandatory skills * (comma-separated)</label>
                 <input className="input" placeholder="React, TypeScript, Node.js..." required
                   value={jobForm.required_skills} onChange={e => setJobForm({ ...jobForm, required_skills: e.target.value })} />
+                <span className="text-sm text-muted" style={{ marginTop: 4 }}>
+                  Each candidate shows how many of these they meet. Missing ones lower the score but never reject anyone automatically.
+                </span>
+              </div>
+              <div className="input-group">
+                <label>Preferred skills (nice to have, comma-separated)</label>
+                <input className="input" placeholder="Docker, GraphQL..."
+                  value={jobForm.preferred_skills ?? ''} onChange={e => setJobForm({ ...jobForm, preferred_skills: e.target.value })} />
+                <span className="text-sm text-muted" style={{ marginTop: 4 }}>
+                  {jobForm.preferred_skills == null
+                    ? 'Not set: nice-to-haves are read from the job description text.'
+                    : 'Leave empty if there are none.'}
+                </span>
               </div>
               <div className="flex gap-12" style={{ justifyContent: 'flex-end', marginTop: 8 }}>
                 <button type="button" className="btn btn-secondary" onClick={() => { setShowModal(false); setEditJob(null); setIsApprovalMode(false); setPendingApprovalReqId(null) }}>Cancel</button>
@@ -4079,7 +4394,8 @@ HR Team`,
         // Manual Select sends no rejections; Top-N / Top-% auto-reject the remaining unsent
         // candidates (already-emailed candidates are never counted or re-emailed).
         const manualMode = selectionMode === 'manual'
-        const rejectCount = manualMode ? 0 : atsCandidates.filter(c => !isMailSent(c) && !selectedCandidates.has(c.candidate_id)).length
+        const rejectCount = manualMode ? 0 : atsCandidates.filter(c => !isMailSent(c) && !selectedCandidates.has(c.candidate_id) && !needsReview(c)).length
+        const heldCount = manualMode ? 0 : atsCandidates.filter(c => !isMailSent(c) && !selectedCandidates.has(c.candidate_id) && needsReview(c)).length
         return (
         <div className="modal-overlay" onClick={() => setShowEmailPreview(false)} style={{ zIndex: 1100 }}>
           <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 750, maxHeight: '90vh', overflow: 'auto' }}>
@@ -4098,6 +4414,11 @@ HR Team`,
                 <div style={{ fontSize: '0.72rem', fontWeight: 700, textTransform: 'uppercase', color: manualMode ? '#6b7280' : '#dc2626', marginBottom: 4 }}>Auto Reject</div>
                 <div style={{ fontSize: '1.3rem', fontWeight: 800, color: manualMode ? '#6b7280' : '#dc2626' }}>{rejectCount}</div>
                 <div style={{ fontSize: '0.8rem', color: manualMode ? '#9ca3af' : '#ef4444' }}>{manualMode ? 'manual select sends no rejections' : 'candidates will receive rejection'}</div>
+                {heldCount > 0 && (
+                  <div style={{ fontSize: '0.78rem', color: '#92400e', marginTop: 6 }}>
+                    {heldCount} held for manual review: their resume could not be read, so they won't be rejected.
+                  </div>
+                )}
               </div>
             </div>
 
@@ -4482,46 +4803,226 @@ HR Team`,
               )}
             </div>
 
+            <div style={{ marginBottom: 16 }}>
+              <div className="flex-between" style={{ marginBottom: 8 }}>
+                <div style={{ fontSize: '0.72rem', fontWeight: 700, textTransform: 'uppercase', color: 'var(--text-tertiary)', fontFamily: 'var(--font-display)' }}>HR Team</div>
+                {canManageJob(viewJob) ? (
+                  <button type="button" className="btn btn-secondary btn-sm" title="Give another HR access to this same job"
+                    onClick={() => { openAddCoHr(viewJob); setViewJob(null) }}>
+                    <Plus size={14} /> Add HR
+                  </button>
+                ) : viewJob.my_role === 'collaborator' && (
+                  <button type="button" className="btn btn-ghost btn-sm" style={{ color: 'var(--status-danger)' }}
+                    onClick={() => handleRemoveCoHr(viewJob, { hr_id: viewJob.my_hr_id }, true)}>
+                    Leave job
+                  </button>
+                )}
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                <span className="badge badge-purple" style={teamChip} title="Manages the team, can transfer or delete the job">
+                  {viewJob.my_role === 'owner' ? 'You' : (viewJob.hr_name || 'Unassigned')}
+                  <span style={{ opacity: 0.7, fontWeight: 500 }}>owner</span>
+                </span>
+                {(viewJob.collaborators || []).map(c => (
+                  <span key={c.hr_id} className="badge badge-blue" style={teamChip}>
+                    {c.hr_id === viewJob.my_hr_id ? 'You' : c.name}
+                    <span style={{ opacity: 0.7, fontWeight: 500 }}>co-HR</span>
+                    {canManageJob(viewJob) && (
+                      <button type="button" title={`Remove ${c.name}`} onClick={() => handleRemoveCoHr(viewJob, c)}
+                        style={{ background: 'none', border: 'none', padding: 0, cursor: 'pointer', color: 'inherit', display: 'inline-flex' }}>
+                        <X size={12} />
+                      </button>
+                    )}
+                  </span>
+                ))}
+              </div>
+              {transferHistory && transferHistory.length > 0 && (
+                <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {transferHistory.map(t => (
+                    <div key={t.id} style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', padding: '8px 12px', background: 'var(--surface-input)', borderRadius: 8 }}>
+                      <ArrowRightLeft size={12} style={{ verticalAlign: -1, marginRight: 6 }} />
+                      <strong>{t.from_hr_name || 'Unassigned'}</strong> → <strong>{t.to_hr_name}</strong>
+                      <span style={{ color: 'var(--text-tertiary)' }}>
+                        {' '}· by {t.transferred_by_email} · {t.created_at ? new Date(t.created_at).toLocaleString() : ''}
+                        {t.bulk ? ' · bulk' : ''}
+                      </span>
+                      {t.reason && <div style={{ marginTop: 3, fontStyle: 'italic' }}>“{t.reason}”</div>}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
             <div style={{ fontSize: '0.78rem', color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono)', marginBottom: 20 }}>
               Created: {viewJob.created_at ? new Date(viewJob.created_at).toLocaleString() : '—'}
             </div>
 
-            <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', borderTop: '1px solid var(--border-subtle)', paddingTop: 16 }}>
-              <button className="btn btn-secondary" onClick={() => setViewJob(null)}>Close</button>
-              {viewJob.status === 'closed' ? (
-                <button className="btn btn-ghost" style={{ color: 'var(--status-success)' }} onClick={() => handleReopenJob(viewJob.id)}>
-                  <RotateCcw size={15} /> Reopen Job
+            <div style={{ borderTop: '1px solid var(--border-subtle)', paddingTop: 12 }}>
+              {/* Changing the job itself: lifecycle and ownership. Quiet, so the everyday
+                  actions below stay the obvious ones — and Delete is never the loudest button. */}
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginLeft: -8, marginBottom: 12, whiteSpace: 'nowrap' }}>
+                {viewJob.status === 'closed' ? (
+                  <button className="btn btn-ghost btn-sm" style={{ color: 'var(--status-success)' }} onClick={() => handleReopenJob(viewJob.id)}>
+                    <RotateCcw size={14} /> Reopen job
+                  </button>
+                ) : (
+                  /* Archive, not Trash2 — Delete is irreversible and destroys every
+                     candidate, interview and offer attached to the job. */
+                  <button className="btn btn-ghost btn-sm" style={{ color: 'var(--text-secondary)' }} onClick={() => handleCloseJob(viewJob.id)}>
+                    <Archive size={14} /> Close job
+                  </button>
+                )}
+                {/* Owner-only: a co-HR works the job but can't hand it away or delete it. */}
+                {canManageJob(viewJob) && (<>
+                  <button className="btn btn-ghost btn-sm" style={{ color: 'var(--text-secondary)' }} title="Hand this job over to another HR"
+                    onClick={() => { openTransfer(viewJob); setViewJob(null) }}>
+                    <ArrowRightLeft size={14} /> Transfer job
+                  </button>
+                  <button className="btn btn-ghost btn-sm" style={{ color: 'var(--status-danger)' }}
+                    title="Permanently delete the job and everything attached to it"
+                    onClick={() => handleDeleteJobPermanent(viewJob.id)}>
+                    <Trash2 size={14} /> Delete job
+                  </button>
+                </>)}
+              </div>
+
+              {/* Everyday actions. */}
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, whiteSpace: 'nowrap' }}>
+                <button className="btn btn-secondary" style={{ marginRight: 'auto' }} onClick={() => setViewJob(null)}>Close</button>
+                <button className="btn btn-secondary" title="Build an AI-generated test for this job"
+                  onClick={() => { setCreateTestJobId(viewJob.id); setShowCreateTest(true); setViewJob(null) }}>
+                  <ClipboardList size={15} /> Create Test
                 </button>
-              ) : (
-                /* Archive, not Trash2 — the neighbouring Delete Job is irreversible and
-                   destroys every candidate, interview and offer attached to the job. */
-                <button className="btn btn-ghost" style={{ color: 'var(--status-danger)' }} onClick={() => handleCloseJob(viewJob.id)}>
-                  <Archive size={15} /> Close Job
+                <button className="btn btn-primary" onClick={() => { openEditJob(viewJob); setViewJob(null) }}>
+                  <Edit3 size={15} /> Edit Job
                 </button>
-              )}
-              <button className="btn" style={{ background: 'var(--status-danger)', color: '#fff' }} onClick={() => handleDeleteJobPermanent(viewJob.id)}>
-                <Trash2 size={15} /> Delete Job
-              </button>
-              <button className="btn btn-primary" onClick={() => { openEditJob(viewJob); setViewJob(null) }}>
-                <Edit3 size={15} /> Edit Job
-              </button>
-              <button className="btn btn-secondary" title="Build an AI-generated test for this job"
-                onClick={() => { setCreateTestJobId(viewJob.id); setShowCreateTest(true); setViewJob(null) }}>
-                <ClipboardList size={15} /> Create Test
-              </button>
-              {viewJob.status === 'draft' && (
-                <button className="btn btn-primary" style={{ background: '#22c55e' }} onClick={() => {
-                  openEditJob(viewJob)
-                  setIsApprovalMode(true)
-                  setViewJob(null)
-                }}>
-                  Approve & Publish
-                </button>
-              )}
+                {viewJob.status === 'draft' && (
+                  <button className="btn btn-primary" style={{ background: '#22c55e' }} onClick={() => {
+                    openEditJob(viewJob)
+                    setIsApprovalMode(true)
+                    setViewJob(null)
+                  }}>
+                    Approve & Publish
+                  </button>
+                )}
+              </div>
             </div>
           </div>
         </div>
       )}
+
+      {/* ═══════════ ADD A CO-HR TO A JOB ═══════════ */}
+      {coHrJob && (() => {
+        // Only HRs not already on the job — the owner and existing co-HRs can't be re-added.
+        const onJob = new Set([coHrJob.hr_id, ...(coHrJob.collaborators || []).map(c => c.hr_id)])
+        const options = hrProfiles.filter(h => !onJob.has(h.id))
+        return (
+          <div className="modal-overlay" onClick={() => !coHrSaving && setCoHrJob(null)}>
+            <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 520 }}>
+              <h2 style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <Users size={20} /> Add HR to Job
+              </h2>
+              <div style={{ padding: '12px 14px', background: 'var(--surface-input)', borderRadius: 10, marginBottom: 16 }}>
+                <div style={{ fontWeight: 600 }}>{coHrJob.title}</div>
+                <div className="text-sm text-muted">
+                  Owner: {coHrJob.my_role === 'owner' ? 'You' : (coHrJob.hr_name || 'Unassigned')}
+                  {coHrJob.collaborators?.length > 0 && `, co-HR: ${coHrJob.collaborators.map(c => c.name).join(', ')}`}
+                </div>
+              </div>
+
+              <div className="input-group">
+                <label>HR to add *</label>
+                <select className="select" value={coHrPick} onChange={e => setCoHrPick(e.target.value)}>
+                  <option value="">Select HR...</option>
+                  {options.map(h => (
+                    <option key={h.id} value={h.id}>{h.name} — {h.department} ({h.email})</option>
+                  ))}
+                </select>
+                {hrProfiles.length > 0 && options.length === 0 && (
+                  <span className="text-sm text-muted">Every active HR is already on this job.</span>
+                )}
+              </div>
+
+              <div style={{ fontSize: '0.8rem', color: 'var(--text-tertiary)', marginBottom: 16 }}>
+                Both HRs will work on this same job — it is shared, not copied. The added HR gets full access to its candidates, interviews and offers. Only you (the owner) or an admin can remove them, transfer or delete the job.
+              </div>
+
+              <div className="flex gap-12" style={{ justifyContent: 'flex-end' }}>
+                <button type="button" className="btn btn-secondary" disabled={coHrSaving} onClick={() => setCoHrJob(null)}>Cancel</button>
+                <button type="button" className="btn btn-primary" disabled={!coHrPick || coHrSaving} onClick={handleAddCoHr}>
+                  <Plus size={15} /> {coHrSaving ? 'Adding...' : 'Add HR'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )
+      })()}
+
+      {/* ═══════════ TRANSFER JOB(S) TO ANOTHER HR ═══════════ */}
+      {transferJob && (() => {
+        const isBulk = transferJob === 'bulk'
+        // Can't hand a job to the HR who already owns it — for a bulk move, that's you.
+        const myEmail = (user?.email || '').toLowerCase()
+        const options = hrProfiles.filter(h => isBulk
+          ? (h.email || '').toLowerCase() !== myEmail
+          : h.id !== transferJob.hr_id)
+        return (
+          <div className="modal-overlay" onClick={() => !transferring && setTransferJob(null)}>
+            <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 520 }}>
+              <h2 style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <ArrowRightLeft size={20} /> {isBulk ? 'Transfer All My Jobs' : 'Transfer Job'}
+              </h2>
+              {isBulk ? (
+                <p className="text-sm text-muted" style={{ marginBottom: 16 }}>
+                  Every job you own will move to the HR you pick. Use this before leave or when handing over your workload.
+                </p>
+              ) : (
+                <div style={{ padding: '12px 14px', background: 'var(--surface-input)', borderRadius: 10, marginBottom: 16 }}>
+                  <div style={{ fontWeight: 600 }}>{transferJob.title}</div>
+                  <div className="text-sm text-muted">Current owner: {transferJob.hr_name || 'Unassigned'}</div>
+                </div>
+              )}
+
+              <div className="input-group">
+                <label>Transfer to *</label>
+                <select className="select" value={transferTo} onChange={e => setTransferTo(e.target.value)}>
+                  <option value="">Select HR...</option>
+                  {options.map(h => (
+                    <option key={h.id} value={h.id}>{h.name} — {h.department} ({h.email})</option>
+                  ))}
+                </select>
+                {hrProfiles.length > 0 && options.length === 0 && (
+                  <span className="text-sm text-muted">No other active HR in your company.</span>
+                )}
+              </div>
+
+              <div className="input-group">
+                <label>Reason (optional)</label>
+                <textarea className="textarea" rows={2} maxLength={500} placeholder="e.g. Going on leave, workload balancing..."
+                  value={transferReason} onChange={e => setTransferReason(e.target.value)} />
+              </div>
+
+              {isBulk && (
+                <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.88rem', marginBottom: 12, cursor: 'pointer' }}>
+                  <input type="checkbox" checked={transferIncludeClosed} onChange={e => setTransferIncludeClosed(e.target.checked)} />
+                  Include closed jobs
+                </label>
+              )}
+
+              <div style={{ fontSize: '0.8rem', color: 'var(--text-tertiary)', marginBottom: 16 }}>
+                Candidates, interviews and offers move with the job. Both HRs are notified and the move is recorded in the job's history.
+              </div>
+
+              <div className="flex gap-12" style={{ justifyContent: 'flex-end' }}>
+                <button type="button" className="btn btn-secondary" disabled={transferring} onClick={() => setTransferJob(null)}>Cancel</button>
+                <button type="button" className="btn btn-primary" disabled={!transferTo || transferring} onClick={handleTransfer}>
+                  <ArrowRightLeft size={15} /> {transferring ? 'Transferring...' : 'Transfer'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )
+      })()}
 
       {/* ═══════════ ATS CANDIDATE SHEET ═══════════ */}
       {atsJob && (
@@ -4540,6 +5041,26 @@ HR Team`,
                     {atsJob.department} &middot; {atsJob.location} &middot; {atsCandidates.length} candidates
                     {selectedCandidates.size > 0 && <span style={{ color: 'var(--accent-primary)', fontWeight: 600 }}> &middot; {selectedCandidates.size} selected</span>}
                   </div>
+                  {(() => {
+                    const staleCount = atsCandidates.filter(c => c.is_stale).length
+                    const mixed = (atsMeta?.rules_versions_present || []).length > 1
+                    if (!staleCount && !mixed) return null
+                    return (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginTop: 8, padding: '8px 12px', borderRadius: 8, background: '#fffbeb', border: '1px solid #fde68a', fontSize: '0.8rem', color: '#92400e' }}>
+                        <span>
+                          {staleCount > 0
+                            ? `${staleCount} score${staleCount === 1 ? ' was' : 's were'} measured against an earlier job description or older scoring rules, so this ranking mixes versions.`
+                            : 'This ranking mixes scores from different scoring-rule versions.'}
+                        </span>
+                        {staleCount > 0 && (
+                          <button className="btn btn-sm" onClick={rescoreStale} disabled={rescoring}
+                            style={{ background: '#fff', border: '1px solid #f59e0b', color: '#92400e' }}>
+                            {rescoring ? 'Rescoring…' : `Rescore ${staleCount}`}
+                          </button>
+                        )}
+                      </div>
+                    )
+                  })()}
                 </div>
                 <div className="flex gap-8">
                   <div style={{ background: 'var(--surface-input)', border: '1px solid var(--border-subtle)', borderRadius: 8, padding: '0 12px', display: 'flex', alignItems: 'center', gap: 8, width: 220 }}>
@@ -4547,6 +5068,9 @@ HR Team`,
                     <input className="input" style={{ border: 'none', background: 'none', padding: '7px 0', boxShadow: 'none', fontSize: '0.85rem' }}
                       placeholder="Search..." value={atsSearch} onChange={e => setAtsSearch(e.target.value)} />
                   </div>
+                  <button className="btn btn-ghost btn-sm" onClick={() => setScreeningJob(atsJob)} title="Review applicants below the cutoff blind, to find suitable people the ranking missed">
+                    Check this ranking
+                  </button>
                   <button className="btn btn-ghost btn-sm" onClick={() => setAtsJob(null)} style={{ fontSize: '1.1rem', padding: '6px 10px' }}>x</button>
                 </div>
               </div>
@@ -4755,18 +5279,31 @@ HR Team`,
                     </tr>
                   </thead>
                   <tbody>
-                    {atsCandidates
-                      .filter(c => !atsSearch || c.name?.toLowerCase().includes(atsSearch.toLowerCase()) || c.email?.toLowerCase().includes(atsSearch.toLowerCase()))
-                      .map((c, i) => {
+                    {(() => {
+                      const visible = atsCandidates.filter(c => !atsSearch || c.name?.toLowerCase().includes(atsSearch.toLowerCase()) || c.email?.toLowerCase().includes(atsSearch.toLowerCase()))
+                      const held = visible.filter(needsReview)
+                      const ranked = visible.filter(c => !needsReview(c))
+                      return [...held.map(c => ({ c, i: null })), ...ranked.map((c, i) => ({ c, i }))]
+                    })()
+                      .map(({ c, i }, idx, rows) => {
+                        const held = needsReview(c)
                         const scoreColor = c.ats_score >= 80 ? '#22c55e' : c.ats_score >= 60 ? '#2b7cba' : c.ats_score >= 40 ? '#f59e0b' : '#ef4444'
-                        // Selection band by ATS score: green (selected) >=70, yellow (pending) 50-69, red (rejected) <50
-                        const band = c.ats_score >= 70 ? 'green' : c.ats_score >= 50 ? 'yellow' : 'red'
-                        const bandColor = band === 'green' ? '#22c55e' : band === 'yellow' ? '#f59e0b' : '#ef4444'
-                        const bandTint  = band === 'green' ? '#f0fdf4' : band === 'yellow' ? '#fffbeb' : '#fef2f2'
+                        // Selection band by ATS score: green (selected) >=70, yellow (pending) 50-69, red (rejected) <50.
+                        // Unreadable resumes get no band: they are not ranked.
+                        const band = held ? 'none' : c.ats_score >= 70 ? 'green' : c.ats_score >= 50 ? 'yellow' : 'red'
+                        const bandColor = band === 'none' ? '#9ca3af' : band === 'green' ? '#22c55e' : band === 'yellow' ? '#f59e0b' : '#ef4444'
+                        const bandTint  = band === 'none' ? '#f9fafb' : band === 'green' ? '#f0fdf4' : band === 'yellow' ? '#fffbeb' : '#fef2f2'
                         const isExpanded = expandedCandidate === c.candidate_id
                         const sent = isMailSent(c)
+                        const cols = selectMode ? 8 : 7
+                        const groupHeader = held && idx === 0
+                          ? `Needs manual review (${rows.filter(r => r.i === null).length}): the resume could not be read reliably, so it is not ranked and will never be rejected automatically.`
+                          : (!held && i === 0 && idx > 0) ? 'Ranked by resume match' : null
                         return (
                           <React.Fragment key={c.candidate_id}>
+                            {groupHeader && (
+                              <tr><td colSpan={cols} style={{ padding: '10px 16px', fontSize: '0.8rem', fontWeight: 700, color: held ? '#92400e' : '#374151', background: held ? '#fffbeb' : '#f3f4f6' }}>{groupHeader}</td></tr>
+                            )}
                             <tr style={{
                                 borderBottom: '1px solid #f3f4f6', transition: 'background 0.1s', cursor: 'pointer',
                                 background: selectedCandidates.has(c.candidate_id) ? '#fef3eb' : bandTint
@@ -4780,11 +5317,27 @@ HR Team`,
                               </td>}
                               {/* Rank */}
                               <td style={{ padding: '14px 16px', fontFamily: 'var(--font-mono)', fontSize: '0.8rem', color: selectedCandidates.has(c.candidate_id) ? 'var(--accent-primary)' : '#9ca3af', fontWeight: 600, borderLeft: selectMode ? undefined : `4px solid ${bandColor}` }}>
-                                {i + 1}
+                                {i === null ? '—' : i + 1}
                               </td>
                               {/* Name */}
                               <td style={{ padding: '14px 16px' }}>
                                 <div style={{ fontWeight: 600, fontSize: '0.92rem' }}>{c.name}</div>
+                                {c.mandatory_total > 0 && !held && (
+                                  <div style={{ fontSize: '0.74rem', marginTop: 2, color: c.mandatory_met === c.mandatory_total ? '#15803d' : '#92400e' }}>
+                                    Meets {c.mandatory_met} of {c.mandatory_total} mandatory
+                                  </div>
+                                )}
+                                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                                  {c.is_overridden && (
+                                    <span title={`Model score ${Math.round(c.model_score)}`} style={{ marginTop: 4, padding: '1px 7px', borderRadius: 4, background: '#eef2ff', color: '#4338ca', fontSize: '0.68rem', fontWeight: 700 }}>Score set by HR</span>
+                                  )}
+                                  {c.stale_reason === 'jd_changed' && (
+                                    <span title={`Scored against job description v${c.jd_version_no}; current is v${atsMeta?.current_jd_version_no}`} style={{ marginTop: 4, padding: '1px 7px', borderRadius: 4, background: '#fffbeb', color: '#92400e', fontSize: '0.68rem', fontWeight: 700 }}>Job description changed since scoring</span>
+                                  )}
+                                  {c.stale_reason === 'rules_updated' && (
+                                    <span title={`Scored under ${c.scoring_rules_version}; current is ${atsMeta?.current_rules_version}`} style={{ marginTop: 4, padding: '1px 7px', borderRadius: 4, background: '#fffbeb', color: '#92400e', fontSize: '0.68rem', fontWeight: 700 }}>Scoring rules updated since</span>
+                                  )}
+                                </div>
                                 {c.plagiarism_flag && (
                                   <div title="Resume overlaps heavily with the job description" style={{
                                     display: 'inline-flex', alignItems: 'center', gap: 4, marginTop: 4,
@@ -4803,6 +5356,11 @@ HR Team`,
                               </td>
                               {/* ATS Score */}
                               <td style={{ padding: '14px 16px', textAlign: 'center' }}>
+                                {held ? (
+                                  <div title={(c.parse_issues || []).join(' ')} style={{ fontSize: '0.75rem', fontWeight: 700, color: '#92400e', background: '#fef3c7', borderRadius: 8, padding: '6px 8px', lineHeight: 1.3 }}>
+                                    Not ranked<br/><span style={{ fontWeight: 500 }}>Read the resume</span>
+                                  </div>
+                                ) : (<>
                                 <div style={{
                                   display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
                                   width: 52, height: 52, borderRadius: '50%',
@@ -4816,6 +5374,7 @@ HR Team`,
                                 <div style={{ fontSize: '0.68rem', fontWeight: 600, color: scoreColor, marginTop: 2, textTransform: 'uppercase', fontFamily: 'var(--font-display)' }}>
                                   {c.ats_level || (c.ats_score >= 80 ? 'Excellent' : c.ats_score >= 60 ? 'Good' : c.ats_score >= 40 ? 'Fair' : 'Low')}
                                 </div>
+                                </>)}
                               </td>
                               {/* Stage */}
                               <td style={{ padding: '14px 16px' }}>
@@ -4844,7 +5403,8 @@ HR Team`,
                               </td>
                               {/* Experience */}
                               <td style={{ padding: '14px 16px', fontFamily: 'var(--font-mono)', fontSize: '0.85rem', fontWeight: 500 }}>
-                                {c.experience_years || 0}y
+                                {/* 0 here usually means none found on the resume, not zero years */}
+                                {c.experience_years ? `${c.experience_years}y` : <span title="Not stated on the resume" style={{ color: '#9ca3af' }}>—</span>}
                               </td>
                               {/* Expand */}
                               <td style={{ padding: '14px 16px', textAlign: 'center' }}>
@@ -4861,192 +5421,17 @@ HR Team`,
                               <tr>
                                 <td colSpan={selectMode ? 8 : 7} style={{ padding: '0 16px 20px', background: '#fafbfc' }}>
                                   <div style={{ padding: '18px 20px', background: '#fff', borderRadius: 12, border: '1px solid var(--border-subtle)', marginTop: 4 }}>
-                                    {/* ATS Score Breakdown Detail (recruiter rubric) */}
+                                    {/* What the score rests on: evidence with resume excerpts, unknowns kept
+                                        separate from gaps, and provenance (components/ats/ATSExplanation). */}
                                     <div style={{ marginBottom: 20, padding: 16, background: '#f9fafb', borderRadius: 10 }}>
-                                      {(() => {
-                                        const bd = c.scoring_breakdown
-                                        const ind = (bd && bd.individual_scores) || {}
-                                        const wc  = (bd && bd.weighted_contributions) || {}
-                                        const sub = (bd && bd.sub_scores) || {}
-                                        const edu = sub.education || {}
-                                        const exp = sub.experience || {}
-                                        const skl = sub.skills || {}
-                                        const rating = c.rating || (bd && bd.rating)
-                                        const rec = c.hiring_recommendation || (bd && bd.hiring_recommendation)
-                                        const strengths = c.strengths || (bd && bd.strengths) || []
-                                        const weaknesses = c.weaknesses || (bd && bd.weaknesses) || []
-                                        const missingPreferred = c.missing_preferred_skills || (bd && bd.missing_preferred_skills) || []
-                                        const FACTORS = [
-                                          { key:'education', label:'Education', weight:35, color:'#6366f1', icon:'🎓', desc:'Degree match (40) + College tier (30) + CGPA (30)' },
-                                          { key:'skills_match', label:'Skills', weight:25, color:'#3b82f6', icon:'🎯', desc:'Required skills (70) + Preferred skills (30)' },
-                                          { key:'experience', label:'Experience', weight:15, color:'#22c55e', icon:'📈', desc:'Relevant exp (50) + Internships (25) + GitHub/OSS/Hackathons (25)' },
-                                          { key:'certification', label:'Certifications', weight:10, color:'#f59e0b', icon:'📜', desc:'Count + relevance of professional certifications' },
-                                          { key:'semantic', label:'Semantic Match', weight:5, color:'#8b5cf6', icon:'🧠', desc:'Meaning-level similarity of the resume to the JD' },
-                                          { key:'project', label:'Projects', weight:5, color:'#ec4899', icon:'🧩', desc:'Relevance of projects to the JD' },
-                                          { key:'keyword', label:'Keywords', weight:5, color:'#0ea5e9', icon:'🔑', desc:'JD keyword coverage in the resume' },
-                                        ]
-                                        const ratingColors = { 'Excellent':'#16a34a','Very Good':'#0d9488','Good':'#d97706','Average':'#ea580c','Poor':'#dc2626' }
-                                        const rColor = ratingColors[rating] || scoreColor
-                                        const secHeader = { fontSize:'0.72rem', fontWeight:700, textTransform:'uppercase', color:'#9ca3af', marginBottom:8, fontFamily:'var(--font-display)' }
-                                        const contrib = (f) => (wc[f.key] != null ? wc[f.key] : ((ind[f.key]||0) * f.weight / 100))
-                                        const SubBar = ({ label, val, max, color }) => (
-                                          <div style={{ marginBottom: 7 }}>
-                                            <div style={{ display:'flex', justifyContent:'space-between', fontSize:'0.76rem', marginBottom:3 }}>
-                                              <span>{label}</span>
-                                              <span style={{ fontFamily:'var(--font-mono)', fontWeight:700, color }}>{val==null?'—':Math.round(val)}<span style={{ color:'#9ca3af' }}>/{max}</span></span>
-                                            </div>
-                                            <div style={{ height:6, background:'#eef2f6', borderRadius:3, overflow:'hidden' }}>
-                                              <div style={{ width:`${val==null?0:Math.min(100,(val/max)*100)}%`, height:'100%', background:color }} />
-                                            </div>
-                                          </div>
-                                        )
-
-                                        if (!bd) {
-                                          return (
-                                            <div style={{ padding:12, background:'#fffbeb', border:'1px solid #fde68a', borderRadius:8, fontSize:'0.82rem', color:'#92400e' }}>
-                                              Detailed breakdown isn't available for this candidate (scored before the new rubric). Overall ATS: <strong>{Math.round(c.ats_score)}/100</strong>. Re-score the candidate to see the full breakdown.
-                                            </div>
-                                          )
-                                        }
-                                        const chartData = FACTORS.map(f => ({ name: f.label, score: Math.round(ind[f.key]||0), fill: f.color }))
-
-                                        return (
-                                          <>
-                                            {/* Header: score + rating + recommendation */}
-                                            <div style={{ display:'flex', alignItems:'center', gap:16, flexWrap:'wrap', marginBottom:14 }}>
-                                              <div style={{ display:'inline-flex', alignItems:'center', justifyContent:'center', width:66, height:66, borderRadius:'50%', border:`4px solid ${rColor}`, background:`${rColor}12`, fontFamily:'var(--font-display)', fontWeight:800, fontSize:'1.4rem', color:rColor }}>{Math.round(c.ats_score)}</div>
-                                              <div style={{ minWidth:0 }}>
-                                                <span style={{ display:'inline-block', padding:'3px 14px', borderRadius:20, background:`${rColor}18`, color:rColor, fontWeight:800, fontSize:'0.82rem', letterSpacing:0.3 }}>{rating || '—'}</span>
-                                                <div style={{ fontSize:'0.9rem', color:'#374151', marginTop:6, fontWeight:600 }}>💼 {rec || 'No recommendation'}</div>
-                                              </div>
-                                            </div>
-
-                                            {c.plagiarism_flag && (
-                                              <div style={{ marginBottom:12, padding:'10px 14px', borderRadius:8, background:'#fef2f2', border:'1px solid #fecaca', color:'#b91c1c', fontSize:'0.8rem', lineHeight:1.5 }}>
-                                                <strong>⚠ Possible JD copy.</strong> This resume/profile shares{c.jd_overlap != null ? ` ${Math.round(c.jd_overlap * 100)}%` : ' a high amount'} of verbatim text with the job description — the candidate may have pasted the JD to inflate their match. Review the resume before trusting the score.
-                                              </div>
-                                            )}
-
-                                            {/* Factor score cards */}
-                                            <div style={secHeader}>Weighted Factor Breakdown</div>
-                                            <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(230px,1fr))', gap:10, marginBottom:16 }}>
-                                              {FACTORS.map(f => { const v = Math.round(ind[f.key]||0); return (
-                                                <div key={f.key} style={{ padding:12, background:'#fff', borderRadius:8, border:'1px solid #e5e7eb' }}>
-                                                  <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:6 }}>
-                                                    <span style={{ fontWeight:700, fontSize:'0.82rem', fontFamily:'var(--font-display)' }}>{f.icon} {f.label}</span>
-                                                    <span style={{ fontFamily:'var(--font-mono)', fontWeight:800, color:f.color }}>{v}<span style={{ fontSize:'0.7rem', color:'#9ca3af' }}>/100</span></span>
-                                                  </div>
-                                                  <div style={{ height:7, background:'#f3f4f6', borderRadius:4, overflow:'hidden', marginBottom:6 }}>
-                                                    <div style={{ width:`${Math.min(v,100)}%`, height:'100%', background:f.color, transition:'width 0.6s ease' }} />
-                                                  </div>
-                                                  <div style={{ fontSize:'0.7rem', color:'#6b7280', lineHeight:1.45 }}>{f.desc}</div>
-                                                  <div style={{ fontSize:'0.66rem', color:'#9ca3af', marginTop:4, fontFamily:'var(--font-mono)' }}>Weight {f.weight}% → contributes {contrib(f).toFixed(1)} pts</div>
-                                                </div>
-                                              )})}
-                                            </div>
-
-                                            {/* Sub-scores + factor chart */}
-                                            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:16, marginBottom:16 }}>
-                                              <div>
-                                                <div style={secHeader}>🎓 Education — {Math.round(ind.education||0)}/100</div>
-                                                <SubBar label="Degree match" val={edu.degree_match} max={40} color="#6366f1" />
-                                                <SubBar label={`College tier${edu.tier ? ' ('+edu.tier.replace('_',' ')+')' : ''}`} val={edu.college_tier} max={30} color="#8b5cf6" />
-                                                <SubBar label={`CGPA${edu.cgpa_found ? '' : ' (not found)'}`} val={edu.cgpa} max={30} color="#a855f7" />
-                                                <div style={{ ...secHeader, marginTop:12 }}>📈 Experience — {Math.round(ind.experience||0)}/100</div>
-                                                <SubBar label="Relevant experience" val={exp.relevant_experience} max={50} color="#22c55e" />
-                                                <SubBar label={`Internships (${exp.internship_count||0})`} val={exp.internships} max={25} color="#16a34a" />
-                                                <SubBar label="GitHub / OSS / Hackathons" val={exp.github_oss_hackathons} max={25} color="#15803d" />
-                                                <div style={{ ...secHeader, marginTop:12 }}>🎯 Skills — {Math.round(ind.skills_match||0)}/100</div>
-                                                <SubBar label="Required skills" val={skl.required_skills} max={70} color="#3b82f6" />
-                                                <SubBar label={`Preferred skills${skl.has_preferred ? '' : ' (none listed)'}`} val={skl.preferred_skills} max={30} color="#0ea5e9" />
-                                              </div>
-                                              <div>
-                                                <div style={secHeader}>Factor Scores (out of 100)</div>
-                                                <ResponsiveContainer width="100%" height={300}>
-                                                  <BarChart data={chartData} layout="vertical" margin={{ left: 20, right: 28, top: 4, bottom: 4 }}>
-                                                    <XAxis type="number" domain={[0,100]} hide />
-                                                    <YAxis type="category" dataKey="name" width={92} tick={{ fontSize: 11 }} />
-                                                    <Tooltip formatter={(v)=>[`${v}/100`, 'Score']} />
-                                                    <Bar dataKey="score" radius={[0,4,4,0]} isAnimationActive={false}>
-                                                      {chartData.map((e,i)=><Cell key={i} fill={e.fill} />)}
-                                                      <LabelList dataKey="score" position="right" style={{ fontSize:11, fontWeight:700 }} />
-                                                    </Bar>
-                                                  </BarChart>
-                                                </ResponsiveContainer>
-                                              </div>
-                                            </div>
-
-                                            {/* Weighted calculation table */}
-                                            <div style={secHeader}>Weighted Calculation</div>
-                                            <div style={{ background:'#fff', border:'1px solid #e5e7eb', borderRadius:8, overflow:'hidden', marginBottom:16 }}>
-                                              <table style={{ width:'100%', borderCollapse:'collapse', fontSize:'0.78rem' }}>
-                                                <thead>
-                                                  <tr style={{ background:'#f9fafb', textAlign:'left', color:'#6b7280' }}>
-                                                    <th style={{ padding:'7px 12px' }}>Factor</th>
-                                                    <th style={{ padding:'7px 12px' }}>Score</th>
-                                                    <th style={{ padding:'7px 12px' }}>Weight</th>
-                                                    <th style={{ padding:'7px 12px' }}>Contribution</th>
-                                                  </tr>
-                                                </thead>
-                                                <tbody>
-                                                  {FACTORS.map(f => (
-                                                    <tr key={f.key} style={{ borderTop:'1px solid #f1f5f9' }}>
-                                                      <td style={{ padding:'7px 12px' }}>{f.icon} {f.label}</td>
-                                                      <td style={{ padding:'7px 12px', fontFamily:'var(--font-mono)' }}>{Math.round(ind[f.key]||0)}</td>
-                                                      <td style={{ padding:'7px 12px', fontFamily:'var(--font-mono)' }}>{f.weight}%</td>
-                                                      <td style={{ padding:'7px 12px', fontFamily:'var(--font-mono)', fontWeight:700 }}>{contrib(f).toFixed(2)}</td>
-                                                    </tr>
-                                                  ))}
-                                                  {bd.bonus && bd.bonus.rural_bonus > 0 && (
-                                                    <tr style={{ borderTop:'1px solid #f1f5f9', color:'#0d9488' }}>
-                                                      <td style={{ padding:'7px 12px' }}>🏡 Rural address bonus</td>
-                                                      <td /><td />
-                                                      <td style={{ padding:'7px 12px', fontFamily:'var(--font-mono)', fontWeight:700 }}>+{bd.bonus.rural_bonus.toFixed(2)}</td>
-                                                    </tr>
-                                                  )}
-                                                  <tr style={{ borderTop:'2px solid #e5e7eb', background:'#f9fafb', fontWeight:800 }}>
-                                                    <td style={{ padding:'9px 12px' }}>Final ATS Score (capped at 100)</td>
-                                                    <td /><td />
-                                                    <td style={{ padding:'9px 12px', fontFamily:'var(--font-mono)', color:scoreColor }}>{Math.round(c.ats_score)}</td>
-                                                  </tr>
-                                                </tbody>
-                                              </table>
-                                            </div>
-
-                                            {/* Strengths / Weaknesses */}
-                                            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:16 }}>
-                                              <div style={{ padding:12, background:'#f0fdf4', border:'1px solid #bbf7d0', borderRadius:8 }}>
-                                                <div style={{ ...secHeader, color:'#15803d', marginBottom:6 }}>✅ Strengths</div>
-                                                {strengths.length ? strengths.map((s,i)=>(<div key={i} style={{ fontSize:'0.8rem', color:'#166534', marginBottom:3 }}>• {s}</div>)) : <span style={{ color:'#9ca3af', fontSize:'0.8rem' }}>None identified</span>}
-                                              </div>
-                                              <div style={{ padding:12, background:'#fef2f2', border:'1px solid #fecaca', borderRadius:8 }}>
-                                                <div style={{ ...secHeader, color:'#b91c1c', marginBottom:6 }}>⚠️ Weaknesses</div>
-                                                {weaknesses.length ? weaknesses.map((s,i)=>(<div key={i} style={{ fontSize:'0.8rem', color:'#991b1b', marginBottom:3 }}>• {s}</div>)) : <span style={{ color:'#9ca3af', fontSize:'0.8rem' }}>None identified</span>}
-                                              </div>
-                                            </div>
-
-                                            {/* Missing skills */}
-                                            <div style={{ marginTop:14 }}>
-                                              <div style={secHeader}>Missing Required Skills</div>
-                                              <div style={{ display:'flex', flexWrap:'wrap', gap:4 }}>
-                                                {(c.missing_skills||[]).length ? c.missing_skills.map((s,i)=>(<span key={i} style={{ padding:'2px 8px', background:'#fef2f2', color:'#dc2626', borderRadius:4, fontSize:'0.74rem', fontWeight:500 }}>{s}</span>)) : <span style={{ color:'#9ca3af', fontSize:'0.8rem' }}>None — all required skills present</span>}
-                                              </div>
-                                              {missingPreferred.length > 0 && (
-                                                <>
-                                                  <div style={{ ...secHeader, marginTop:10 }}>Missing Preferred Skills</div>
-                                                  <div style={{ display:'flex', flexWrap:'wrap', gap:4 }}>
-                                                    {missingPreferred.map((s,i)=>(<span key={i} style={{ padding:'2px 8px', background:'#fff7ed', color:'#c2410c', borderRadius:4, fontSize:'0.74rem', fontWeight:500 }}>{s}</span>))}
-                                                  </div>
-                                                </>
-                                              )}
-                                            </div>
-                                          </>
-                                        )
-                                      })()}
+                                      <ATSExplanation
+                                        loadUrl={`/hr/jobs/${atsJob.id}/candidates/${c.candidate_id}/ats-explanation`}
+                                        onRescore={async () => { await api.post(`/hr/jobs/${atsJob.id}/candidates/${c.candidate_id}/rescore`); reloadAtsCandidates() }}
+                                      />
                                     </div>
 
                                     {/* Contact + Photo + Skills */}
-                                    <div style={{ display: 'grid', gridTemplateColumns: 'auto 1fr 1fr 1fr', gap: 20, marginBottom: 16, alignItems: 'start' }}>
+                                    <div className="stack-mobile" style={{ display: 'grid', gridTemplateColumns: 'auto 1fr 1fr 1fr', gap: 20, marginBottom: 16, alignItems: 'start' }}>
                                       {/* Photo column */}
                                       <div style={{ textAlign: 'center' }}>
                                         <div style={{ fontSize: '0.72rem', fontWeight: 700, textTransform: 'uppercase', color: '#9ca3af', marginBottom: 6, fontFamily: 'var(--font-display)' }}>Photo</div>
@@ -5059,7 +5444,7 @@ HR Team`,
                                         <div style={{ fontSize: '0.72rem', fontWeight: 700, textTransform: 'uppercase', color: '#9ca3af', marginBottom: 6, fontFamily: 'var(--font-display)' }}>Contact Info</div>
                                         <div style={{ fontSize: '0.88rem', marginBottom: 4 }}><strong>Email:</strong> {c.email}</div>
                                         <div style={{ fontSize: '0.88rem', marginBottom: 4 }}><strong>Phone:</strong> {c.phone || 'Not provided'}</div>
-                                        <div style={{ fontSize: '0.88rem' }}><strong>Experience:</strong> {c.experience_years || 0} years</div>
+                                        <div style={{ fontSize: '0.88rem' }}><strong>Experience:</strong> {c.experience_years ? `${c.experience_years} years` : 'Not stated on the resume'}</div>
                                         {c.resume_path && (
                                           <a href={`/${c.resume_path}`} target="_blank" rel="noreferrer"
                                              style={{ display: 'inline-block', marginTop: 10, padding: '6px 14px', borderRadius: 8,
@@ -5094,8 +5479,24 @@ HR Team`,
                                         )) : <span style={{ color: '#9ca3af', fontSize: '0.84rem' }}>No skills extracted</span>}
                                       </div>
                                     </div>
+                                    {held && (
+                                      <div style={{ marginTop: 14, padding: '12px 14px', borderRadius: 10, background: '#fffbeb', border: '1px solid #fde68a' }}>
+                                        <div style={{ fontSize: '0.85rem', fontWeight: 700, color: '#92400e', marginBottom: 4 }}>Why this resume needs a person</div>
+                                        <ul style={{ margin: 0, paddingLeft: 18, fontSize: '0.82rem', color: '#78350f', lineHeight: 1.6 }}>
+                                          {(c.parse_issues || ['The resume text could not be read reliably.']).map((t, ti) => <li key={ti}>{t}</li>)}
+                                        </ul>
+                                        <div style={{ fontSize: '0.8rem', color: '#78350f', marginTop: 6 }}>
+                                          Open the resume and judge it directly. You can set a score below once you have.
+                                        </div>
+                                      </div>
+                                    )}
+                                    <ATSOverridePanel jobId={atsJob.id} candidate={c} onChanged={reloadAtsCandidates} />
                                     <div style={{ marginTop: 12, fontSize: '0.78rem', color: '#9ca3af', fontFamily: 'var(--font-mono)' }}>
                                       Applied: {c.applied_at ? new Date(c.applied_at).toLocaleString() : '—'}
+                                      {c.scored_at ? ` · Scored ${new Date(c.scored_at + (String(c.scored_at).endsWith('Z') ? '' : 'Z')).toLocaleString()}` : ''}
+                                      {c.scoring_rules_version ? ` · Rules ${c.scoring_rules_version}` : ''}
+                                      {c.jd_version_no ? ` · Job description v${c.jd_version_no}` : ''}
+                                      {c.scoring_source ? ` · Scored from ${c.scoring_source === 'profile' ? 'profile' : 'resume'}` : ''}
                                     </div>
                                   </div>
                                 </td>
@@ -5429,7 +5830,7 @@ HR Team`,
                     Incoming Requests — {incomingRequests.length}
                   </h3>
                 </div>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))', gap: 18 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(340px, 100%), 1fr))', gap: 18 }}>
                   {incomingRequests.map(req => <UnmatchedReqCard key={req.id} req={req} />)}
                 </div>
               </div>
@@ -5444,7 +5845,7 @@ HR Team`,
                     Closed — {closedRequests.length}
                   </h3>
                 </div>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))', gap: 18 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(340px, 100%), 1fr))', gap: 18 }}>
                   {closedRequests.map(req => <ClosedReqCard key={req.id} req={req} />)}
                 </div>
               </div>
@@ -5459,7 +5860,7 @@ HR Team`,
                     Pending — {pendingJobs.length} job{pendingJobs.length !== 1 ? 's' : ''}
                   </h3>
                 </div>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))', gap: 18 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(340px, 100%), 1fr))', gap: 18 }}>
                   {pendingJobs.map(job => <ReqCard key={job.job_id} job={job} />)}
                 </div>
               </div>
@@ -5474,7 +5875,7 @@ HR Team`,
                     Completed — {completedJobs.length} job{completedJobs.length !== 1 ? 's' : ''}
                   </h3>
                 </div>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))', gap: 18 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(340px, 100%), 1fr))', gap: 18 }}>
                   {completedJobs.map(job => <ReqCard key={job.job_id} job={job} />)}
                 </div>
               </div>
@@ -5489,7 +5890,7 @@ HR Team`,
                     No Requests Yet — {noReqJobs.length} job{noReqJobs.length !== 1 ? 's' : ''}
                   </h3>
                 </div>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))', gap: 18 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(340px, 100%), 1fr))', gap: 18 }}>
                   {noReqJobs.map(job => <ReqCard key={job.job_id} job={job} />)}
                 </div>
               </div>

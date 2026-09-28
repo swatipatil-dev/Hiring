@@ -16,6 +16,8 @@ import os
 import time
 from typing import Optional
 
+from .rq_safety import SERIALIZER, check_allowed, rebuild_result, to_plain
+
 _REDIS_URL = os.getenv("JUDGE_REDIS_URL", os.getenv("REDIS_URL", "redis://localhost:6379/0"))
 _QUEUE_NAME = os.getenv("JUDGE_QUEUE", "judge")
 _JOB_TIMEOUT = int(os.getenv("JUDGE_JOB_TIMEOUT_S", "300"))
@@ -30,6 +32,21 @@ _redis = None          # decode_responses=True  — pub/sub JSON
 _redis_raw = None      # decode_responses=False — RQ (pickled payloads)
 _redis_checked = False
 _redis_ok = False
+
+
+def redis_url_has_password(url: Optional[str] = None) -> bool:
+    """Whether the queue's Redis URL carries a password (redis://:pw@host/db)."""
+    from urllib.parse import urlparse
+    try:
+        return bool(urlparse(url or _REDIS_URL).password)
+    except ValueError:
+        return False
+
+
+def _queue():
+    """The judge queue, JSON-serialised (see src/judge/rq_safety.py)."""
+    from rq import Queue
+    return Queue(_QUEUE_NAME, connection=get_redis_raw(), serializer=SERIALIZER)
 
 
 def _channel(submission_id: str) -> str:
@@ -110,8 +127,7 @@ def enqueue_submission(submission_id: str) -> dict:
         judge_submission_job(submission_id)
         return {"mode": "sync", "submission_id": submission_id}
 
-    from rq import Queue
-    q = Queue(_QUEUE_NAME, connection=get_redis_raw())
+    q = _queue()
     job = q.enqueue(
         "src.judge.worker.judge_submission_job",
         submission_id,
@@ -152,8 +168,12 @@ def run_in_worker(func_path: str, *args, wait_s: Optional[int] = None, **kwargs)
         Exception: whatever the job raised, re-raised here so existing
             try/except blocks around the old inline calls behave unchanged.
     """
+    check_allowed(func_path)            # the worker would refuse it anyway
+    args = to_plain(list(args))
+    kwargs = to_plain(kwargs)
+
     if _sync_forced():
-        return _call_locally(func_path, *args, **kwargs)
+        return rebuild_result(func_path, _call_locally(func_path, *args, **kwargs))
 
     if not redis_available():
         # Deliberately NOT falling back to inline: in production that fails with
@@ -163,10 +183,9 @@ def run_in_worker(func_path: str, *args, wait_s: Optional[int] = None, **kwargs)
             "the code execution service is not reachable (queue unavailable)"
         )
 
-    from rq import Queue
     from rq.job import Job
 
-    q = Queue(_QUEUE_NAME, connection=get_redis_raw())
+    q = _queue()
     job = q.enqueue(func_path, *args, job_timeout=_JOB_TIMEOUT,
                     result_ttl=600, failure_ttl=86400, **kwargs)
 
@@ -174,9 +193,9 @@ def run_in_worker(func_path: str, *args, wait_s: Optional[int] = None, **kwargs)
     while True:
         # Re-fetch rather than refresh(): with a worker pool the job may be
         # picked up by any process, and a stale local object never updates.
-        job = Job.fetch(job.id, connection=get_redis_raw())
+        job = Job.fetch(job.id, connection=get_redis_raw(), serializer=SERIALIZER)
         if job.is_finished:
-            return job.return_value()
+            return rebuild_result(func_path, job.return_value())
         if job.is_failed:
             raise RuntimeError(job.exc_info or "judge job failed in the worker")
         if time.monotonic() >= deadline:

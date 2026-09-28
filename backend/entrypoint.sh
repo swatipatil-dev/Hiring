@@ -23,8 +23,27 @@ if [ "$ROLE" = "worker" ]; then
     # Each concurrent job still runs its own container with its own
     # --memory/--cpus/--pids-limit caps from src/judge/sandbox.py, so raising
     # JUDGE_WORKERS raises real resource use. Keep it at or below the CPU count.
+    #
+    # This process is root-equivalent (docker group), so it only runs what it must:
+    #
+    # --job-class   refuses any job that is not one of the judge's own functions;
+    #               stock RQ runs whatever importable function a job names.
+    # --serializer  jobs arrive as JSON, not pickle — unpickling alone can execute
+    #               code. The API enqueues with the same serializer (src/judge/queue.py),
+    #               so the two must be deployed together.
+    #
+    # And it holds no secret it doesn't use. systemd hands it the whole .env; the
+    # worker needs DATABASE_URL (standalone submissions), REDIS_URL and the Gemini
+    # settings (hidden test generation). The rest is dropped before Python starts,
+    # and it cannot re-read .env: that file is 0600 and owned by the API user.
+    unset SECRET_KEY EMAIL_ENCRYPTION_KEY JUDGE_REGRADE_TOKEN \
+          SMTP_USER SMTP_PASS INNOMAX_HR_USER INNOMAX_HR_PASS \
+          INNOMAX_OFFICIAL_USER INNOMAX_OFFICIAL_PASS \
+          SUPERADMIN_PASSWORD PLATFORM_ADMIN_PASSWORD
     echo "Starting coding-judge RQ worker pool (${JUDGE_WORKERS:-3} workers)..."
     exec rq worker-pool -n "${JUDGE_WORKERS:-3}" "${JUDGE_QUEUE:-judge}" \
+        --job-class src.judge.rq_safety.SafeJob \
+        --serializer rq.serializers.JSONSerializer \
         --url "${JUDGE_REDIS_URL:-${REDIS_URL:-redis://localhost:6379/0}}"
     exit 1   # see the note above: a role branch must never fall through
 fi

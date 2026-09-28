@@ -208,7 +208,8 @@ export default function MyProfile() {
           <div className="stats-grid" style={{ marginBottom: 18 }}>
             <div className="stat-card">
               <div className="stat-label">Your role</div>
-              <div className="stat-value">{ROLE_LABELS[role] || perms.role || '—'}</div>
+              {/* A word, not a number: scale it down on narrow tiles rather than break it. */}
+              <div className="stat-value" style={{ fontSize: 'clamp(1.1rem, 5vw, 2.2rem)', overflowWrap: 'normal' }}>{ROLE_LABELS[role] || perms.role || '—'}</div>
             </div>
             <div className="stat-card">
               <div className="stat-label">Permissions granted</div>

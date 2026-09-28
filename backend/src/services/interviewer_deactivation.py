@@ -29,6 +29,7 @@ from src.models.models import (
     InterviewerProfile,
     JobPosting,
 )
+from src.services.job_access import job_hr_user_ids
 from src.services.notification_service import create_notification
 
 logger = logging.getLogger(__name__)
@@ -152,20 +153,18 @@ def _full_name(user):
 
 
 def _notify_hr(db, job, company_id, *, title, message, reference_type, reference_id):
-    """Notify the job's HR owner. Silently skips a job with no HR attached."""
-    hr_user_id = None
-    if job is not None and job.hr is not None:
-        hr_user_id = job.hr.user_id
-    if not hr_user_id:
+    """Notify every HR on the job (owner + co-HRs). Silently skips a job with no HR."""
+    if job is None:
         return
-    create_notification(
-        db,
-        user_id=hr_user_id,
-        company_id=company_id or (job.company_id if job is not None else None),
-        title=title,
-        message=message,
-        type="interviewer_unassigned",
-        reference_type=reference_type,
-        reference_id=reference_id,
-        commit=False,
-    )
+    for hr_user_id in job_hr_user_ids(db, job):
+        create_notification(
+            db,
+            user_id=hr_user_id,
+            company_id=company_id or job.company_id,
+            title=title,
+            message=message,
+            type="interviewer_unassigned",
+            reference_type=reference_type,
+            reference_id=reference_id,
+            commit=False,
+        )

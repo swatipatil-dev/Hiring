@@ -2,6 +2,12 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import api from '../../api/client'
 import { isSupported as fullscreenSupported, requestFullscreen } from '../../utils/fullscreen'
+import {
+  STATUS, isSatisfied, checkBrowser, checkServer, checkProctorSocket,
+  sampleVideoBrightness, classifyCamera, classifyMicrophone, MIC_HEARD_LEVEL, buildSignalPath,
+} from '../../utils/systemCheck'
+import SignalPathCheck from '../../components/SignalPathCheck'
+import ExplanationForm from '../../components/ExplanationForm'
 
 export default function TestInstructions() {
   const { interviewId } = useParams()
@@ -12,15 +18,26 @@ export default function TestInstructions() {
   const [totalTime, setTotalTime] = useState(0)
   const [loading, setLoading] = useState(true)
   const [agreed, setAgreed] = useState(false)
+  // Separate from `agreed` on purpose: agreeing to the test rules is not agreeing to be
+  // recorded. A proctored test needs both.
+  const [consented, setConsented] = useState(false)
 
   // Camera & Mic state
-  const [camStatus, setCamStatus] = useState('idle')   // idle | checking | granted | denied | error
+  const [camStatus, setCamStatus] = useState('idle')   // idle | checking | granted | denied | error | ended
   const [micStatus, setMicStatus] = useState('idle')
   const [micLevel, setMicLevel] = useState(0)
+  const [camMeta, setCamMeta] = useState({ measured: false })  // picture actually arriving, and how bright
+  const [micMuted, setMicMuted] = useState(false)
+  const [micHeard, setMicHeard] = useState(false)
+  const micHeardRef = useRef(false)
+  const camTimerRef = useRef(null)
   const videoRef = useRef(null)
   const streamRef = useRef(null)
   const audioCtxRef = useRef(null)
   const animRef = useRef(null)
+
+  // Browser + connectivity rows (camera/mic rows are derived from the state above).
+  const [envRows, setEnvRows] = useState([])
 
   // Cleanup streams on unmount
   useEffect(() => {
@@ -34,12 +51,41 @@ export default function TestInstructions() {
       if (animRef.current) {
         cancelAnimationFrame(animRef.current)
       }
+      clearTimeout(camTimerRef.current)
     }
+  }, [])
+
+  // Sample the live picture: first after the camera has had ~1s to settle exposure, then
+  // every 1.5s so turning a light on clears the "too dark" warning without a re-check.
+  const watchCamera = useCallback(() => {
+    clearTimeout(camTimerRef.current)
+    let tries = 0
+    const tick = () => {
+      const v = videoRef.current
+      const brightness = sampleVideoBrightness(v)
+      tries += 1
+      if (brightness != null && tries >= 3) {
+        setCamMeta({ measured: true, brightness, width: v.videoWidth, height: v.videoHeight })
+        camTimerRef.current = setTimeout(tick, 1500)
+        return
+      }
+      if (tries >= 12) {   // ~3.6s and still no frame: the camera is not delivering a picture
+        setCamMeta({ measured: true, brightness: null })
+        return
+      }
+      camTimerRef.current = setTimeout(tick, 300)
+    }
+    camTimerRef.current = setTimeout(tick, 300)
   }, [])
 
   const checkDevices = useCallback(async () => {
     setCamStatus('checking')
     setMicStatus('checking')
+    setCamMeta({ measured: false })
+    setMicMuted(false)
+    setMicHeard(false)
+    micHeardRef.current = false
+    clearTimeout(camTimerRef.current)
 
     // Stop any previous stream
     if (streamRef.current) {
@@ -65,6 +111,8 @@ export default function TestInstructions() {
       if (videoTrack && videoTrack.readyState === 'live') {
         setCamStatus('granted')
         // srcObject is set via the ref callback on the <video> element
+        videoTrack.addEventListener('ended', () => { clearTimeout(camTimerRef.current); setCamStatus('ended') })
+        watchCamera()
       } else {
         setCamStatus('error')
       }
@@ -73,6 +121,12 @@ export default function TestInstructions() {
       const audioTrack = stream.getAudioTracks()[0]
       if (audioTrack && audioTrack.readyState === 'live') {
         setMicStatus('granted')
+        // `muted` here is the SOURCE being muted (OS-level mute switch, another app
+        // holding the device) — the page cannot unmute it, so the candidate must.
+        setMicMuted(audioTrack.muted)
+        audioTrack.addEventListener('mute', () => setMicMuted(true))
+        audioTrack.addEventListener('unmute', () => setMicMuted(false))
+        audioTrack.addEventListener('ended', () => setMicStatus('ended'))
         try {
           const audioCtx = new (window.AudioContext || window.webkitAudioContext)()
           audioCtxRef.current = audioCtx
@@ -85,12 +139,20 @@ export default function TestInstructions() {
           const updateLevel = () => {
             analyser.getByteFrequencyData(dataArray)
             const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length
-            setMicLevel(Math.min(100, Math.round((avg / 128) * 100)))
+            const level = Math.min(100, Math.round((avg / 128) * 100))
+            setMicLevel(level)
+            if (level >= MIC_HEARD_LEVEL && !micHeardRef.current) {
+              micHeardRef.current = true
+              setMicHeard(true)
+            }
             animRef.current = requestAnimationFrame(updateLevel)
           }
           updateLevel()
         } catch {
-          // Audio analysis failed but mic still works
+          // No level meter means we can't confirm the mic hears anything; don't strand
+          // the candidate over a missing Web Audio API when the track itself is live.
+          micHeardRef.current = true
+          setMicHeard(true)
         }
       } else {
         setMicStatus('error')
@@ -104,6 +166,33 @@ export default function TestInstructions() {
         setMicStatus('error')
       }
     }
+  }, [watchCamera])
+
+  // Browser and connection checks. Run on load (no permission prompt involved) and again
+  // from "Re-run checks". The proctoring socket is only probed for proctored tests.
+  const runEnvChecks = useCallback(async (iv) => {
+    const proctored = !!iv?.enable_webcam_monitoring
+    const browser = checkBrowser({
+      needsMedia: proctored,
+      needsFullscreen: iv?.require_fullscreen !== false,
+      fullscreenSupported: fullscreenSupported(),
+    })
+    const running = (id, label) => ({ id, label, status: STATUS.RUNNING, detail: 'Checking…' })
+    const pending = [running('server', 'Internet connection')]
+    if (proctored) pending.push(running('proctor-socket', 'Proctoring connection'))
+    setEnvRows([...browser, ...pending])
+
+    const settle = (row) => setEnvRows(rows => rows.map(r => (r.id === row.id ? row : r)))
+    const jobs = [checkServer(() => api.get('/version')).then(settle)]
+    // Only worth probing when the browser can open a socket at all; otherwise the
+    // "Proctoring support" row already explains the failure.
+    if (proctored) {
+      jobs.push(browser.some(r => r.id === 'media-support' && r.status === STATUS.FAIL)
+        ? Promise.resolve(settle({ id: 'proctor-socket', label: 'Proctoring connection', status: STATUS.FAIL,
+            detail: 'Not available in this browser. See "Proctoring support" above.' }))
+        : checkProctorSocket().then(settle))
+    }
+    await Promise.all(jobs)
   }, [])
 
   useEffect(() => {
@@ -129,6 +218,7 @@ export default function TestInstructions() {
         if (match?.enable_webcam_monitoring) {
           api.post('/proctor/warmup').catch(() => {})
         }
+        runEnvChecks(match)
         let qs = []
         try {
           const r = await api.get(`/mcq/interviews/${interviewId}/questions`)
@@ -142,13 +232,32 @@ export default function TestInstructions() {
       } catch {} finally { setLoading(false) }
     }
     load()
-  }, [interviewId])
+  }, [interviewId, runEnvChecks])
 
   const webcamEnabled = !!interview?.enable_webcam_monitoring
   // Defaults ON, matching the server: a test predating this flag still runs fullscreen.
   const requireFullscreen = interview?.require_fullscreen !== false
-  const devicesReady = camStatus === 'granted' && micStatus === 'granted'
-  const canStart = agreed && (!webcamEnabled || devicesReady)
+
+  const checkRows = webcamEnabled
+    ? [
+        ...envRows,
+        classifyCamera({ permission: camStatus, ...camMeta }),
+        classifyMicrophone({ permission: micStatus, muted: micMuted, heard: micHeard }),
+      ]
+    : envRows
+  const failedChecks = checkRows.filter(r => r.status === STATUS.FAIL)
+  const openChecks = checkRows.filter(r => !isSatisfied(r) && r.status !== STATUS.FAIL)
+  // A failure always blocks. A proctored test also waits for every check to finish —
+  // starting before the proctoring socket or camera is confirmed is exactly the silent
+  // failure this exists to prevent. An unproctored test has nothing to wait for.
+  const checksOk = failedChecks.length === 0 && (!webcamEnabled || openChecks.length === 0)
+  const canStart = agreed && checksOk && (!webcamEnabled || consented)
+  const checkSection = webcamEnabled ? '05' : '04'
+
+  const rerunChecks = () => {
+    runEnvChecks(interview)
+    if (webcamEnabled) checkDevices()
+  }
 
   const handleStart = async () => {
     if (!canStart) return
@@ -160,6 +269,16 @@ export default function TestInstructions() {
     // element fullscreen), the exam still starts: OnlineTest re-checks on mount, prompts
     // if it can, and reports the gap to the proctor so HR sees an unmonitored run for
     // what it is. Nobody loses a job application because of their phone.
+    if (webcamEnabled) {
+      // Handed to the exam page, which sends it with /proctor/sessions/start so the
+      // consent is stored with the monitoring record it covers.
+      try {
+        sessionStorage.setItem(`hf_monitoring_consent_${interviewId}`, JSON.stringify({
+          accepted_at: new Date().toISOString(),
+          disclosure_version: MONITORING_DISCLOSURE_VERSION,
+        }))
+      } catch { /* storage blocked: the test still starts; the record just lacks the marker */ }
+    }
     if (requireFullscreen && fullscreenSupported()) {
       await requestFullscreen()
     }
@@ -186,10 +305,11 @@ export default function TestInstructions() {
             Assessment already completed
           </h2>
           <p style={{ fontSize: 14, lineHeight: 1.6, color: '#6b7280', marginBottom: 20 }}>
-            You have already submitted <strong>{jobName}</strong>. Each assessment can only
-            be taken once, so it cannot be reopened. Your recruiter will be in touch with
-            the outcome.
+            You have already submitted <strong>{jobName}</strong>. Each attempt can only be
+            submitted once. Your recruiter will be in touch with the outcome, and can offer
+            another attempt if something went wrong.
           </p>
+          <div style={{ margin: '0 0 20px' }}><ExplanationForm interviewId={interviewId} /></div>
           <button onClick={() => navigate('/candidate/dashboard')} style={p.startBtn}>
             Back to dashboard
           </button>
@@ -203,11 +323,11 @@ export default function TestInstructions() {
     <div style={p.root}>
       <div style={p.topBar}/>
 
-      <div style={p.wrap}>
+      <div style={p.wrap} className="ti-wrap">
         {/* ── HERO ── */}
         <header style={p.hero}>
           <div style={p.heroBg}/>
-          <div style={p.heroContent}>
+          <div style={p.heroContent} className="ti-hero">
             <div style={p.heroLeft}>
               <div style={p.badge}>ONLINE ASSESSMENT</div>
               <h1 style={p.heroTitle}>{jobName}</h1>
@@ -224,7 +344,7 @@ export default function TestInstructions() {
         </header>
 
         {/* ── BODY ── */}
-        <div style={p.body}>
+        <div style={p.body} className="ti-body">
           <div style={p.main}>
             <Section n="01" title="General Instructions">
               <Rule>This is a <b>timed assessment</b>. The timer begins when you click "Start Test" and cannot be paused.</Rule>
@@ -259,87 +379,29 @@ export default function TestInstructions() {
             </Section>
 
             {webcamEnabled && (
-            <Section n="04" title="Camera & Microphone Check">
-              <Rule>This test is <b>proctored</b>. Your camera and microphone must remain on throughout the assessment.</Rule>
-              <Rule>Ensure your <b>face is clearly visible</b> and you are in a <b>well-lit environment</b>.</Rule>
-              <Rule>Do <b>not wear headphones or earbuds</b> unless explicitly permitted.</Rule>
-              <Rule>Any <b>suspicious activity</b> (looking away, multiple faces, unusual sounds) will be flagged.</Rule>
-
-              <div style={p.deviceCheckWrap}>
-                {/* Camera Preview */}
-                <div style={p.deviceCard}>
-                  <div style={p.deviceHeader}>
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={camStatus==='granted'?'#16a34a':'#6b7280'} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
-                    <span style={p.deviceLabel}>Camera</span>
-                    <DeviceStatusBadge status={camStatus} />
-                  </div>
-                  <div style={p.videoBox}>
-                    {camStatus === 'granted' ? (
-                      <video ref={el => {
-                        videoRef.current = el
-                        if (el && streamRef.current && el.srcObject !== streamRef.current) {
-                          el.srcObject = streamRef.current
-                          el.play().catch(() => {})
-                        }
-                      }} autoPlay playsInline muted style={p.videoEl} />
-                    ) : (
-                      <div style={p.videoPlaceholder}>
-                        <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
-                        <span style={p.placeholderTxt}>
-                          {camStatus === 'denied' ? 'Camera access denied — check browser permissions' :
-                           camStatus === 'error' ? 'Camera not detected' :
-                           camStatus === 'checking' ? 'Requesting access...' :
-                           'Click "Check Devices" to begin'}
-                        </span>
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-                {/* Microphone Level */}
-                <div style={p.deviceCard}>
-                  <div style={p.deviceHeader}>
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={micStatus==='granted'?'#16a34a':'#6b7280'} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
-                    <span style={p.deviceLabel}>Microphone</span>
-                    <DeviceStatusBadge status={micStatus} />
-                  </div>
-                  <div style={p.micBox}>
-                    {micStatus === 'granted' ? (
-                      <div style={p.micLevelWrap}>
-                        <span style={p.micHint}>Speak to test your microphone</span>
-                        <div style={p.micBarTrack}>
-                          <div style={{...p.micBarFill, width: `${micLevel}%`, background: micLevel > 60 ? '#16a34a' : micLevel > 25 ? '#d97706' : '#94a3b8'}} />
-                        </div>
-                        <div style={p.micLevelLabels}>
-                          <span>Silent</span><span>Good</span><span>Loud</span>
-                        </div>
-                      </div>
-                    ) : (
-                      <div style={p.videoPlaceholder}>
-                        <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/></svg>
-                        <span style={p.placeholderTxt}>
-                          {micStatus === 'denied' ? 'Microphone access denied — check browser permissions' :
-                           micStatus === 'error' ? 'Microphone not detected' :
-                           micStatus === 'checking' ? 'Requesting access...' :
-                           'Click "Check Devices" to begin'}
-                        </span>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              </div>
-
-              <div style={p.checkBtnWrap}>
-                <button style={p.checkBtn} onClick={checkDevices}>
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
-                  {devicesReady ? 'Re-check Devices' : 'Check Devices'}
-                </button>
-                {!devicesReady && camStatus !== 'idle' && (
-                  <span style={p.checkHint}>Both camera and microphone must be working to start the test.</span>
-                )}
-              </div>
-            </Section>
+              <Section n="04" title="How This Test Is Monitored">
+                <MonitoringDisclosure />
+              </Section>
             )}
+
+            <Section n={checkSection} title="System Check">
+              {webcamEnabled && (<>
+              <Rule>Keep your camera and microphone <b>on</b> for the whole test.</Rule>
+              <Rule>Make sure your <b>face is clearly visible</b> and the room is <b>well lit</b>.</Rule>
+              <Rule>Do <b>not wear headphones or earbuds</b> unless your recruiter has said you may.</Rule>
+              </>)}
+
+              <SignalPathCheck
+                steps={buildSignalPath(checkRows)}
+                proctored={webcamEnabled}
+                camStatus={camStatus}
+                micLevel={micLevel}
+                streamRef={streamRef}
+                videoRef={videoRef}
+                onEnableDevices={checkDevices}
+                onRerun={rerunChecks}
+              />
+            </Section>
           </div>
 
           <aside style={p.side}>
@@ -353,8 +415,10 @@ export default function TestInstructions() {
                 <li>Use a laptop or desktop browser.</li>
                 <li>Close all other tabs and apps.</li>
                 <li>Do not switch windows during the test.</li>
-                <li>Camera and microphone must stay <b>on</b> throughout.</li>
-                <li>Sit in a quiet, well-lit room with no one else visible.</li>
+                {webcamEnabled && <>
+                  <li>Camera and microphone must stay <b>on</b> throughout.</li>
+                  <li>Sit in a quiet, well-lit room with no one else visible.</li>
+                </>}
               </ul>
             </div>
 
@@ -374,6 +438,9 @@ export default function TestInstructions() {
               ))}
             </div>
 
+            <AdjustmentCard interviewId={interviewId} interview={interview}
+              onChange={(patch) => setInterview((iv) => ({ ...iv, ...patch }))} />
+
             <div style={p.helpCard}>
               Having trouble? Contact your HR representative before starting the test.
             </div>
@@ -381,12 +448,27 @@ export default function TestInstructions() {
         </div>
 
         {/* ── FOOTER ── */}
-        <footer style={p.footer}>
+        <footer style={p.footer} className="ti-footer">
           <label style={p.chkWrap}>
             <input type="checkbox" checked={agreed} onChange={()=>setAgreed(!agreed)} style={p.chk}/>
             <span style={p.chkTxt}>I have read all instructions and agree to the assessment rules.</span>
           </label>
-          <div style={p.fActions}>
+          {webcamEnabled && (
+            <label style={p.chkWrap}>
+              <input type="checkbox" checked={consented} onChange={() => setConsented(!consented)} style={p.chk}/>
+              <span style={p.chkTxt}>
+                I understand how this test is monitored (section 04) and agree to it.
+              </span>
+            </label>
+          )}
+          {!checksOk && (
+            <p style={p.startHint} role="status">
+              {failedChecks.length > 0
+                ? `Fix the ${failedChecks.length === 1 ? 'problem' : 'problems'} in the System Check (section ${checkSection}) before starting.`
+                : `Finish the System Check (section ${checkSection}) before starting.`}
+            </p>
+          )}
+          <div style={p.fActions} className="ti-actions">
             <button style={p.backBtn} onClick={()=>navigate('/candidate/interviews')}>
               Back to Dashboard
             </button>
@@ -410,9 +492,140 @@ export default function TestInstructions() {
 
 function Section({ n, title, children }) {
   return (
-    <div style={p.sec}>
+    <div style={p.sec} className="ti-sec">
       <h2 style={p.secH}><span style={p.secN}>{n}</span>{title}</h2>
       <div style={p.secBody}>{children}</div>
+    </div>
+  )
+}
+
+/**
+ * Ask for an adjustment before starting (extra time, microphone monitoring off...), and
+ * see what was decided. Nothing changes until HR approves specific settings; approved
+ * extra time is already reflected in the minutes shown on this page.
+ */
+function AdjustmentCard({ interviewId, interview, onChange }) {
+  const [open, setOpen] = useState(false)
+  const [text, setText] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState(null)
+  const status = interview?.accommodation_status
+  const approved = interview?.accommodations_summary || []
+
+  const send = async () => {
+    setSaving(true); setError(null)
+    try {
+      const r = await api.post(`/candidate/interviews/${interviewId}/accommodation-request`, { text: text.trim() })
+      onChange(r.data)
+      setOpen(false)
+    } catch (e) {
+      setError(e?.response?.data?.detail || 'Your request could not be sent. Try again.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div style={p.adjCard}>
+      <h4 style={p.infoTitle}>Need an adjustment?</h4>
+      {status === 'approved' ? (
+        <>
+          <p style={p.adjText}>Approved for this test:</p>
+          <ul style={p.adjList}>{approved.map((a) => <li key={a}>{a}</li>)}</ul>
+          {!approved.length && <p style={p.adjText}>No changes were needed.</p>}
+        </>
+      ) : status === 'requested' ? (
+        <>
+          <p style={p.adjText}>Your request was sent to the hiring team:</p>
+          <q style={p.adjQuote}>{interview.accommodation_request}</q>
+          <p style={p.adjText}>
+            They will reply before you start. If you start now, the test runs without the
+            adjustment.
+          </p>
+        </>
+      ) : (
+        <>
+          {status === 'declined' && (
+            <p style={p.adjText}>Your last request was declined. You can ask again or contact your recruiter.</p>
+          )}
+          <p style={p.adjText}>
+            For example extra time, or microphone monitoring turned off. Ask before you start;
+            the hiring team decides what to approve.
+          </p>
+          {open ? (
+            <>
+              <label htmlFor="adj-text" style={p.adjLabel}>What do you need, and why?</label>
+              <textarea id="adj-text" value={text} onChange={(e) => setText(e.target.value)}
+                rows={4} maxLength={2000} style={p.adjInput} />
+              {error && <p role="alert" style={{ ...p.adjText, color: '#b91c1c' }}>{error}</p>}
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button type="button" onClick={send} disabled={saving || text.trim().length < 10}
+                  style={{ ...p.adjBtn, opacity: saving || text.trim().length < 10 ? 0.5 : 1 }}>
+                  {saving ? 'Sending…' : 'Send request'}
+                </button>
+                <button type="button" onClick={() => setOpen(false)} style={p.adjBtnGhost}>Cancel</button>
+              </div>
+            </>
+          ) : (
+            <button type="button" onClick={() => setOpen(true)} style={p.adjBtnGhost}>Ask for an adjustment</button>
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+
+// Bump when the wording below changes materially: the version is stored with each
+// candidate's consent, so a reviewer can see exactly what that candidate agreed to.
+const MONITORING_DISCLOSURE_VERSION = '2026-09-28'
+
+/**
+ * What proctoring collects, who sees it, and what it can and cannot do to the candidate.
+ * Every statement here is checked against the code: see backend/proctoring/routes.py
+ * (_TERMINATING_FLAGS, MARKER_VIOLATION_TYPES, evidence saving) and the face analyzer.
+ * If the behaviour changes, this text must change with it.
+ */
+function MonitoringDisclosure() {
+  const items = [
+    ['Your camera', 'The picture from your camera is sent to HireFlow\u2019s servers and analysed automatically while you take the test, to check that you are present, that no one else is with you, and that no phone is in use.'],
+    ['Your face', 'Your face is compared with the photo you uploaded with your application, to check it is the same person. This is not an identity-document check. If there is no photo on file, a snapshot taken at the start of the test is used instead, and the hiring team is told that.'],
+    ['Your microphone', 'Sound is analysed as you speak for other voices and background noise. Audio is not recorded or transcribed; only measurements such as volume are kept when something is flagged.'],
+    ['Your browser', 'Switching away from the test tab and leaving fullscreen are recorded.'],
+    ['What is saved', 'When something is flagged, a still image from your camera is saved with a note of what was detected and when.'],
+    ['Who can see it', 'Only the hiring team for this job: the recruiters and interviewers working on it.'],
+    ['How long it is kept', 'Until the employer deletes the job.'],
+  ]
+  return (
+    <div style={p.discWrap}>
+      <p style={p.discLead}>
+        This test is proctored. Here is exactly what that means, so you can decide before you start.
+      </p>
+      <dl style={p.discList}>
+        {items.map(([term, text]) => (
+          <div key={term} style={p.discRow} className="ti-disc-row">
+            <dt style={p.discTerm}>{term}</dt>
+            <dd style={p.discText}>{text}</dd>
+          </div>
+        ))}
+      </dl>
+      <div style={p.discNote}>
+        <p style={p.discNoteHead}>A person makes every decision</p>
+        <p style={p.discNoteText}>
+          Flags are reviewed by someone on the hiring team. Nothing detected during the test
+          rejects you automatically. Looking away, background noise, switching tabs or leaving
+          fullscreen are recorded for that review and never end the test.
+        </p>
+        <p style={p.discNoteText}>
+          The test ends early only if a second person or a phone is seen repeatedly (you are
+          warned three times first), or if the person on camera does not match your photo for
+          about five minutes. Your answers up to that point are submitted and a person reviews
+          what happened.
+        </p>
+        <p style={{ ...p.discNoteText, marginBottom: 0 }}>
+          If you need an adjustment, such as extra time or microphone monitoring turned off,
+          use “Need an adjustment?” on this page before you start.
+        </p>
+      </div>
     </div>
   )
 }
@@ -426,32 +639,25 @@ function Rule({ children }) {
   )
 }
 
-function DeviceStatusBadge({ status }) {
-  const cfg = {
-    idle:     { bg: '#f3f4f6', color: '#6b7280', label: 'Not checked' },
-    checking: { bg: '#eff6ff', color: '#2563eb', label: 'Checking...' },
-    granted:  { bg: '#dcfce7', color: '#16a34a', label: 'Working' },
-    denied:   { bg: '#fef2f2', color: '#dc2626', label: 'Denied' },
-    error:    { bg: '#fef2f2', color: '#dc2626', label: 'Not found' },
-  }[status] || { bg: '#f3f4f6', color: '#6b7280', label: 'Unknown' }
-
-  return (
-    <span style={{
-      marginLeft: 'auto', fontSize: '.7rem', fontWeight: 700,
-      padding: '3px 10px', borderRadius: 20,
-      background: cfg.bg, color: cfg.color,
-    }}>
-      {status === 'granted' && <span style={{ marginRight: 4 }}>&#10003;</span>}
-      {(status === 'denied' || status === 'error') && <span style={{ marginRight: 4 }}>&#10007;</span>}
-      {cfg.label}
-    </span>
-  )
-}
-
 const css = `
   @keyframes spin{to{transform:rotate(360deg)}}
   @keyframes rise{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
   @keyframes slideR{from{opacity:0;transform:translateX(24px)}to{opacity:1;transform:translateX(0)}}
+  /* The layout is inline-styled; these override it on narrow screens (hence !important).
+     The two-column grid used to squeeze the instructions into ~170px on a phone. */
+  @media (max-width: 860px) {
+    .ti-body { grid-template-columns: minmax(0, 1fr) !important; }
+    .ti-wrap { padding: 16px 16px 40px !important; }
+    .ti-hero { padding: 22px 20px !important; }
+    .ti-sec { padding: 18px 16px !important; }
+    .ti-footer { padding: 18px 16px !important; }
+    .ti-actions { flex-direction: column-reverse; align-items: stretch !important; gap: 10px; }
+    .ti-actions button { justify-content: center; }
+    .ti-disc-row { grid-template-columns: minmax(0, 1fr) !important; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .ti-wrap, .ti-footer, aside { animation: none !important; }
+  }
 `
 
 const p = {
@@ -522,30 +728,28 @@ const p = {
 
   helpCard:{background:'#f0f4f8',border:'1px solid #d0d8e4',borderRadius:10,padding:'14px 16px',fontSize:'.78rem',color:'#4b5563',lineHeight:1.5},
 
-  /* Device Check */
-  deviceCheckWrap:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:14,marginTop:14},
-  deviceCard:{background:'#fafaf7',border:'1px solid #e5e2db',borderRadius:10,padding:14,display:'flex',flexDirection:'column',gap:10},
-  deviceHeader:{display:'flex',alignItems:'center',gap:8},
-  deviceLabel:{fontSize:'.85rem',fontWeight:700,color:'#1e293b'},
-  videoBox:{borderRadius:8,overflow:'hidden',background:'#1e293b',aspectRatio:'4/3',display:'flex',alignItems:'center',justifyContent:'center'},
-  videoEl:{width:'100%',height:'100%',objectFit:'cover',transform:'scaleX(-1)'},
-  videoPlaceholder:{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:8,padding:20,textAlign:'center',height:'100%'},
-  placeholderTxt:{fontSize:'.75rem',color:'#9ca3af',lineHeight:1.4,maxWidth:200},
-  micBox:{borderRadius:8,background:'#1e293b',padding:20,display:'flex',alignItems:'center',justifyContent:'center',minHeight:100},
-  micLevelWrap:{width:'100%',display:'flex',flexDirection:'column',gap:8},
-  micHint:{fontSize:'.75rem',color:'#94a3b8',textAlign:'center'},
-  micBarTrack:{height:10,borderRadius:5,background:'#334155',overflow:'hidden'},
-  micBarFill:{height:'100%',borderRadius:5,transition:'width .1s ease'},
-  micLevelLabels:{display:'flex',justifyContent:'space-between',fontSize:'.6rem',color:'#64748b'},
-  checkBtnWrap:{display:'flex',alignItems:'center',gap:14,marginTop:14},
-  checkBtn:{
-    display:'flex',alignItems:'center',gap:8,
-    padding:'10px 22px',borderRadius:7,border:'none',
-    background:'#2563eb',color:'#fff',fontSize:'.84rem',fontWeight:700,
-    cursor:'pointer',fontFamily:"'Manrope',sans-serif",
-    boxShadow:'0 2px 8px rgba(37,99,235,.25)',transition:'all .2s',
-  },
-  checkHint:{fontSize:'.78rem',color:'#dc2626',fontWeight:600},
+  startHint:{margin:'-6px 0 14px 28px',fontSize:'.8rem',fontWeight:600,color:'#b45309'},
+
+  /* Adjustment request */
+  adjCard:{background:'#fff',border:'1px solid #d6cfc4',borderRadius:10,padding:'16px 18px',display:'flex',flexDirection:'column',gap:8},
+  adjText:{margin:0,fontSize:'.8rem',lineHeight:1.55,color:'#4b5563'},
+  adjList:{margin:0,padding:'0 0 0 18px',fontSize:'.82rem',lineHeight:1.6,color:'#1e293b',fontWeight:600},
+  adjQuote:{display:'block',fontSize:'.8rem',lineHeight:1.5,color:'#1e293b',background:'#f5f2ed',borderRadius:6,padding:'8px 10px'},
+  adjLabel:{fontSize:'.8rem',fontWeight:700,color:'#1e293b'},
+  adjInput:{fontFamily:'inherit',fontSize:'.82rem',padding:'8px 10px',borderRadius:6,border:'1px solid #c9c2b6',resize:'vertical'},
+  adjBtn:{padding:'8px 14px',borderRadius:7,border:'none',background:'#1e3a5f',color:'#fff',fontSize:'.8rem',fontWeight:700,cursor:'pointer',fontFamily:"'Manrope',sans-serif"},
+  adjBtnGhost:{alignSelf:'flex-start',padding:'8px 14px',borderRadius:7,border:'1px solid #c9c2b6',background:'#fff',color:'#374151',fontSize:'.8rem',fontWeight:700,cursor:'pointer',fontFamily:"'Manrope',sans-serif"},
+
+  /* Monitoring disclosure */
+  discWrap:{display:'flex',flexDirection:'column',gap:12},
+  discLead:{margin:0,fontSize:'.87rem',lineHeight:1.6,color:'#374151'},
+  discList:{margin:0,display:'flex',flexDirection:'column',gap:10},
+  discRow:{display:'grid',gridTemplateColumns:'minmax(0,9.5rem) minmax(0,1fr)',gap:'4px 16px'},
+  discTerm:{fontSize:'.84rem',fontWeight:700,color:'#1e293b'},
+  discText:{margin:0,fontSize:'.84rem',lineHeight:1.6,color:'#374151',maxWidth:'62ch'},
+  discNote:{marginTop:4,padding:'14px 16px',borderRadius:8,background:'#f0f7f5',border:'1px solid #cfe6e0'},
+  discNoteHead:{margin:'0 0 6px',fontSize:'.86rem',fontWeight:800,color:'#0f5f53'},
+  discNoteText:{margin:'0 0 8px',fontSize:'.84rem',lineHeight:1.6,color:'#274b45',maxWidth:'66ch'},
 
   /* Footer */
   footer:{background:'#fff',borderRadius:12,border:'1px solid #d6cfc4',padding:'22px 30px',marginTop:20,boxShadow:'0 2px 10px rgba(0,0,0,.04)',animation:'rise .5s ease .25s both'},

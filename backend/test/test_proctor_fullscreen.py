@@ -3,11 +3,12 @@
 The exam runs fullscreen so a candidate cannot read another tab alongside the
 questions. Fullscreen cannot actually *prevent* that — browsers guarantee Escape and
 F11 always work and no page may suppress them — so the integrity story is that leaving
-is conspicuous and costly: the client hides the questions, and each exit is a strike
-under the same policy that governs tab switches.
+is conspicuous: the client hides the questions, and each exit is recorded and warned
+about, the same as a tab switch. Exits never end the test; a person reviews them.
 
-These pin the server half of that: the strike counter, the terminate threshold, and the
-rule that a browser which simply cannot go fullscreen is recorded but never punished.
+These pin the server half of that: the per-flag count, the rule that exits never
+terminate, and the rule that a browser which simply cannot go fullscreen is recorded but
+never punished.
 
 The endpoints are called directly rather than through the app, so no models load and no
 database is touched: `db_session_id = None` makes `_persist_violation` a no-op, which is
@@ -69,29 +70,23 @@ def _exit(sid, count):
     return _run(record_fullscreen_exit(sid, FullscreenExitRequest(count=count)))
 
 
-# ── Strike policy ────────────────────────────────────────────────────────────
+# ── Warning-only policy ──────────────────────────────────────────────────────
 
-def test_the_first_exit_warns_rather_than_ending_the_test(session):
-    """One slip is not cheating. The candidate gets told what it cost them."""
+def test_an_exit_is_recorded_and_warned_about(session):
     r = _exit(session, 1)
-    assert r["strike"] == 1
-    assert r["max"] == TERMINATE_STRIKES
+    assert r["occurrence"] == 1
     assert r["warning"] is True
     assert r["terminate"] is False
-    assert r["message"] is None
 
 
-def test_the_fourth_exit_ends_the_test(session):
-    """Three warnings, then out — the same threshold every other serious flag uses."""
-    for n in range(1, TERMINATE_STRIKES + 1):
+def test_exits_never_end_the_test(session):
+    """Leaving fullscreen is evidence for a reviewer, not grounds to stop the test —
+    however many times it happens."""
+    for n in range(1, 11):
         r = _exit(session, n)
-        assert r["terminate"] is False, f"strike {n} should still be a warning"
-
-    final = _exit(session, TERMINATE_STRIKES + 1)
-    assert final["terminate"] is True
-    assert final["reason"] == "FULLSCREEN_EXIT"
-    assert final["message"], "a terminated candidate must be told why"
-    assert _sessions[session]["terminated"] is True
+        assert r["terminate"] is False, f"exit {n} must not end the test"
+        assert r["occurrence"] == n
+    assert not _sessions[session].get("terminated")
 
 
 def test_exits_do_not_borrow_the_tab_switch_counter(session):
@@ -99,7 +94,7 @@ def test_exits_do_not_borrow_the_tab_switch_counter(session):
     the tab, and a shared counter would charge one act twice."""
     _sessions[session]["strikes"]["TAB_SWITCH"] = 2
     r = _exit(session, 1)
-    assert r["strike"] == 1, "fullscreen exits start their own count"
+    assert r["occurrence"] == 1, "fullscreen exits start their own count"
     assert _sessions[session]["strikes"]["TAB_SWITCH"] == 2, "tab-switch count untouched"
 
 

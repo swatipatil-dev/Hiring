@@ -750,7 +750,8 @@ async def schedule_interview_for_candidate(
 
 # ==================== AI SERVICE ENDPOINTS ====================
 
-@router.get("/ai/health", response_model=OllamaHealthCheck)
+# Staff only: each call spends Gemini quota, and the error text describes the backend.
+@router.get("/ai/health", response_model=OllamaHealthCheck, dependencies=[Depends(require_role(["hr", "admin", "interviewer", "superadmin"]))])
 async def check_ai_service():
     """Check AI service health"""
     try:
@@ -767,7 +768,7 @@ async def check_ai_service():
             error=str(e)
         )
 
-@router.post("/ai/test-connection")
+@router.post("/ai/test-connection", dependencies=[Depends(require_role(["hr", "admin", "interviewer", "superadmin"]))])
 async def test_ai_connection():
     """Test AI service connection"""
     try:
@@ -792,7 +793,7 @@ async def test_ai_connection():
             "message": f"AI service error: {str(e)}"
         }
 
-@router.get("/interviews/test-ollama")
+@router.get("/interviews/test-ollama", dependencies=[Depends(require_role(["hr", "admin", "interviewer", "superadmin"]))])
 async def test_ollama():
     """Test Ollama AI service connection"""
     try:
@@ -1157,6 +1158,9 @@ async def publish_interview(
         job.company_id = current_user.company_id or hr_user.company_id
     job.hr_id = hr_profile.id
     job.updated_at = datetime.now()
+    # If the chosen HR was a co-HR on this job, they are now its owner — never both.
+    from src.services.job_access import remove_collaborator_if_owner, job_hr_user_ids
+    remove_collaborator_if_owner(db, job)
 
     existing_request = db.query(CandidateRequest).filter(
         CandidateRequest.job_id == str(job.id),
@@ -1212,6 +1216,19 @@ async def publish_interview(
         reference_id=str(interview.id)
     )
     db.add(notification)
+
+    # Co-HRs on the job get the same "test published" alert (the owner already has one).
+    for co_user_id in job_hr_user_ids(db, job):
+        if co_user_id != hr_user.id:
+            db.add(Notification(
+                company_id=job.company_id or current_user.company_id,
+                user_id=co_user_id,
+                title=notification.title,
+                message=notification.message,
+                type="test_published",
+                reference_type="interview",
+                reference_id=str(interview.id),
+            ))
 
     # Also notify about the job requirement so it appears in My Job Requirements
     job_notif = Notification(

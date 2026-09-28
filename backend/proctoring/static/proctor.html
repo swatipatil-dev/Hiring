@@ -78,11 +78,11 @@
     </div>
     <div class="score-bar">
       <div class="score-card">
-        <div class="label">Cheating Score</div>
+        <div class="label">Assessment Integrity Flags</div>
         <div class="value" id="mainScore">0</div>
       </div>
       <div class="score-card">
-        <div class="label">Flags</div>
+        <div class="label">Active Flags</div>
         <div class="value" id="flagCount">0</div>
       </div>
       <div class="score-card">
@@ -192,7 +192,7 @@ async function stopSession() {
   document.getElementById('btnStart').disabled = false;
   document.getElementById('btnStop').disabled = true;
 
-  addTimeline('Session stopped. Avg score: ' + data.avg_cheating_score);
+  addTimeline('Session stopped. Avg integrity flags: ' + data.avg_cheating_score);
   sessionId = null;
 }
 

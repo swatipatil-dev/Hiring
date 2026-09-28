@@ -12,7 +12,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Dict, Optional, Union
+from typing import Dict, List, Optional, Union
 
 def _log(msg):
     """Force-flush log to stderr so it appears in uvicorn output."""
@@ -56,10 +56,17 @@ MAX_SESSIONS = int(os.getenv("PROCTOR_MAX_SESSIONS", "0")) or max(
 
 # ---------- Pydantic models ----------
 
+class MonitoringConsent(BaseModel):
+    """The candidate agreed to the monitoring disclosure on the instructions page."""
+    accepted_at: str                   # ISO timestamp from the candidate's browser
+    disclosure_version: str            # which wording they saw (TestInstructions.jsx)
+
+
 class StartSessionRequest(BaseModel):
     candidate_id: str
     test_id: Union[int, str]   # accepts string from URL params, stored as int FK
     interview_id: Optional[int] = None
+    monitoring_consent: Optional[MonitoringConsent] = None
 
     @property
     def test_id_int(self) -> int:
@@ -70,6 +77,8 @@ class StartSessionResponse(BaseModel):
     session_id: str
     ws_video_url: str
     ws_audio_url: str
+    # Approved accommodation: the client should not open the audio stream at all.
+    audio_monitoring_off: bool = False
     # No ws_behavioral_url: the behavioral engine is disabled (see
     # core/behavioral_engine.py), so advertising a stream nothing consumes only
     # invites a client to feed a module that would manufacture violations. The
@@ -246,6 +255,19 @@ def _fire_and_forget(fn, *fargs, **fkwargs):
     task.add_done_callback(_bg_writes.discard)
 
 
+def _approved_accommodations_for(interview_id) -> dict:
+    """Approved accommodations for this attempt, or {} (none, or not found)."""
+    try:
+        from src.services.assessment_fairness import approved_accommodations
+        with _db_session() as db:
+            from src.models.models import Interview
+            iv = db.query(Interview).filter(Interview.id == int(interview_id)).first()
+            return approved_accommodations(iv)
+    except Exception as e:
+        logger.error("Could not read accommodations for interview %s: %s", interview_id, e)
+        return {}
+
+
 def _save_evidence(frame, evidence_path: str):
     """Encode + upload an evidence frame. Runs in a worker thread."""
     try:
@@ -284,6 +306,11 @@ def _update_session_scores(db_session_id: str, result):
         logger.error("Failed to update session scores: %s", e)
 
 
+# Rows written to proctoring_violations that are NOT flags: they record facts about the
+# session (how identity was established, that the candidate consented). Excluded from
+# every flag count and from the event timeline.
+from src.models.models import PROCTORING_MARKER_TYPES as MARKER_VIOLATION_TYPES  # noqa: E402
+
 # Severity mapping for flags
 FLAG_SEVERITY = {
     "NO_FACE": "HIGH", "MULTIPLE_FACES": "CRITICAL", "IDENTITY_MISMATCH": "CRITICAL",
@@ -297,12 +324,13 @@ FLAG_SEVERITY = {
     "CANDIDATE_LEFT": "CRITICAL", "LEANING_FORWARD": "LOW", "HEAD_DOWN": "LOW",
     "LEANING_SIDEWAYS": "LOW",
     "BEHAVIORAL_ANOMALY": "MEDIUM",
-    "TAB_SWITCH": "HIGH",
+    # MEDIUM: recorded for the reviewer, never a strike (see the termination policy below).
+    "TAB_SWITCH": "MEDIUM",
     # Leaving fullscreen is the same act as switching tabs, reached by a different key,
     # so it carries the same weight. FULLSCREEN_UNAVAILABLE is not a violation at all -
     # it records that the browser had no fullscreen API (iOS Safari has none), so HR can
     # tell an unmonitored run from a clean one rather than reading silence as a pass.
-    "FULLSCREEN_EXIT": "HIGH",
+    "FULLSCREEN_EXIT": "MEDIUM",
     "FULLSCREEN_UNAVAILABLE": "LOW",
     # Objects YOLO can see besides a phone. MEDIUM, not HIGH: they are worth showing HR
     # with the annotated frame, but they are single-model calls with no second
@@ -347,6 +375,50 @@ def _flag_module(flag: str) -> str:
     return FLAG_MODULE.get(flag, "object" if flag.endswith("_DETECTED") else "unknown")
 
 
+def _observed_measurements(module: str, result, face_data: dict) -> dict:
+    """Raw readings from the module that raised the flag, as distinct from the flag itself.
+
+    The flag name, severity and score are the pipeline's interpretation; these are what
+    the sensor actually measured on that frame. HR's report shows the two side by side so
+    a reviewer can judge "2 faces at 0.91 similarity" instead of taking "MULTIPLE_FACES"
+    on trust.
+    """
+    if module == "face":
+        return {
+            "face_detected": face_data.get("face_detected"),
+            "face_count": face_data.get("face_count"),
+            "yaw_deg": round(face_data.get("yaw") or 0.0, 1),
+            "pitch_deg": round(face_data.get("pitch") or 0.0, 1),
+            "gaze_direction": face_data.get("gaze_direction"),
+            "identity_match": face_data.get("identity_match"),
+            "has_reference": face_data.get("has_reference"),
+        }
+    if module == "object":
+        obj = result.object_result or {}
+        return {
+            "objects": [
+                {"label": o.get("label"), "confidence": o.get("confidence")}
+                for o in obj.get("objects") or []
+            ],
+            "person_count": obj.get("person_count"),
+        }
+    if module == "pose":
+        pose = result.pose_result or {}
+        return {
+            "phone_gesture_confidence": round(pose.get("phone_gesture_confidence") or 0.0, 3),
+            "visibility_score": round(pose.get("visibility_score") or 0.0, 3),
+            "posture_deviation": round(pose.get("posture_deviation") or 0.0, 3),
+            "person_count": pose.get("person_count"),
+        }
+    if module == "behavioral":
+        beh = result.behavioral_result or {}
+        return {
+            "anomaly_score": round(beh.get("anomaly_score") or 0.0, 3),
+            "top_contributing_features": beh.get("top_contributing_features") or [],
+        }
+    return {}
+
+
 def _violation_details(flag: str, frame_number: int, result, face_data: dict) -> dict:
     """What HR sees under a violation row. Audio flags carry their measurements."""
     details = {
@@ -354,6 +426,9 @@ def _violation_details(flag: str, frame_number: int, result, face_data: dict) ->
         "cheating_score": result.cheating_score,
         "similarity": face_data.get("similarity_score"),
     }
+    observed = _observed_measurements(_flag_module(flag), result, face_data)
+    if observed:
+        details["observed"] = observed
     if _flag_module(flag) == "audio":
         audio = result.audio_result or {}
         details.update({
@@ -372,31 +447,37 @@ def _violation_details(flag: str, frame_number: int, result, face_data: dict) ->
 # without writing a row per frame.
 _MEDIUM_PERSIST_INTERVAL_SEC = 10.0
 
-# Serious flags that count as a strike once per continuous EPISODE (rising edge),
-# rather than after a sustained duration (NO_FACE / IDENTITY_MISMATCH are duration-based).
-# MULTIPLE_VOICES is deliberately absent: it is MEDIUM now, so _is_serious() is False and
-# it would never reach here anyway — but leaving it listed would misdescribe the policy.
-_EDGE_SERIOUS_FLAGS = {"MULTIPLE_FACES", "PHONE_DETECTED", "PHONE_GESTURE", "CANDIDATE_LEFT"}
+# Termination policy: a test ends automatically ONLY on strong evidence that someone else
+# is involved — a second face or a phone in view (each after TERMINATE_STRIKES warnings),
+# or a face that keeps not matching the reference for IDENTITY_MISMATCH_STRIKE_SEC.
+#
+# Everything else — leaving the frame (NO_FACE, CANDIDATE_LEFT), phone-like gestures from
+# the pose model, gaze and head turns, background audio, tab switches, leaving fullscreen —
+# is recorded for a human reviewer and warned about, but never ends the test. Those are
+# single-model guesses or ordinary behaviour (a candidate glancing at notes they are
+# allowed, a sneeze, a notification that stole focus), and ending a hiring test on them
+# is an automated adverse decision with no one checking it.
+#
+# These flags strike once per continuous EPISODE (rising edge); IDENTITY_MISMATCH is
+# duration-based below.
+_TERMINATING_EPISODE_FLAGS = {"MULTIPLE_FACES", "PHONE_DETECTED"}
+_TERMINATING_FLAGS = _TERMINATING_EPISODE_FLAGS | {"IDENTITY_MISMATCH"}
 
 # Candidate-facing reason text shown when the test auto-terminates.
 _TERMINATE_MESSAGES = {
-    "NO_FACE": "Your face was not visible for too long.",
     "IDENTITY_MISMATCH": "The person on camera did not match the registered candidate.",
     "MULTIPLE_FACES": "More than one person was detected repeatedly.",
     "PHONE_DETECTED": "A phone was detected repeatedly.",
-    "PHONE_GESTURE": "Phone-use gestures were detected repeatedly.",
-    "CANDIDATE_LEFT": "You left the camera view repeatedly.",
-    "TAB_SWITCH": "You switched away from the test tab too many times.",
-    "FULLSCREEN_EXIT": "You left fullscreen too many times.",
 }
 
 
-def _is_serious(flag: str) -> bool:
-    return _flag_severity(flag) in ("HIGH", "CRITICAL")
-
-
 def _mark_session_terminated(entry: dict, reason: str) -> bool:
-    """Mark a session terminated in memory + DB (sync). Returns False if already terminated."""
+    """Mark a session terminated in memory + DB (sync). Returns False if already terminated.
+
+    Terminated is a STATUS, not a verdict: it records that the test ended early, and the
+    session goes to a human reviewer. No decision is written here — the system used to
+    stamp decision="CHEATING" on every terminated session, a conclusion nobody had drawn.
+    """
     if entry.get("terminated"):
         return False
     entry["terminated"] = True
@@ -413,7 +494,6 @@ def _mark_session_terminated(entry: dict, reason: str) -> bool:
                 if s:
                     s.status = "terminated"
                     s.ended_at = datetime.utcnow()
-                    s.decision = "CHEATING"
                     db.commit()
         except Exception as e:
             logger.error("Failed to mark session terminated: %s", e)
@@ -435,7 +515,12 @@ async def _terminate_session(session_id: str, entry: dict, ws, reason: str):
 
 
 async def _evaluate_strikes(session_id: str, entry: dict, result, ws):
-    """Per-flag 3-warnings-then-terminate policy for serious flags; continuous warnings for minor flags."""
+    """Warnings for every flag; termination only for _TERMINATING_FLAGS (see above).
+
+    Terminating flags get numbered strike warnings (3 warnings, then the test ends).
+    All other flags get a throttled, un-numbered warning — they are recorded for review
+    and never count toward ending the test.
+    """
     cfg = entry["pipeline"].cfg
     now = time.time()
     # Grace window at session start (camera warm-up / live enrollment).
@@ -458,19 +543,8 @@ async def _evaluate_strikes(session_id: str, entry: dict, result, ws):
             except Exception:
                 pass
 
-    # ── Duration-based serious flags ──
-    face = result.face_result or {}
-    no_face = (not face.get("face_detected", False)) or ("NO_FACE" in flags)
-    if no_face:
-        entry["no_face_since"] = entry["no_face_since"] or now
-        if now - entry["no_face_since"] >= cfg.NO_FACE_STRIKE_SEC:
-            entry["no_face_since"] = None  # re-arm for the next episode
-            await _strike("NO_FACE")
-            if entry["terminated"]:
-                return
-    else:
-        entry["no_face_since"] = None
-
+    # ── Duration-based: a face that keeps not matching the reference ──
+    # (NO_FACE used to strike here too. Leaving the frame is now a warning only.)
     if "IDENTITY_MISMATCH" in flags:
         entry["mismatch_since"] = entry["mismatch_since"] or now
         if now - entry["mismatch_since"] >= cfg.IDENTITY_MISMATCH_STRIKE_SEC:
@@ -481,8 +555,8 @@ async def _evaluate_strikes(session_id: str, entry: dict, result, ws):
     else:
         entry["mismatch_since"] = None
 
-    # ── Episode (rising-edge) serious flags ──
-    for flag in _EDGE_SERIOUS_FLAGS:
+    # ── Episode (rising-edge) terminating flags ──
+    for flag in _TERMINATING_EPISODE_FLAGS:
         if flag in flags and flag not in active:
             active.add(flag)
             await _strike(flag)
@@ -491,8 +565,8 @@ async def _evaluate_strikes(session_id: str, entry: dict, result, ws):
         elif flag not in flags:
             active.discard(flag)
 
-    # ── Minor (LOW/MEDIUM) flags: continuous warning only, throttled ~1/sec ──
-    minor = [f for f in flags if not _is_serious(f)]
+    # ── Everything else: warning only, throttled ~1/sec, never a strike ──
+    minor = [f for f in flags if f not in _TERMINATING_FLAGS]
     if minor and now - entry.get("last_minor_warn", 0.0) >= 1.0:
         entry["last_minor_warn"] = now
         try:
@@ -650,7 +724,6 @@ async def start_session(req: StartSessionRequest):
         "frame_count": 0,
         # ── Auto-termination strike tracking ──
         "strikes": {},                  # serious flag -> warning/strike count
-        "no_face_since": None,          # timestamp NO_FACE started (None = face present)
         "mismatch_since": None,         # timestamp IDENTITY_MISMATCH started
         "active_serious": set(),        # serious flags currently active (episode edge detection)
         "last_minor_warn": 0.0,         # throttle for minor (LOW/MEDIUM) warnings
@@ -662,6 +735,21 @@ async def start_session(req: StartSessionRequest):
     # Needed by the WS handler, and a fast local INSERT — keep it on the critical path,
     # but still off the loop.
     _sessions[session_id]["db_session_id"] = await asyncio.to_thread(_create_db_session, req)
+
+    # Accommodations HR approved for this attempt, read from the database — the browser
+    # cannot switch monitoring off for itself.
+    acc = await asyncio.to_thread(_approved_accommodations_for, req.interview_id or req.test_id_int)
+    pipeline.gaze_flags_off = bool(acc.get("gaze_flags_off"))
+    pipeline.audio_monitoring_off = bool(acc.get("audio_monitoring_off"))
+
+    # Keep the candidate's consent with the record it covers, as a marker row (like
+    # LIVE_ENROLLED) — the report shows it in the session header, never as a flag.
+    if req.monitoring_consent and _sessions[session_id]["db_session_id"]:
+        _fire_and_forget(
+            _persist_violation, _sessions[session_id]["db_session_id"],
+            "MONITORING_CONSENT", "LOW", "proctor", 0,
+            details=req.monitoring_consent.model_dump(),
+        )
 
     # Reference-photo load + SFace embedding happen after we respond. The session entry
     # must already exist: the helper mutates it.
@@ -677,6 +765,7 @@ async def start_session(req: StartSessionRequest):
         status="active",
         face_registered=False,
         enrollment_pending=True,
+        audio_monitoring_off=pipeline.audio_monitoring_off,
     )
 
 
@@ -700,14 +789,19 @@ async def stop_session(session_id: str):
                     ProctoringSession.id == entry["db_session_id"]
                 ).first()
                 if db_session:
-                    db_session.status = "completed"
-                    db_session.ended_at = datetime.utcnow()
+                    # The client stops every session on submit — including one the server
+                    # just terminated. Overwriting "terminated" here erased the only record
+                    # that the test ended early, so the report showed a normal completion.
+                    if db_session.status != "terminated":
+                        db_session.status = "completed"
+                    db_session.ended_at = db_session.ended_at or datetime.utcnow()
                     db_session.cheating_score = summary["avg_cheating_score"]
                     db.commit()
         except Exception as e:
             logger.error("Failed to finalize DB session: %s", e)
 
-    return {"session_id": session_id, "status": "completed", **summary}
+    status = "terminated" if entry.get("terminated") else "completed"
+    return {"session_id": session_id, "status": status, **summary}
 
 
 @router.get("/sessions/{session_id}/status", response_model=SessionStatusResponse)
@@ -867,7 +961,7 @@ async def get_proctoring_results(
     alive), this reads persisted ProctoringSession + ProctoringViolation rows, so
     it works after the test has ended. Tenant-scoped to the caller's company.
     """
-    from src.models.models import ProctoringSession, ProctoringViolation
+    from src.models.models import ProctoringSession, ProctoringViolation, ProctoringReview, User
 
     sessions_q = db.query(ProctoringSession).filter(ProctoringSession.test_id == interview_id)
     if current_user.company_id:
@@ -886,7 +980,22 @@ async def get_proctoring_results(
             ProctoringViolation.session_id == s.id
         ).order_by(ProctoringViolation.timestamp.desc()).all()
 
+        reviews = db.query(ProctoringReview).filter(
+            ProctoringReview.session_id == s.id
+        ).order_by(ProctoringReview.created_at.desc()).all()
+        reviewer_names = _user_names(db, User, {r.reviewer_id for r in reviews})
+        latest_review = {}                       # violation_id (None = session) -> newest row
+        for r in reviews:
+            latest_review.setdefault(r.violation_id, r)
+
         live_enrolled = any(v.violation_type == "LIVE_ENROLLED" for v in violations)
+        consent = next((v for v in violations if v.violation_type == "MONITORING_CONSENT"), None)
+        flagged = [v for v in violations if v.violation_type not in MARKER_VIOLATION_TYPES]
+        # What face matching compared against. It is never an identity-document check:
+        # the reference is the photo the candidate uploaded, or a snapshot they took at
+        # the start of the test when there was none.
+        reference = ("live_snapshot" if live_enrolled
+                     else "application_photo" if s.face_registered else "none")
         out_sessions.append({
             "session_id": s.id,
             "candidate_id": s.candidate_id,
@@ -901,9 +1010,20 @@ async def get_proctoring_results(
                 "pose": s.pose_score, "behavioral": s.behavioral_score,
             },
             "face_registered": s.face_registered,
-            "identity_verified": bool(s.face_registered) and not live_enrolled,
+            "identity_verified": bool(s.face_registered) and not live_enrolled,   # legacy; use `reference`
             "live_enrolled": live_enrolled,
-            "total_violations": len([v for v in violations if v.violation_type != "LIVE_ENROLLED"]),
+            "reference": reference,
+            "monitoring_consent": (
+                {**(consent.details or {}), "recorded_at": consent.timestamp.isoformat() if consent.timestamp else None}
+                if consent else None
+            ),
+            "total_violations": len(flagged),
+            "unreviewed_count": sum(
+                1 for v in flagged
+                if v.violation_type not in UNREVIEWABLE_TYPES and v.id not in latest_review
+            ),
+            "review": _review_dict(latest_review.get(None), reviewer_names),
+            "review_history": [_review_dict(r, reviewer_names) for r in reviews],
             "violations": [
                 {
                     "id": v.id,
@@ -917,16 +1037,132 @@ async def get_proctoring_results(
                         f"/api/v1/proctor/evidence/{s.id}/{os.path.basename(v.evidence_path)}"
                         if v.evidence_path else None
                     ),
+                    "review": _review_dict(latest_review.get(v.id), reviewer_names),
+                    "reviewable": v.violation_type not in UNREVIEWABLE_TYPES,
                 }
-                for v in violations if v.violation_type != "LIVE_ENROLLED"
+                for v in flagged
             ],
         })
 
+    # The attempt itself: which try this is, the adjustments it ran with, and the
+    # candidate's own explanation — context a reviewer needs next to the flags.
+    from src.models.models import Interview, AssessmentExplanation
+    from src.services.assessment_fairness import approved_accommodations, describe
+    iv = db.query(Interview).filter(Interview.id == interview_id).first()
+    explanations = db.query(AssessmentExplanation).filter(
+        AssessmentExplanation.interview_id == interview_id
+    ).order_by(AssessmentExplanation.created_at).all()
+
     return {
         "interview_id": interview_id,
+        "attempt_number": (iv.attempt_number or 1) if iv else 1,
+        "previous_attempt_id": iv.previous_attempt_id if iv else None,
+        "accommodations_summary": describe(approved_accommodations(iv)) if iv else [],
+        "candidate_explanations": [
+            {"id": e.id, "text": e.text, "created_at": e.created_at.isoformat() if e.created_at else None}
+            for e in explanations
+        ],
         "session_count": len(out_sessions),
         "sessions": out_sessions,
     }
+
+
+REVIEW_OUTCOMES = ("confirmed", "dismissed", "inconclusive")
+
+# Timeline rows that record a fact rather than an allegation, so there is nothing to
+# confirm or dismiss. They stay visible; they just never count as "waiting for review".
+from src.models.models import PROCTORING_UNREVIEWABLE_TYPES as UNREVIEWABLE_TYPES  # noqa: E402
+
+
+def _user_names(db, User, ids) -> dict:
+    ids = {i for i in ids if i}
+    if not ids:
+        return {}
+    return {u.id: f"{u.first_name} {u.last_name}".strip()
+            for u in db.query(User).filter(User.id.in_(ids)).all()}
+
+
+def _review_dict(r, names: dict):
+    if r is None:
+        return None
+    return {
+        "id": r.id,
+        "violation_id": r.violation_id,
+        "outcome": r.outcome,
+        "remarks": r.remarks,
+        "reviewer_id": r.reviewer_id,
+        "reviewer_name": names.get(r.reviewer_id),
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    }
+
+
+class ReviewRequest(BaseModel):
+    session_id: str                          # ProctoringSession.id (the DB id in the report)
+    violation_ids: Optional[List[str]] = None  # None/empty = a verdict on the whole session
+    outcome: str
+    remarks: Optional[str] = None
+
+
+@router.post("/reviews")
+async def record_review(
+    req: ReviewRequest,
+    db: Session = Depends(get_db),
+    current_user=Depends(_REVIEW_ROLES),
+):
+    """Record a reviewer's outcome — Confirmed, Dismissed or Inconclusive — for flagged
+    events, or for the whole session.
+
+    Append-only: changing your mind adds a new row, and the report shows the latest one
+    with its history, so there is always a record of who concluded what and when.
+    Several violation ids can be reviewed at once because the report folds repeated
+    readings of one flag into a single timeline entry, and one decision covers them all.
+    A confirmed outcome needs remarks: it is the one that can count against a candidate,
+    so it must say why.
+    """
+    from src.models.models import ProctoringSession, ProctoringViolation, ProctoringReview, User
+
+    outcome = (req.outcome or "").strip().lower()
+    if outcome not in REVIEW_OUTCOMES:
+        raise HTTPException(422, f"outcome must be one of {', '.join(REVIEW_OUTCOMES)}")
+    remarks = (req.remarks or "").strip() or None
+    if remarks and len(remarks) > 2000:
+        raise HTTPException(422, "Remarks are limited to 2000 characters")
+    if outcome == "confirmed" and not remarks:
+        raise HTTPException(422, "Say what you saw when confirming a flag")
+
+    session = db.query(ProctoringSession).filter(ProctoringSession.id == req.session_id).first()
+    if not session or (current_user.company_id and session.company_id
+                       and session.company_id != current_user.company_id):
+        raise HTTPException(404, "Proctoring session not found")
+
+    ids = list(dict.fromkeys(req.violation_ids or []))   # de-duplicated, order kept
+    if ids:
+        found = {v.id: v for v in db.query(ProctoringViolation).filter(
+            ProctoringViolation.id.in_(ids),
+            ProctoringViolation.session_id == session.id,
+        ).all()}
+        missing = [i for i in ids if i not in found]
+        if missing:
+            raise HTTPException(404, "Some of those events are not part of this session")
+        if any(found[i].violation_type in MARKER_VIOLATION_TYPES | UNREVIEWABLE_TYPES for i in ids):
+            raise HTTPException(422, "Those entries record facts, not flags, and have nothing to review")
+
+    rows = [
+        ProctoringReview(
+            company_id=session.company_id or current_user.company_id,
+            session_id=session.id,
+            violation_id=vid,
+            outcome=outcome,
+            remarks=remarks,
+            reviewer_id=current_user.id,
+            created_at=datetime.utcnow(),
+        )
+        for vid in (ids or [None])
+    ]
+    db.add_all(rows)
+    db.commit()
+    names = _user_names(db, User, {current_user.id})
+    return {"reviews": [_review_dict(r, names) for r in rows]}
 
 
 @router.get("/evidence/{session_id}/{filename}")
@@ -1100,39 +1336,33 @@ class TabSwitchRequest(BaseModel):
 
 @router.post("/sessions/{session_id}/tab-switch")
 async def record_tab_switch(session_id: str, req: TabSwitchRequest):
-    """Record a tab switch and apply the per-flag strike policy (3 warnings → 4th terminates)."""
+    """Record a tab switch for the reviewer. Warns the candidate; never ends the test.
+
+    Tab switches used to count as strikes (4th ended the test). A notification that steals
+    focus, a password manager, an accessibility tool — all look identical from here, so the
+    event is evidence for a person to weigh, not grounds to stop the assessment.
+    """
     entry = _sessions.get(session_id)
     if not entry:
         raise HTTPException(404, "Session not found")
 
-    cfg = entry["pipeline"].cfg
-    n = entry["strikes"].get("TAB_SWITCH", 0) + 1   # one strike per tab-switch event
+    n = entry["strikes"].get("TAB_SWITCH", 0) + 1   # a running count, not a strike toward ending
     entry["strikes"]["TAB_SWITCH"] = n
-    terminate = n > cfg.TERMINATE_STRIKES
 
     db_session_id = entry.get("db_session_id")
     if db_session_id:
-        severity = "HIGH" if n >= cfg.TERMINATE_STRIKES else "MEDIUM"
         _persist_violation(
-            db_session_id, "TAB_SWITCH", severity, "behavioral",
-            score_impact=15 if n >= cfg.TERMINATE_STRIKES else 10,
-            details={"tab_switch_count": req.count, "strike": n, "timestamp": req.timestamp},
+            db_session_id, "TAB_SWITCH", "MEDIUM", "behavioral", score_impact=10,
+            details={"tab_switch_count": req.count, "occurrence": n, "timestamp": req.timestamp},
         )
 
-    if terminate:
-        _mark_session_terminated(entry, "TAB_SWITCH")
-
-    logger.warning("Tab switch strike %d/%d for session %s (terminate=%s)",
-                   n, cfg.TERMINATE_STRIKES, session_id, terminate)
+    logger.info("Tab switch #%d recorded for session %s", n, session_id)
     return {
         "session_id": session_id,
         "tab_switch_count": req.count,
-        "strike": n,
-        "max": cfg.TERMINATE_STRIKES,
-        "warning": not terminate,
-        "terminate": terminate,
-        "reason": "TAB_SWITCH" if terminate else None,
-        "message": _TERMINATE_MESSAGES["TAB_SWITCH"] if terminate else None,
+        "occurrence": n,
+        "warning": True,
+        "terminate": False,
     }
 
 
@@ -1147,45 +1377,34 @@ class FullscreenUnavailableRequest(BaseModel):
 
 @router.post("/sessions/{session_id}/fullscreen-exit")
 async def record_fullscreen_exit(session_id: str, req: FullscreenExitRequest):
-    """Record a fullscreen exit and apply the same strike policy as a tab switch.
+    """Record a fullscreen exit for the reviewer. Warns the candidate; never ends the test.
 
     Deliberately its own flag rather than reusing TAB_SWITCH: HR's report should be able
     to distinguish "pressed Escape" from "switched tab", and the two fire from different
-    browser events, so sharing a strike counter would double-count a single act on the
-    browsers where leaving fullscreen also backgrounds the tab.
+    browser events, so sharing a counter would double-count a single act on the browsers
+    where leaving fullscreen also backgrounds the tab.
     """
     entry = _sessions.get(session_id)
     if not entry:
         raise HTTPException(404, "Session not found")
 
-    cfg = entry["pipeline"].cfg
     n = entry["strikes"].get("FULLSCREEN_EXIT", 0) + 1
     entry["strikes"]["FULLSCREEN_EXIT"] = n
-    terminate = n > cfg.TERMINATE_STRIKES
 
     db_session_id = entry.get("db_session_id")
     if db_session_id:
-        severity = "HIGH" if n >= cfg.TERMINATE_STRIKES else "MEDIUM"
         _persist_violation(
-            db_session_id, "FULLSCREEN_EXIT", severity, "behavioral",
-            score_impact=15 if n >= cfg.TERMINATE_STRIKES else 10,
-            details={"exit_count": req.count, "strike": n, "timestamp": req.timestamp},
+            db_session_id, "FULLSCREEN_EXIT", "MEDIUM", "behavioral", score_impact=10,
+            details={"exit_count": req.count, "occurrence": n, "timestamp": req.timestamp},
         )
 
-    if terminate:
-        _mark_session_terminated(entry, "FULLSCREEN_EXIT")
-
-    logger.warning("Fullscreen exit strike %d/%d for session %s (terminate=%s)",
-                   n, cfg.TERMINATE_STRIKES, session_id, terminate)
+    logger.info("Fullscreen exit #%d recorded for session %s", n, session_id)
     return {
         "session_id": session_id,
         "exit_count": req.count,
-        "strike": n,
-        "max": cfg.TERMINATE_STRIKES,
-        "warning": not terminate,
-        "terminate": terminate,
-        "reason": "FULLSCREEN_EXIT" if terminate else None,
-        "message": _TERMINATE_MESSAGES["FULLSCREEN_EXIT"] if terminate else None,
+        "occurrence": n,
+        "warning": True,
+        "terminate": False,
     }
 
 
@@ -1224,6 +1443,43 @@ async def proctor_health():
 
 
 # ---------- WebSocket Endpoints ----------
+
+# Pre-test connectivity probe limits. The probe carries one frame-sized payload, so the
+# cap only has to exceed a proctoring frame (~50 KB of base64 JPEG) with room to spare.
+_PING_MAX_BYTES = 256 * 1024
+_PING_MAX_MESSAGES = 10
+_PING_IDLE_SEC = 15.0
+
+
+@router.websocket("/ws/ping")
+async def ws_ping(ws: WebSocket):
+    """Pre-test check that proctoring WebSockets can reach this service.
+
+    The candidate's system check (TestInstructions.jsx) connects here before the test.
+    It travels the exact route the real sockets use — the /api/v1/proctor/ws/ proxy rule
+    to the single-worker proctor service — so a proxy that downgrades the Upgrade
+    request, a corporate firewall or a VPN that blocks WebSockets fails HERE, where the
+    candidate can still fix it, instead of silently mid-test (see deploy/cpanel/
+    hireflow.conf: a broken WS route once left every session "clean" with zero frames).
+
+    Replies with the size of each message so the client can time an upload of a
+    frame-sized payload. Nothing is stored and no session is needed. Bounded in message
+    count, size and idle time so it cannot be held open or used as a bulk sink.
+    """
+    await ws.accept()
+    try:
+        for _ in range(_PING_MAX_MESSAGES):
+            data = await asyncio.wait_for(ws.receive_text(), timeout=_PING_IDLE_SEC)
+            if len(data) > _PING_MAX_BYTES:
+                await ws.close(code=1009, reason="Probe payload too large")
+                return
+            await ws.send_json({"event": "pong", "bytes": len(data)})
+        await ws.close(code=1000)
+    except (WebSocketDisconnect, asyncio.TimeoutError):
+        try:
+            await ws.close(code=1000)
+        except Exception:
+            pass
 
 @router.websocket("/ws/video/{session_id}")
 async def ws_video(ws: WebSocket, session_id: str):
@@ -1511,6 +1767,8 @@ async def ws_audio(ws: WebSocket, session_id: str):
     try:
         while True:
             data = await ws.receive_bytes()
+            if pipeline.audio_monitoring_off:
+                continue   # accommodation: audio is not analysed, whatever the client sends
             pipeline.ingest_audio(data)
     except WebSocketDisconnect:
         logger.info("Audio WS disconnected: session=%s", session_id)

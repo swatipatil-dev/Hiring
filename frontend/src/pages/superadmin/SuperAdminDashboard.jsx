@@ -202,6 +202,9 @@ const STYLES = `
     gap: 14px;
     margin-bottom: 32px;
   }
+  @media (max-width: 640px) {
+    .sa-stats { grid-template-columns: repeat(2, 1fr); }
+  }
 
   .sa-stat-card {
     background: #ffffff;
@@ -1641,9 +1644,9 @@ export default function SuperAdminDashboard() {
             </div>
 
             {/* Add row */}
-            <div style={{ display: 'flex', gap: 8, marginBottom: 14, alignItems: 'center' }}>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 14, alignItems: 'center' }}>
               <input
-                style={{ flex: 2, padding: '10px 14px', borderRadius: 9, border: '1.5px solid #e5e7eb', fontSize: '0.88rem', fontFamily: 'Syne, sans-serif', outline: 'none', color: '#1a1d23' }}
+                style={{ flex: '2 1 140px', minWidth: 0, padding: '10px 14px', borderRadius: 9, border: '1.5px solid #e5e7eb', fontSize: '0.88rem', fontFamily: 'Syne, sans-serif', outline: 'none', color: '#1a1d23' }}
                 placeholder="Department name"
                 value={ownDeptName}
                 onChange={e => setOwnDeptName(e.target.value)}
@@ -1652,7 +1655,7 @@ export default function SuperAdminDashboard() {
                 onBlur={e => e.target.style.borderColor = '#e5e7eb'}
               />
               <input
-                style={{ flex: 3, padding: '10px 14px', borderRadius: 9, border: '1.5px solid #e5e7eb', fontSize: '0.88rem', fontFamily: 'Syne, sans-serif', outline: 'none', color: '#1a1d23' }}
+                style={{ flex: '3 1 180px', minWidth: 0, padding: '10px 14px', borderRadius: 9, border: '1.5px solid #e5e7eb', fontSize: '0.88rem', fontFamily: 'Syne, sans-serif', outline: 'none', color: '#1a1d23' }}
                 placeholder="Description (optional)"
                 value={ownDeptDesc}
                 onChange={e => setOwnDeptDesc(e.target.value)}
@@ -2391,10 +2394,10 @@ export default function SuperAdminDashboard() {
                         </select>
                       </div>
 
-                      <div style={{ display: 'flex', gap: 8, marginBottom: 10, alignItems: 'center' }}>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 10, alignItems: 'center' }}>
                         <input
                           className="sa-input"
-                          style={{ flex: 2 }}
+                          style={{ flex: '2 1 140px', minWidth: 0 }}
                           placeholder="Department name"
                           value={quickDeptName}
                           onChange={e => setQuickDeptName(e.target.value)}
@@ -2402,7 +2405,7 @@ export default function SuperAdminDashboard() {
                         />
                         <input
                           className="sa-input"
-                          style={{ flex: 2 }}
+                          style={{ flex: '2 1 140px', minWidth: 0 }}
                           placeholder="Description (optional)"
                           value={quickDeptDesc}
                           onChange={e => setQuickDeptDesc(e.target.value)}
@@ -2915,13 +2918,31 @@ export default function SuperAdminDashboard() {
               )
             })()}
 
+            {/* Career page link + embed snippet.
+                Both used to carry ?key=<sk_live_…>. That put a live secret on the
+                client's own public website, readable in page source by anyone — and in
+                every link the client shared. The slug is public, so it can travel. */}
+            <div style={{ marginTop: 18 }}>
+              <div className="sa-embed-label">Career Page Link</div>
+              <div className="sa-embed-box">
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 10 }}>
+                  <span>{`${window.location.origin}/${selectedCompany.slug}`}</span>
+                  <button
+                    onClick={() => copyKey(`${window.location.origin}/${selectedCompany.slug}`, selectedCompany.id + '_link')}
+                    style={{ flexShrink: 0, background: 'none', border: 'none', cursor: 'pointer', color: copied === selectedCompany.id + '_link' ? '#059669' : '#9ca3af', padding: 0 }}>
+                    {copied === selectedCompany.id + '_link' ? <Check size={14} /> : <Copy size={14} />}
+                  </button>
+                </div>
+              </div>
+            </div>
+
             <div style={{ marginTop: 18 }}>
               <div className="sa-embed-label">Embed Code</div>
               <div className="sa-embed-box">
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 10 }}>
-                  <span>{`<iframe src="${window.location.origin}/jobs?key=${selectedCompany.api_key}" width="100%" height="700" frameborder="0"></iframe>`}</span>
+                  <span>{`<iframe src="${window.location.origin}/${selectedCompany.slug}/jobs" width="100%" height="700" frameborder="0"></iframe>`}</span>
                   <button
-                    onClick={() => copyKey(selectedCompany.api_key, selectedCompany.id + '_detail')}
+                    onClick={() => copyKey(`<iframe src="${window.location.origin}/${selectedCompany.slug}/jobs" width="100%" height="700" frameborder="0"></iframe>`, selectedCompany.id + '_detail')}
                     style={{ flexShrink: 0, background: 'none', border: 'none', cursor: 'pointer', color: copied === selectedCompany.id + '_detail' ? '#059669' : '#9ca3af', padding: 0 }}>
                     {copied === selectedCompany.id + '_detail' ? <Check size={14} /> : <Copy size={14} />}
                   </button>

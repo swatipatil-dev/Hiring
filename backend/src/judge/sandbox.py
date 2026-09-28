@@ -28,6 +28,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -48,6 +49,9 @@ class SandboxResult:
     wall_ms: int
     timed_out: bool
     oom_killed: bool
+    # True when the program wrote more than _OUTPUT_CAP to stdout or stderr; the
+    # excess was read and thrown away, never held in memory.
+    output_truncated: bool = False
 
 
 _DOCKER = os.getenv("JUDGE_DOCKER_BIN", "docker")
@@ -214,24 +218,13 @@ def run_in_sandbox(
     timeout_s = (time_limit_ms / 1000.0) + margin_s
 
     start = time.monotonic()
-    timed_out = False
-    try:
-        proc = subprocess.run(
-            cmd,
-            input=stdin.encode("utf-8", "replace"),
-            capture_output=True,
-            timeout=timeout_s,
-        )
-        exit_code = proc.returncode
-        stdout = proc.stdout[:_OUTPUT_CAP].decode("utf-8", "replace")
-        stderr = proc.stderr[:_OUTPUT_CAP].decode("utf-8", "replace")
-    except subprocess.TimeoutExpired as e:
-        timed_out = True
-        exit_code = 124
-        stdout = (e.stdout or b"")[:_OUTPUT_CAP].decode("utf-8", "replace")
-        stderr = (e.stderr or b"")[:_OUTPUT_CAP].decode("utf-8", "replace")
-        # The docker client was killed by the timeout, but the container may live on.
-        _force_kill(name)
+    exit_code, out_b, err_b, timed_out, truncated = _execute(
+        cmd, stdin.encode("utf-8", "replace"), timeout_s,
+        # The docker client is killed by the timeout, but the container may live on.
+        on_timeout=lambda: _force_kill(name),
+    )
+    stdout = out_b.decode("utf-8", "replace")
+    stderr = err_b.decode("utf-8", "replace")
 
     wall_ms = int((time.monotonic() - start) * 1000)
 
@@ -257,7 +250,79 @@ def run_in_sandbox(
     return SandboxResult(
         stdout=stdout, stderr=stderr, exit_code=exit_code,
         wall_ms=wall_ms, timed_out=timed_out, oom_killed=oom,
+        output_truncated=truncated,
     )
+
+
+def _drain(stream, cap: int, sink: list, overflow: list) -> None:
+    """Read ``stream`` to EOF, keeping only the first ``cap`` bytes.
+
+    Reading continues past the cap (discarding) so the child never blocks on a full
+    pipe; what matters is that a program printing gigabytes costs the worker at most
+    ``cap`` bytes. Reading everything and slicing afterwards, as before, let a single
+    submission push the worker past its MemoryMax and take every queued run with it.
+    """
+    kept = bytearray()
+    try:
+        while True:
+            chunk = stream.read(64 * 1024)
+            if not chunk:
+                break
+            room = cap - len(kept)
+            if room > 0:
+                kept += chunk[:room]
+            if len(chunk) > max(room, 0):
+                overflow[0] = True
+    except (OSError, ValueError):
+        pass
+    finally:
+        sink.append(bytes(kept))
+
+
+def _feed(stream, data: bytes) -> None:
+    try:
+        stream.write(data)
+    except (OSError, ValueError):
+        pass              # the program exited without reading all of its input
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
+def _execute(cmd: List[str], stdin: bytes, timeout_s: float, *,
+             cap: Optional[int] = None, on_timeout=None):
+    """Run ``cmd`` with bounded output capture.
+
+    Returns (exit_code, stdout, stderr, timed_out, output_truncated); stdout and stderr
+    are each at most ``cap`` bytes (default ``_OUTPUT_CAP``).
+    """
+    cap = _OUTPUT_CAP if cap is None else cap
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    out, err, overflow = [], [], [False]
+    threads = [
+        threading.Thread(target=_drain, args=(proc.stdout, cap, out, overflow), daemon=True),
+        threading.Thread(target=_drain, args=(proc.stderr, cap, err, overflow), daemon=True),
+        threading.Thread(target=_feed, args=(proc.stdin, stdin), daemon=True),
+    ]
+    for th in threads:
+        th.start()
+    timed_out = False
+    try:
+        exit_code = proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        if on_timeout:
+            on_timeout()
+        proc.kill()
+        proc.wait()
+        exit_code = 124
+    for th in threads:
+        th.join(timeout=5)
+    return (exit_code, out[0] if out else b"", err[0] if err else b"",
+            timed_out, overflow[0])
 
 
 def _force_kill(name: str) -> None:

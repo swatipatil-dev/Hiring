@@ -110,8 +110,9 @@ export default function OverviewTab({ profile, apps, myInterviews, myOffers, job
       {/* Greeting + profile strength */}
       <div style={{
         ...card, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16,
+        flexWrap: 'wrap',
       }}>
-        <div>
+        <div style={{ flex: '1 1 200px', minWidth: 0 }}>
           <div style={{ fontSize: 20, fontWeight: 700, color: 'var(--text-primary)' }}>
             Hi {firstName} 👋
           </div>
@@ -151,7 +152,7 @@ export default function OverviewTab({ profile, apps, myInterviews, myOffers, job
           onClick={nba.onClick}
           style={{
             cursor: 'pointer', borderRadius: 14, padding: '16px 20px',
-            display: 'flex', alignItems: 'center', gap: 16,
+            display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap',
             background: toneBg[nba.tone], boxShadow: '0 6px 20px rgba(15,118,110,0.18)',
           }}
         >
@@ -161,7 +162,7 @@ export default function OverviewTab({ profile, apps, myInterviews, myOffers, job
           }}>
             <nba.icon size={22} strokeWidth={1.9} />
           </div>
-          <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ flex: '1 1 180px', minWidth: 0 }}>
             <div style={{ fontSize: 10.5, textTransform: 'uppercase', letterSpacing: 0.6, fontWeight: 700, color: 'rgba(255,255,255,0.82)', marginBottom: 3 }}>
               Next best step
             </div>
@@ -184,7 +185,8 @@ export default function OverviewTab({ profile, apps, myInterviews, myOffers, job
       )}
 
       {/* Quick stat tiles */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 14 }}>
+      {/* auto-fit: three across on desktop, two per row on a phone. */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(150px, 100%), 1fr))', gap: 14 }}>
         {[
           { label: 'Applications',  value: statApplied,      icon: Send,     route: '/candidate/applications' },
           { label: 'Interviewing',  value: statInterviewing, icon: Calendar, route: '/candidate/interviews' },
@@ -215,7 +217,7 @@ export default function OverviewTab({ profile, apps, myInterviews, myOffers, job
       </div>
 
       {/* Two-column: upcoming interview + recent applications */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
+      <div className="stack-mobile" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
         <div style={card}>
           <div style={headerRow}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>

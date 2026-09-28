@@ -13,8 +13,10 @@
 #
 # Prerequisites:
 #   useradd -r -s /sbin/nologin -G docker hfjudge
-#   mkdir -p /srv/judge_work && chown hfjudge:hfjudge /srv/judge_work
+#   mkdir -p /srv/judge_work && chown hfjudge:hfjudge /srv/judge_work && chmod 700 /srv/judge_work
 #   bash backend/scripts/build_judge_images.sh   # builds hireflow-judge-{python,cpp,node,java}
+#   Redis with a password, and that password in REDIS_URL (docs/CPANEL_DEPLOYMENT.md):
+#   this worker runs whatever the queue hands it, within src/judge/rq_safety.py's list.
 
 [Unit]
 Description=HireFlow coding-judge RQ worker
@@ -75,11 +77,32 @@ MemoryMax=2G
 CPUWeight=30
 IOWeight=30
 
-NoNewPrivileges=false
-PrivateTmp=true
-ProtectSystem=full
+# ── Confinement of the worker process itself ─────────────────────────────────
+# The worker only needs to: read the app code, write candidates' job directories
+# under /srv/judge_work, and talk to Redis, MySQL and the Docker socket. Everything
+# else is taken away, so a bug in the worker (not the sandbox) reaches as little as
+# possible. As above, none of this applies to the containers, which dockerd starts.
+#
+# strict: the whole filesystem is read-only except ReadWritePaths. (It was `full`,
+# which leaves /opt writable — ReadWritePaths=/opt/hireflow granted nothing extra,
+# and the app's code and uploads were writable by the one docker-group process.)
+ProtectSystem=strict
+ReadWritePaths=/srv/judge_work
 ProtectHome=true
-ReadWritePaths=/opt/hireflow /srv/judge_work
+PrivateTmp=true
+# The docker CLI needs no setuid binary and no new privileges; the docker group is
+# what grants socket access.
+NoNewPrivileges=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+# Unix sockets (Docker) and TCP (Redis, MySQL, Gemini for test generation).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Three pool workers plus a docker client each; a runaway loop stops here.
+TasksMax=256
+# No UMask=: job files must stay readable by the container's `nobody` user. The
+# 0700 work root (set by the worker at startup) is what keeps other accounts out.
 
 [Install]
 WantedBy=multi-user.target

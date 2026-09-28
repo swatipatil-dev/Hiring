@@ -19,7 +19,8 @@ import json
 import uuid
 
 from src.config.database_config_mysql import get_db
-from src.auth import get_current_user
+from src.auth import get_current_user, require_role
+from src.services.interview_access import STAFF_ROLES
 from src.models.models import User
 from src.services.email_service import (
     send_mcq_result, send_offer_accepted, send_offer_rejected, resolve_sender
@@ -27,6 +28,11 @@ from src.services.email_service import (
 from src.models.models import Candidate as _CandidateModel, Interview as _InterviewModel
 
 router = APIRouter(prefix="/api/v1/evaluation", tags=["Evaluation & Workflow"])
+
+# The two submit endpoints return the answer key (correct answers, reference
+# solutions) and move the candidate's stage, so they are for staff. Candidates
+# submit through /api/v1/candidate/interviews/{id}/submit, which returns a score only.
+_staff_user = require_role(list(STAFF_ROLES))
 
 
 # ==================== SCHEMAS ====================
@@ -61,7 +67,7 @@ class OfferResponse(BaseModel):
 def submit_mcq_test(
     submission: MCQSubmission,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(_staff_user),
 ):
     """Submit MCQ answers and get instant mark sheet."""
 
@@ -247,7 +253,7 @@ def submit_mcq_test(
 def submit_coding_answer(
     submission: CodingSubmission,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(_staff_user),
 ):
     """Submit coding or pseudocode answer for a question. Returns structured evaluation."""
 
@@ -420,6 +426,14 @@ def respond_to_offer(
         from src.services.email_service import delivery_outcome
         disp = resolve_step_dispatch(db, _cid, _step, offer=offer_obj)
         smtp_config = disp["smtp_config"] or resolve_sender(db, _cid, "candidate")
+        # Co-HRs on a shared job hear about the reply too. CC'd, not addressed, so the
+        # offer's own HR stays the primary recipient; nobody is listed twice.
+        if offer_obj is not None and offer_obj.job is not None:
+            from src.services.job_access import job_hr_emails
+            listed = {e.lower() for e in ([hr_email] if hr_email else []) + list(disp["cc"] or [])}
+            extra = [e for e in job_hr_emails(db, offer_obj.job) if e.lower() not in listed]
+            if extra:
+                disp["cc"] = list(disp["cc"] or []) + extra
         try:
             if new_status == "accepted":
                 _res = send_offer_accepted(hr_email or "hr@company.com", candidate_name,

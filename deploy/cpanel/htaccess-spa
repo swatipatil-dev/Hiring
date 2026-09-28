@@ -23,6 +23,13 @@
 # Vite emits content-hashed asset filenames, so they can be cached hard.
 # index.html must NOT be, or a deploy leaves clients on stale asset references.
 <IfModule mod_headers.c>
+  # Keep the path and query off outbound Referer headers. The public pages pull webfonts
+  # from fonts.googleapis.com, so every navigation used to hand a third party whatever was
+  # in the URL — which, while ?key=<sk_live_…> links are still in circulation, is a live
+  # secret. strict-origin-when-cross-origin rather than same-origin so first-party
+  # analytics and redirect chains still see a Referer.
+  Header always set Referrer-Policy "strict-origin-when-cross-origin"
+
   <FilesMatch "\.(js|css|woff2?|png|jpe?g|svg|webp|ico)$">
     Header set Cache-Control "public, max-age=31536000, immutable"
   </FilesMatch>

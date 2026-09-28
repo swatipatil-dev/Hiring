@@ -33,6 +33,26 @@ def client_ip_key(request) -> str:
     return get_remote_address(request)
 
 
+def user_key(request) -> str:
+    """The signed-in user's id, for per-user limits; the client IP when there is none.
+
+    Candidates often sit a test from the same office or campus network, so keying the
+    code-execution limits on IP would let one busy room lock everyone out. The token
+    is only decoded here to pick a bucket — the route still authenticates it.
+    """
+    auth = request.headers.get("authorization") or ""
+    if auth.lower().startswith("bearer "):
+        try:
+            from jose import jwt
+            from src.auth import SECRET_KEY, ALGORITHM
+            sub = jwt.decode(auth[7:].strip(), SECRET_KEY, algorithms=[ALGORITHM]).get("sub")
+            if sub:
+                return f"user:{sub}"
+        except Exception:
+            pass
+    return client_ip_key(request)
+
+
 # Single shared limiter so the routes' decorators and app.state.limiter (used by
 # the 429 handler) are the same instance.
 limiter = Limiter(key_func=client_ip_key)

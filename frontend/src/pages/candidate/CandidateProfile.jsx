@@ -85,7 +85,7 @@ function ProfileStrengthBanner({ completion }) {
 
         {/* Middle */}
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6, flexWrap: 'wrap' }}>
             <span style={{ fontWeight: 700, fontSize: 15, color: 'var(--text-primary)' }}>Profile Strength</span>
             <span style={{
               background: lvl.bg, color: lvl.color, border: `1px solid ${lvl.border}`,
@@ -374,14 +374,23 @@ export default function CandidateProfile() {
   }
 
   return (
-    <div style={{ display: 'flex', gap: 20, alignItems: 'flex-start' }}>
+    <div className="cp-layout" style={{ display: 'flex', gap: 20, alignItems: 'flex-start' }}>
+      {/* On phones the nav sits above the content as one sideways-scrolling row. */}
+      <style>{`
+        @media (max-width: 768px) {
+          .cp-layout { flex-direction: column; align-items: stretch !important; gap: 14px !important; }
+          .cp-nav { width: auto !important; position: static !important; display: flex; gap: 4px; overflow-x: auto; padding: 6px !important; }
+          .cp-nav-title { display: none; }
+          .cp-nav > button { width: auto !important; flex-shrink: 0; white-space: nowrap; margin-bottom: 0 !important; }
+        }
+      `}</style>
       {/* Section nav */}
-      <aside style={{
+      <aside className="cp-nav" style={{
         width: 220, flexShrink: 0,
         background: '#fff', border: '1px solid var(--border-subtle)',
         borderRadius: 14, padding: '10px', position: 'sticky', top: 24,
       }}>
-        <div style={{
+        <div className="cp-nav-title" style={{
           padding: '6px 10px 10px', fontSize: 11, fontWeight: 600,
           letterSpacing: 0.6, color: 'var(--text-tertiary)', textTransform: 'uppercase',
         }}>Sections</div>
@@ -457,7 +466,7 @@ export default function CandidateProfile() {
             <div style={{
               display: 'flex', justifyContent: 'space-between', alignItems: 'center',
               marginTop: 20, paddingTop: 18, borderTop: '1px solid var(--border-subtle)',
-              gap: 12,
+              gap: 12, flexWrap: 'wrap',
             }}>
               {prev ? (
                 <button onClick={() => go(prev.id)} style={{
@@ -642,8 +651,8 @@ function PersonalSection({ profile, reload, flash }) {
         </div>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ fontSize: 17, fontWeight: 700, color: 'var(--text-primary)', lineHeight: 1.2 }}>{fullName}</div>
-          <div style={{ fontSize: 13, color: 'var(--text-secondary)', marginTop: 2 }}>{profile.email || ''}</div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 10 }}>
+          <div style={{ fontSize: 13, color: 'var(--text-secondary)', marginTop: 2, overflowWrap: 'anywhere' }}>{profile.email || ''}</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 10, flexWrap: 'wrap' }}>
             <button onClick={() => photoRef.current?.click()} style={{
               display: 'inline-flex', alignItems: 'center', gap: 6,
               background: TEAL, color: '#fff', border: 'none',

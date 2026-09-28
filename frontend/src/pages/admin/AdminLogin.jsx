@@ -9,7 +9,8 @@ export default function AdminLogin() {
   const { login, logout } = useAuth()
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
-  const apiKey = searchParams.get('key') || ''
+  // Branding only — this page does not scope the login, it just themes itself.
+  const companySlug = searchParams.get('c') || ''
 
   const [company,  setCompany]  = useState(null)
   const [email,    setEmail]    = useState('')
@@ -18,14 +19,14 @@ export default function AdminLogin() {
   const [error,    setError]    = useState('')
   const [loading,  setLoading]  = useState(false)
 
-  // Load company branding if API key provided
+  // Load company branding when a company slug is supplied
   useEffect(() => {
-    if (!apiKey) return
-    fetch(`${API}/public/company-info?key=${encodeURIComponent(apiKey)}`)
+    if (!companySlug) return
+    fetch(`${API}/public/company-info?c=${encodeURIComponent(companySlug)}`)
       .then(r => r.ok ? r.json() : null)
       .then(d  => { if (d) setCompany(d) })
       .catch(() => {})
-  }, [apiKey])
+  }, [companySlug])
 
   const accent = company?.primary_color || '#2b7cba'
 
@@ -53,8 +54,9 @@ export default function AdminLogin() {
   return (
     <div style={{ display: 'flex', minHeight: '100vh', fontFamily: "'Segoe UI', system-ui, sans-serif", background: '#f1f5f9' }}>
 
-      {/* Left branding panel */}
-      <div style={{
+      {/* Left branding panel — decorative, so it steps aside on narrow screens
+          rather than pushing the form off the edge (see <style> below). */}
+      <div className="al-brand" style={{
         width: 400, flexShrink: 0, display: 'flex', flexDirection: 'column',
         background: `linear-gradient(160deg, ${accent} 0%, ${accent}cc 100%)`,
         padding: '48px 44px',
@@ -99,8 +101,8 @@ export default function AdminLogin() {
       </div>
 
       {/* Right form panel */}
-      <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '40px 24px' }}>
-        <div style={{
+      <div className="al-form-panel" style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '40px 24px' }}>
+        <div className="al-card" style={{
           background: '#fff', borderRadius: 20, padding: '44px 48px',
           width: '100%', maxWidth: 460,
           boxShadow: '0 8px 48px rgba(0,0,0,0.1)', border: '1px solid #e8edf4',
@@ -185,6 +187,16 @@ export default function AdminLogin() {
           </div>
         </div>
       </div>
+
+      <style>{`
+        @media (max-width: 820px) {
+          .al-brand { display: none !important; }
+        }
+        @media (max-width: 480px) {
+          .al-form-panel { padding: 24px 12px !important; }
+          .al-card { padding: 28px 20px !important; }
+        }
+      `}</style>
     </div>
   )
 }

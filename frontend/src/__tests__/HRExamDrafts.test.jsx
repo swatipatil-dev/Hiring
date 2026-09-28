@@ -20,6 +20,9 @@ import { MemoryRouter } from 'react-router-dom'
 const get = vi.fn()
 const del = vi.fn()
 
+// HRDashboard reads the signed-in user (to tell owner / co-HR apart); in the app it
+// always sits inside AuthProvider, which these isolated renders don't mount.
+vi.mock('../context/AuthContext', () => ({ useAuth: () => ({ user: { role: 'hr' } }) }))
 vi.mock('../api/client', () => ({
   default: {
     get: (...a) => get(...a),

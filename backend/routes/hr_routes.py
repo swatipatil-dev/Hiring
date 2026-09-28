@@ -14,7 +14,7 @@ from src.models.models import (
     User, JobPosting, Candidate, ATSResult, CandidateStageHistory,
     Interview, InterviewFeedback, Offer, HRProfile, Department, InterviewerProfile,
     CandidateRequest, Notification, ResumePoolEntry, ResumePoolAttachment,
-    MailTemplate
+    MailTemplate, JobHRCollaborator
 )
 from src.services.resume_pool_import import (
     import_registered_users, import_orphan_candidates,
@@ -35,6 +35,11 @@ from src.services.llm_resume_extractor import (
 from src.services.talent_pool import (
     derive_outcome, outcome_filter, outcome_sum_columns,
 )
+from src.services.job_transfer import transfer_job, hr_display_name, JobTransferError
+from src.services.job_access import (
+    job_access_filter, can_access_job, is_job_owner, is_collaborator, collaborator_summary,
+)
+from src.services.notification_service import create_notification
 from pydantic import BaseModel, EmailStr, Field
 from datetime import datetime, timedelta
 import asyncio
@@ -102,6 +107,54 @@ def _proctoring_flags(raw):
             for flag in PROCTORING_FLAGS}
 
 
+# Appended by the server to every invitation for a proctored test, whatever HR typed in
+# the body, so a candidate always learns about monitoring before opening the link. Kept in
+# step with MonitoringDisclosure (frontend/src/pages/candidate/TestInstructions.jsx),
+# which gives the full detail and collects consent.
+MONITORING_EMAIL_NOTICE = (
+    "<p style='margin:18px 0 0;padding:12px 14px;border-radius:8px;background:#f0f7f5;"
+    "border:1px solid #cfe6e0;color:#274b45;font-size:0.9rem;line-height:1.6'>"
+    "<b>This assessment is proctored.</b> Your camera and microphone are analysed "
+    "automatically during the test, your face is compared with the photo on your "
+    "application, and leaving the test tab is recorded. Flags are reviewed by a person "
+    "&mdash; nothing rejects you automatically. The test page explains exactly what is "
+    "collected and asks for your agreement before you start. If you need an adjustment, "
+    "such as extra time, please reply to this email before you begin."
+    "</p>"
+)
+
+
+def _test_is_proctored(test, overrides=None) -> bool:
+    """Whether webcam monitoring will be on for a test sent with these overrides."""
+    flags = _proctoring_flags(test.security_settings_data if test else None)
+    flags.update({k: bool(v) for k, v in (overrides or {}).items() if k in flags})
+    return flags["enable_webcam_monitoring"]
+
+
+from src.services.jd_versions import ensure_jd_version  # noqa: E402
+from src.services.ats_scoring_pipeline import (  # noqa: E402
+    needs_review_candidate_ids, effective_score_col, effective_score,
+    build_inputs_for_candidate, score_for_job, persist_ats_result, ATS_REVIEW_THRESHOLD,
+)
+from src.services.assessment_fairness import (  # noqa: E402
+    approved_accommodations, parse_accommodations, describe as describe_accommodations,
+)
+
+
+def _preferred_json(preferred, required):
+    """Nice-to-haves as stored: de-duplicated, and never repeating a mandatory skill."""
+    if preferred is None:
+        return None
+    req = {str(r).strip().lower() for r in (required or [])}
+    seen, out = set(), []
+    for p in preferred:
+        key = str(p).strip().lower()
+        if key and key not in req and key not in seen:
+            seen.add(key)
+            out.append(str(p).strip())
+    return json.dumps(out)
+
+
 def _safe_targets(raw):
     """Parse skill_type_targets_data into a list of
     ``{"skill_name","question_type","count_per_set"}``. Returns [] when the column is NULL
@@ -158,6 +211,22 @@ class ATSCandidateResponse(BaseModel):
     weaknesses: List[str] = []
     missing_preferred_skills: List[str] = []
     scoring_breakdown: Optional[Dict[str, Any]] = None
+    # ── Explainability and provenance. `ats_score` above is the EFFECTIVE score (HR's
+    # override when there is one); `model_score` is what the scorer produced.
+    model_score: Optional[float] = None
+    override_score: Optional[float] = None
+    is_overridden: bool = False
+    parse_status: Optional[str] = None          # ok | needs_review | None (legacy)
+    parse_issues: List[str] = []                # plain-language reasons
+    mandatory_met: Optional[int] = None
+    mandatory_total: Optional[int] = None
+    evidence_coverage: Optional[float] = None
+    scoring_source: Optional[str] = None        # profile | resume
+    scoring_rules_version: Optional[str] = None
+    jd_version_no: Optional[int] = None
+    is_stale: bool = False
+    stale_reason: Optional[str] = None          # jd_changed | rules_updated | legacy
+    scored_at: Optional[datetime] = None
 
 class JobCandidatesEnhancedResponse(BaseModel):
     job_id: str
@@ -165,6 +234,10 @@ class JobCandidatesEnhancedResponse(BaseModel):
     total_candidates: int
     candidates: List[ATSCandidateResponse]
     ats_distribution: Dict[str, Any]
+    current_rules_version: Optional[str] = None
+    current_jd_version_no: Optional[int] = None
+    rules_versions_present: List[str] = []
+    needs_review_count: int = 0
 
 class CandidateSelectionRequest(BaseModel):
     candidate_ids: List[str]
@@ -182,6 +255,9 @@ class BulkActionResponse(BaseModel):
     rejected_count: int
     moved_to_stage: str
     job_id: str
+    # Applicants whose resume could not be read reliably: never auto-selected by rank or
+    # auto-rejected, because they were not really ranked.
+    held_for_review: int = 0
 
 class JobPostingCreate(BaseModel):
     title: str
@@ -193,8 +269,26 @@ class JobPostingCreate(BaseModel):
     salary_min: Optional[float] = None
     salary_max: Optional[float] = None
     experience_years: int
-    required_skills: List[str]
+    required_skills: List[str]                   # mandatory requirements
+    # Nice-to-haves. None = not specified (on update: leave as is; the scorer may infer
+    # them from the JD text). [] = explicitly none.
+    preferred_skills: Optional[List[str]] = None
     job_category: Optional[str] = "technical"   # technical | non_technical | mixed
+
+class JobTransferRequest(BaseModel):
+    to_hr_id: str
+    reason: Optional[str] = Field(None, max_length=500)
+
+class BulkJobTransferRequest(BaseModel):
+    to_hr_id: str
+    # Whose jobs to move. Omitted = the caller's own jobs.
+    from_hr_id: Optional[str] = None
+    # Job statuses to include. Omitted = every status except "closed".
+    statuses: Optional[List[str]] = None
+    reason: Optional[str] = Field(None, max_length=500)
+
+class AddJobCollaboratorRequest(BaseModel):
+    hr_id: str
 
 class JobApprovalRequest(BaseModel):
     salary_min: float = Field(..., description="Minimum salary (required)")
@@ -203,6 +297,8 @@ class JobApprovalRequest(BaseModel):
     employment_type: Optional[str] = None
     description: Optional[str] = None
     requirements: Optional[str] = None
+    required_skills: Optional[List[str]] = None
+    preferred_skills: Optional[List[str]] = None
 
 class JobPostingResponse(BaseModel):
     id: str
@@ -217,6 +313,7 @@ class JobPostingResponse(BaseModel):
     salary_max: Optional[float] = None
     experience_years: Optional[int] = 0
     required_skills: List[str] = []
+    preferred_skills: Optional[List[str]] = None     # None = not specified
     status: str
     created_at: datetime
     assigned_interviewer_email: Optional[str] = None
@@ -229,6 +326,17 @@ class JobPostingResponse(BaseModel):
     has_test: bool = False
     test_id: Optional[int] = None
     test_status: Optional[str] = None
+    # The owning HR — what a transfer changes. Admins see every company job, so the
+    # card has to say whose it is.
+    hr_id: Optional[str] = None
+    hr_name: Optional[str] = None
+    # Co-HRs: other HRs with the same access to this same job.
+    collaborators: List[Dict[str, Any]] = []
+    # The viewer's relation to the job: owner | collaborator | admin. Only the list
+    # endpoint computes it; the UI uses it to show owner-only actions.
+    my_role: Optional[str] = None
+    # The viewer's own HR profile id, so a co-HR's "Leave job" can name themselves.
+    my_hr_id: Optional[str] = None
 
 class CandidateATSResponse(BaseModel):
     candidate_id: str
@@ -388,13 +496,25 @@ async def get_tests_for_job(
     ]
 
 
-def create_job_response(job: JobPosting, test: Optional[Interview] = None) -> JobPostingResponse:
+def create_job_response(job: JobPosting, test: Optional[Interview] = None,
+                        viewer: Optional[User] = None,
+                        viewer_hr_id: Optional[str] = None) -> JobPostingResponse:
     """Create job posting response.
 
     ``test`` is the job's template Interview when the caller has already looked it up in
     bulk. Left None the response reports no test, which is what every single-job caller
     wants — only the list endpoint pays for the lookup.
     """
+    collaborators = collaborator_summary(job)
+    my_role = None
+    if viewer is not None and viewer.role == "admin":
+        my_role = "admin"
+    elif viewer_hr_id:
+        if job.hr_id and str(job.hr_id) == str(viewer_hr_id):
+            my_role = "owner"
+        elif any(c["hr_id"] == str(viewer_hr_id) for c in collaborators):
+            my_role = "collaborator"
+
     interviewer_email = None
     interviewer_name = None
     if hasattr(job, 'interviewer') and job.interviewer:
@@ -415,6 +535,7 @@ def create_job_response(job: JobPosting, test: Optional[Interview] = None) -> Jo
         salary_max=float(job.salary_max) if job.salary_max else None,
         experience_years=job.experience_years or 0,
         required_skills=_parse_skills(job.required_skills),
+        preferred_skills=(_parse_skills(job.preferred_skills) if job.preferred_skills is not None else None),
         status=job.status,
         created_at=job.created_at,
         assigned_interviewer_email=interviewer_email,
@@ -422,6 +543,11 @@ def create_job_response(job: JobPosting, test: Optional[Interview] = None) -> Jo
         has_test=test is not None,
         test_id=test.id if test else None,
         test_status=test.status if test else None,
+        hr_id=str(job.hr_id) if job.hr_id else None,
+        hr_name=hr_display_name(job.hr) if job.hr_id else None,
+        collaborators=collaborators,
+        my_role=my_role,
+        my_hr_id=str(viewer_hr_id) if viewer_hr_id else None,
     )
 
 def update_candidate_stage(db: Session, candidate_id: str, new_stage: str, changed_by_id: str, notes: str = None):
@@ -576,6 +702,7 @@ async def create_job(
         salary_max=job_data.salary_max,
         experience_years=job_data.experience_years,
         required_skills=json.dumps(job_data.required_skills) if job_data.required_skills else None,
+        preferred_skills=_preferred_json(job_data.preferred_skills, job_data.required_skills),
         job_category=job_data.job_category or "technical",
         company_id=job_company_id,
         status="active"
@@ -599,11 +726,13 @@ async def get_my_jobs(
     query = db.query(JobPosting).filter(JobPosting.company_id == current_user.company_id)
 
     # Filter by HR profile for non-admin users (auto-creates profile if missing).
-    # Always scope to the HR's own jobs — an HR must only see jobs assigned to them
-    # (admins fall through and see all company jobs).
+    # Scope to jobs the HR owns or is a co-HR on (admins fall through and see all
+    # company jobs). job_access_filter uses a subquery, so a shared job is listed once.
+    viewer_hr_id = None
     if current_user.role != "admin":
         hr_profile = get_hr_profile(db, current_user)
-        query = query.filter(JobPosting.hr_id == hr_profile.id)
+        viewer_hr_id = hr_profile.id
+        query = query.filter(job_access_filter(hr_profile.id))
     
     # Closed jobs stay in the HR list. HR owns the job's lifecycle and needs to see
     # a closed posting to reopen it, so hiding it here made a close look like a
@@ -613,7 +742,11 @@ async def get_my_jobs(
     if status:
         query = query.filter(JobPosting.status == status)
 
-    jobs = query.order_by(JobPosting.created_at.desc()).offset(skip).limit(limit).all()
+    # Owner name is on every card; load it with the page rather than once per job.
+    jobs = (query.options(selectinload(JobPosting.hr).selectinload(HRProfile.user),
+                          selectinload(JobPosting.collaborators)
+                          .selectinload(JobHRCollaborator.hr).selectinload(HRProfile.user))
+            .order_by(JobPosting.created_at.desc()).offset(skip).limit(limit).all())
 
     # Each job's template test, in ONE query rather than one per card. candidate_id IS NULL
     # is what separates a template from a per-candidate attempt; a DRAFT counts, because a
@@ -632,7 +765,8 @@ async def get_my_jobs(
             if existing is None or (existing.status or "").upper() == "DRAFT":
                 tests_by_job[iv.job_id] = iv
 
-    return [create_job_response(job, tests_by_job.get(job.id)) for job in jobs]
+    return [create_job_response(job, tests_by_job.get(job.id), viewer=current_user,
+                                viewer_hr_id=viewer_hr_id) for job in jobs]
 
 
 # ==================== RESUME MATCHER (reverse ATS) ====================
@@ -730,6 +864,8 @@ class ResumeMatchResult(BaseModel):
     extracted_experience: Optional[float] = None
     best_match: Optional[JobMatch] = None
     alternates: List[JobMatch] = []
+    # ok | needs_review: whether the stored resume text could be read reliably.
+    parse_status: Optional[str] = None
     uploaded_at: Optional[datetime] = None
     status: str = "new"
     moved_candidate_id: Optional[str] = None
@@ -1074,7 +1210,8 @@ def _entry_to_result(entry: ResumePoolEntry,
     last_activity = next((a.applied_at for a in applications if a.applied_at), None)
 
     return ResumeMatchResult(
-        id=entry.id,
+        parse_status=getattr(entry, "parse_status", None),
+id=entry.id,
         filename=entry.filename or "resume",
         full_name=entry.full_name,
         email=entry.email,
@@ -2593,13 +2730,14 @@ async def move_pool_resume_to_ats(
                    f"for {job.title} (stage: {duplicate.current_stage})",
         )
 
-    # Pull the stored per-job scores for the chosen job.
-    try:
-        matches = json.loads(entry.match_results) if entry.match_results else []
-    except (json.JSONDecodeError, TypeError, ValueError):
-        matches = []
-    match = next((m for m in matches if isinstance(m, dict) and m.get("job_id") == job_id), None)
-    ats_score = float(match["ats_score"]) if match and match.get("ats_score") is not None else 0.0
+    # Score against the job as it is now, through the shared pipeline, so the new ATS
+    # result carries the full breakdown, provenance and parse status. (This used to copy
+    # the pool's stored match, which lacked the breakdown and could predate a JD edit.)
+    inputs = build_inputs_for_candidate(db, user_id=getattr(entry, "source_user_id", None),
+                                        resume_text=entry.resume_text or "")
+    outcome = score_for_job(inputs, job)
+    held = outcome.parse["status"] == "needs_review"
+    ats_score = float(outcome.result.ats_score or 0)
 
     # company_id must be set or the candidate exists in MySQL but stays invisible
     # behind the tenant filter (see docs/DASHBOARD_DATA_PITFALLS.md).
@@ -2623,21 +2761,8 @@ async def move_pool_resume_to_ats(
     db.add(candidate)
     db.flush()                              # need candidate.id for the child rows
 
-    ats_record = ATSResult(
-        company_id=company_id,
-        candidate_id=candidate.id,
-        job_id=job_id,
-        skills_match_score=(match or {}).get("skills_match_score"),
-        semantic_score=(match or {}).get("semantic_score"),
-        experience_score=(match or {}).get("experience_score"),
-        keyword_score=(match or {}).get("keyword_score"),
-        ats_score=ats_score,
-        matched_skills=json.dumps((match or {}).get("matched_skills") or []),
-        missing_skills=json.dumps((match or {}).get("missing_skills") or []),
-        scoring_breakdown=json.dumps({k: v for k, v in (match or {}).items()
-                                      if k.endswith("_score")}),
-    )
-    db.add(ats_record)
+    persist_ats_result(db, candidate=candidate, job=job, outcome=outcome,
+                       event_type="scored", actor_id=current_user.id)
 
     # Same stage progression the apply flow writes, so the audit trail is identical.
     db.add(CandidateStageHistory(
@@ -2651,7 +2776,14 @@ async def move_pool_resume_to_ats(
         from_stage="applied", to_stage="ats_screening", changed_by_id=current_user.id,
         notes=f"ATS screening completed automatically. Score: {ats_score}/100",
     ))
-    if ats_score >= 50:
+    if held:
+        candidate.current_stage = "hr_review"
+        db.add(CandidateStageHistory(
+            company_id=company_id, candidate_id=candidate.id,
+            from_stage="ats_screening", to_stage="hr_review", changed_by_id=current_user.id,
+            notes="Resume could not be read reliably, so it was not ranked: manual review.",
+        ))
+    elif ats_score >= ATS_REVIEW_THRESHOLD:
         candidate.current_stage = "hr_review"
         db.add(CandidateStageHistory(
             company_id=company_id, candidate_id=candidate.id,
@@ -2676,6 +2808,7 @@ async def move_pool_resume_to_ats(
         "job_id": job_id,
         "job_title": job.title,
         "ats_score": ats_score,
+        "resume_needs_review": held,
         "current_stage": candidate.current_stage,
         "message": f"{candidate.first_name} {candidate.last_name} added to {job.title}",
     }
@@ -2729,10 +2862,11 @@ async def get_job_details(
     # Check permissions
     if current_user.role != "admin":
         hr_profile = get_hr_profile(db, current_user)
-        if job.hr_id != hr_profile.id:
+        if not can_access_job(db, job, hr_profile):
             raise HTTPException(status_code=403, detail="Access denied")
-    
-    return create_job_response(job)
+        return create_job_response(job, viewer=current_user, viewer_hr_id=hr_profile.id)
+
+    return create_job_response(job, viewer=current_user)
 
 
 # IMPORTANT: Specific sub-path routes MUST come before generic {job_id} catch-all
@@ -2759,6 +2893,8 @@ async def approve_job(
     if approval.salary_min > approval.salary_max:
         raise HTTPException(status_code=400, detail="Minimum salary cannot exceed maximum salary")
 
+    # Keep what the job said before approval as a version, if it was never scored.
+    ensure_jd_version(db, job, current_user.id)
     # Update job with HR-provided details
     job.salary_min = approval.salary_min
     job.salary_max = approval.salary_max
@@ -2770,8 +2906,14 @@ async def approve_job(
         job.description = approval.description
     if approval.requirements:
         job.requirements = approval.requirements
+    if approval.required_skills is not None:
+        job.required_skills = json.dumps(approval.required_skills)
+    if approval.preferred_skills is not None:
+        job.preferred_skills = _preferred_json(approval.preferred_skills,
+                                               approval.required_skills or _parse_skills(job.required_skills))
     job.status = "active"
     job.updated_at = datetime.utcnow()
+    ensure_jd_version(db, job, current_user.id)
 
     # Notify the interviewer who created the job
     if job.created_by_id:
@@ -2839,14 +2981,55 @@ async def assign_hr_to_job(
     current_user: User = Depends(AuthMiddleware.get_current_hr),
     db: Session = Depends(get_db)
 ):
-    """Assign or reassign an HR to a job posting"""
+    """Assign or reassign an HR to a job posting.
+
+    Kept for existing callers; POST /jobs/{job_id}/transfer is the richer form. Both go
+    through transfer_job so offers, interviews, history and notifications move together.
+    """
+    job = _company_job_or_404(db, job_id, current_user)
+    _require_job_owner_or_admin(db, job, current_user)
+    hr_profile = _assignable_hr_or_error(db, hr_id, current_user)
+
+    # This endpoint always treated re-assigning the current owner as a harmless no-op.
+    if str(job.hr_id or "") != str(hr_profile.id):
+        transfer_job(db, job=job, to_hr=hr_profile, actor=current_user)
+        db.commit()
+
+    return {
+        "message": "HR assigned to job successfully",
+        "job_id": job_id,
+        "job_title": job.title,
+        "hr_name": f"{hr_profile.user.first_name} {hr_profile.user.last_name}",
+        "hr_email": hr_profile.user.email
+    }
+
+
+def _company_job_or_404(db: Session, job_id: str, current_user: User) -> JobPosting:
     job = db.query(JobPosting).filter(
         JobPosting.id == job_id,
         JobPosting.company_id == current_user.company_id
     ).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    return job
 
+
+def _require_job_owner_or_admin(db: Session, job: JobPosting, current_user: User) -> None:
+    """Managing a job's HR team, transferring it and permanently deleting it are the
+    owner's calls. Co-HRs get full day-to-day access, but not these."""
+    if current_user.role == "admin":
+        return
+    # A job nobody owns yet (e.g. admin-created, hr_id NULL) has no owner to defer to;
+    # it stays open to any HR in the company, as it was before co-HRs existed.
+    if not job.hr_id:
+        return
+    if not is_job_owner(job, get_hr_profile(db, current_user)):
+        raise HTTPException(status_code=403,
+                            detail="Only the job's owner HR or an admin can do this.")
+
+
+def _assignable_hr_or_error(db: Session, hr_id: str, current_user: User) -> HRProfile:
+    """An ACTIVE HR profile in the caller's company, or the right HTTP error."""
     hr_profile = active_hr_query(db, current_user.company_id).filter(
         HRProfile.id == hr_id,
         User.company_id == current_user.company_id
@@ -2864,18 +3047,253 @@ async def assign_hr_to_job(
                 detail="That HR user has been deactivated and cannot be assigned."
             )
         raise HTTPException(status_code=404, detail="HR profile not found")
+    return hr_profile
 
-    job.hr_id = hr_id
-    job.updated_at = datetime.utcnow()
+
+@router.post("/jobs/transfer-bulk")
+async def transfer_jobs_bulk(
+    body: BulkJobTransferRequest,
+    current_user: User = Depends(AuthMiddleware.get_current_hr),
+    db: Session = Depends(get_db)
+):
+    """Hand every job one HR owns over to another HR in a single transaction.
+
+    Defaults to the caller's own jobs, excluding closed ones. `from_hr_id` may name a
+    deactivated HR — clearing out a departed colleague's jobs is the main reason to use it.
+    """
+    to_hr = _assignable_hr_or_error(db, body.to_hr_id, current_user)
+
+    if body.from_hr_id and current_user.role != "admin"             and str(body.from_hr_id) != str(get_hr_profile(db, current_user).id):
+        raise HTTPException(status_code=403, detail="Only an admin can transfer another HR's jobs.")
+    if body.from_hr_id:
+        from_hr = db.query(HRProfile).join(User, HRProfile.user_id == User.id).filter(
+            HRProfile.id == body.from_hr_id,
+            User.company_id == current_user.company_id
+        ).first()
+        if not from_hr:
+            raise HTTPException(status_code=404, detail="Source HR profile not found")
+    else:
+        from_hr = get_hr_profile(db, current_user)
+
+    if str(from_hr.id) == str(to_hr.id):
+        raise HTTPException(status_code=400, detail="Pick a different HR to transfer the jobs to.")
+
+    q = db.query(JobPosting).filter(
+        JobPosting.company_id == current_user.company_id,
+        JobPosting.hr_id == from_hr.id,
+    )
+    if body.statuses:
+        q = q.filter(JobPosting.status.in_(body.statuses))
+    else:
+        q = q.filter(or_(JobPosting.status.is_(None), JobPosting.status != "closed"))
+    jobs = q.order_by(JobPosting.created_at.desc()).all()
+
+    if not jobs:
+        return {"message": "No jobs matched — nothing was transferred.", "transferred": 0, "jobs": []}
+
+    moved = [
+        transfer_job(db, job=j, to_hr=to_hr, actor=current_user,
+                     reason=body.reason, bulk=True, notify=False)
+        for j in jobs
+    ]
+
+    # One summary per person instead of one bell entry per job.
+    actor_name = f"{current_user.first_name or ''} {current_user.last_name or ''}".strip() or current_user.email
+    to_name = hr_display_name(to_hr)
+    reason = (body.reason or "").strip()
+    suffix = f" Reason: {reason}" if reason else ""
+    titles = ", ".join(m["job_title"] for m in moved[:5]) + (" …" if len(moved) > 5 else "")
+    if to_hr.user_id != current_user.id:
+        create_notification(
+            db, user_id=to_hr.user_id, company_id=current_user.company_id,
+            title=f"{len(moved)} job(s) transferred to you",
+            message=f"{actor_name} transferred {len(moved)} job(s) to you: {titles}.{suffix}",
+            type="job_transferred", reference_type="job", reference_id=moved[0]["job_id"],
+            commit=False,
+        )
+    if from_hr.user_id != current_user.id:
+        create_notification(
+            db, user_id=from_hr.user_id, company_id=current_user.company_id,
+            title=f"{len(moved)} job(s) transferred away",
+            message=f"{actor_name} transferred {len(moved)} of your job(s) to {to_name}: {titles}.{suffix}",
+            type="job_transferred", reference_type="job", reference_id=moved[0]["job_id"],
+            commit=False,
+        )
+
+    db.commit()
+    return {
+        "message": f"Transferred {len(moved)} job(s) to {to_name}",
+        "transferred": len(moved),
+        "jobs": moved,
+    }
+
+
+@router.post("/jobs/{job_id}/transfer")
+async def transfer_job_to_hr(
+    job_id: str,
+    body: JobTransferRequest,
+    current_user: User = Depends(AuthMiddleware.get_current_hr),
+    db: Session = Depends(get_db)
+):
+    """Hand a job over to another HR. Its candidates, interviews and offers go with it,
+    both HRs are notified, and the move is recorded in the job's transfer history."""
+    job = _company_job_or_404(db, job_id, current_user)
+    _require_job_owner_or_admin(db, job, current_user)
+    to_hr = _assignable_hr_or_error(db, body.to_hr_id, current_user)
+
+    try:
+        result = transfer_job(db, job=job, to_hr=to_hr, actor=current_user, reason=body.reason)
+    except JobTransferError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     db.commit()
 
+    return {"message": f"'{job.title}' transferred to {result['to_hr_name']}", **result}
+
+
+@router.get("/jobs/{job_id}/transfer-history")
+async def get_job_transfer_history(
+    job_id: str,
+    current_user: User = Depends(AuthMiddleware.get_current_hr),
+    db: Session = Depends(get_db)
+):
+    """Every hand-over of this job, newest first."""
+    from src.models.models import JobTransferHistory
+
+    _company_job_or_404(db, job_id, current_user)
+    rows = db.query(JobTransferHistory).filter(
+        JobTransferHistory.job_id == job_id,
+        JobTransferHistory.company_id == current_user.company_id,
+    ).order_by(JobTransferHistory.created_at.desc()).all()
+    return [
+        {
+            "id": r.id,
+            "from_hr_name": r.from_hr_name,
+            "to_hr_name": r.to_hr_name,
+            "transferred_by_email": r.transferred_by_email,
+            "reason": r.reason,
+            "offers_moved": r.offers_moved or 0,
+            "interviews_moved": r.interviews_moved or 0,
+            "bulk": bool(r.bulk),
+            "created_at": r.created_at,
+        }
+        for r in rows
+    ]
+
+
+# ==================== CO-HRs (shared jobs) ====================
+# A co-HR works the SAME job as its owner — nothing is copied. The owner or an admin
+# manages the team; a co-HR may only remove themselves.
+
+def _hr_person(profile: Optional[HRProfile]) -> Optional[Dict[str, Any]]:
+    if not profile or not profile.user:
+        return None
+    return {"hr_id": str(profile.id), "name": hr_display_name(profile), "email": profile.user.email}
+
+
+@router.get("/jobs/{job_id}/collaborators")
+async def get_job_collaborators(
+    job_id: str,
+    current_user: User = Depends(AuthMiddleware.get_current_hr),
+    db: Session = Depends(get_db)
+):
+    """The job's HR team: its owner and its co-HRs."""
+    job = _company_job_or_404(db, job_id, current_user)
+    if current_user.role != "admin" and not can_access_job(db, job, get_hr_profile(db, current_user)):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    rows = (db.query(JobHRCollaborator)
+            .filter(JobHRCollaborator.job_id == job.id)
+            .order_by(JobHRCollaborator.created_at).all())
     return {
-        "message": "HR assigned to job successfully",
-        "job_id": job_id,
-        "job_title": job.title,
-        "hr_name": f"{hr_profile.user.first_name} {hr_profile.user.last_name}",
-        "hr_email": hr_profile.user.email
+        "owner": _hr_person(job.hr) if job.hr_id else None,
+        "collaborators": [
+            {**(_hr_person(r.hr) or {"hr_id": str(r.hr_id), "name": None, "email": None}),
+             "added_by_email": r.added_by.email if r.added_by else None,
+             "created_at": r.created_at}
+            for r in rows
+        ],
     }
+
+
+@router.post("/jobs/{job_id}/collaborators")
+async def add_job_collaborator(
+    job_id: str,
+    body: AddJobCollaboratorRequest,
+    current_user: User = Depends(AuthMiddleware.get_current_hr),
+    db: Session = Depends(get_db)
+):
+    """Give another HR access to this job. The job is shared, not duplicated."""
+    from sqlalchemy.exc import IntegrityError
+
+    job = _company_job_or_404(db, job_id, current_user)
+    _require_job_owner_or_admin(db, job, current_user)
+    hr_profile = _assignable_hr_or_error(db, body.hr_id, current_user)
+
+    if is_job_owner(job, hr_profile):
+        raise HTTPException(status_code=400, detail="That HR already owns this job.")
+    if is_collaborator(db, job, hr_profile):
+        raise HTTPException(status_code=409, detail="That HR is already on this job.")
+
+    db.add(JobHRCollaborator(
+        company_id=job.company_id or current_user.company_id,
+        job_id=job.id,
+        hr_id=hr_profile.id,
+        added_by_id=current_user.id,
+    ))
+    actor_name = f"{current_user.first_name or ''} {current_user.last_name or ''}".strip() or current_user.email
+    if hr_profile.user_id != current_user.id:
+        create_notification(
+            db, user_id=hr_profile.user_id, company_id=job.company_id,
+            title="Job shared with you",
+            message=f"{actor_name} added you as an HR on '{job.title}'. You now have full access to it.",
+            type="job_shared", reference_type="job", reference_id=job.id, commit=False,
+        )
+    try:
+        db.commit()
+    except IntegrityError:
+        # Two adds raced past the check above; the unique constraint kept it to one row.
+        db.rollback()
+        raise HTTPException(status_code=409, detail="That HR is already on this job.")
+
+    return {"message": f"{hr_display_name(hr_profile)} now has access to '{job.title}'",
+            **(_hr_person(hr_profile) or {})}
+
+
+@router.delete("/jobs/{job_id}/collaborators/{hr_id}")
+async def remove_job_collaborator(
+    job_id: str,
+    hr_id: str,
+    current_user: User = Depends(AuthMiddleware.get_current_hr),
+    db: Session = Depends(get_db)
+):
+    """Take a co-HR off the job. The owner or an admin can remove anyone; a co-HR can
+    remove only themselves (leave the job)."""
+    job = _company_job_or_404(db, job_id, current_user)
+    me = get_hr_profile(db, current_user) if current_user.role != "admin" else None
+    leaving = me is not None and str(me.id) == str(hr_id)
+    if not leaving:
+        _require_job_owner_or_admin(db, job, current_user)
+
+    row = db.query(JobHRCollaborator).filter(
+        JobHRCollaborator.job_id == job.id,
+        JobHRCollaborator.hr_id == hr_id,
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="That HR is not a co-HR on this job.")
+
+    removed = row.hr
+    db.delete(row)
+    if not leaving and removed and removed.user_id != current_user.id:
+        actor_name = f"{current_user.first_name or ''} {current_user.last_name or ''}".strip() or current_user.email
+        create_notification(
+            db, user_id=removed.user_id, company_id=job.company_id,
+            title="Removed from job",
+            message=f"{actor_name} removed you from '{job.title}'.",
+            type="job_shared", reference_type="job", reference_id=job.id, commit=False,
+        )
+    db.commit()
+    return {"message": "You left the job" if leaving
+            else f"{hr_display_name(removed) or 'HR'} removed from '{job.title}'"}
 
 
 @router.put("/jobs/{job_id}")
@@ -2892,6 +3310,10 @@ async def update_job(
     ).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    # Snapshot the job as it was, then again after the edit. A new version appears only
+    # when something scoring reads changed, and scores measured against the old one are
+    # then shown as "scored against an earlier job description".
+    ensure_jd_version(db, job, current_user.id)
     job.title = job_data.title
     job.description = job_data.description
     job.requirements = job_data.requirements
@@ -2902,7 +3324,10 @@ async def update_job(
     job.salary_max = job_data.salary_max
     job.experience_years = job_data.experience_years
     job.required_skills = json.dumps(job_data.required_skills)
+    if job_data.preferred_skills is not None:
+        job.preferred_skills = _preferred_json(job_data.preferred_skills, job_data.required_skills)
     job.updated_at = datetime.utcnow()
+    ensure_jd_version(db, job, current_user.id)
     db.commit()
     return create_job_response(job)
 
@@ -2992,6 +3417,7 @@ async def delete_job_permanent(
     """
     from src.models.models import (
         JobDeletionArchive, ProctoringSession, ProctoringTranscript, ProctoringViolation,
+        ProctoringReview, AssessmentExplanation,
     )
     from src.models.question_models import (
         Question as InterviewQuestion, QuestionSetAssignment,
@@ -3005,6 +3431,7 @@ async def delete_job_permanent(
     ).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    _require_job_owner_or_admin(db, job, current_user)
 
     # ---- Collect every dependent id up front ----
     cand_ids = [r[0] for r in db.query(Candidate.id).filter(Candidate.job_id == job_id).all()]
@@ -3077,12 +3504,16 @@ async def delete_job_permanent(
 
     # 1) Proctoring (deepest — references interviews via test_id)
     if session_ids:
+        # Reviews reference both sessions and violations, so they go first.
+        bulk_delete(ProctoringReview, ProctoringReview.session_id.in_(session_ids))
         bulk_delete(ProctoringViolation, ProctoringViolation.session_id.in_(session_ids))
         bulk_delete(ProctoringTranscript, ProctoringTranscript.session_id.in_(session_ids))
         bulk_delete(ProctoringSession, ProctoringSession.id.in_(session_ids))
 
     # 2) Rows referencing interviews / interview_questions / candidates (leaf level)
     bulk_delete(InterviewFeedback, InterviewFeedback.interview_id.in_(interview_ids) if _in_iv else None)
+    bulk_delete(AssessmentExplanation,
+                AssessmentExplanation.interview_id.in_(interview_ids) if _in_iv else None)
     bulk_delete(QuestionSetAssignment,
                 QuestionSetAssignment.interview_id.in_(interview_ids) if _in_iv else None,
                 QuestionSetAssignment.question_id.in_(question_ids) if _in_q else None)
@@ -3100,6 +3531,11 @@ async def delete_job_permanent(
 
     # 3) Interview questions (now unreferenced), then interviews
     bulk_delete(InterviewQuestion, InterviewQuestion.id.in_(question_ids) if _in_q else None)
+    # A retest points at the attempt it replaced. InnoDB checks that self-reference row by
+    # row inside one DELETE, so unlink the attempts first or the delete can fail midway.
+    if _in_iv:
+        db.query(Interview).filter(Interview.id.in_(interview_ids)).update(
+            {Interview.previous_attempt_id: None}, synchronize_session=False)
     bulk_delete(Interview, Interview.id.in_(interview_ids) if _in_iv else None,
                 Interview.job_id == job_id)
 
@@ -3137,6 +3573,7 @@ async def delete_job_permanent(
 
     bulk_delete(Candidate, Candidate.id.in_(cand_ids) if _in_cand else None)
     bulk_delete(CandidateRequest, CandidateRequest.job_id == job_id)
+    bulk_delete(JobHRCollaborator, JobHRCollaborator.job_id == job_id)
 
     # 5) The archive row, then the job itself. Written last so it only exists if every
     # destructive step above succeeded — a rolled-back delete must not leave a record
@@ -3584,6 +4021,7 @@ async def send_test_invite_and_reject(
     time_overrides = {
         k: int(v) for k, v in (request.time_per_question_type or {}).items() if v
     } or None or None
+    invite_proctored = _test_is_proctored(source_test, proctoring_overrides)
 
     # Pre-validate pool readiness before processing any candidates (fail-fast)
     from src.models.question_models import Question as InterviewQuestion, QuestionSetAssignment, CandidateQuestionHistory
@@ -3628,6 +4066,10 @@ async def send_test_invite_and_reject(
     invited = 0
     rejected = 0
     skipped = 0
+    # Applicants whose resume could not be read reliably are never auto-rejected: they
+    # were not really ranked, so "not selected" says nothing about them. A person decides.
+    held_ids = needs_review_candidate_ids(db, job.id)
+    held_for_review = 0
     # Delivery failures, tracked separately from the business counts above so the
     # response can distinguish "we sent 12" from "we tried 12 times".
     invite_failed = 0
@@ -3660,6 +4102,8 @@ async def send_test_invite_and_reject(
             subject = (request.invite_subject or f"Test Invitation – {job.title}")
             body = (request.invite_body or "").replace("{{test_link}}", test_link).replace("{{candidate_name}}", name).replace("{{deadline}}", request.test_deadline)
             body_html = body.replace("\n", "<br>")
+            if invite_proctored:
+                body_html += MONITORING_EMAIL_NOTICE
             _res = dispatch(c.email, subject, f"<div style='font-family:sans-serif;line-height:1.7'>{body_html}</div>",
                   smtp_config=ti_smtp, cc=(ti_disp["cc"] if not ti_cc_sent else None), db=db)
             ti_cc_sent = True
@@ -3670,6 +4114,8 @@ async def send_test_invite_and_reject(
             else:
                 invite_failed += 1
                 logger.warning(f"test-invite email to {c.email} not delivered")
+        elif request.reject_others and is_unsent and c.id in held_ids:
+            held_for_review += 1
         elif request.reject_others and is_unsent:
             prev_stage = c.current_stage
             c.current_stage = "rejected"
@@ -3700,12 +4146,16 @@ async def send_test_invite_and_reject(
                     f"rejection emails could not be sent.")
     if skipped:
         message += f" {skipped} already-notified candidates were skipped."
+    if held_for_review:
+        message += (f" {held_for_review} candidate{'s were' if held_for_review != 1 else ' was'} not rejected "
+                    "because their resume needs manual review.")
 
     return {
         "message": message,
         "invited": invited,
         "rejected": rejected,
         "skipped": skipped,
+        "held_for_review": held_for_review,
         "test_assigned": source_test.title if source_test else "No test linked"
     }
 
@@ -3835,8 +4285,9 @@ async def send_round2_invite(
                 f"Take your time, trust your preparation, and give it your best. Best of luck — we're rooting for you!\n\n"
                 f"Warm regards,\nThe Talent Acquisition Team")
         text = text.replace("{{test_link}}", test_link).replace("{{candidate_name}}", name).replace("{{deadline}}", deadline)
+        notice = MONITORING_EMAIL_NOTICE if _test_is_proctored(r2) else ""
         try:
-            dispatch(c.email, subject, f"<div style='font-family:sans-serif;line-height:1.7'>{text.replace(chr(10), '<br>')}</div>",
+            dispatch(c.email, subject, f"<div style='font-family:sans-serif;line-height:1.7'>{text.replace(chr(10), '<br>')}{notice}</div>",
                      smtp_config=r2_smtp, cc=(r2_disp["cc"] if not r2_cc_sent else None))
             r2_cc_sent = True
         except Exception as e:
@@ -3960,7 +4411,7 @@ async def hr_submit_interview_feedback(
         q = q.filter(JobPosting.company_id == current_user.company_id)
     if current_user.role != "admin":
         hr_profile = get_hr_profile(db, current_user)
-        q = q.filter(JobPosting.hr_id == hr_profile.id)
+        q = q.filter(job_access_filter(hr_profile.id))
     interview = q.first()
     if not interview:
         raise HTTPException(status_code=404, detail="Interview not found")
@@ -4242,9 +4693,13 @@ async def get_test_results(
         # HR can open the full per-flag report (GET /api/v1/proctor/results/{id}) for
         # each contributing round — keeps the detail modal consistent with this count.
         red_flags = 0
+        unreviewed_flags = 0
         proctor_interview_ids = []
         try:
-            from src.models.models import ProctoringSession, ProctoringViolation
+            from src.models.models import (
+                ProctoringSession, ProctoringViolation, ProctoringReview,
+                PROCTORING_MARKER_TYPES, PROCTORING_UNREVIEWABLE_TYPES,
+            )
             cuid = primary.candidate.user_id if primary.candidate else None
             if cuid:
                 seen_iv_ids = set()
@@ -4252,14 +4707,29 @@ async def get_test_results(
                     if not src_iv or src_iv.id in seen_iv_ids:
                         continue
                     seen_iv_ids.add(src_iv.id)
-                    s = db.query(ProctoringSession).filter(
-                        ProctoringSession.candidate_id == cuid, ProctoringSession.test_id == src_iv.id).first()
-                    if s:
-                        red_flags += db.query(ProctoringViolation).filter(
-                            ProctoringViolation.session_id == s.id).count()
-                        proctor_interview_ids.append(src_iv.id)
+                    # Every session for this test, as the report shows them — a reload
+                    # mid-test starts a new one. This used to count one arbitrary
+                    # session (.first(), unordered) and include marker rows like
+                    # LIVE_ENROLLED, so it disagreed with the report it links to.
+                    session_ids = [sid for (sid,) in db.query(ProctoringSession.id).filter(
+                        ProctoringSession.candidate_id == cuid,
+                        ProctoringSession.test_id == src_iv.id).all()]
+                    if not session_ids:
+                        continue
+                    flag_rows = db.query(ProctoringViolation.id, ProctoringViolation.violation_type).filter(
+                        ProctoringViolation.session_id.in_(session_ids),
+                        ~ProctoringViolation.violation_type.in_(
+                            PROCTORING_MARKER_TYPES | PROCTORING_UNREVIEWABLE_TYPES),
+                    ).all()
+                    reviewed = {vid for (vid,) in db.query(ProctoringReview.violation_id).filter(
+                        ProctoringReview.session_id.in_(session_ids),
+                        ProctoringReview.violation_id.isnot(None)).distinct().all()}
+                    red_flags += len(flag_rows)
+                    unreviewed_flags += sum(1 for vid, _ in flag_rows if vid not in reviewed)
+                    proctor_interview_ids.append(src_iv.id)
         except Exception:
             red_flags = 0
+            unreviewed_flags = 0
             proctor_interview_ids = []
 
         interviewer_name = interviewer_email = interviewer_id = ""
@@ -4271,6 +4741,22 @@ async def get_test_results(
 
         round2_status = ("completed" if coding_done else "sent" if coding_r else "pending" if mcq_done else None)
         round2_pending = bool(mcq_done and coding_r is None)
+
+        # Retests and accommodations. `open_iv` is the attempt the candidate has not taken
+        # yet (a fresh invite or a granted retest) — adjustments apply to that one.
+        open_iv = _pick([i for i in ivs if i.status != "COMPLETED"])
+        retest_pending = bool(open_iv and open_iv.previous_attempt_id)
+        acc_iv = open_iv or primary
+        earlier_attempts = sorted(
+            [i.id for i in ivs if i.status == "COMPLETED" and i.id not in proctor_interview_ids
+             and i.round_type == primary.round_type and i.id != primary.id],
+            reverse=True)
+        try:
+            from src.models.models import AssessmentExplanation
+            explanation_count = db.query(AssessmentExplanation).filter(
+                AssessmentExplanation.interview_id.in_([i.id for i in ivs])).count()
+        except Exception:
+            explanation_count = 0
 
         results.append({
             "id": primary.id,
@@ -4291,7 +4777,17 @@ async def get_test_results(
             "test_score": test_score,
             "total_marks": total_marks,
             "red_flags": red_flags,
-            "proctor_interview_ids": proctor_interview_ids,
+            "unreviewed_flags": unreviewed_flags,
+            # Earlier attempts follow the current one so HR sees the whole history.
+            "proctor_interview_ids": proctor_interview_ids + earlier_attempts,
+            "attempt_number": primary.attempt_number or 1,
+            "retest_pending": retest_pending,
+            "open_interview_id": open_iv.id if open_iv else None,
+            "accommodation_status": acc_iv.accommodation_status,
+            "accommodation_request": acc_iv.accommodation_request,
+            "accommodations": approved_accommodations(acc_iv) or None,
+            "accommodations_summary": describe_accommodations(approved_accommodations(acc_iv)),
+            "explanation_count": explanation_count,
             "coding_verdict": coding["coding_verdict"],
             "coding_score": coding["coding_score"],
             "coding_max_score": coding["coding_max_score"],
@@ -4311,6 +4807,178 @@ async def get_test_results(
         })
 
     return results
+
+
+class RetestRequest(BaseModel):
+    reason: str = Field(..., min_length=10, max_length=2000)
+    accommodations: Optional[dict] = None
+
+
+def _hr_attempt(db: Session, current_user: User, interview_id: int) -> Interview:
+    """A candidate's test attempt this HR may act on, or 404/403."""
+    iv = db.query(Interview).filter(
+        Interview.id == interview_id,
+        Interview.company_id == current_user.company_id,
+        Interview.candidate_id.isnot(None),
+    ).first()
+    if not iv:
+        raise HTTPException(status_code=404, detail="Test attempt not found")
+    if current_user.role != "admin" and iv.job:
+        if not can_access_job(db, iv.job, get_hr_profile(db, current_user)):
+            raise HTTPException(status_code=403, detail="You don't have access to this job")
+    return iv
+
+
+@router.post("/test-results/{interview_id}/retest")
+async def grant_retest(
+    interview_id: int,
+    body: RetestRequest,
+    current_user: User = Depends(AuthMiddleware.get_current_hr),
+    db: Session = Depends(get_db),
+):
+    """Give a candidate another attempt at a test.
+
+    Creates a NEW attempt cloned from the same template, pointing back at this one. The
+    earlier attempt, its score and its proctoring record are left exactly as they were,
+    so a retest never erases what happened. A reason is required and recorded in the
+    candidate's stage history. Optional accommodations are approved for the new attempt.
+    """
+    from src.services.assessment_fairness import source_template_id, set_accommodations
+    from src.models.question_models import Question as InterviewQuestion
+
+    attempt = _hr_attempt(db, current_user, interview_id)
+    if (attempt.status or "").upper() != "COMPLETED":
+        raise HTTPException(status_code=409, detail="Only a submitted test can be retaken.")
+    pending = db.query(Interview).filter(
+        Interview.previous_attempt_id == attempt.id,
+        Interview.status != "COMPLETED",
+    ).first()
+    if pending:
+        raise HTTPException(status_code=409, detail="A retest for this attempt is already waiting for the candidate.")
+
+    template = db.query(Interview).filter(Interview.id == source_template_id(attempt)).first() \
+        if source_template_id(attempt) else None
+    if not template:
+        raise HTTPException(status_code=409, detail="The original test template for this attempt no longer exists, so it can't be retaken. Send a new test instead.")
+    candidate = db.query(Candidate).filter(Candidate.id == attempt.candidate_id).first()
+    job = attempt.job or (db.query(JobPosting).filter(JobPosting.id == attempt.job_id).first() if attempt.job_id else None)
+    if not candidate or not job:
+        raise HTTPException(status_code=409, detail="The candidate or job for this attempt no longer exists.")
+
+    # Keep this attempt's per-send settings: proctoring overrides live in its security
+    # blob, and per-question-type minutes on its own question copies.
+    security = _parse_security_settings(attempt.security_settings_data) or None
+    minutes = {}
+    for q in db.query(InterviewQuestion).filter(InterviewQuestion.interview_id == attempt.id).all():
+        minutes.setdefault(q.question_type, q.time_limit_minutes)
+    # Undo any extra time the earlier attempt had, so it isn't counted twice.
+    base = (parse_accommodations(attempt.accommodations).get("_base_minutes") or {})
+    if base:
+        minutes = {}
+        for q in db.query(InterviewQuestion).filter(InterviewQuestion.interview_id == attempt.id).all():
+            minutes.setdefault(q.question_type, int(base.get(str(q.id), q.time_limit_minutes or 5)))
+
+    retest = _clone_test_for_candidate(
+        db, template, candidate, job, current_user,
+        round_num=attempt.test_round or 1, round_type=attempt.round_type,
+        security_overrides=security, time_overrides=minutes or None,
+    )
+    retest.attempt_number = (attempt.attempt_number or 1) + 1
+    retest.previous_attempt_id = attempt.id
+    if body.accommodations:
+        try:
+            set_accommodations(db, retest, "approved", body.accommodations)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+
+    reason = body.reason.strip()
+    note = f"Retest granted (attempt {retest.attempt_number}): {reason}"
+    summary = describe_accommodations(approved_accommodations(retest))
+    if summary:
+        note += f" Adjustments: {', '.join(summary)}."
+    if candidate.current_stage in ("interview_scheduled", "offer_sent", "hired"):
+        db.add(CandidateStageHistory(candidate_id=candidate.id, from_stage=candidate.current_stage,
+                                     to_stage=candidate.current_stage, changed_by_id=current_user.id, notes=note))
+    else:
+        update_candidate_stage(db, candidate.id, "shortlisted", current_user.id, note)
+    db.commit()
+
+    # Tell the candidate. Same wording rules as a first invite, including the monitoring
+    # notice when the test is proctored.
+    from src.services.email_service import dispatch, delivery_outcome
+    email_sent = False
+    try:
+        base_url = os.getenv("FRONTEND_URL", "http://localhost:3001")
+        name = f"{candidate.first_name} {candidate.last_name}".strip()
+        body_html = (
+            f"Dear {name},<br><br>You have been given another attempt at the assessment for "
+            f"<b>{job.title}</b>.<br><br>Open it from your dashboard: "
+            f"<a href='{base_url}/candidate/interviews'>{base_url}/candidate/interviews</a>"
+        )
+        if summary:
+            body_html += "<br><br>Adjustments for this attempt: " + ", ".join(summary) + "."
+        if _test_is_proctored(retest):
+            body_html += MONITORING_EMAIL_NOTICE
+        res = dispatch(candidate.email, f"Another attempt: {job.title} assessment",
+                       f"<div style='font-family:sans-serif;line-height:1.7'>{body_html}</div>", db=db)
+        email_sent = delivery_outcome(res)["ok"]
+    except Exception as e:
+        logger.warning(f"retest email to {candidate.email} failed: {e}")
+
+    return {
+        "retest_interview_id": retest.id,
+        "attempt_number": retest.attempt_number,
+        "previous_attempt_id": attempt.id,
+        "accommodations_summary": summary,
+        "email_sent": email_sent,
+    }
+
+
+class AccommodationDecision(BaseModel):
+    status: str                                  # approved | declined
+    extra_time_percent: int = 0
+    audio_monitoring_off: bool = False
+    gaze_flags_off: bool = False
+    fullscreen_not_required: bool = False
+    notes: Optional[str] = None
+
+
+@router.patch("/interviews/{interview_id}/accommodations")
+async def decide_accommodations(
+    interview_id: int,
+    body: AccommodationDecision,
+    current_user: User = Depends(AuthMiddleware.get_current_hr),
+    db: Session = Depends(get_db),
+):
+    """Approve specific adjustments for an attempt the candidate hasn't taken yet, or
+    decline a request. Approving extra time lengthens this candidate's own questions."""
+    from src.services.assessment_fairness import set_accommodations
+    iv = _hr_attempt(db, current_user, interview_id)
+    if (iv.status or "").upper() in ("COMPLETED", "IN_PROGRESS"):
+        raise HTTPException(status_code=409, detail="Adjustments can only be changed before the test starts.")
+    try:
+        set_accommodations(db, iv, body.status, body.model_dump(exclude={"status"}))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    iv.updated_at = datetime.utcnow()
+    if iv.candidate_id:
+        summary = describe_accommodations(approved_accommodations(iv))
+        cand = db.query(Candidate).filter(Candidate.id == iv.candidate_id).first()
+        if cand:
+            db.add(CandidateStageHistory(
+                candidate_id=cand.id, from_stage=cand.current_stage, to_stage=cand.current_stage,
+                changed_by_id=current_user.id,
+                notes=(f"Test adjustments approved: {', '.join(summary) or 'none'}" if body.status == "approved"
+                       else "Test adjustment request declined") + (f". {body.notes.strip()}" if body.notes else ""),
+            ))
+    db.commit()
+    return {
+        "interview_id": iv.id,
+        "accommodation_status": iv.accommodation_status,
+        "accommodations": approved_accommodations(iv) or None,
+        "accommodations_summary": describe_accommodations(approved_accommodations(iv)),
+        "duration_minutes": iv.duration_minutes,
+    }
 
 
 @router.get("/test-results/{interview_id}/answers")
@@ -4844,13 +5512,16 @@ async def get_job_candidates_enhanced(
         sort_order = validate_order_params(order)
         
         # Check if job exists and permissions
-        job = db.query(JobPosting).filter(JobPosting.id == job_id).first()
+        job = db.query(JobPosting).filter(
+            JobPosting.id == job_id,
+            JobPosting.company_id == current_user.company_id,
+        ).first()
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
         
         if current_user.role != "admin":
             hr_profile = get_hr_profile(db, current_user)
-            if job.hr_id != hr_profile.id:
+            if not can_access_job(db, job, hr_profile):
                 raise HTTPException(status_code=403, detail="Access denied")
         
         # Subquery: get only the latest ATSResult per candidate
@@ -4869,10 +5540,10 @@ async def get_job_candidates_enhanced(
         
         # Apply filters efficiently
         if min_score is not None:
-            query = query.filter(ATSResult.ats_score >= min_score)
-        
+            query = query.filter(effective_score_col() >= min_score)
+
         if max_score is not None:
-            query = query.filter(ATSResult.ats_score <= max_score)
+            query = query.filter(effective_score_col() <= max_score)
         
         if stage:
             query = query.filter(Candidate.current_stage == stage)
@@ -4891,9 +5562,9 @@ async def get_job_candidates_enhanced(
         # Apply sorting
         if sort_by == "ats_score":
             if sort_order == "desc":
-                query = query.order_by(desc(ATSResult.ats_score))
+                query = query.order_by(desc(effective_score_col()))
             else:
-                query = query.order_by(ATSResult.ats_score)
+                query = query.order_by(effective_score_col())
         elif sort_by == "applied_at":
             if sort_order == "desc":
                 query = query.order_by(desc(Candidate.created_at))
@@ -4909,11 +5580,25 @@ async def get_job_candidates_enhanced(
         offset = (page - 1) * per_page
         candidates = query.offset(offset).limit(per_page).all()
         
+        # Job-description version numbers, for "scored against v2 (current v3)".
+        from src.models.models import JobDescriptionVersion
+        from src.services.jd_versions import staleness
+        from src.services.enhanced_ats_service import SCORING_RULES_VERSION
+        from src.services import parse_quality as _pq
+        jd_no = {v.id: v.version_no for v in db.query(JobDescriptionVersion).filter(
+            JobDescriptionVersion.job_id == job_id).all()}
+
         # Create enhanced candidate responses with error handling
         result = []
         for candidate, ats_result in candidates:
             try:
-                ats_interpretation = get_ats_interpretation(ats_result.ats_score)
+                eff = effective_score(ats_result) or 0.0
+                ats_interpretation = get_ats_interpretation(eff)
+                stale = staleness(ats_result, job, SCORING_RULES_VERSION)
+                try:
+                    issues = json.loads(ats_result.parse_issues) if ats_result.parse_issues else []
+                except (TypeError, ValueError):
+                    issues = []
 
                 # Parse the stored breakdown JSON for the full recruiter view.
                 plagiarism_flag = False
@@ -4949,7 +5634,7 @@ async def get_job_candidates_enhanced(
                     email=candidate.email,
                     phone=candidate.phone,
                     current_stage=candidate.current_stage,
-                    ats_score=ats_result.ats_score,
+                    ats_score=eff,
                     ats_level=ats_interpretation['level'],
                     ats_color=ats_interpretation['color'],
                     skills_match_score=ats_result.skills_match_score,
@@ -4975,6 +5660,20 @@ async def get_job_candidates_enhanced(
                     weaknesses=weaknesses,
                     missing_preferred_skills=missing_preferred,
                     scoring_breakdown=breakdown,
+                    model_score=float(ats_result.ats_score) if ats_result.ats_score is not None else None,
+                    override_score=ats_result.override_score,
+                    is_overridden=ats_result.override_score is not None,
+                    parse_status=ats_result.parse_status,
+                    parse_issues=_pq.describe(issues),
+                    mandatory_met=ats_result.mandatory_met,
+                    mandatory_total=ats_result.mandatory_total,
+                    evidence_coverage=ats_result.evidence_coverage,
+                    scoring_source=ats_result.scoring_source,
+                    scoring_rules_version=ats_result.scoring_rules_version,
+                    jd_version_no=jd_no.get(ats_result.jd_version_id),
+                    is_stale=stale in ("jd_changed", "rules_updated"),
+                    stale_reason=stale,
+                    scored_at=ats_result.scored_at,
                 ))
             except Exception as candidate_error:
                 print(f"Error processing candidate {candidate.id}: {candidate_error}")
@@ -4988,7 +5687,11 @@ async def get_job_candidates_enhanced(
             job_title=job.title,
             total_candidates=total_count,
             candidates=result,
-            ats_distribution=ats_distribution
+            ats_distribution=ats_distribution,
+            current_rules_version=SCORING_RULES_VERSION,
+            current_jd_version_no=jd_no.get(job.current_jd_version_id),
+            rules_versions_present=sorted({c.scoring_rules_version for c in result if c.scoring_rules_version}),
+            needs_review_count=sum(1 for c in result if c.parse_status == "needs_review"),
         )
         
     except HTTPException:
@@ -5030,12 +5733,16 @@ async def select_candidates_bulk(
 
     if current_user.role != "admin":
         hr_profile = get_hr_profile(db, current_user)
-        if job.hr_id != hr_profile.id:
+        if not can_access_job(db, job, hr_profile):
             raise HTTPException(status_code=403, detail="Access denied")
 
     # Get all candidates for this job
     all_candidates = db.query(Candidate).filter(Candidate.job_id == job_id).all()
     selected_candidates = []
+    held_ids = needs_review_candidate_ids(db, job_id)
+    # Only results whose resume was read reliably take part in a ranking. NULL = scored
+    # before parse status existed, treated as ok.
+    _ranked = or_(ATSResult.parse_status.is_(None), ATSResult.parse_status != "needs_review")
     
     # Apply selection strategy
     if selection.selection_type == "top_n":
@@ -5045,7 +5752,7 @@ async def select_candidates_bulk(
         # Get ATS results for sorting
         candidates_with_ats = db.query(Candidate, ATSResult).join(
             ATSResult, Candidate.id == ATSResult.candidate_id
-        ).filter(Candidate.job_id == job_id).order_by(desc(ATSResult.ats_score)).limit(selection.top_n).all()
+        ).filter(Candidate.job_id == job_id, _ranked).order_by(desc(effective_score_col())).limit(selection.top_n).all()
         
         selected_candidates = [c[0] for c in candidates_with_ats]
         
@@ -5057,7 +5764,8 @@ async def select_candidates_bulk(
             ATSResult, Candidate.id == ATSResult.candidate_id
         ).filter(
             Candidate.job_id == job_id,
-            ATSResult.ats_score >= selection.min_score
+            _ranked,
+            effective_score_col() >= selection.min_score
         ).all()
         
         selected_candidates = [c[0] for c in candidates_with_ats]
@@ -5068,7 +5776,7 @@ async def select_candidates_bulk(
 
         candidates_with_ats = db.query(Candidate, ATSResult).join(
             ATSResult, Candidate.id == ATSResult.candidate_id
-        ).filter(Candidate.job_id == job_id).order_by(desc(ATSResult.ats_score)).all()
+        ).filter(Candidate.job_id == job_id, _ranked).order_by(desc(effective_score_col())).all()
 
         if candidates_with_ats:
             import math
@@ -5115,6 +5823,8 @@ async def select_candidates_bulk(
         selected_id_set = {c.id for c in selected_candidates}
         for candidate in all_candidates:
             if candidate.id not in selected_id_set and candidate.current_stage not in ("rejected", "hired"):
+                if candidate.id in held_ids:
+                    continue
                 prev_stage = candidate.current_stage
                 candidate.current_stage = "rejected"
                 candidate.updated_at = datetime.utcnow()
@@ -5138,12 +5848,17 @@ async def select_candidates_bulk(
     for c in rejected_candidates:
         notify_candidate_rejected(db, c)
 
+    held = len([c for c in all_candidates if c.id in held_ids
+                and c.current_stage not in ("rejected", "hired")
+                and c.id not in {x.id for x in selected_candidates}])
     return BulkActionResponse(
-        message=f"Successfully processed {len(selected_candidates)} candidates using {selection.selection_type} strategy",
+        message=f"Successfully processed {len(selected_candidates)} candidates using {selection.selection_type} strategy"
+                + (f". {held} held for manual review (resume could not be read reliably)." if held else ""),
         selected_count=moved_count,
         rejected_count=rejected_count,
         moved_to_stage=selection.next_stage,
-        job_id=job_id
+        job_id=job_id,
+        held_for_review=held,
     )
 
 @router.post("/jobs/{job_id}/move-to-screening")
@@ -5170,7 +5885,7 @@ async def move_candidates_to_screening(
 
     if current_user.role != "admin":
         hr_profile = get_hr_profile(db, current_user)
-        if job.hr_id != hr_profile.id:
+        if not can_access_job(db, job, hr_profile):
             raise HTTPException(status_code=403, detail="Access denied")
 
     # Get all candidates for this job
@@ -5196,10 +5911,15 @@ async def move_candidates_to_screening(
     # Optionally reject others
     rejected_count = 0
     rejected_candidates = []
+    held_for_review = 0
     if request.reject_others:
         selected_id_set = {c.id for c in selected_candidates}
+        held_ids = needs_review_candidate_ids(db, job_id)
         for candidate in all_candidates:
             if candidate.id not in selected_id_set and candidate.current_stage not in ("rejected", "hired"):
+                if candidate.id in held_ids:      # resume unreadable: a person decides
+                    held_for_review += 1
+                    continue
                 update_candidate_stage(
                     db, candidate.id, "rejected", current_user.id,
                     "Auto-rejected during screening selection"
@@ -5218,6 +5938,7 @@ async def move_candidates_to_screening(
         "message": "Candidates moved to screening successfully",
         "moved_to_screening": moved_count,
         "auto_rejected": rejected_count,
+        "held_for_review": held_for_review,
         "job_id": job_id
     }
 
@@ -5365,7 +6086,7 @@ def _dashboard_counts(db: Session, current_user: User, own_only: bool, hr_profil
         JobPosting.company_id == current_user.company_id
     )
     if own_only:
-        jobs_q = jobs_q.filter(JobPosting.hr_id == hr_profile.id)
+        jobs_q = jobs_q.filter(job_access_filter(hr_profile.id))
     jobs = jobs_q.scalar() or 0
 
     # The card reads "Active Jobs" and the click filters status=active, so count
@@ -5381,7 +6102,7 @@ def _dashboard_counts(db: Session, current_user: User, own_only: bool, hr_profil
     if current_user.company_id:
         iv_q = iv_q.filter(JobPosting.company_id == current_user.company_id)
     if own_only:
-        iv_q = iv_q.filter(JobPosting.hr_id == hr_profile.id)
+        iv_q = iv_q.filter(job_access_filter(hr_profile.id))
     interviews = iv_q.scalar() or 0
 
     # ── offers ── mirrors GET /offers
@@ -5389,7 +6110,8 @@ def _dashboard_counts(db: Session, current_user: User, own_only: bool, hr_profil
     if current_user.company_id:
         of_q = of_q.filter(JobPosting.company_id == current_user.company_id)
     if own_only:
-        of_q = of_q.filter(Offer.hr_id == hr_profile.id)
+        # Job-based, not Offer.hr_id: a co-HR's offer on a shared job is the owner's too.
+        of_q = of_q.filter(job_access_filter(hr_profile.id))
     offers = of_q.scalar() or 0
 
     return DashboardCounts(
@@ -5439,7 +6161,7 @@ async def get_scheduled_interviews(
 
     if current_user.role != "admin":
         hr_profile = get_hr_profile(db, current_user)
-        query = query.filter(JobPosting.hr_id == hr_profile.id)
+        query = query.filter(job_access_filter(hr_profile.id))
 
     if status:
         # Stored uppercase; normalise the client's casing so ?status=scheduled works.
@@ -5659,7 +6381,8 @@ async def get_offers(
 
     if current_user.role != "admin":
         hr_profile = get_hr_profile(db, current_user)
-        query = query.filter(Offer.hr_id == hr_profile.id)
+        # Every offer on a job this HR owns or co-HRs — must match _dashboard_counts.
+        query = query.filter(job_access_filter(hr_profile.id))
 
     if status:
         query = query.filter(Offer.status == status)
@@ -5858,7 +6581,7 @@ async def get_my_candidate_requirements(
 
     # Get all jobs assigned to this HR — tenant-scoped so legacy NULL-company rows
     # don't surface for users who do have a company_id (would otherwise 404 on update).
-    my_jobs_q = db.query(JobPosting).filter(JobPosting.hr_id == hr_profile.id)
+    my_jobs_q = db.query(JobPosting).filter(job_access_filter(hr_profile.id))
     if current_user.company_id:
         my_jobs_q = my_jobs_q.filter(JobPosting.company_id == current_user.company_id)
     my_jobs = my_jobs_q.all()
@@ -6535,7 +7258,7 @@ async def get_my_activity(
             "candidates": db.query(func.count(Candidate.id)).join(
                 JobPosting, Candidate.job_id == JobPosting.id
             ).filter(
-                JobPosting.hr_id == hr_profile.id,
+                job_access_filter(hr_profile.id),
                 Candidate.created_at >= since,
             ).scalar() or 0,
             "interviews_scheduled": db.query(func.count(Interview.id)).join(
@@ -6543,7 +7266,7 @@ async def get_my_activity(
             ).join(
                 JobPosting, Candidate.job_id == JobPosting.id
             ).filter(
-                JobPosting.hr_id == hr_profile.id,
+                job_access_filter(hr_profile.id),
                 Interview.created_at >= since,
             ).scalar() or 0,
             "offers_sent": db.query(func.count(Offer.id)).filter(

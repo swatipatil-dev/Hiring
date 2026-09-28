@@ -78,10 +78,14 @@ def grade_interview_question(question, language: str, source_code: str,
             # query (sample_answer), comparing result sets order-independently rather
             # than string-matching expected_output.
             from .languages import get_language as _get_lang
+            from .sql_testgen import coerce_reference_sql
             result = run_in_worker(
                 "src.judge.worker.judge_sql_job",
                 source_code, tcs,
-                getattr(question, "sample_answer", None),
+                # Only the reference's final SELECT: a reference that builds its own
+                # tables would fail against the read-only graded connection, silently
+                # dropping grading back to string-matching expected_output.
+                coerce_reference_sql(getattr(question, "sample_answer", None)),
                 _get_lang("sql").image,
                 _CASE_TIME_MS, _CASE_MEM_MB)
         else:

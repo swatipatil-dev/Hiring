@@ -1,10 +1,12 @@
-import { NavLink, useNavigate } from 'react-router-dom'
+import { useEffect, useRef, useState } from 'react'
+import { NavLink, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
+import { clearSlug, getStoredSlug } from '../utils/tenant'
 import {
   LayoutDashboard, Users, Building2, BarChart3, Briefcase, KanbanSquare,
   Calendar, Gift, ScanSearch, ClipboardList, MessageSquare,
   Search, FileText, Clock, LogOut, Shield, UserCircle, UserPlus, Crown, Mail,
-  LifeBuoy, BookOpen, SlidersHorizontal, History,
+  LifeBuoy, BookOpen, SlidersHorizontal, History, Menu, X,
 } from 'lucide-react'
 
 const NAV = {
@@ -59,6 +61,10 @@ const ROLE_COLORS = { superadmin: '#f59e0b', admin: '#e87c6c', hr: '#4ecdb5', in
 
 const INNOMAX_COMPANY_ID = 'b88497df-ffa7-4a7f-b441-9f9ef365d6df'
 
+// Below this width the rail becomes an off-canvas drawer. Matches the index.css
+// breakpoint where .main-content drops its sidebar margin.
+const DRAWER_QUERY = '(max-width: 1024px)'
+
 export default function Sidebar() {
   const { user, logout } = useAuth()
   const navigate = useNavigate()
@@ -66,13 +72,48 @@ export default function Sidebar() {
   const items = NAV[role] || NAV.candidate
   const RoleIcon = ROLE_ICONS[role] || UserCircle
 
+  // ── Mobile drawer ──
+  const [open, setOpen] = useState(false)
+  const location = useLocation()
+  const toggleRef = useRef(null)
+  const closeRef = useRef(null)
+  const closeMenu = () => { setOpen(false); toggleRef.current?.focus() }
+
+  // Picking a page closes the drawer.
+  useEffect(() => { setOpen(false) }, [location.pathname])
+
+  // Growing past the breakpoint turns the drawer back into the rail.
+  useEffect(() => {
+    const mq = window.matchMedia(DRAWER_QUERY)
+    const onChange = e => { if (!e.matches) setOpen(false) }
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
+
+  // While open: Escape closes, the page behind doesn't scroll, focus starts on ✕.
+  useEffect(() => {
+    if (!open) return
+    const onKey = e => { if (e.key === 'Escape') closeMenu() }
+    document.addEventListener('keydown', onKey)
+    const prevOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    closeRef.current?.focus()
+    return () => {
+      document.removeEventListener('keydown', onKey)
+      document.body.style.overflow = prevOverflow
+    }
+  }, [open])
+
   const handleLogout = () => {
-    const companyKey = localStorage.getItem('hireflow_company_key')
+    // The slug rides in the JWT and is mirrored onto the cached user, so it is
+    // authoritative here and needs no storage lookup. getStoredSlug is the fallback for
+    // a session that pre-dates that claim.
+    const companySlug = user?.company_slug || getStoredSlug()
     const isHireFlowUser = !user?.company_id || user.company_id === INNOMAX_COMPANY_ID
     logout()
-    localStorage.removeItem('hireflow_company_key')
-    if (!isHireFlowUser && companyKey) {
-      navigate(`/jobs?key=${encodeURIComponent(companyKey)}`)
+    clearSlug()
+    if (!isHireFlowUser && companySlug) {
+      navigate(`/${encodeURIComponent(companySlug)}/jobs`)
     } else {
       navigate('/login')
     }
@@ -103,8 +144,17 @@ export default function Sidebar() {
   const avatarColor = isInnomax ? '#3d8ed6' : '#ffffff'
 
   return (
+    <>
+    <button ref={toggleRef} type="button" className="nav-toggle"
+      aria-label="Open menu" aria-controls="app-sidebar" aria-expanded={open}
+      onClick={() => setOpen(true)}>
+      <Menu size={20} />
+    </button>
+    <div className={`sidebar-backdrop${open ? ' open' : ''}`} onClick={closeMenu} aria-hidden="true" />
     <aside
-      className={`sidebar ${isCandidate ? 'sidebar-candidate' : ''}`}
+      id="app-sidebar"
+      aria-label="Main menu"
+      className={`sidebar ${isCandidate ? 'sidebar-candidate' : ''}${open ? ' open' : ''}`}
       style={{
         '--sidebar-bg': sidebarBg,
         '--nav-active': navActive,
@@ -118,6 +168,10 @@ export default function Sidebar() {
           - Platform owner (Innomax)  → show the platform logo asset.
           - Tenant with no logo        → neutral initials placeholder, never the
             platform logo, so one company never sees another's brand. */}
+      <button ref={closeRef} type="button" className="sidebar-close" aria-label="Close menu" onClick={closeMenu}>
+        <X size={18} />
+      </button>
+
       <div className="sidebar-logo">
         {user?.company_logo ? (
           <img
@@ -423,7 +477,82 @@ export default function Sidebar() {
         }
         .sidebar-candidate .nav-item.active { background: var(--nav-active-bg, rgba(78,205,181,0.08)); color: var(--nav-active, #4ecdb5); }
         .sidebar-candidate .nav-item.active::before { display: block; }
+
+        .nav-item:focus-visible {
+          outline: 2px solid var(--nav-active, #3d8ed6);
+          outline-offset: -2px;
+        }
+
+        /* ── Mobile / tablet: off-canvas drawer ─────────────────────── */
+        .nav-toggle, .sidebar-close, .sidebar-backdrop { display: none; }
+        @media (max-width: 1024px) {
+          .nav-toggle {
+            display: grid;
+            place-items: center;
+            position: fixed;
+            top: calc((var(--header-height) - 40px) / 2);
+            left: 12px;
+            width: 40px;
+            height: 40px;
+            z-index: 95;
+            background: var(--bg-elevated);
+            border: 1px solid var(--border-subtle);
+            border-radius: 10px;
+            color: var(--text-primary);
+            cursor: pointer;
+          }
+          .nav-toggle:focus-visible { outline: 2px solid var(--accent-primary); outline-offset: 2px; }
+          .sidebar {
+            width: min(280px, 86vw);
+            transform: translateX(-100%);
+            /* visibility keeps the closed drawer out of the tab order and away from
+               screen readers; it flips only after the slide-out finishes. */
+            visibility: hidden;
+            transition: transform 0.26s cubic-bezier(0.16, 1, 0.3, 1), visibility 0s linear 0.26s;
+          }
+          .sidebar.open {
+            transform: none;
+            visibility: visible;
+            transition: transform 0.26s cubic-bezier(0.16, 1, 0.3, 1);
+            box-shadow: 0 0 48px rgba(0, 0, 0, 0.35);
+          }
+          .sidebar-close {
+            display: grid;
+            place-items: center;
+            position: absolute;
+            top: 12px;
+            right: 12px;
+            width: 36px;
+            height: 36px;
+            border: none;
+            border-radius: 10px;
+            background: rgba(255,255,255,0.08);
+            color: #d4dae6;
+            cursor: pointer;
+            z-index: 1;
+          }
+          .sidebar-close:focus-visible { outline: 2px solid var(--nav-active, #3d8ed6); outline-offset: 2px; }
+          .sidebar-backdrop {
+            display: block;
+            position: fixed;
+            inset: 0;
+            z-index: 99;
+            background: rgba(15, 20, 30, 0.45);
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.26s ease;
+          }
+          .sidebar-backdrop.open { opacity: 1; pointer-events: auto; }
+          /* The 130px desktop logo would push half the menu below the fold. */
+          .sidebar-logo { padding: 16px 56px 12px; }
+          .sidebar-logo-img { height: 84px; }
+          .sidebar-logo-placeholder { height: 64px; width: 64px; font-size: 1.8rem; border-radius: 18px; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+          .sidebar, .sidebar.open, .sidebar-backdrop { transition: none; }
+        }
       `}</style>
     </aside>
+    </>
   )
 }

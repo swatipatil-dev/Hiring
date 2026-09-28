@@ -62,7 +62,7 @@ function RoleCard({ role, count, selected, onSelect }) {
         : `${role.label}, ${count} ${count === 1 ? 'user' : 'users'}`}
       onClick={() => onSelect(role.key)}
       style={{
-        flex: '1 1 150px', minWidth: 140, textAlign: 'left', cursor: 'pointer',
+        flex: '1 1 120px', minWidth: 110, textAlign: 'left', cursor: 'pointer',
         padding: '14px 16px', borderRadius: 12,
         background: selected ? role.tint : 'var(--surface-card)',
         border: `1px solid ${selected ? role.line : 'var(--border-subtle)'}`,
@@ -650,7 +650,7 @@ export default function AdminDashboard() {
               {(analytics?.candidates_by_stage?.length > 0) ? (
                 <ResponsiveContainer width="100%" height={240}>
                   <BarChart data={analytics.candidates_by_stage} barSize={32}>
-                    <XAxis dataKey="stage" tick={{ fill: '#9ca3af', fontSize: 11, fontFamily: 'JetBrains Mono' }} axisLine={false} tickLine={false} />
+                    <XAxis dataKey="stage" tick={{ fill: '#9ca3af', fontSize: 11, fontFamily: 'JetBrains Mono' }} axisLine={false} tickLine={false} minTickGap={12} />
                     <YAxis hide />
                     <Tooltip content={<CustomTooltip />} />
                     <Bar dataKey="count" radius={[6, 6, 0, 0]}>
@@ -729,7 +729,7 @@ export default function AdminDashboard() {
           </div>
 
           {/* Gender + Age Charts Side by Side */}
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20, marginBottom: 24 }}>
+          <div className="stack-mobile" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20, marginBottom: 24 }}>
 
             {/* Gender Distribution Pie Chart */}
             <div className="card" style={{ position: 'relative', overflow: 'hidden' }}>
@@ -1106,7 +1106,7 @@ export default function AdminDashboard() {
               </div>
 
               {/* HR Scorecards */}
-              <div style={{ display: 'grid', gridTemplateColumns: `repeat(${Math.min(hrComparison.length, 4)}, 1fr)`, gap: 12, marginTop: 24 }}>
+              <div className="stack-mobile" style={{ display: 'grid', gridTemplateColumns: `repeat(${Math.min(hrComparison.length, 4)}, minmax(0, 1fr))`, gap: 12, marginTop: 24 }}>
                 {hrComparison.map((hr, i) => {
                   // offers / candidates — the share of candidates who received an offer.
                   // It was labelled "Hire Rate", which is a different number: this does not
@@ -1516,7 +1516,7 @@ export default function AdminDashboard() {
             {departments.length === 0 ? (
               <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-tertiary)' }}>No departments found</div>
             ) : (
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 16 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(300px, 100%), 1fr))', gap: 16 }}>
                 {departments.map((d, i) => {
                   const stat = deptStats.find(s => s.name === d.name) || {}
                   const accent = CHART_COLORS[i % CHART_COLORS.length]
@@ -1652,7 +1652,7 @@ export default function AdminDashboard() {
               {' '}(not your regular password). Emails to candidates will come from this address.
             </p>
 
-            <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 14 }}>
+            <div className="stack-mobile" style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 14 }}>
               <div className="input-group">
                 <label>SMTP Host</label>
                 <input className="input" required

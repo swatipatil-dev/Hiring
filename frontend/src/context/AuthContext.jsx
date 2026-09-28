@@ -73,7 +73,7 @@ export function AuthProvider({ children }) {
 
   const login = useCallback(async (email, password, opts = {}) => {
     const body = { email, password }
-    if (opts.apiKey) body.api_key = opts.apiKey
+    if (opts.slug) body.company_slug = opts.slug
     if (opts.platformLogin) body.platform_login = true
     const res = await api.post('/auth/login', body)
     const { access_token, user: u } = res.data

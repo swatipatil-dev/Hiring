@@ -1,5 +1,17 @@
 # 🔄 JOB TO CAREER PAGE FLOW ANALYSIS
 
+> ## ⚠️ Superseded — do not follow this document
+>
+> Written in March 2024, before multi-tenancy. It describes a single-company system: no
+> `company_id` scoping, no tenant resolution, and a `postgresql://` `DATABASE_URL` for a
+> system that runs on MySQL. The endpoint shapes still roughly match, but the model of
+> the system does not.
+>
+> For how a candidate actually reaches a job today — `career.innomaxskills.com/<slug>`,
+> tenant resolution, and the public careers API — read
+> **[TENANT_CUSTOM_DOMAINS.md](TENANT_CUSTOM_DOMAINS.md)**. Kept only for the ATS scoring
+> walkthrough, which is still broadly accurate.
+
 ## 📋 Overview
 
 This document explains the complete flow from when HR/Admin creates a job posting to when candidates can see and apply for jobs on the career page.

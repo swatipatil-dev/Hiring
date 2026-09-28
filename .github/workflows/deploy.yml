@@ -359,7 +359,12 @@ jobs:
           grep -q '^backend/requirements-cpanel' <<<"$CHANGED" && echo "deps=true"       >> "$GITHUB_OUTPUT" || true
           grep -qE '^deploy/cpanel/.*\.(service|timer)$' <<<"$CHANGED" && echo "units=true" >> "$GITHUB_OUTPUT" || true
           grep -q '^deploy/cpanel/hireflow.conf' <<<"$CHANGED" && echo "apache=true"     >> "$GITHUB_OUTPUT" || true
-          grep -q '^frontend/'                   <<<"$CHANGED" && echo "frontend=true"   >> "$GITHUB_OUTPUT" || true
+          # htaccess-spa rides the frontend publish step, which is the only thing that
+          # copies it to the docroot. Without it in this pattern a release touching only
+          # that file deploys green while the live .htaccess stays stale — and it now
+          # carries a security header. Worst case here is republishing an unchanged
+          # bundle, which is idempotent.
+          grep -qE '^(frontend/|deploy/cpanel/htaccess-spa$)' <<<"$CHANGED" && echo "frontend=true" >> "$GITHUB_OUTPUT" || true
 
       # Step 2 — back up before any migration. A dump with zero CREATE TABLE
       # lines is not a backup; the runbook says stop if the count is 0.

@@ -38,7 +38,7 @@ Tick what applies. Leave the rest — an untouched box is information too.
 ## Target branch
 
 - [ ] Correct for the stage — `develop` for integration, `testing` for pre-release, `main`
-      only for what is ready to go live. Merging to `main` opens a production deploy for
-      approval.
+      only for what is ready to go live. **Merging to `main` deploys to production by
+      itself** as soon as CI goes green: no button, no reviewer. CI is the only gate.
 
-<!-- Deploys never happen automatically. See docs/CICD_SETUP.md. -->
+<!-- Merging to main deploys to production automatically once CI is green. See docs/CICD_SETUP.md. -->

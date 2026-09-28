@@ -343,13 +343,16 @@ def test_candidate_gender_stats_is_tenant_scoped(client, db, two_companies):
 
 @pytest.mark.security
 def test_mcq_submit_blocks_cross_tenant_interview(client, two_companies):
-    """Company-A candidate cannot submit MCQ for Company-B's interview (404)."""
+    """Company-A staff cannot submit MCQ for Company-B's interview (404).
+
+    (Candidates can't call this endpoint at all — it returns the answer key; see
+    test_question_access.py.)"""
     a = two_companies["a"]
     b = two_companies["b"]
 
     resp = client.post(
         "/api/v1/evaluation/mcq/submit",
-        headers=a["candidate"],
+        headers=a["admin"],
         json={
             "interview_id": b["interview_id"],
             "candidate_name": "Alice",
@@ -418,7 +421,7 @@ def test_mcq_submit_ignores_client_supplied_recipient(client, db, two_companies,
 
     resp = client.post(
         "/api/v1/evaluation/mcq/submit",
-        headers=a["candidate"],
+        headers=a["admin"],
         json={
             "interview_id": a["interview_id"],
             "candidate_name": "Attacker Display Name",
@@ -468,7 +471,7 @@ def test_mcq_submit_sends_nothing_when_interview_has_no_candidate(
 
     resp = client.post(
         "/api/v1/evaluation/mcq/submit",
-        headers=a["candidate"],
+        headers=a["admin"],
         json={
             "interview_id": a["interview_id"],
             "candidate_name": "Attacker",

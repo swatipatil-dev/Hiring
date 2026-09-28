@@ -14,7 +14,9 @@ import random
 import uuid
 from datetime import datetime
 
-from src.models.models import Interview
+from src.models.models import Interview, User
+from src.auth import require_role
+from src.services.interview_access import STAFF_ROLES, staff_can_access_interview
 from src.models.question_models import Question as QuestionModel, QuestionStatus, QuestionSetAssignment
 from src.config.database_config_mysql import get_db
 from src.models.question_schemas import (
@@ -31,7 +33,30 @@ from src.prompt_builder import PromptBuilder, normalize_coding_language
 from src.services.gemini_service import gemini_service, is_rate_limit_error
 from src.judge.starter_sanitizer import sanitize_starter
 
-router = APIRouter(prefix="/interviews", tags=["Question Generator"])
+# Staff only. These routes return every question with its answer key and hidden test
+# cases, and can rewrite or delete them; candidates get their paper from
+# /api/v1/candidate and /api/v1/mcq, which strip answers.
+_staff_user = require_role(list(STAFF_ROLES))
+router = APIRouter(prefix="/interviews", tags=["Question Generator"],
+                   dependencies=[Depends(_staff_user)])
+
+
+def _in_caller_company(query, user: User):
+    """Limit a Question query to questions whose interview belongs to the caller's company."""
+    if user.role == "superadmin":
+        return query
+    return query.join(Interview, QuestionModel.interview_id == Interview.id).filter(
+        Interview.company_id == user.company_id
+    )
+
+
+def _staff_interview(db: Session, interview_id: int, user: User) -> Interview:
+    """The interview if the caller's company owns it; 404 otherwise (never 403, so
+    interview ids from another company can't be probed)."""
+    interview = db.query(Interview).filter(Interview.id == interview_id).first()
+    if not staff_can_access_interview(user, interview):
+        raise HTTPException(status_code=404, detail="Interview not found")
+    return interview
 
 
 def _revalidate_coding_testcases(q, language=None):
@@ -273,12 +298,13 @@ async def get_service_health():
 async def generate_questions(
     interview_id: int,
     request: QuestionGenerationRequest,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(_staff_user),
 ):
     """Generate questions for an interview using AI"""
 
     # Get interview details
-    interview = db.query(Interview).filter(Interview.id == interview_id).first()
+    interview = _staff_interview(db, interview_id, current_user)
     if not interview:
         raise HTTPException(status_code=404, detail="Interview not found")
 
@@ -484,7 +510,8 @@ def search_questions_by_skill(
     question_type: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
     limit: int = Query(default=100, ge=1, le=500),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(_staff_user),
 ):
     """Search previously generated questions by skill name with optional filters.
 
@@ -493,10 +520,10 @@ def search_questions_by_skill(
     Results are de-duped by normalized question text (newest kept) as a defensive measure in
     case the bank already contains duplicate rows.
     """
-    query = db.query(QuestionModel).filter(
+    query = _in_caller_company(db.query(QuestionModel).filter(
         QuestionModel.skill_name.ilike(f"%{skill_name}%"),
         QuestionModel.is_pool_question == True,
-    )
+    ), current_user)
     if difficulty:
         query = query.filter(QuestionModel.difficulty_level.ilike(difficulty))
     if question_type:
@@ -524,10 +551,11 @@ def search_questions_by_skill(
 def import_questions(
     interview_id: int,
     body: ImportQuestionsRequest,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(_staff_user),
 ):
     """Copy previously generated questions into the current interview's pool."""
-    interview = db.query(Interview).filter(Interview.id == interview_id).first()
+    interview = _staff_interview(db, interview_id, current_user)
     if not interview:
         raise HTTPException(status_code=404, detail="Interview not found")
 
@@ -543,7 +571,10 @@ def import_questions(
     imported = []
     skipped = 0
     for qid in body.question_ids:
-        src = db.query(QuestionModel).filter(QuestionModel.id == qid).first()
+        # Only this company's bank: another company's answer keys must not be copyable.
+        src = _in_caller_company(
+            db.query(QuestionModel).filter(QuestionModel.id == qid), current_user
+        ).first()
         if not src:
             continue
         key = _normalize_text(src.question_text)
@@ -897,10 +928,11 @@ def _parse_mcq_csv(text):
 def add_manual_questions(
     interview_id: int,
     body: ManualQuestionsRequest,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(_staff_user),
 ):
     """Add manually-entered MCQs into this interview's pool (assembly-ready)."""
-    interview = db.query(Interview).filter(Interview.id == interview_id).first()
+    interview = _staff_interview(db, interview_id, current_user)
     if not interview:
         raise HTTPException(status_code=404, detail="Interview not found")
 
@@ -933,9 +965,10 @@ async def add_manual_questions_csv(
     difficulty: str = Form("MEDIUM"),
     marks_per_question: int = Form(1),
     db: Session = Depends(get_db),
+    current_user: User = Depends(_staff_user),
 ):
     """Bulk-add MCQs from a CSV (columns: question, option_a..option_d, correct_option)."""
-    interview = db.query(Interview).filter(Interview.id == interview_id).first()
+    interview = _staff_interview(db, interview_id, current_user)
     if not interview:
         raise HTTPException(status_code=404, detail="Interview not found")
 
@@ -989,12 +1022,13 @@ def get_questions(
     interview_id: int,
     status: Optional[str] = Query(None),
     question_type: Optional[str] = Query(None),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(_staff_user),
 ):
     """Get all questions for an interview with optional filtering"""
 
     # Verify interview exists
-    interview = db.query(Interview).filter(Interview.id == interview_id).first()
+    interview = _staff_interview(db, interview_id, current_user)
     if not interview:
         raise HTTPException(status_code=404, detail="Interview not found")
 
@@ -1026,9 +1060,11 @@ def update_question(
     interview_id: int,
     question_id: str,
     question_update: QuestionUpdate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(_staff_user),
 ):
     """Update a specific question"""
+    _staff_interview(db, interview_id, current_user)
 
     db_question = db.query(QuestionModel).filter(
         QuestionModel.id == question_id,
@@ -1061,11 +1097,12 @@ def update_question(
 async def regenerate_question(
     interview_id: int,
     question_id: str,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(_staff_user),
 ):
     """Regenerate a single question"""
 
-    interview = db.query(Interview).filter(Interview.id == interview_id).first()
+    interview = _staff_interview(db, interview_id, current_user)
     if not interview:
         raise HTTPException(status_code=404, detail="Interview not found")
 
@@ -1128,11 +1165,12 @@ async def regenerate_question(
 @router.delete("/{interview_id}/questions")
 def delete_all_questions(
     interview_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(_staff_user),
 ):
     """Delete all questions for an interview"""
 
-    interview = db.query(Interview).filter(Interview.id == interview_id).first()
+    interview = _staff_interview(db, interview_id, current_user)
     if not interview:
         raise HTTPException(status_code=404, detail="Interview not found")
 
@@ -1152,11 +1190,12 @@ def delete_all_questions(
 async def generate_skill_questions(
     interview_id: int,
     request: GeneratePoolRequest,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(_staff_user),
 ):
     """Generate pool questions for a specific skill and question type"""
 
-    interview = db.query(Interview).filter(Interview.id == interview_id).first()
+    interview = _staff_interview(db, interview_id, current_user)
     if not interview:
         raise HTTPException(status_code=404, detail="Interview not found")
 
@@ -1291,13 +1330,14 @@ async def generate_skill_questions(
 def configure_test_assembly(
     interview_id: int,
     request: AssembleSetsRequest,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(_staff_user),
 ):
     """Configure on-the-fly test assembly from approved pool questions.
     Saves skill_type_targets on the interview and validates pool readiness.
     Tests are assembled randomly per candidate at invite time."""
 
-    interview = db.query(Interview).filter(Interview.id == interview_id).first()
+    interview = _staff_interview(db, interview_id, current_user)
     if not interview:
         raise HTTPException(status_code=404, detail="Interview not found")
 
@@ -1398,11 +1438,12 @@ def configure_test_assembly(
 @router.get("/{interview_id}/test-sets")
 def get_test_sets(
     interview_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(_staff_user),
 ):
     """Get all assembled test sets for an interview"""
 
-    interview = db.query(Interview).filter(Interview.id == interview_id).first()
+    interview = _staff_interview(db, interview_id, current_user)
     if not interview:
         raise HTTPException(status_code=404, detail="Interview not found")
 

@@ -3,6 +3,7 @@
 Handles job browsing, applications with OCR support, and candidate-specific operations
 """
 
+import asyncio
 import logging
 from fastapi import APIRouter, HTTPException, status, Depends, UploadFile, File, Form, Query
 from sqlalchemy.orm import Session, joinedload
@@ -49,6 +50,13 @@ from src.utils import (
     create_error_response, create_success_response
 )
 from src.services.job_dedup import duplicate_as_conflict
+from src.services.ats_scoring_pipeline import (
+    build_inputs_for_candidate, score_for_job, persist_ats_result, ATS_REVIEW_THRESHOLD,
+)
+from src.services import parse_quality
+from src.services.assessment_fairness import (
+    approved_accommodations, describe as describe_accommodations,
+)
 
 router = APIRouter(prefix="/api/v1/candidate", tags=["Candidates"])
 
@@ -433,70 +441,19 @@ async def apply_for_job_enhanced(
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to save photo: {e}")
 
-    # Enhanced resume parsing and ATS scoring
-    import types as _types
-    _default_ats = _types.SimpleNamespace(
-        ats_score=0, extracted_skills=[], extracted_experience=0,
-        matched_skills=[], missing_skills=[], recommendations=[],
-        strengths=[], weaknesses=[], scoring_breakdown={},
-        skills_match_score=0, semantic_score=0, experience_score=0, keyword_score=0,
-    )
-    resume_text = ""
-    confidence = 0.0
-    ats_result = _default_ats
-    ats_interpretation = {"level": "unknown", "color": "#888"}
-    try:
-        # Score from the candidate's structured profile when available; only fall
-        # back to the uploaded resume's text when the profile has no usable data.
-        profile = db.query(CandidateProfileExt).filter(
-            CandidateProfileExt.user_id == current_user.id
-        ).first()
-        profile_text = build_profile_text(profile) if profile else ""
+    # Resume parsing and ATS scoring: the shared pipeline (src/services/ats_scoring_pipeline).
+    # It never raises: a resume that cannot be read reliably comes back `needs_review`
+    # instead of as a silent 0, and goes to a person rather than into the ranking.
+    inputs = build_inputs_for_candidate(db, user_id=current_user.id, resume_path=resume_path)
+    profile = inputs.profile
+    resume_text = inputs.resume_text
+    confidence = float(inputs.extraction.get("confidence") or 0.0)
+    outcome = score_for_job(inputs, job)
+    ats_result = outcome.result
+    needs_review = outcome.parse["status"] == "needs_review"
+    ats_interpretation = ({"level": "unknown", "color": "#888"} if needs_review
+                          else get_ats_interpretation(ats_result.ats_score))
 
-        # Still extract the resume text — it is stored on the Candidate record and
-        # serves as the scoring fallback for sparse/empty profiles.
-        resume_text, confidence = extract_text_from_file(resume_path)
-        scoring_text = profile_text or resume_text
-        # Structured signals feeding the recruiter-rubric sub-scores (education
-        # degree/tier/CGPA, experience internships/github, etc.). All gracefully
-        # degrade to text extraction when the profile is sparse.
-        educations = (
-            [{'education_level': e.education_level, 'degree': e.degree,
-              'institution_name': e.institution_name, 'grade': e.grade}
-             for e in (profile.educations or [])]
-            if profile else []
-        )
-        institution_names = [e['institution_name'] for e in educations if e['institution_name']]
-        work_experiences = (
-            [{'employment_type': w.employment_type, 'job_title': w.job_title}
-             for w in (profile.work_experiences or [])]
-            if profile else []
-        )
-        # GitHub / portfolio links for the experience sub-score.
-        links_text = ""
-        if profile:
-            link_bits = [profile.github_url or "", profile.linkedin_url or ""]
-            link_bits += [p.repository_url or "" for p in (profile.projects or [])]
-            link_bits += [p.project_url or "" for p in (profile.projects or [])]
-            links_text = " ".join(b for b in link_bits if b)
-        permanent_pincode = (profile.permanent_pincode or profile.pincode) if profile else None
-        if scoring_text:
-            ats_service = EnhancedATSScoringService()
-            ats_result = ats_service.enhanced_score_candidate(
-                resume_text=scoring_text,
-                job_description=job.description + " " + job.requirements,
-                required_skills=_parse_skills(job.required_skills),
-                required_experience=job.experience_years or 0,
-                institution_names=institution_names,
-                permanent_pincode=permanent_pincode,
-                educations=educations,
-                work_experiences=work_experiences,
-                links_text=links_text,
-            )
-            ats_interpretation = get_ats_interpretation(ats_result.ats_score)
-    except Exception as e:
-        print(f"ATS scoring skipped: {e}")
-    
     # Resolve company_id with a fallback chain so multi-tenant isolation never
     # silently breaks. Use raw SQL to defeat any stale ORM identity-map state,
     # then fall back through HR profile / HR user / department if needed.
@@ -552,21 +509,8 @@ async def apply_for_job_enhanced(
         db.commit()
     db.refresh(candidate)
     
-    # Create ATS result record
-    ats_record = ATSResult(
-        candidate_id=candidate.id,
-        job_id=job_id,
-        skills_match_score=ats_result.skills_match_score,
-        semantic_score=ats_result.semantic_score,
-        experience_score=ats_result.experience_score,
-        keyword_score=ats_result.keyword_score,
-        ats_score=ats_result.ats_score,
-        matched_skills=json.dumps(ats_result.matched_skills) if ats_result.matched_skills else None,
-        missing_skills=json.dumps(ats_result.missing_skills) if ats_result.missing_skills else None,
-        scoring_breakdown=json.dumps(ats_result.scoring_breakdown) if isinstance(ats_result.scoring_breakdown, (dict, list)) else ats_result.scoring_breakdown
-    )
-    
-    db.add(ats_record)
+    # ATS result with provenance, and the first entry in its score history.
+    persist_ats_result(db, candidate=candidate, job=job, outcome=outcome, event_type="scored")
 
     # Create stage history: applied
     stage_applied = CandidateStageHistory(
@@ -587,14 +531,22 @@ async def apply_for_job_enhanced(
     )
     db.add(stage_ats)
 
-    # Auto-advance to hr_review if ATS score meets threshold (>=50)
-    if ats_result.ats_score and float(ats_result.ats_score) >= 50:
+    # A resume that could not be read reliably goes straight to a person; it must never
+    # sit below the threshold looking like a weak candidate.
+    if needs_review:
+        candidate.current_stage = "hr_review"
+        db.add(CandidateStageHistory(
+            candidate_id=candidate.id, from_stage="ats_screening", to_stage="hr_review",
+            notes="Resume could not be read reliably, so it was not ranked: manual review. "
+                  + " ".join(parse_quality.describe(outcome.parse["issues"])),
+        ))
+    elif ats_result.ats_score and float(ats_result.ats_score) >= ATS_REVIEW_THRESHOLD:
         candidate.current_stage = "hr_review"
         stage_hr = CandidateStageHistory(
             candidate_id=candidate.id,
             from_stage="ats_screening",
             to_stage="hr_review",
-            notes=f"Auto-promoted to HR review (ATS score {ats_result.ats_score} >= 50 threshold)"
+            notes=f"Auto-promoted to HR review (ATS score {ats_result.ats_score} >= {ATS_REVIEW_THRESHOLD} threshold)"
         )
         db.add(stage_hr)
 
@@ -637,6 +589,7 @@ async def apply_for_job_enhanced(
         "ats_color": ats_interpretation['color'],
         "application_stage": candidate.current_stage,
         "processing_confidence": confidence,
+        "resume_needs_review": needs_review,
         "recommendations": ats_result.recommendations,
         "strengths": ats_result.strengths,
         "weaknesses": ats_result.weaknesses,
@@ -705,48 +658,18 @@ async def quick_apply_for_job(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save photo: {e}")
 
-    # Extract resume text and run ATS scoring
-    try:
-        # Score from the candidate's structured profile; fall back to the saved
-        # resume's text only when the profile has no usable data to score on.
-        profile_text = build_profile_text(profile)
-
-        resume_text, confidence = extract_text_from_file(profile.resume_path)
-        scoring_text = profile_text or resume_text
-        if not scoring_text:
-            raise HTTPException(status_code=400, detail="No profile data or resume text available to score. Please complete your profile or re-upload your resume.")
-
-        educations = [
-            {'education_level': e.education_level, 'degree': e.degree,
-             'institution_name': e.institution_name, 'grade': e.grade}
-            for e in (profile.educations or [])
-        ]
-        work_experiences = [
-            {'employment_type': w.employment_type, 'job_title': w.job_title}
-            for w in (profile.work_experiences or [])
-        ]
-        link_bits = [profile.github_url or "", profile.linkedin_url or ""]
-        link_bits += [p.repository_url or "" for p in (profile.projects or [])]
-        link_bits += [p.project_url or "" for p in (profile.projects or [])]
-        links_text = " ".join(b for b in link_bits if b)
-
-        ats_service = EnhancedATSScoringService()
-        ats_result = ats_service.enhanced_score_candidate(
-            resume_text=scoring_text,
-            job_description=job.description + " " + job.requirements,
-            required_skills=_parse_skills(job.required_skills),
-            required_experience=job.experience_years or 0,
-            institution_names=[e['institution_name'] for e in educations if e['institution_name']],
-            permanent_pincode=(profile.permanent_pincode or profile.pincode),
-            educations=educations,
-            work_experiences=work_experiences,
-            links_text=links_text,
-        )
-        ats_interpretation = get_ats_interpretation(ats_result.ats_score)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"ATS scoring failed: {str(e)}")
+    # Resume parsing and ATS scoring: the shared pipeline. Only "nothing at all to score"
+    # is the candidate's to fix (400); a scorer failure becomes needs_review, not a 500.
+    inputs = build_inputs_for_candidate(db, user_id=current_user.id, resume_path=profile.resume_path)
+    if not (inputs.scoring_text or "").strip():
+        raise HTTPException(status_code=400, detail="No profile data or resume text available to score. Please complete your profile or re-upload your resume.")
+    resume_text = inputs.resume_text
+    confidence = float(inputs.extraction.get("confidence") or 0.0)
+    outcome = score_for_job(inputs, job)
+    ats_result = outcome.result
+    needs_review = outcome.parse["status"] == "needs_review"
+    ats_interpretation = ({"level": "unknown", "color": "#888"} if needs_review
+                          else get_ats_interpretation(ats_result.ats_score))
 
     # Derive application fields from profile
     expected_salary = None
@@ -791,20 +714,8 @@ async def quick_apply_for_job(
         db.commit()
     db.refresh(candidate)
 
-    # Create ATS result record
-    ats_record = ATSResult(
-        candidate_id=candidate.id,
-        job_id=job_id,
-        skills_match_score=ats_result.skills_match_score,
-        semantic_score=ats_result.semantic_score,
-        experience_score=ats_result.experience_score,
-        keyword_score=ats_result.keyword_score,
-        ats_score=ats_result.ats_score,
-        matched_skills=json.dumps(ats_result.matched_skills) if ats_result.matched_skills else None,
-        missing_skills=json.dumps(ats_result.missing_skills) if ats_result.missing_skills else None,
-        scoring_breakdown=json.dumps(ats_result.scoring_breakdown) if isinstance(ats_result.scoring_breakdown, (dict, list)) else ats_result.scoring_breakdown
-    )
-    db.add(ats_record)
+    # ATS result with provenance, and the first entry in its score history.
+    persist_ats_result(db, candidate=candidate, job=job, outcome=outcome, event_type="scored")
 
     stage_applied = CandidateStageHistory(
         candidate_id=candidate.id,
@@ -823,13 +734,22 @@ async def quick_apply_for_job(
     )
     db.add(stage_ats)
 
-    if ats_result.ats_score and float(ats_result.ats_score) >= 50:
+    # A resume that could not be read reliably goes straight to a person; it must never
+    # sit below the threshold looking like a weak candidate.
+    if needs_review:
+        candidate.current_stage = "hr_review"
+        db.add(CandidateStageHistory(
+            candidate_id=candidate.id, from_stage="ats_screening", to_stage="hr_review",
+            notes="Resume could not be read reliably, so it was not ranked: manual review. "
+                  + " ".join(parse_quality.describe(outcome.parse["issues"])),
+        ))
+    elif ats_result.ats_score and float(ats_result.ats_score) >= ATS_REVIEW_THRESHOLD:
         candidate.current_stage = "hr_review"
         stage_hr = CandidateStageHistory(
             candidate_id=candidate.id,
             from_stage="ats_screening",
             to_stage="hr_review",
-            notes=f"Auto-promoted to HR review (ATS score {ats_result.ats_score} >= 50 threshold)"
+            notes=f"Auto-promoted to HR review (ATS score {ats_result.ats_score} >= {ATS_REVIEW_THRESHOLD} threshold)"
         )
         db.add(stage_hr)
 
@@ -1087,6 +1007,9 @@ async def get_my_interviews(
                     location = line.replace("Location:", "").strip()
         if not location and iv.job and iv.job.location:
             location = iv.job.location
+        approved_acc = approved_accommodations(iv)
+        if approved_acc.get("fullscreen_not_required"):
+            require_fullscreen = False
         result.append({
             "id": iv.id,
             "title": iv.title,
@@ -1106,6 +1029,11 @@ async def get_my_interviews(
             "require_fullscreen": require_fullscreen,
             "copy_paste_allowed": copy_paste_allowed,
             "is_scheduled_interview": bool(iv.notes and "Mode:" in iv.notes),
+            "attempt_number": iv.attempt_number or 1,
+            "accommodation_status": iv.accommodation_status,
+            "accommodation_request": iv.accommodation_request,
+            "accommodations": approved_acc or None,
+            "accommodations_summary": describe_accommodations(approved_acc),
         })
     return result
 
@@ -1164,7 +1092,8 @@ async def get_interview_questions_for_candidate(
 
 class SubmitAnswerItem(BaseModel):
     question_id: str
-    selected_option: Optional[str] = None
+    # MCQ choice, or the candidate's code for a coding question (the judge's 64 KB bound).
+    selected_option: Optional[str] = Field(None, max_length=64 * 1024)
     language: Optional[str] = None   # for coding answers: the editor language
 
 class SubmitInterviewRequest(BaseModel):
@@ -1172,22 +1101,10 @@ class SubmitInterviewRequest(BaseModel):
 
 
 def _resolve_owned_interview(interview_id: int, current_user: User, db: Session):
-    """Return the interview if it belongs to this tenant + candidate, else None."""
-    candidates = db.query(Candidate).filter(Candidate.user_id == current_user.id).all()
-    if not candidates:
-        candidates = db.query(Candidate).filter(Candidate.email == current_user.email).all()
-    candidate_ids = [c.id for c in candidates]
-
-    qry = db.query(Interview).filter(
-        Interview.id == interview_id,
-        Interview.company_id == current_user.company_id,
-    )
-    if candidate_ids:
-        qry = qry.filter(Interview.candidate_id.in_(candidate_ids))
-    else:
-        qry = qry.filter(Interview.candidate_id.isnot(None))
-    interview = qry.first()
-    return interview, (candidate_ids[0] if candidate_ids else None)
+    """Return (interview, candidate_id) if it is this candidate's own, else (None, None)."""
+    from src.services.interview_access import candidate_owns_interview
+    interview = candidate_owns_interview(db, current_user, interview_id)
+    return interview, (interview.candidate_id if interview else None)
 
 
 @router.post("/interviews/{interview_id}/voice-answer")
@@ -1275,6 +1192,125 @@ async def submit_voice_answer(
     }
 
 
+def _own_interview(db: Session, current_user: User, interview_id: int) -> Interview:
+    """The candidate's own interview, or 404. Same ownership rule as the questions endpoint."""
+    candidate_ids = [c.id for c in db.query(Candidate).filter(Candidate.user_id == current_user.id).all()]
+    if not candidate_ids:
+        candidate_ids = [c.id for c in db.query(Candidate).filter(Candidate.email == current_user.email).all()]
+    interview = db.query(Interview).filter(
+        Interview.id == interview_id, Interview.candidate_id.in_(candidate_ids)
+    ).first() if candidate_ids else None
+    if not interview:
+        raise HTTPException(status_code=404, detail="Interview not found")
+    return interview
+
+
+class ExplanationRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=2000)
+
+
+MAX_EXPLANATIONS_PER_TEST = 5
+
+
+@router.post("/interviews/{interview_id}/explanation")
+async def submit_explanation(
+    interview_id: int,
+    body: ExplanationRequest,
+    current_user: User = Depends(AuthMiddleware.get_current_candidate),
+    db: Session = Depends(get_db),
+):
+    """The candidate's own account of their test, shown to the reviewers alongside the
+    proctoring record. For a test that ended early, or anything the candidate wants the
+    hiring team to know when they look at the flags."""
+    from src.models.models import AssessmentExplanation
+    interview = _own_interview(db, current_user, interview_id)
+    if (interview.status or "").upper() != "COMPLETED":
+        raise HTTPException(status_code=409, detail="You can add an explanation once the test has been submitted.")
+    text = body.text.strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="Write a few words first.")
+    count = db.query(AssessmentExplanation).filter(
+        AssessmentExplanation.interview_id == interview.id,
+        AssessmentExplanation.candidate_user_id == current_user.id,
+    ).count()
+    if count >= MAX_EXPLANATIONS_PER_TEST:
+        raise HTTPException(status_code=409, detail="You have already added the maximum number of explanations for this test.")
+    row = AssessmentExplanation(
+        company_id=interview.company_id, interview_id=interview.id,
+        candidate_user_id=current_user.id, text=text, created_at=datetime.utcnow(),
+    )
+    db.add(row)
+    db.commit()
+    return {"id": row.id, "text": row.text, "created_at": row.created_at.isoformat()}
+
+
+@router.get("/interviews/{interview_id}/explanations")
+async def list_my_explanations(
+    interview_id: int,
+    current_user: User = Depends(AuthMiddleware.get_current_candidate),
+    db: Session = Depends(get_db),
+):
+    from src.models.models import AssessmentExplanation
+    interview = _own_interview(db, current_user, interview_id)
+    rows = db.query(AssessmentExplanation).filter(
+        AssessmentExplanation.interview_id == interview.id,
+        AssessmentExplanation.candidate_user_id == current_user.id,
+    ).order_by(AssessmentExplanation.created_at).all()
+    return [{"id": r.id, "text": r.text, "created_at": r.created_at.isoformat() if r.created_at else None}
+            for r in rows]
+
+
+class AccommodationRequestBody(BaseModel):
+    text: str = Field(..., min_length=10, max_length=2000)
+
+
+@router.post("/interviews/{interview_id}/accommodation-request")
+async def request_accommodation(
+    interview_id: int,
+    body: AccommodationRequestBody,
+    current_user: User = Depends(AuthMiddleware.get_current_candidate),
+    db: Session = Depends(get_db),
+):
+    """Ask the hiring team for an adjustment (extra time, microphone monitoring off...)
+    before starting. HR approves specific settings; nothing changes until they do."""
+    interview = _own_interview(db, current_user, interview_id)
+    if (interview.status or "").upper() in ("COMPLETED", "IN_PROGRESS"):
+        raise HTTPException(status_code=409, detail="Adjustments must be requested before the test starts.")
+    if interview.accommodation_status == "approved":
+        raise HTTPException(status_code=409, detail="Your adjustments are already approved. Contact your recruiter to change them.")
+    interview.accommodation_request = body.text.strip()
+    interview.accommodation_status = "requested"
+    interview.updated_at = datetime.utcnow()
+    db.commit()
+    return {"accommodation_status": "requested", "accommodation_request": interview.accommodation_request}
+
+
+def _proctoring_termination_reason(db: Session, interview_id: int) -> Optional[str]:
+    """The flag that ended this test early, or None if proctoring didn't end it.
+
+    The server marks the session terminated (and records TEST_TERMINATED with its reason)
+    before the client auto-submits, so by the time submit runs the record is in place.
+    """
+    from src.models.models import ProctoringSession, ProctoringViolation
+    session = (db.query(ProctoringSession)
+               .filter(ProctoringSession.test_id == interview_id,
+                       ProctoringSession.status == "terminated")
+               .order_by(ProctoringSession.started_at.desc()).first())
+    if not session:
+        return None
+    marker = (db.query(ProctoringViolation)
+              .filter(ProctoringViolation.session_id == session.id,
+                      ProctoringViolation.violation_type == "TEST_TERMINATED")
+              .order_by(ProctoringViolation.timestamp.desc()).first())
+    details = marker.details if marker else None
+    if isinstance(details, str):
+        try:
+            details = json.loads(details)
+        except ValueError:
+            details = None
+    return (details or {}).get("reason") or "PROCTORING"
+
+
 @router.post("/interviews/{interview_id}/submit")
 async def submit_interview(
     interview_id: int,
@@ -1285,25 +1321,10 @@ async def submit_interview(
     """Submit interview answers, calculate score, and mark as completed"""
     from src.models.question_models import Question as InterviewQuestion, CommunicationAnswer
 
-    candidates = db.query(Candidate).filter(Candidate.user_id == current_user.id).all()
-    # Fallback: match by email if user_id link is missing
-    if not candidates:
-        candidates = db.query(Candidate).filter(Candidate.email == current_user.email).all()
-    candidate_ids = [c.id for c in candidates]
-
-    # Find interview — must belong to this tenant and this candidate
-    if candidate_ids:
-        interview = db.query(Interview).filter(
-            Interview.id == interview_id,
-            Interview.company_id == current_user.company_id,
-            Interview.candidate_id.in_(candidate_ids)
-        ).first()
-    else:
-        interview = db.query(Interview).filter(
-            Interview.id == interview_id,
-            Interview.company_id == current_user.company_id,
-            Interview.candidate_id.isnot(None)
-        ).first()
+    # Must be this candidate's own interview. There is deliberately no fallback for an
+    # account without Candidate rows (see src/services/interview_access.py).
+    from src.services.interview_access import candidate_owns_interview
+    interview = candidate_owns_interview(db, current_user, interview_id)
 
     if not interview:
         raise HTTPException(status_code=404, detail="Interview not found")
@@ -1320,23 +1341,38 @@ async def submit_interview(
     total_marks = 0
     scored_answers = []
 
-    if body and body.answers:
-        questions = db.query(InterviewQuestion).filter(
-            InterviewQuestion.interview_id == interview_id
-        ).all()
-        q_map = {q.id: q for q in questions}
+    # The paper the candidate was served (the same rows GET .../questions returns).
+    # Its marks are the denominator whatever the client sends, so leaving out the
+    # answers you're unsure of can't raise the percentage.
+    served = db.query(InterviewQuestion).filter(
+        InterviewQuestion.interview_id == interview_id,
+        InterviewQuestion.is_approved == True,
+    ).all()
+    q_map = {q.id: q for q in served}
 
-        for ans in body.answers:
+    def _marks(q):
+        # Every MCQ is worth exactly 1 mark; coding keeps its stored weighting.
+        # (A NULL/0 points value must NOT silently become 10 — that inflated the
+        # denominator, e.g. a 40-question test showing "/49".)
+        return (q.points or 10) if (q.question_type or "").lower() == "coding" else 1
+
+    # One answer per question (the last one sent wins), so repeating a question id
+    # can't score it twice or re-run the judge for it.
+    answers = list({a.question_id: a for a in (body.answers if body else [])}.values())
+    answered_ids = {a.question_id for a in answers if a.question_id in q_map}
+    for q in served:
+        if q.id not in answered_ids and (q.question_type or "").lower() != "communication":
+            total_marks += _marks(q)          # unanswered: counts, scores 0
+
+    if answers:
+        for ans in answers:
             q = q_map.get(ans.question_id)
             if not q:
                 continue
             # Communication questions are scored from their uploaded recording below.
             if (q.question_type or "").lower() == "communication":
                 continue
-            # Every MCQ is worth exactly 1 mark; coding keeps its stored weighting.
-            # (A NULL/0 points value must NOT silently become 10 — that inflated the
-            # denominator, e.g. a 40-question test showing "/49".)
-            points = (q.points or 10) if (q.question_type or "").lower() == "coding" else 1
+            points = _marks(q)
             total_marks += points
 
             # Coding questions with test cases → judge the candidate's code
@@ -1346,7 +1382,10 @@ async def submit_interview(
                 # Prefer the candidate's editor language; fall back to the question's
                 # HR-assigned language, then python.
                 answer_lang = ans.language or getattr(q, 'language', None) or 'python'
-                graded = grade_interview_question(q, answer_lang, ans.selected_option or '')
+                # Off the event loop: judging waits seconds on the worker, and every
+                # other request on this API worker would wait with it.
+                graded = await asyncio.to_thread(
+                    grade_interview_question, q, answer_lang, ans.selected_option or '')
                 if graded.get('unavailable'):
                     # Judge was down at submit time. Don't silently award 0: drop this
                     # question from the denominator for now and flag it for deferred
@@ -1464,12 +1503,20 @@ async def submit_interview(
         if cand and cand.current_stage not in ("interview_scheduled", "offer_sent", "hired", "rejected"):
             prev = cand.current_stage
             cand.current_stage = "test_completed"
+            notes = f"MCQ test submitted. Score: {score}/{total_marks if total_marks > 0 else '?'}"
+            ended_early = _proctoring_termination_reason(db, interview.id)
+            if ended_early:
+                # A test the proctor ended early auto-submits through this same endpoint,
+                # and used to look exactly like a normal submission. Say so, and say that
+                # it is waiting on a person — the score reflects a shortened attempt.
+                notes += (f". Ended early by proctoring ({ended_early.replace('_', ' ').lower()}); "
+                          "the score covers answers up to that point. Pending proctoring review.")
             db.add(CandidateStageHistory(
                 candidate_id=cand.id,
                 from_stage=prev,
                 to_stage="test_completed",
                 changed_by_id=current_user.id,
-                notes=f"MCQ test submitted. Score: {score}/{total_marks if total_marks > 0 else '?'}"
+                notes=notes,
             ))
 
     db.commit()

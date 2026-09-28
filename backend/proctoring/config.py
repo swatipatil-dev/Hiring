@@ -142,9 +142,10 @@ class ProctorConfig:
     db_persist_every_n_frames: int = 15  # write cheating log every 15th frame (was 5 — reduced DB load)
     persist_violations_immediately: bool = True  # HIGH/CRITICAL saved instantly
 
-    # Auto-termination policy (per-flag 3 warnings → 4th strike ends the test)
-    TERMINATE_STRIKES: int = 3                    # warnings allowed per serious flag; terminate when strikes > this
-    NO_FACE_STRIKE_SEC: float = 105.0             # sustained no-face that counts as one NO_FACE strike
+    # Auto-termination policy. Only a second face or a phone (per-episode strikes) and a
+    # sustained identity mismatch can end a test — see _TERMINATING_FLAGS in routes.py.
+    # Everything else is recorded for a human reviewer and never ends the test.
+    TERMINATE_STRIKES: int = 3                    # warnings allowed per terminating flag; terminate when strikes > this
     IDENTITY_MISMATCH_STRIKE_SEC: float = 300.0   # sustained mismatch (5 min) that counts as one strike
     TERMINATION_GRACE_SEC: float = 10.0           # ignore strikes during camera warm-up / live enrollment
 

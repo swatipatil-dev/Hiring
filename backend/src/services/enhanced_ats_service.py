@@ -58,6 +58,18 @@ SKILL_TO_CLUSTER: Dict[str, str] = {
 }
 CLUSTER_PARTIAL_CREDIT = 0.6  # 60% of full credit for a same-category skill
 
+# Identifies the scoring RULES that produced a result: weights, sub-score formulas,
+# evidence handling. Stored with every ATS result so a score can be traced to the rules
+# behind it, and results scored under older rules are shown as such. Bump it whenever a
+# change would move a score.
+#   2026.10-v1  the 7-factor recruiter rubric as it stood before explainability work
+#   2026.10-v2  mandatory vs preferred: explicit preferred skills used as given (an empty
+#               list means none); inferred ones exclude mandatory skills; "meets X of Y"
+#   2026.10-v3  evidence: skills credited by where they are shown (experience/projects >
+#               skills list > related > not found) on the full text; unknown education /
+#               experience parts excluded rather than scored 0; no credit for bare words
+SCORING_RULES_VERSION = "2026.10-v3"
+
 SENTENCE_TRANSFORMERS_AVAILABLE = False
 _SEMANTIC_MODEL = None
 st_util = None
@@ -250,10 +262,12 @@ SECTION_HEADERS: Dict[str, List[str]] = {
     ],
 }
 
+# Where a skill appears says how well it is evidenced: used in a job or project beats a
+# line in a skills list. (This used to rank the skills list highest.)
 SECTION_SKILL_WEIGHTS: Dict[str, float] = {
-    "skills": 1.5,
-    "experience": 1.2,
-    "projects": 1.1,
+    "experience": 1.5,
+    "projects": 1.3,
+    "skills": 1.0,
     "certifications": 1.0,
     "education": 0.8,
     "summary": 0.7,
@@ -342,6 +356,20 @@ class EnhancedATSScoreResult(BaseModel):
     weaknesses: List[str]
     rating: str = ""
     hiring_recommendation: str = ""
+    # Mandatory requirements (the job's required_skills): shown to HR as "meets X of Y",
+    # never grounds for automatic rejection.
+    mandatory_met: Optional[int] = None
+    mandatory_total: Optional[int] = None
+    missing_mandatory: List[str] = []
+    # Where the nice-to-haves came from: explicit (HR listed them), inferred (read from the
+    # JD text), or none.
+    preferred_source: Optional[str] = None
+    # Share of the scoring weight that rests on evidence found in the resume (0-1). Low
+    # coverage means most of the score could not be assessed; the pipeline sends it to a
+    # person rather than ranking it.
+    evidence_coverage: Optional[float] = None
+    # Everything behind the score, with resume excerpts (see src/services/ats_evidence.py).
+    explanation: Dict[str, Any] = {}
 
 # ==================== MODULE-LEVEL HELPER FUNCTIONS ====================
 
@@ -453,6 +481,23 @@ def _is_section_header(line: str) -> Optional[str]:
     return None
 
 
+def _inline_section_header(line: str) -> Optional[Tuple[str, str]]:
+    """A heading written on the same line as its content: "EXPERIENCE 2018-2024 Manager".
+
+    Only an ALL-CAPS heading counts, so prose such as "Experience with Python" is not
+    mistaken for one. Returns (section_name, rest_of_line) or None. Without this, a
+    resume laid out this way had every line filed under "other", so experience dates,
+    certifications and skills used in real work were all missed.
+    """
+    for section_name, headers in SECTION_HEADERS.items():
+        for h in sorted(headers, key=len, reverse=True):
+            head, rest = line[:len(h)], line[len(h):]
+            content = rest.strip(" :\t-|")
+            if head == h.upper() and rest[:1] in (" ", ":", "\t", "-", "|") and content:
+                return section_name, content
+    return None
+
+
 def detect_sections(text: str) -> Dict[str, str]:
     """
     Split resume text into named sections by scanning for section header lines.
@@ -470,11 +515,12 @@ def detect_sections(text: str) -> Dict[str, str]:
             continue
 
         matched_section = _is_section_header(line)
-        if matched_section:
+        inline = None if matched_section else _inline_section_header(stripped)
+        if matched_section or inline:
             if buffer:
                 sections[current_section] = sections.get(current_section, "") + "\n".join(buffer) + "\n"
-            current_section = matched_section
-            buffer = []
+            current_section = matched_section or inline[0]
+            buffer = [inline[1]] if inline else []
         else:
             buffer.append(stripped)
 
@@ -691,8 +737,9 @@ def compute_weighted_skills_score(sections: Dict[str, str], required_skills: Lis
     if not skill_scores:
         return 0.0
 
-    # Weighted score: sum(weight_of_best_match) / sum(max_weight) × 100
-    max_weight = SECTION_SKILL_WEIGHTS["skills"]  # 1.5
+    # Weighted score: sum(weight_of_best_match) / sum(max_weight) × 100. Normalised by the
+    # strongest section (experience), so a skill shown in real work scores highest.
+    max_weight = max(SECTION_SKILL_WEIGHTS.values())
     total = sum(skill_scores.values())
     perfect = len(required_normalized) * max_weight
     return round(min(100.0, (total / perfect) * 100), 2)
@@ -1689,8 +1736,10 @@ class EnhancedATSScoringService:
         }
         return score, detail
 
-    def extract_preferred_skills(self, jd_text: str) -> List[str]:
-        """Skills mentioned under a preferred / nice-to-have / desirable section of the JD."""
+    def extract_preferred_skills(self, jd_text: str, exclude: Optional[List[str]] = None) -> List[str]:
+        """Skills mentioned under a preferred / nice-to-have / desirable section of the JD,
+        minus any that are mandatory (`exclude`) — a required skill must not also earn
+        preferred credit."""
         if not jd_text:
             return []
         low = jd_text.lower()
@@ -1700,8 +1749,8 @@ class EnhancedATSScoringService:
         if not hits:
             return []
         segment = jd_text[min(hits):min(hits) + 600]
-        # Don't double-count: caller diffs preferred against required separately.
-        return self.extract_skills(segment)
+        excluded = {normalize_skill(x).lower() for x in (exclude or [])}
+        return [sk for sk in self.extract_skills(segment) if normalize_skill(sk).lower() not in excluded]
 
     @staticmethod
     def _rating_and_recommendation(score: float):
@@ -1835,7 +1884,8 @@ class EnhancedATSScoringService:
         work_experiences: Optional[List[Dict[str, Any]]] = None,
         links_text: Optional[str] = None,
         preferred_skills: Optional[List[str]] = None,
-        prepared: Optional[PreparedResume] = None
+        prepared: Optional[PreparedResume] = None,
+        known_experience_years: Optional[float] = None,
     ) -> EnhancedATSScoreResult:
         """
         Recruiter-rubric ATS scoring.
@@ -1857,6 +1907,11 @@ class EnhancedATSScoringService:
         # None of it reads the job description, so a caller scoring one resume against
         # many jobs passes `prepared` and pays for it once instead of once per job.
         prep = prepared if prepared is not None else self.prepare_resume(resume_text)
+        # Evidence is looked for in the FULL text: the processed text is cut to a token
+        # budget, and a skill mentioned after the cut used to count as missing.
+        from src.services import ats_evidence as ev
+        evidence_text = clean_resume_text((resume_text or "")[:ev.FULL_TEXT_MAX_CHARS])
+        units = ev.section_units(detect_sections(evidence_text))
         resume_text = prep.text
         sections = prep.sections
         resume_result = prep.parsed
@@ -1871,30 +1926,49 @@ class EnhancedATSScoringService:
         project_score = self.calculate_project_score(resume_result.projects, jd_text=job_description)
 
         # ── Skills = Required (70) + Preferred (30) ──
+        # None = HR never listed nice-to-haves, so infer them from the JD text; an explicit
+        # list (even an empty one) is used as given. Either way a mandatory skill is never
+        # also counted as preferred.
+        required_keys = {normalize_skill(x).lower() for x in required_skills}
         if preferred_skills is None:
-            preferred_skills = self.extract_preferred_skills(job_description)
-        skills_score, skills_detail = self.score_skills_v2(
-            resume_result.skills, required_skills, preferred_skills)
+            preferred_skills = self.extract_preferred_skills(job_description, exclude=required_skills)
+            preferred_source = "inferred" if preferred_skills else "none"
+        else:
+            preferred_skills = [p for p in preferred_skills if normalize_skill(p).lower() not in required_keys]
+            preferred_source = "explicit" if preferred_skills else "none"
+        # Each required / preferred skill: demonstrated, listed, related or not found,
+        # with excerpts. One pass decides both the score and the matched/missing lists.
+        extracted_set = {normalize_skill(x).lower() for x in resume_result.skills}
+        required_checks = [ev.classify_skill(sk, units, extracted_set) for sk in required_skills]
+        preferred_checks = [ev.classify_skill(sk, units, extracted_set) for sk in (preferred_skills or [])]
+        skills_score, skills_detail = ev.skills_score(required_checks, preferred_checks)
 
-        # ── Education = Degree match (40) + College tier (30) + CGPA (30) ──
-        education_score, education_detail = self.score_education_v2(
+        # ── Education = Degree (40) + College tier (30) + CGPA (30); unknown parts excluded ──
+        _, edu_v2 = self.score_education_v2(
             educations, institution_names, resume_result.education, resume_text, required_education)
+        inst_names = [e.get('institution_name') for e in educations] if educations else (institution_names or [])
+        education_score, education_detail = ev.education_score(
+            degree_sub=edu_v2['degree_match'], cand_degree=edu_v2['degree_match'],
+            tier=edu_v2['tier'], has_institution=any(inst_names),
+            cgpa_sub=edu_v2['cgpa'], cgpa_found=edu_v2['cgpa_found'], units=units)
 
         # ── Experience = Relevant (50) + Internships (25) + GitHub/OSS/Hack (25) ──
-        experience_score, experience_detail = self.score_experience_v2(
-            resume_result.experience_years, required_experience, work_experiences,
-            links_text, resume_text)
+        years, years_method, years_excerpts = ev.experience_years_evidence(
+            units, resume_result.experience_years, known_experience_years)
+        experience_score, experience_detail = ev.experience_score(
+            years, required_experience, work_experiences, links_text, units)
+        experience_detail['years_method'] = years_method
+        experience_detail['years_evidence'] = years_excerpts
 
-        # Composite ATS score (recruiter rubric).
-        ats_score = (
-            education_score * weights['education'] +
-            skills_score * weights['skills_match'] +
-            experience_score * weights['experience'] +
-            certification_score * weights['certification'] +
-            semantic_score * weights['semantic'] +
-            project_score * weights['project'] +
-            keyword_score * weights['keyword']
-        )
+        # Composite: weighted over the factors with evidence; a factor with nothing to go
+        # on (all of education unknown, say) is left out and the rest re-weighted, rather
+        # than dragging the score down as a zero.
+        factor_scores = {
+            'education': education_score, 'skills_match': skills_score, 'experience': experience_score,
+            'certification': certification_score, 'semantic': semantic_score,
+            'project': project_score, 'keyword': keyword_score,
+        }
+        ats_score, evidence_coverage, factor_rows = ev.combine(factor_scores, weights)
 
         # College tier is now part of the education score (no separate tier bonus).
         # Rural permanent address remains a small affirmative bonus, capped at 100.
@@ -1912,27 +1986,19 @@ class EnhancedATSScoringService:
         if JD_COPY_PENALTY > 0 and plagiarism["flagged"]:
             ats_score = max(0.0, ats_score - JD_COPY_PENALTY)
 
-        # C4.1 — Normalize required skills before diff
+        # Matched / related / missing come from the same evidence that set the score, so
+        # the lists can no longer disagree with it (they used to use exact set matching
+        # while the score used substring matching).
         required_normalized = [normalize_skill(s).lower() for s in required_skills]
         resume_normalized = [normalize_skill(s).lower() for s in resume_result.skills]
-
-        matched_skills = list(set(resume_normalized) & set(required_normalized))
-        raw_missing = list(set(required_normalized) - set(resume_normalized))
-
-        # Skill clustering — split raw missing into cluster-matched and truly missing
-        resume_normalized_set = set(resume_normalized)
-        cluster_matched_skills: List[Dict[str, str]] = []
-        missing_skills: List[str] = []
-        for skill in raw_missing:
-            cluster_hit = _find_cluster_match(skill, resume_normalized_set)
-            if cluster_hit:
-                cluster_matched_skills.append({
-                    "required": skill,
-                    "found": cluster_hit,
-                    "cluster": SKILL_TO_CLUSTER.get(skill.lower(), ""),
-                })
-            else:
-                missing_skills.append(skill)
+        matched_skills = [normalize_skill(c['skill']).lower() for c in required_checks
+                          if c['level'] in ('demonstrated', 'listed')]
+        cluster_matched_skills: List[Dict[str, str]] = [
+            {"required": normalize_skill(c['skill']).lower(), "found": c.get('related_to'),
+             "cluster": SKILL_TO_CLUSTER.get(normalize_skill(c['skill']).lower(), "")}
+            for c in required_checks if c['level'] == 'related']
+        missing_skills: List[str] = [normalize_skill(c['skill']).lower() for c in required_checks
+                                     if c['level'] == 'not_found']
 
         rating, hiring_recommendation = self._rating_and_recommendation(ats_score)
 
@@ -1941,20 +2007,13 @@ class EnhancedATSScoringService:
             missing_skills, resume_result.certifications
         )
 
-        strengths, weaknesses = self._strengths_weaknesses_v2(
-            education_detail, experience_detail, skills_detail,
-            matched_skills, missing_skills, certification_score
-        )
+        strengths, weaknesses = _evidence_strengths_weaknesses(
+            required_checks, preferred_checks, education_detail, experience_detail, certification_score)
 
         education_level = self._determine_education_level(resume_result.education)
 
         # Preferred skills the candidate is missing (for the dashboard).
-        missing_preferred = []
-        if preferred_skills:
-            res_norm = set(resume_normalized)
-            for s in preferred_skills:
-                if normalize_skill(s).lower() not in res_norm:
-                    missing_preferred.append(s)
+        missing_preferred = [c['skill'] for c in preferred_checks if c['level'] == 'not_found']
 
         scoring_breakdown = {
             'weights_used': weights,
@@ -1967,15 +2026,7 @@ class EnhancedATSScoringService:
                 'project': project_score,
                 'keyword': keyword_score,
             },
-            'weighted_contributions': {
-                'education': round(education_score * weights['education'], 2),
-                'skills_match': round(skills_score * weights['skills_match'], 2),
-                'experience': round(experience_score * weights['experience'], 2),
-                'certification': round(certification_score * weights['certification'], 2),
-                'semantic': round(semantic_score * weights['semantic'], 2),
-                'project': round(project_score * weights['project'], 2),
-                'keyword': round(keyword_score * weights['keyword'], 2),
-            },
+            'weighted_contributions': {r['key']: r['contribution'] for r in factor_rows},
             'sub_scores': {
                 'education': education_detail,
                 'experience': experience_detail,
@@ -1986,7 +2037,16 @@ class EnhancedATSScoringService:
             'strengths': strengths,
             'weaknesses': weaknesses,
             'preferred_skills': preferred_skills or [],
+            'preferred_source': preferred_source,
             'missing_preferred_skills': missing_preferred,
+            'mandatory': {
+                'met': len(matched_skills),
+                'total': len(required_checks),
+                'missing': [c['skill'] for c in required_checks if c['level'] not in ('demonstrated', 'listed')],
+            },
+            'factors': factor_rows,
+            'evidence_coverage': evidence_coverage,
+            'unknown_factors': [r['key'] for r in factor_rows if r['status'] == 'unknown_excluded'],
             'parsing_confidence': resume_result.confidence_score,
             'processing_method': resume_result.processing_method,
             'sections_detected': list(sections.keys()),
@@ -2000,13 +2060,33 @@ class EnhancedATSScoringService:
             'plagiarism': plagiarism,
         }
 
+        explanation = ev.cap_explanation({
+            "schema": 1,
+            "scoring_rules_version": SCORING_RULES_VERSION,
+            "mandatory": {"met": len(matched_skills), "total": len(required_checks), "items": required_checks},
+            "preferred": {"source": preferred_source,
+                          "met": sum(1 for c in preferred_checks if c['level'] in ('demonstrated', 'listed')),
+                          "total": len(preferred_checks), "items": preferred_checks},
+            "experience": experience_detail,
+            "education": education_detail,
+            "factors": factor_rows,
+            "evidence_coverage": evidence_coverage,
+            "bonuses": {"rural": rural, "rural_bonus": rural_bonus},
+            "plagiarism": plagiarism,
+        })
         return EnhancedATSScoreResult(
+            mandatory_met=len(matched_skills),
+            mandatory_total=len(required_checks),
+            missing_mandatory=[c['skill'] for c in required_checks if c['level'] not in ('demonstrated', 'listed')],
+            preferred_source=preferred_source,
+            evidence_coverage=evidence_coverage,
+            explanation=explanation,
             ats_score=round(ats_score, 2),
             skills_match_score=round(skills_score, 2),
             semantic_score=round(semantic_score, 2),
-            experience_score=round(experience_score, 2),
+            experience_score=round(experience_score or 0.0, 2),
             keyword_score=round(keyword_score, 2),
-            education_score=round(education_score, 2),
+            education_score=round(education_score or 0.0, 2),
             certification_score=round(certification_score, 2),
             project_score=round(project_score, 2),
             matched_skills=matched_skills,
@@ -2061,10 +2141,11 @@ class EnhancedATSScoringService:
         if skills_score < 70:
             recommendations.append(f"Consider learning missing skills: {', '.join(missing_skills[:3])}")
 
-        if experience_score < 70:
+        # None = not stated on the resume: nothing to recommend from an absence.
+        if experience_score is not None and experience_score < 70:
             recommendations.append("Gain more relevant work experience through internships or projects")
 
-        if education_score < 70:
+        if education_score is not None and education_score < 70:
             recommendations.append("Consider pursuing additional certifications or advanced degrees")
 
         if not certifications:
@@ -2195,3 +2276,69 @@ def enhanced_score_candidate_ats(
 def get_enhanced_ats_interpretation(ats_score: float) -> Dict[str, Any]:
     """Get enhanced score interpretation"""
     return enhanced_ats_service.get_score_interpretation(ats_score)
+
+
+def current_model_versions(llm_model: Optional[str] = None) -> Dict[str, str]:
+    """Which models this process scores with, for provenance. Records what was actually
+    used: the semantic factor falls back to TF-IDF when sentence-transformers is absent,
+    and scores differ between the two."""
+    nlp = _NLP if _NLP else None
+    versions = {
+        "semantic": "all-MiniLM-L6-v2" if SENTENCE_TRANSFORMERS_AVAILABLE else "tfidf",
+        "nlp": (f"{nlp.meta.get('name', '?')}-{nlp.meta.get('version', '?')}" if nlp is not None
+                and hasattr(nlp, "meta") else "none"),
+    }
+    if llm_model:
+        versions["llm"] = llm_model
+    return versions
+
+
+
+def _evidence_strengths_weaknesses(required, preferred, edu, exp, certification_score):
+    """Strengths and gaps that say what was found, quoting it where possible, and that say
+    "not found on the resume" rather than "lacks" — absence of evidence is not proof."""
+    strengths, weaknesses = [], []
+    shown = [c for c in required if c["level"] == "demonstrated"]
+    for c in shown[:3]:
+        quote = c["excerpts"][0]["excerpt"] if c["excerpts"] else ""
+        strengths.append(f"{c['skill']} used in real work: \u201c{quote}\u201d" if quote else f"{c['skill']} used in real work")
+    listed = [c["skill"] for c in required if c["level"] == "listed"]
+    if listed:
+        strengths.append(f"Lists {', '.join(listed[:5])} (not shown in an experience or project entry)")
+    related = [c for c in required if c["level"] == "related"]
+    for c in related[:3]:
+        weaknesses.append(f"{c['skill']}: not found; has the related {c.get('related_to')}")
+    missing = [c["skill"] for c in required if c["level"] == "not_found"]
+    if missing:
+        weaknesses.append(f"Not found on the resume: {', '.join(missing[:5])}")
+    pref_found = [c["skill"] for c in preferred if c["level"] in ("demonstrated", "listed")]
+    if pref_found:
+        strengths.append(f"Nice-to-haves found: {', '.join(pref_found[:5])}")
+
+    if edu.get("tier") in ("tier_1", "tier_2"):
+        strengths.append(f"Graduated from a {edu['tier'].replace('_', '-').title()} institute")
+    if edu.get("degree_status") == "met":
+        strengths.append("Meets the required degree level")
+    elif edu.get("degree_status") == "below":
+        weaknesses.append("Degree level is below the role requirement")
+    elif edu.get("degree_status") == "unknown":
+        weaknesses.append("Degree not stated on the resume: verify")
+    if edu.get("cgpa_status") == "unknown":
+        weaknesses.append("CGPA not stated on the resume (not counted)")
+
+    status = exp.get("relevant_status")
+    if status == "met":
+        strengths.append(f"About {exp.get('years_found'):g} years of experience, meeting the {exp.get('required_years')} required")
+    elif status == "below":
+        weaknesses.append(f"About {exp.get('years_found'):g} years of experience; {exp.get('required_years')} required")
+    elif status == "unknown":
+        weaknesses.append("Years of experience not stated on the resume: verify")
+    if exp.get("internship_count"):
+        strengths.append(f"{exp['internship_count']} internship(s) listed")
+    if exp.get("has_github"):
+        strengths.append("GitHub profile linked")
+    if exp.get("has_hackathon"):
+        strengths.append("Hackathon participation described")
+    if certification_score >= 60:
+        strengths.append("Holds relevant professional certifications")
+    return strengths, weaknesses

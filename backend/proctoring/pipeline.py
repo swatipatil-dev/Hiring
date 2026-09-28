@@ -52,6 +52,12 @@ class ProctorPipeline:
         self._last_frame_result: Optional[ProctorFrame] = None
         self._last_behavioral_at = 0.0
 
+        # Accommodations HR approved for this candidate's attempt. Set by the proctoring
+        # routes from the database at session start, never from the browser. A pipeline
+        # is built per session, so these cannot leak to another candidate.
+        self.gaze_flags_off = False        # no gaze / head-turn / looking-down flags or score
+        self.audio_monitoring_off = False  # no audio flags, audio excluded from the score
+
         # Lazy-init modules (avoid importing heavy libs at import time)
         self._face = None
         self._objects = None
@@ -237,6 +243,15 @@ class ProctorPipeline:
                 # Extra persons confirmed facing the screen — escalate severity
                 logger.warning("CONFIRMED extra person(s) facing screen: %d persons, %d faces", yolo_person_count, face_count)
 
+        # Apply approved accommodations before anything is warned about, stored or scored.
+        suppressed = self.suppressed_flags()
+        if suppressed:
+            result.flags = [f for f in result.flags if f not in suppressed]
+        if self.audio_monitoring_off:
+            # Dropping the module (not zeroing it) re-weights the score over the modules
+            # that did report — the same way an absent module is already handled.
+            result.module_scores.pop("audio", None)
+
         # Compute unified cheating score (weighted average)
         result.cheating_score = self._compute_cheating_score(result.module_scores)
         self._score_history.append(result.cheating_score)
@@ -267,20 +282,33 @@ class ProctorPipeline:
             return 0.0
         return round(total / weight_sum, 1)
 
+    def suppressed_flags(self) -> frozenset:
+        from src.services.assessment_fairness import GAZE_FLAGS, AUDIO_FLAGS
+        out = set()
+        if self.gaze_flags_off:
+            out |= GAZE_FLAGS
+        if self.audio_monitoring_off:
+            out |= AUDIO_FLAGS
+        return frozenset(out)
+
     def _calc_face_score(self, r) -> float:
         score = 0.0
         if not r.face_detected:
             score += 40
         if r.face_count > 1:
             score += 30
-        if r.head_turned:
+        # Where the candidate looks is not scored when that monitoring is accommodated off.
+        if r.head_turned and not self.gaze_flags_off:
             score += 15
-        if r.gaze_deviation_score > 0.5:
+        if r.gaze_deviation_score > 0.5 and not self.gaze_flags_off:
             score += 10 * r.gaze_deviation_score
         # Only penalize a CONFIRMED identity mismatch (a reference was registered and
         # it didn't match). Absence of a reference photo is "unknown", not an impostor —
         # so head-turn/multi-face/object scoring still works without a photo.
-        if getattr(r, "has_reference", False) and not r.identity_match:
+        # Keyed on the flag, not on `not r.identity_match`: a no-face frame never runs a
+        # comparison and leaves identity_match at its False default, which used to add
+        # a phantom +85 "impostor" on top of the NO_FACE +40 for every look-away.
+        if getattr(r, "has_reference", False) and "IDENTITY_MISMATCH" in (r.flags or ()):
             score += 85  # different face = almost certain cheating
         return min(score, 100)
 

@@ -74,6 +74,16 @@ export default function Header({ title, subtitle, onBellClick, unreadCount = 0 }
           color: var(--accent-primary);
           background: var(--accent-light);
         }
+        /* Below 1024px the sidebar is a drawer, so the header spans the full width and
+           leaves room on the left for the menu button (Sidebar.jsx .nav-toggle). */
+        @media (max-width: 1024px) {
+          .top-header { left: 0; padding: 0 16px 0 64px; }
+        }
+        @media (max-width: 640px) {
+          .header-left { min-width: 0; }
+          .header-left h1 { font-size: 1.05rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+          .header-left .subtitle { display: none; }
+        }
         .notif-dot {
           position: absolute;
           top: 6px;

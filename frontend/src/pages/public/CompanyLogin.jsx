@@ -1,6 +1,11 @@
 /**
  * Company-branded login page.
- * URL: /app?key=<company_api_key>
+ * URL: /<company-slug>   (e.g. /innomax-it-solutions)
+ *
+ * The slug is the company's public identifier. It replaced /app?key=<sk_live_…>, which
+ * put a live secret in a URL that gets printed on job ads, forwarded, bookmarked and
+ * logged. Old links still work: the key is exchanged for a slug on mount and scrubbed
+ * from the address bar.
  *
  * Loads company branding via the public API, then shows a full login/register
  * experience styled with the company's logo and primary color.
@@ -8,9 +13,10 @@
  * After login, users are routed to their role's dashboard.
  */
 import { useEffect, useState, useRef } from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { Eye, EyeOff, Briefcase, Users, ChevronRight } from 'lucide-react'
 import { useAuth } from '../../context/AuthContext'
+import { clearSlug, exchangeLegacyKey, getStoredSlug, storeSlug } from '../../utils/tenant'
 
 const API = '/api/v1'
 const ALLOWED_ROLES = ['admin', 'hr', 'interviewer', 'candidate']
@@ -20,13 +26,14 @@ const ROLE_ROUTES = {
 
 export default function CompanyLogin() {
   const [searchParams] = useSearchParams()
-  const apiKey  = searchParams.get('key') || ''
+  const params   = useParams()
   const navigate = useNavigate()
   const { loginDirect } = useAuth()
 
+  const [slug,     setSlug]     = useState(params.companySlug || searchParams.get('c') || '')
   const [company,  setCompany]  = useState(null)
   const [loading,  setLoading]  = useState(true)
-  const [keyError, setKeyError] = useState('')
+  const [notFound, setNotFound] = useState(false)
 
   // view: 'login' | 'register'
   const [view,     setView]     = useState('login')
@@ -62,15 +69,44 @@ export default function CompanyLogin() {
 
   const accent = company?.primary_color || '#2b7cba'
 
-  // ── Load company branding ──────────────────────────────────────────────────
+  // ── Resolve the company, then load its branding ───────────────────────────
   useEffect(() => {
-    if (!apiKey) { setLoading(false); return }
-    fetch(`${API}/public/company-info?key=${encodeURIComponent(apiKey)}`)
-      .then(r => r.ok ? r.json() : null)
-      .then(d  => { if (d) setCompany(d) })
-      .catch(() => {})
-      .finally(() => setLoading(false))
-  }, [apiKey])
+    let cancelled = false
+    // Whether the visitor actually named a company. A bare /app with nothing at all is
+    // still a valid entry point and falls back to the unbranded form, as it always has;
+    // naming a company that does not resolve is an error worth showing.
+    const named = Boolean(params.companySlug || searchParams.get('c') || searchParams.get('key'))
+
+    ;(async () => {
+      let active = params.companySlug || searchParams.get('c') || ''
+      if (!active && searchParams.get('key')) {
+        // A legacy link. Trade the secret for the slug once, then rewrite the address
+        // bar so it stops travelling in Referer headers and bookmarks.
+        active = (await exchangeLegacyKey(searchParams, sl => `/${sl}`)) || ''
+      }
+      if (!active) active = getStoredSlug() || ''
+      if (cancelled) return
+      setSlug(active)
+
+      if (!active) {
+        setNotFound(named)
+        setLoading(false)
+        return
+      }
+      try {
+        const r = await fetch(`${API}/public/company-info?c=${encodeURIComponent(active)}`)
+        if (!r.ok) throw new Error('unresolved')
+        const d = await r.json()
+        if (!cancelled) setCompany(d)
+      } catch {
+        if (!cancelled) setNotFound(true)
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    })()
+
+    return () => { cancelled = true }
+  }, [params.companySlug, searchParams])
 
   // ── Helpers ────────────────────────────────────────────────────────────────
   const saveAndGo = (data) => {
@@ -79,7 +115,7 @@ export default function CompanyLogin() {
       setLoginErr('Access denied. This portal is for company users only.')
       return
     }
-    if (apiKey) localStorage.setItem('hireflow_company_key', apiKey)
+    storeSlug(slug)
     loginDirect(data.access_token, data.user)
     navigate(ROLE_ROUTES[role] || '/candidate')
   }
@@ -100,7 +136,7 @@ export default function CompanyLogin() {
     try {
       const r = await fetch(`${API}/auth/login`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, password, api_key: apiKey || undefined }),
+        body: JSON.stringify({ email, password, company_slug: slug || undefined }),
       })
       const data = await r.json()
       if (!r.ok) {
@@ -128,7 +164,7 @@ export default function CompanyLogin() {
     try {
       const r = await fetch(`${API}/auth/resend-otp`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: toEmail, api_key: apiKey || undefined }),
+        body: JSON.stringify({ email: toEmail, company_slug: slug || undefined }),
       })
       const data = await r.json().catch(() => ({}))
       if (!r.ok) throw new Error(data.detail || 'Failed to send OTP')
@@ -152,7 +188,7 @@ export default function CompanyLogin() {
           email: reg.email, password: reg.password,
           first_name: reg.first_name, last_name: reg.last_name,
           phone: reg.phone || undefined, role: 'candidate',
-          api_key: apiKey || undefined,
+          company_slug: slug || undefined,
         }),
       })
       const data = await r.json()
@@ -171,7 +207,7 @@ export default function CompanyLogin() {
     try {
       const r = await fetch(`${API}/auth/verify-otp`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: pendingEmail, otp: otpValue, api_key: apiKey || undefined }),
+        body: JSON.stringify({ email: pendingEmail, otp: otpValue, company_slug: slug || undefined }),
       })
       const data = await r.json()
       if (!r.ok) throw new Error(data.detail || 'Invalid OTP')
@@ -184,6 +220,37 @@ export default function CompanyLogin() {
   if (loading) return (
     <div style={pg(accent)}>
       <div style={{ margin: 'auto', color: '#9ca3af', fontSize: '0.9rem' }}>Loading…</div>
+    </div>
+  )
+
+  // The visitor named a company that does not resolve — a renamed or deactivated slug, a
+  // typo, or a rotated ?key= link. Say so, rather than showing an unbranded form that
+  // would silently sign them in against no company at all.
+  //
+  // The button is not decoration. A slug in localStorage outlives the company it names,
+  // and ProtectedRoute and the catch-all route both redirect by it — so without a way to
+  // clear it, a visitor whose company was renamed can bounce back here from anything that
+  // needs auth, with no way out but wiping site data.
+  if (notFound) return (
+    <div style={pg(accent)}>
+      <div style={{ margin: 'auto', maxWidth: 420, padding: 32, textAlign: 'center' }}>
+        <div style={{ fontSize: '1.15rem', fontWeight: 700, color: '#111827', marginBottom: 10 }}>
+          Company not found
+        </div>
+        <p style={{ fontSize: '0.88rem', color: '#6b7280', lineHeight: 1.6, margin: 0 }}>
+          We couldn&rsquo;t find a company at this address. The link may have changed, or the
+          company may no longer be active. Please check with whoever shared it with you.
+        </p>
+        <button
+          onClick={() => { clearSlug(); navigate('/login') }}
+          style={{
+            marginTop: 22, padding: '10px 20px', border: 'none', borderRadius: 10,
+            background: accent, color: '#fff', fontSize: '0.85rem', fontWeight: 700,
+            cursor: 'pointer',
+          }}>
+          Go to sign in
+        </button>
+      </div>
     </div>
   )
 
@@ -409,7 +476,7 @@ export default function CompanyLogin() {
         {/* Jobs board link */}
         <div style={{ marginTop: 20, textAlign: 'center', fontSize: '0.78rem', color: '#9ca3af' }}>
           Looking for open positions?{' '}
-          <a href={`/jobs?key=${encodeURIComponent(apiKey)}`}
+          <a href={`/${encodeURIComponent(slug)}/jobs`}
             style={{ color: accent, fontWeight: 600, textDecoration: 'none' }}>
             View job board →
           </a>

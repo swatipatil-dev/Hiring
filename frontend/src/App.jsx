@@ -20,22 +20,25 @@ import OnlineTest from './pages/candidate/OnlineTest'
 import TestInstructions from './pages/candidate/TestInstructions'
 import MyProfile from './pages/shared/MyProfile'
 import ErrorBoundary from './components/ErrorBoundary'
+import { getStoredSlug } from './utils/tenant'
 
 const ROLE_ROUTES = { superadmin: '/superadmin', admin: '/admin', hr: '/hr', interviewer: '/interviewer', candidate: '/candidate' }
 
-// A visitor who arrived through a company job board / portal has the company's
-// API key stored. Such users must never be bounced to the Innomax platform
-// login — keep them inside their company's context.
-function getCompanyKey() {
-  try { return localStorage.getItem('hireflow_company_key') } catch { return null }
-}
+// A visitor who arrived through a company job board / portal has that company's slug
+// stored. Such users must never be bounced to the Innomax platform login — keep them
+// inside their company's context.
+//
+// This used to read the company's `sk_live_` API key out of localStorage and paste it
+// back into every redirect below, which is how a secret meant for one link ended up in
+// the address bar of anyone who ever signed in. The slug is public, so it can travel.
+const companyPath = (slug, sub = '') => `/${encodeURIComponent(slug)}${sub}`
 
 function ProtectedRoute({ children, allowedRoles }) {
   const { isAuthenticated, user } = useAuth()
   if (!isAuthenticated) {
-    const key = getCompanyKey()
+    const slug = getStoredSlug()
     // Needs auth → send to the company's own login, not Innomax's.
-    return <Navigate to={key ? `/app?key=${encodeURIComponent(key)}` : '/login'} replace />
+    return <Navigate to={slug ? companyPath(slug) : '/login'} replace />
   }
   if (allowedRoles && !allowedRoles.includes(user?.role?.toLowerCase())) {
     return <Navigate to={ROLE_ROUTES[user?.role?.toLowerCase()] || '/login'} replace />
@@ -57,30 +60,47 @@ export default function App() {
   const location = useLocation()
   const isAuth = ['/login', '/register'].includes(location.pathname)
 
+  // Each is mounted on two paths below (the wildcard plus one path a company slug
+  // route would otherwise capture); one element keeps them identical.
+  const hrPage = (
+    <ProtectedRoute allowedRoles={['hr']}>
+      <DashboardShell><HRDashboard /></DashboardShell>
+    </ProtectedRoute>
+  )
+  const candidatePage = (
+    <ProtectedRoute allowedRoles={['candidate']}>
+      <DashboardShell><CandidateDashboard /></DashboardShell>
+    </ProtectedRoute>
+  )
+
   return (
     <ErrorBoundary>
     <Routes>
-      {/* Landing — the Innomax hero page. Only platform (Innomax) visitors land
-          here. A company visitor (one carrying a company key) is sent to their
-          own career page instead, never the Innomax hero. */}
+      {/* Landing — the Innomax hero page.
+          This and /login below are the platform's own front door, and they stay that way
+          no matter which company portals the browser has visited. They used to redirect a
+          visitor carrying a company slug to that company's job board, because a company
+          had no URL of its own — a key in a query string is not something you can type or
+          bookmark, so the platform root doubled as their entrance. Every company now has
+          /<slug>, so that hack is obsolete, and leaving it in meant one visit to any
+          client's careers page permanently took career.innomaxskills.com away from
+          whoever made it — staff included. Do not put it back. */}
       <Route path="/" element={
         isAuthenticated
           ? <Navigate to={ROLE_ROUTES[user?.role?.toLowerCase()] || '/candidate'} replace />
-          : getCompanyKey()
-            ? <Navigate to={`/jobs?key=${encodeURIComponent(getCompanyKey())}`} replace />
-            : <LandingPage />
+          : <LandingPage />
       } />
 
       {/* Public */}
       <Route path="/login" element={
         isAuthenticated
           ? <Navigate to={ROLE_ROUTES[user?.role?.toLowerCase()] || '/candidate'} replace />
-          : getCompanyKey()
-            ? <Navigate to={`/jobs?key=${encodeURIComponent(getCompanyKey())}`} replace />
-            : <Login />
+          : <Login />
       } />
       <Route path="/register" element={isAuthenticated ? <Navigate to={ROLE_ROUTES[user?.role?.toLowerCase()] || '/candidate'} replace /> : <Register />} />
       <Route path="/forgot-password" element={<ForgotPassword />} />
+      {/* Legacy shapes. These carried ?key=<sk_live_…>; the pages now exchange that
+          key for a slug on mount and rewrite the URL. Remove with the ?key= support. */}
       <Route path="/jobs" element={<JobBoard />} />
       <Route path="/portal" element={<CompanyPortal />} />
       <Route path="/app" element={<CompanyLogin />} />
@@ -124,12 +144,11 @@ export default function App() {
         </ProtectedRoute>
       } />
 
-      {/* HR */}
-      <Route path="/hr/*" element={
-        <ProtectedRoute allowedRoles={['hr']}>
-          <DashboardShell><HRDashboard /></DashboardShell>
-        </ProtectedRoute>
-      } />
+      {/* HR. /hr/jobs is spelled out because React Router ranks /:companySlug/jobs
+          (dynamic + static) above /hr/* (static + splat): without it the sidebar's
+          Job Postings link rendered the public job board for a company named "hr". */}
+      <Route path="/hr/*" element={hrPage} />
+      <Route path="/hr/jobs" element={hrPage} />
 
       {/* Interviewer */}
       <Route path="/interviewer/*" element={
@@ -152,19 +171,26 @@ export default function App() {
         </ProtectedRoute>
       } />
 
-      {/* Candidate */}
-      <Route path="/candidate/*" element={
-        <ProtectedRoute allowedRoles={['candidate']}>
-          <DashboardShell><CandidateDashboard /></DashboardShell>
-        </ProtectedRoute>
-      } />
+      {/* Candidate. /candidate/jobs spelled out for the same reason as /hr/jobs. */}
+      <Route path="/candidate/*" element={candidatePage} />
+      <Route path="/candidate/jobs" element={candidatePage} />
+
+      {/* Brand-name company URLs: career.innomaxskills.com/<company-slug>.
+          Declared last, but React Router v6 ranks static segments above dynamic ones, so
+          /login and friends still win. What actually keeps a company from claiming one of
+          those names is RESERVED_SLUGS in backend/src/tenancy/slug.py — add any new
+          top-level route there too. An unknown slug renders CompanyLogin's "not found"
+          state rather than the catch-all below, which is why it is a real route. */}
+      <Route path="/:companySlug" element={<CompanyLogin />} />
+      <Route path="/:companySlug/jobs" element={<JobBoard />} />
+      <Route path="/:companySlug/portal" element={<CompanyPortal />} />
 
       {/* Default redirect */}
       <Route path="*" element={
         <Navigate to={
           isAuthenticated
             ? (ROLE_ROUTES[user?.role?.toLowerCase()] || '/candidate')
-            : (getCompanyKey() ? `/jobs?key=${encodeURIComponent(getCompanyKey())}` : '/login')
+            : (getStoredSlug() ? companyPath(getStoredSlug(), '/jobs') : '/login')
         } replace />
       } />
     </Routes>

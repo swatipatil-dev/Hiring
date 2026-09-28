@@ -8,8 +8,12 @@ Conventions match the rest of the app:
   * Pydantic request/response models are declared inline.
 
 Prefix: ``/api/v1/judge`` (registered in main.py).
+
+No ``from __future__ import annotations`` here: /run and /grade-question are wrapped
+by slowapi's rate limiter, and FastAPI then resolves string annotations in slowapi's
+module, where RunRequest etc. don't exist — the app fails to import (seen on the
+production Python 3.11 / pydantic 2.9 stack).
 """
-from __future__ import annotations
 
 import asyncio
 import json
@@ -33,6 +37,9 @@ from src.models.models import (
 from src.tenancy import set_current_company
 from src.judge import languages as judge_languages
 from src.judge.queue import enqueue_submission
+from src.rate_limit import limiter, user_key
+from src.services.interview_access import (candidate_owns_interview, is_staff,
+                                           staff_can_access_interview)
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +51,12 @@ _ADMIN_ROLES = ("admin", "hr", "superadmin")
 # a test. Attempts that could not actually be judged (sandbox unavailable) do NOT
 # count. Once exhausted, the candidate can only finish via "Submit Test".
 MAX_RUN_ATTEMPTS = 3
+
+# Input bounds. Source matches the TEXT column it is stored in (64 KB); stdin is
+# generous for hand-written test input. Without them the only ceiling was Apache's
+# 64 MB request limit, and the payload then travelled through Redis to the worker.
+MAX_SOURCE_CHARS = 64 * 1024
+MAX_STDIN_CHARS = 1024 * 1024
 
 
 # ──────────────────────────── schemas ────────────────────────────
@@ -91,7 +104,7 @@ class ProblemUpdate(BaseModel):
 class SubmissionCreate(BaseModel):
     problem_id: str
     language: str
-    source_code: str = Field(..., min_length=1)
+    source_code: str = Field(..., min_length=1, max_length=MAX_SOURCE_CHARS)
     contest_id: Optional[str] = None
     proctoring_session_id: Optional[str] = None
 
@@ -99,19 +112,21 @@ class SubmissionCreate(BaseModel):
 class RunRequest(BaseModel):
     """Scratch 'Run Code' — execute once against an optional stdin (no scoring)."""
     language: str
-    source_code: str = Field(..., min_length=1)
-    stdin: str = ""
+    source_code: str = Field(..., min_length=1, max_length=MAX_SOURCE_CHARS)
+    stdin: str = Field("", max_length=MAX_STDIN_CHARS)
     # When set, a SQL run with EMPTY stdin is seeded from this question's sample
     # dataset (the CREATE+INSERT setup) so candidates can try their query against
     # the data shown in the problem without hand-writing seed SQL.
     question_id: Optional[str] = None
+    # Required with question_id for candidates: the question must be in their own test.
+    interview_id: Optional[int] = None
 
 
 class GradeQuestionRequest(BaseModel):
     """Judge a candidate's code for an AI-generated coding question against its test cases."""
     question_id: str
     language: str = "python"
-    source_code: str = Field(..., min_length=1)
+    source_code: str = Field(..., min_length=1, max_length=MAX_SOURCE_CHARS)
     # When set, persist this evaluate attempt as an InterviewCodeSubmission for the
     # owning candidate (the exam's per-question Submit). Omitted for admin/HR previews.
     interview_id: Optional[int] = None
@@ -185,7 +200,9 @@ async def list_languages(current_user: User = Depends(get_current_user)):
 
 
 @router.post("/run")
+@limiter.limit("20/minute", key_func=user_key)
 async def run_code(
+    request: Request,
     body: RunRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -211,8 +228,7 @@ async def run_code(
     stdin = body.stdin or ""
     seeded_from_sample = False
     if lang == "sql" and not stdin.strip() and body.question_id:
-        from src.models.question_models import Question as InterviewQuestion
-        q = db.query(InterviewQuestion).filter(InterviewQuestion.id == body.question_id).first()
+        q, _ = _question_for_caller(db, current_user, body.question_id, body.interview_id)
         if q and getattr(q, "test_cases", None):
             try:
                 cases = json.loads(q.test_cases) or []
@@ -256,29 +272,54 @@ async def run_code(
 
 
 def _candidate_owns_interview(db: Session, user: User, interview_id: int):
-    """Return the Interview if it belongs to the current candidate, else None.
-    Mirrors the ownership check in candidate_routes.submit_interview."""
-    cands = db.query(Candidate).filter(Candidate.user_id == user.id).all()
-    if not cands:
-        cands = db.query(Candidate).filter(Candidate.email == user.email).all()
-    cand_ids = [c.id for c in cands]
-    qy = db.query(Interview).filter(
-        Interview.id == interview_id,
-        Interview.company_id == user.company_id,
-    )
-    qy = qy.filter(Interview.candidate_id.in_(cand_ids)) if cand_ids \
-        else qy.filter(Interview.candidate_id.isnot(None))
-    return qy.first()
+    """Return the Interview if it is the current candidate's own, else None.
+    The same rule as candidate_routes.submit_interview (src/services/interview_access)."""
+    return candidate_owns_interview(db, user, interview_id)
+
+
+def _question_for_caller(db: Session, user: User, question_id: str,
+                         interview_id: Optional[int]):
+    """Resolve a coding question the caller may run code against, or raise 404.
+
+    Candidates: only a question of their own, unfinished interview. Hidden test cases
+    are graded here, so letting a candidate grade any question id (or grade without an
+    interview, which also skipped the run cap) let them probe hidden tests at will.
+    Staff: any question in their company, with or without an interview (previews).
+    """
+    from src.models.question_models import Question as InterviewQuestion
+    q = db.query(InterviewQuestion).filter(InterviewQuestion.id == question_id).first()
+    if not q:
+        raise HTTPException(404, "Question not found")
+    if is_staff(user):
+        owner = db.query(Interview).filter(Interview.id == q.interview_id).first()
+        if not staff_can_access_interview(user, owner):
+            raise HTTPException(404, "Question not found")
+        return q, None
+    if interview_id is None:
+        raise HTTPException(404, "Question not found")
+    interview = _candidate_owns_interview(db, user, interview_id)
+    if not interview or q.interview_id != interview.id:
+        raise HTTPException(404, "Question not found")
+    if interview.status == "COMPLETED":
+        raise HTTPException(403, "Test already submitted.")
+    return q, interview
+
+
+def _counts_as_run():
+    """An attempt uses up a run once it is being judged or has a verdict; attempts
+    stored while the sandbox was down ('pending', no verdict) are free."""
+    from sqlalchemy import or_
+    return or_(InterviewCodeSubmission.verdict.isnot(None),
+               InterviewCodeSubmission.status == "running")
 
 
 def _runs_used(db: Session, interview_id: int, question_id: str, user_id: str) -> int:
-    """Count a candidate's graded run attempts for a question. Only attempts that
-    actually produced a verdict count — 'pending' (sandbox-down) runs are free."""
+    """Count a candidate's run attempts for a question (see _counts_as_run)."""
     return (db.query(InterviewCodeSubmission)
             .filter(InterviewCodeSubmission.interview_id == interview_id,
                     InterviewCodeSubmission.question_id == question_id,
                     InterviewCodeSubmission.user_id == user_id,
-                    InterviewCodeSubmission.verdict.isnot(None))
+                    _counts_as_run())
             .count())
 
 
@@ -299,7 +340,9 @@ def _interview_submission_dict(s: InterviewCodeSubmission) -> dict:
 
 
 @router.post("/grade-question")
+@limiter.limit("10/minute", key_func=user_key)
 async def grade_question(
+    request: Request,
     body: GradeQuestionRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -312,51 +355,60 @@ async def grade_question(
     is persisted as an InterviewCodeSubmission — including 'pending' attempts made
     while the judge sandbox is unavailable — so nothing is lost across devices.
     """
-    from src.models.question_models import Question as InterviewQuestion
     from src.judge.interview_grading import grade_interview_question
 
-    q = db.query(InterviewQuestion).filter(InterviewQuestion.id == body.question_id).first()
-    if not q:
-        raise HTTPException(404, "Question not found")
+    q, interview = _question_for_caller(db, current_user, body.question_id, body.interview_id)
     reveal = current_user.role in _ADMIN_ROLES
 
-    # Candidate in-test run: enforce the per-question run cap BEFORE judging so an
-    # over-limit click reveals nothing and burns no compute.
-    interview = None
-    if body.interview_id is not None:
-        interview = _candidate_owns_interview(db, current_user, body.interview_id)
-        if not interview:
-            raise HTTPException(404, "Interview not found")
-        used = _runs_used(db, body.interview_id, q.id, current_user.id)
+    # Candidate in-test run: claim a run BEFORE judging, so an over-limit click
+    # reveals nothing and burns no compute. The interview row is locked while the
+    # runs are counted and the claim is written, so parallel clicks queue here
+    # instead of all passing the check before any of them is recorded.
+    sub = None
+    if interview is not None:
+        db.query(Interview).filter(Interview.id == interview.id).with_for_update().first()
+        used = _runs_used(db, interview.id, q.id, current_user.id)
         if used >= MAX_RUN_ATTEMPTS:
+            db.rollback()
             raise HTTPException(
                 429,
                 f"Run limit reached ({MAX_RUN_ATTEMPTS}/{MAX_RUN_ATTEMPTS}). "
                 f"Use Submit Test to finish.",
             )
-
-    result = grade_interview_question(q, body.language, body.source_code, reveal_hidden=reveal)
-
-    if interview is not None:
-        unavailable = bool(result.get("unavailable"))
-        verdict = None if unavailable else result.get("verdict")
         sub = InterviewCodeSubmission(
-            interview_id=body.interview_id,
+            interview_id=interview.id,
             question_id=q.id,
             user_id=current_user.id,
             language=body.language,
             source_code=body.source_code,
-            status="pending" if unavailable else "graded",
-            verdict=verdict,
-            score=float(result.get("points_awarded") or 0),
-            max_score=float(result.get("max_points") or 0),
-            passed_count=int(result.get("passed") or 0),
-            total_count=int(result.get("total") or 0),
-            message=result.get("message"),
+            status="running",
         )
         db.add(sub)
+        db.commit()          # releases the lock; this attempt now counts
+
+    try:
+        # Judging waits on the worker for seconds; keep the event loop free meanwhile.
+        result = await asyncio.to_thread(
+            grade_interview_question, q, body.language, body.source_code,
+            reveal_hidden=reveal)
+    except Exception:
+        if sub is not None:  # nothing was judged: give the run back
+            sub.status = "pending"
+            sub.message = "Grading failed before a result was produced."
+            db.commit()
+        raise
+
+    if sub is not None:
+        unavailable = bool(result.get("unavailable"))
+        sub.status = "pending" if unavailable else "graded"
+        sub.verdict = None if unavailable else result.get("verdict")
+        sub.score = float(result.get("points_awarded") or 0)
+        sub.max_score = float(result.get("max_points") or 0)
+        sub.passed_count = int(result.get("passed") or 0)
+        sub.total_count = int(result.get("total") or 0)
+        sub.message = result.get("message")
         db.commit()
-        used = _runs_used(db, body.interview_id, q.id, current_user.id)
+        used = _runs_used(db, interview.id, q.id, current_user.id)
         result = {
             **result,
             "submission_id": sub.id,
@@ -386,7 +438,7 @@ async def list_interview_submissions(
                     InterviewCodeSubmission.user_id == current_user.id)
             .order_by(InterviewCodeSubmission.created_at.asc())
             .all())
-    used = sum(1 for s in rows if s.verdict is not None)
+    used = sum(1 for s in rows if s.verdict is not None or s.status == "running")
     return {
         "submissions": [_interview_submission_dict(s) for s in rows],
         "runs_used": used,
@@ -569,7 +621,8 @@ async def regrade_pending(
         q = _question(s.question_id)
         if not q:
             continue
-        g = grade_interview_question(q, s.language, s.source_code or "")
+        # Off the event loop: a sweep can grade hundreds of answers.
+        g = await asyncio.to_thread(grade_interview_question, q, s.language, s.source_code or "")
         if g.get("unavailable"):
             continue
         s.status = "graded"
@@ -604,8 +657,8 @@ async def regrade_pending(
             q = _question(a.get("question_id"))
             if not q:
                 continue
-            g = grade_interview_question(q, a.get("language") or "python",
-                                         a.get("selected_option") or "")
+            g = await asyncio.to_thread(grade_interview_question, q, a.get("language") or "python",
+                                        a.get("selected_option") or "")
             if g.get("unavailable"):
                 still_pending += 1
                 continue

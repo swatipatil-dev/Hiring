@@ -109,6 +109,9 @@ body {
 
 .main-content {
   flex: 1;
+  /* A flex item's default min-width is its content's min width, so one wide table
+     used to stretch the whole page past the screen on phones. */
+  min-width: 0;
   margin-left: var(--sidebar-width);
   padding: calc(var(--header-height) + 32px) 40px 40px;
   min-height: 100vh;
@@ -593,6 +596,12 @@ button.stat-card:focus-visible .stat-affordance,
   color: var(--text-secondary);
 }
 
+.tab:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: -2px;
+  border-radius: 6px;
+}
+
 .tab.active {
   color: var(--accent-primary);
 }
@@ -701,8 +710,69 @@ button.stat-card:focus-visible .stat-affordance,
 
 @media (max-width: 640px) {
   .grid-2, .grid-3 { grid-template-columns: 1fr; }
-  .stats-grid { grid-template-columns: 1fr; }
+  /* Two small tiles per row reads better than four full-width ones stacked; the
+     tile itself tightens so a word value ("Interviewer") still fits. */
+  .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .stat-card { padding: 16px; }
+  .stat-value { font-size: 1.7rem; overflow-wrap: anywhere; }
+  .stat-label { letter-spacing: 0.04em; }
   .page-header { flex-direction: column; align-items: flex-start; gap: 12px; }
+}
+
+/* ─── Small screens: shared fixes ─────────────────
+   Page-specific layouts opt in with the helper classes at the end:
+   .stack-mobile    side-by-side columns become one column
+   .scroll-x-mobile a row that can't shrink scrolls sideways instead */
+@media (max-width: 1024px) {
+  /* Tables scroll inside their card rather than being clipped by it or stretching
+     the page. :has() finds the box that holds the table, whatever it is. */
+  .main-content :has(> table) {
+    overflow-x: auto !important;
+    max-width: 100%;
+    min-width: 0;
+    -webkit-overflow-scrolling: touch;
+  }
+  /* Tab strips scroll rather than spill off the edge. */
+  .tabs {
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .tabs::-webkit-scrollbar { display: none; }
+  .tab { white-space: nowrap; flex-shrink: 0; }
+
+  .stack-mobile-lg {
+    grid-template-columns: 1fr !important;
+    flex-direction: column !important;
+  }
+  .stack-mobile-lg > * { max-width: 100%; min-width: 0; }
+  .scroll-x-mobile {
+    overflow-x: auto !important;
+    flex-wrap: nowrap !important;
+    scrollbar-width: thin;
+  }
+  .scroll-x-mobile > * { flex-shrink: 0; }
+}
+
+@media (max-width: 768px) {
+  .stack-mobile {
+    grid-template-columns: 1fr !important;
+    flex-direction: column !important;
+  }
+  .stack-mobile > * { max-width: 100%; min-width: 0; }
+}
+
+@media (max-width: 640px) {
+  /* Title + actions rows: let the actions drop below instead of overflowing. */
+  .flex-between { flex-wrap: wrap; gap: 12px; }
+  /* Popups use nearly the whole screen. */
+  .modal-overlay { padding: 12px; }
+  .modal {
+    padding: 20px;
+    border-radius: 16px;
+    max-height: calc(100dvh - 24px);
+  }
+  /* 16px stops iOS Safari zooming the page when a field is focused. */
+  .input, .select, .textarea { font-size: 16px; }
 }
 
 /* Admin HR scorecards — a <button> carrying its own gradient/border inline, so it needs

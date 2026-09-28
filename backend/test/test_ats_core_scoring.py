@@ -118,9 +118,10 @@ class TestComputeWeightedSkillsScore:
         assert score <= 20.0, f"No skills in resume should score low, got {score}"
 
     def test_exact_match_in_skills_section(self):
+        # Listed in a skills section only: credited, but below skills shown in real work.
         sections = {"skills": "python fastapi postgresql docker"}
         score = compute_weighted_skills_score(sections, ["python", "fastapi", "docker"])
-        assert score >= 80.0, f"All required skills present — expected ≥80, got {score}"
+        assert 60.0 <= score < 100.0, f"Listed-only skills — expected 60-99, got {score}"
 
     def test_partial_match_scores_between_0_and_100(self):
         sections = {"skills": "python fastapi"}
@@ -136,15 +137,15 @@ class TestComputeWeightedSkillsScore:
         )
         assert score <= 20.0
 
-    def test_skill_in_experience_section_scores_lower_than_skills_section(self):
+    def test_skill_demonstrated_in_experience_scores_higher_than_listed_in_skills(self):
         skills_section_score = compute_weighted_skills_score(
             {"skills": "python"}, ["python"]
         )
         experience_section_score = compute_weighted_skills_score(
             {"experience": "python"}, ["python"]
         )
-        # skills section weight (1.5) > experience section weight (1.2)
-        assert skills_section_score >= experience_section_score
+        # Shown in a job (experience 1.5) outranks a line in a skills list (1.0).
+        assert experience_section_score > skills_section_score
 
     def test_cluster_match_gives_partial_credit(self):
         """

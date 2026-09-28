@@ -881,8 +881,8 @@ export default function CreateTestWizard({
   return (
     <>
       <div>
-        {/* Step indicator */}
-        <div className="flex gap-8 mb-24">
+        {/* Step indicator — scrolls sideways on narrow screens rather than spilling off. */}
+        <div className="flex gap-8 mb-24 scroll-x-mobile" style={{ whiteSpace: 'nowrap' }}>
           {[
             { n: 1, label: 'Job & Interview' },
             { n: 2, label: 'Skills & Questions' },

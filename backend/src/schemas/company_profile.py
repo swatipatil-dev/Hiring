@@ -1,10 +1,15 @@
 """
 Shared symbols for the Company onboarding-profile surface.
 
-Both ``routes/superadmin_routes.py`` and ``routes/admin_routes.py`` need the
-exact same list of editable profile columns and the exact same GET serializer
-shape — keeping a single source of truth here prevents the two surfaces from
-drifting apart as fields are added.
+``routes/superadmin_routes.py`` needs one list of editable profile columns and one GET
+serializer shape — a single source of truth here stops the surfaces that use it drifting
+apart as fields are added.
+
+**``serialize_company`` returns ``api_key`` in plaintext, so it is superadmin-only.**
+Today its only callers are the two ``require_superadmin`` routes in superadmin_routes.py.
+Do not wire it onto a tenant-admin or public surface without dropping that field first —
+``Company.api_key`` is an ``sk_live_`` secret, and the whole point of the slug-based
+portal URLs is that it stops travelling anywhere it does not have to.
 """
 
 from src.models.models import Company

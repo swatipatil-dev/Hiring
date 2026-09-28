@@ -57,6 +57,7 @@ from routes import (
     ats_router,
     database_management_router,
     advanced_router,
+    ats_explain_router,
 )
 
 # Enhanced Services
@@ -319,6 +320,14 @@ async def root():
         "status": "running"
     }
 
+def _judge_queue_auth() -> bool:
+    try:
+        from src.judge.queue import redis_url_has_password
+        return redis_url_has_password()
+    except Exception:
+        return False
+
+
 @app.get("/health")
 async def health_check():
     """Health check — returns 503 when the database is unreachable."""
@@ -340,6 +349,9 @@ async def health_check():
                 # What the pipeline recorded as deployed. Additive: the deploy's own
                 # health check greps for "status":"healthy", so extra keys are safe.
                 "release": _release_summary(),
+                # False means the judge's Redis has no password: on a shared server
+                # any local account could then queue work for the judge worker.
+                "judge_queue_auth": _judge_queue_auth(),
                 "timestamp": db_status.get("timestamp", datetime.now().isoformat()),
             }
         )
@@ -425,6 +437,7 @@ app.include_router(mcq_router, prefix="/api/v1", tags=["MCQ Questions"])
 app.include_router(database_management_router, tags=["Database Management"])
 app.include_router(evaluation_router, tags=["Evaluation & Workflow"])
 app.include_router(advanced_router, tags=["Advanced Features"])
+app.include_router(ats_explain_router, tags=["ATS Explainability"])
 if proctor_router:
     app.include_router(proctor_router, tags=["AI Proctoring"])
 app.include_router(superadmin_router, tags=["Super Admin"])

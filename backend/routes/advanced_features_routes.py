@@ -505,21 +505,12 @@ def compare_candidates(
             r["shared_skills"] = sorted(common)
             r["unique_skills"] = sorted(all_skill_sets[i] - common)
 
-    # Composite ranking: 40% ATS + 35% interview + 25% assessment
-    for r in results:
-        r["composite_score"] = round(
-            r["ats"]["score"] * 0.40
-            + r["interviews"]["avg_overall"] * 0.35
-            + r["avg_assessment_score"] * 0.25,
-            1,
-        )
-    results.sort(key=lambda x: x["composite_score"], reverse=True)
-    for rank, r in enumerate(results, 1):
-        r["rank"] = rank
-
+    # No blended "composite" score. Resume match, test and interview results measure
+    # different things at different stages; averaging them into one number hid which
+    # one was driving a ranking. They are returned side by side, in the order requested.
     return {
         "comparison": results,
-        "ranking_formula": "40% ATS + 35% Interview Feedback + 25% Assessments",
+        "note": "Resume match, test and interview results are shown separately and not combined.",
         "shared_skills_across_all": sorted(
             all_skill_sets[0].intersection(*all_skill_sets[1:]) if len(all_skill_sets) > 1 else all_skill_sets[0]
         ),
@@ -1056,7 +1047,9 @@ def add_bank_question_to_interview(
 class AutoRejectRequest(BaseModel):
     ats_threshold: Optional[float] = None
     min_experience_years: Optional[int] = None
-    required_skills: Optional[List[str]] = None  # reject if ALL are missing
+    # No longer accepted: missing mandatory skills are shown to HR, never auto-rejected.
+    # "Not found in the resume" is too often a parsing or wording gap to act on alone.
+    required_skills: Optional[List[str]] = None
     dry_run: bool = True
     notes: Optional[str] = None
 
@@ -1068,7 +1061,10 @@ def auto_reject(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles("admin", "hr")),
 ):
-    if not any([req.ats_threshold, req.min_experience_years, req.required_skills]):
+    if req.required_skills:
+        raise HTTPException(400, "Missing mandatory skills are shown to HR on each candidate and "
+                                 "are never grounds for automatic rejection. Remove required_skills.")
+    if not any([req.ats_threshold, req.min_experience_years]):
         raise HTTPException(400, "Provide at least one rejection rule")
 
     job = db.query(JobPosting).filter(JobPosting.id == job_id).first()
@@ -1080,18 +1076,29 @@ def auto_reject(
         Candidate.current_stage.notin_(["hired", "rejected", "offer"]),
     ).all()
 
+    from src.services.ats_scoring_pipeline import needs_review_candidate_ids
+    held_ids = needs_review_candidate_ids(db, job_id)
     to_reject = []
+    held = []
     for c in eligible:
+        # Resume could not be read reliably: its score says nothing, a person decides.
+        if c.id in held_ids:
+            held.append({"candidate_id": c.id, "name": f"{c.first_name} {c.last_name}",
+                         "reason": "Resume needs manual review"})
+            continue
         reasons = []
         if req.ats_threshold and _float(c.ats_score) < req.ats_threshold:
             reasons.append(f"ATS {_float(c.ats_score):.1f} < threshold {req.ats_threshold}")
-        if req.min_experience_years and (c.experience_years or 0) < req.min_experience_years:
-            reasons.append(f"Experience {c.experience_years}yr < required {req.min_experience_years}yr")
-        if req.required_skills:
-            cand_skills = set(s.lower() for s in _safe_json(c.extracted_skills))
-            missing_req = [s for s in req.required_skills if s.lower() not in cand_skills]
-            if len(missing_req) == len(req.required_skills):  # ALL required skills missing
-                reasons.append(f"Missing all required skills: {missing_req}")
+        if req.min_experience_years:
+            # No experience found is not the same as too little: extraction misses dates
+            # all the time. Unknown is held for a person, never rejected.
+            if not c.experience_years:
+                held.append({"candidate_id": c.id, "name": f"{c.first_name} {c.last_name}",
+                             "reason": "Experience not found on resume"})
+                if not reasons:
+                    continue
+            elif c.experience_years < req.min_experience_years:
+                reasons.append(f"Experience {c.experience_years}yr < required {req.min_experience_years}yr")
         if reasons:
             to_reject.append({
                 "candidate_id": c.id,
@@ -1111,6 +1118,7 @@ def auto_reject(
             },
             "would_reject": len(to_reject),
             "candidates": to_reject,
+            "held_for_review": held,
             "message": "Set dry_run=false to apply permanently.",
         }
 
@@ -1143,6 +1151,7 @@ def auto_reject(
         "dry_run": False,
         "rejected_count": len(to_reject),
         "candidates": to_reject,
+        "held_for_review": held,
     }
 
 
@@ -1449,10 +1458,8 @@ def candidate_scorecard(
     avg_dim = {k: round(sum(v) / len(v), 1) for k, v in dim_scores.items()}
     interview_score = avg_dim.get("overall", 0.0)
 
-    # Assessment score
-    assessment_score = 0.0  # assessment_rounds removed; composite uses ATS + interview only
-
-    composite = round(ats_score * 0.40 + interview_score * 0.35 + assessment_score * 0.25, 1)
+    # No composite: resume match and interview results stay separate (see /compare).
+    from src.services.ats_scoring_pipeline import effective_score
 
     # Skill gap analysis
     ats = db.query(ATSResult).filter(
@@ -1475,16 +1482,15 @@ def candidate_scorecard(
             rank = sum(1 for s in all_scores if s < ats_score)
             percentile = round(rank / len(all_scores) * 100, 1)
 
-    # Recommendation
+    # Recommendation: what the interviewers recommended, and nothing else. The resume
+    # score used to push this to "No Hire" on its own; it is shown separately instead.
     dominant_vote = max(hire_votes, key=hire_votes.get) if hire_votes else None
-    if composite >= 75 or dominant_vote == "strong_hire":
-        recommendation, badge = "Strong Hire", "green"
-    elif composite >= 60 or dominant_vote == "hire":
-        recommendation, badge = "Hire", "lightgreen"
-    elif composite >= 45:
-        recommendation, badge = "Consider", "yellow"
-    else:
-        recommendation, badge = "No Hire", "red"
+    recommendation, badge = {
+        # The values interviewers can record (routes/interviewer_routes.py).
+        "strong_hire": ("Strong Hire", "green"), "hire": ("Hire", "lightgreen"),
+        "proceed": ("Proceed", "yellow"), "no_hire": ("No Hire", "red"),
+        "strong_no_hire": ("Strong No Hire", "red"),
+    }.get(dominant_vote, (None, None))
 
     # Risk factors
     risks = []
@@ -1494,7 +1500,8 @@ def candidate_scorecard(
         risks.append("Below-average interview performance")
     if missing:
         risks.append(f"Missing {len(missing)} required skill(s): {', '.join(missing[:3])}")
-    if (c.experience_years or 0) < (c.job.experience_years or 0) if c.job else False:
+    # Only when experience is known: "none found on the resume" is not "too little".
+    if c.job and c.experience_years and c.experience_years < (c.job.experience_years or 0):
         risks.append("Less experience than required")
 
     return {
@@ -1503,14 +1510,18 @@ def candidate_scorecard(
         "email": c.email,
         "current_stage": c.current_stage,
         "ats_percentile": percentile,
-        "scores": {
-            "ats": round(ats_score, 1),
-            "interview_overall": round(interview_score, 1),
-            "interview_dimensions": avg_dim,
-            "assessment": round(assessment_score, 1),
-            "composite": composite,
+        "resume_match": {
+            # From the result itself (override included), not the copy on the candidate.
+            "score": round(effective_score(ats) if ats else ats_score, 1),
+            "parse_status": ats.parse_status if ats else None,
+            "mandatory_met": ats.mandatory_met if ats else None,
+            "mandatory_total": ats.mandatory_total if ats else None,
+            "is_overridden": bool(ats and ats.override_score is not None),
         },
-        "weights": {"ats": "40%", "interview": "35%", "assessment": "25%"},
+        "interview": {
+            "overall": round(interview_score, 1),
+            "dimensions": avg_dim,
+        },
         "skill_gap": {
             "required_skills": required,
             "matched_skills": matched,

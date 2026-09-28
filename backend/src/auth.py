@@ -185,7 +185,7 @@ def authenticate_user(
 ) -> Optional[User]:
     """Authenticate user with email and password.
 
-    When ``company_id`` is supplied (e.g. login arrived via /app?key=...), the
+    When ``company_id`` is supplied (e.g. login arrived via /<company-slug>), the
     lookup is scoped to that company so the same email used at multiple
     companies resolves unambiguously.
     """

@@ -6,13 +6,27 @@ inside the hardened ``hireflow-judge-python`` container, so candidate SQL is gra
 with the same CPU / memory / wall-clock isolation as every other language. It reads a
 JSON "job" on stdin and writes a JSON result on stdout.
 
-The grading logic is a faithful port of the pure helpers in ``src/judge/sql_runner.py``
-(in-memory SQLite, result-set comparison against a reference query, order-independent).
-Keep the two in sync — ``test/test_judge_sql_sandbox.py`` asserts parity.
+It is also imported in-process by ``src/judge/sql_runner.py`` (test-case generation
+runs LLM-written seed SQL through the same restricted path), so there is exactly one
+implementation of the rules below.
+
+Every case gets a fresh in-memory SQLite database that is thrown away afterwards —
+nothing reaches disk or outlives the case. On top of that, the database is
+restricted:
+
+  * Seeding (the question's setup script): anything except ATTACH/DETACH and
+    extension loading, under a time limit.
+  * The query being graded (candidate's or reference): read-only. The connection is
+    switched to ``PRAGMA query_only`` and an authorizer allows only reading —
+    SELECT / WITH / VALUES, reading tables, calling ordinary functions. So a query
+    cannot write, attach another database file, change pragmas or load extensions.
+  * Each query has its own time limit (a runaway recursive CTE is a TLE for that
+    case only, not for every case) and a row limit.
 
 Job (stdin):
     {"candidate_sql": str,
      "reference_sql": str | null,
+     "query_timeout_ms": int (optional),
      "cases": [{"id","input"(setup SQL),"expected_output","weight","ordinal",
                 "is_sample","is_hidden"}, ...]}
 
@@ -21,13 +35,38 @@ Result (stdout):
      "cases":[{"test_case_id","verdict","time_ms","stdout","stderr","ordinal","is_hidden"}]}
 """
 import json
+import re
 import sqlite3
 import sys
 import time
 
-AC, WA, RE, PENDING = "AC", "WA", "RE", "PENDING"
+AC, WA, RE, TLE, PENDING = "AC", "WA", "RE", "TLE", "PENDING"
 # Mirror src/judge/verdict.py severity ordering (worst non-AC wins overall).
-_SEVERITY = {AC: 0, WA: 1, RE: 2, "TLE": 3, "MLE": 4, "CE": 5}
+_SEVERITY = {AC: 0, WA: 1, RE: 2, TLE: 3, "MLE": 4, "CE": 5}
+
+QUERY_TIMEOUT_MS = 2000          # per query, per case
+SEED_TIMEOUT_MS = 2000           # per setup script
+MAX_ROWS = 10000                 # rows a query may return
+_RESULT_BUDGET = 200 * 1024      # total stdout text across cases; the sandbox caps at 256 KB
+
+# Functions a query may never call, even if the build provides them.
+_BLOCKED_FUNCTIONS = {"load_extension", "readfile", "writefile", "edit", "fts3_tokenizer"}
+# What a read-only query is allowed to do (sqlite3 authorizer action codes).
+_READ_ACTIONS = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION,
+                 getattr(sqlite3, "SQLITE_RECURSIVE", 33)}
+_READ_ONLY_START = re.compile(r"^\s*(?:SELECT|WITH|VALUES)\b", re.I)
+
+
+class QueryRejected(Exception):
+    """The query tried something other than reading."""
+
+
+class QueryTimeout(Exception):
+    """The query ran past its time limit."""
+
+
+class TooManyRows(Exception):
+    """The query returned more than MAX_ROWS rows."""
 
 
 def _split_statements(sql):
@@ -55,25 +94,97 @@ def _split_statements(sql):
     return statements
 
 
-def _run_script(conn, sql):
-    """Run every statement; return (columns, rows) of the LAST result set."""
+def _strip_comments(stmt):
+    stmt = re.sub(r"/\*.*?\*/", " ", stmt, flags=re.S)
+    return re.sub(r"--[^\n]*", " ", stmt)
+
+
+def _seed_authorizer(action, arg1, arg2, db_name, source):
+    if action in (sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH):
+        return sqlite3.SQLITE_DENY
+    if action == sqlite3.SQLITE_FUNCTION and (arg2 or "").lower() in _BLOCKED_FUNCTIONS:
+        return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
+
+
+def _read_only_authorizer(action, arg1, arg2, db_name, source):
+    if action not in _READ_ACTIONS:
+        return sqlite3.SQLITE_DENY
+    if action == sqlite3.SQLITE_FUNCTION and (arg2 or "").lower() in _BLOCKED_FUNCTIONS:
+        return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
+
+
+def _set_deadline(conn, timeout_ms):
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    # Called every N SQLite VM steps; a non-zero return aborts the statement.
+    conn.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, 1000)
+    return deadline
+
+
+def _timed_out(err, deadline):
+    return "interrupted" in str(err).lower() and time.monotonic() > deadline
+
+
+def _run_read_only(conn, sql, timeout_ms):
+    """Run a read-only script; return (columns, rows) of the LAST result set."""
+    statements = _split_statements(sql)
+    for stmt in statements:
+        if not _READ_ONLY_START.match(_strip_comments(stmt)):
+            raise QueryRejected("Only SELECT queries are allowed in this question "
+                                "(statements must start with SELECT, WITH or VALUES).")
+    conn.execute("PRAGMA query_only = ON")
+    conn.set_authorizer(_read_only_authorizer)
+    deadline = _set_deadline(conn, timeout_ms)
     cols, rows = None, []
     cur = conn.cursor()
-    for stmt in _split_statements(sql):
-        cur.execute(stmt)
-        if cur.description is not None:
-            cols = [d[0] for d in cur.description]
-            rows = cur.fetchall()
+    try:
+        for stmt in statements:
+            cur.execute(stmt)
+            if cur.description is not None:
+                cols = [d[0] for d in cur.description]
+                rows = []
+                while True:
+                    chunk = cur.fetchmany(1000)
+                    if not chunk:
+                        break
+                    rows.extend(chunk)
+                    if len(rows) > MAX_ROWS:
+                        raise TooManyRows(f"The result has more than {MAX_ROWS} rows.")
+    except sqlite3.DatabaseError as e:
+        if _timed_out(e, deadline):
+            raise QueryTimeout(f"The query ran longer than {timeout_ms} ms.")
+        if "not authorized" in str(e).lower() or "readonly" in str(e).lower() \
+                or "read-only" in str(e).lower():
+            raise QueryRejected("Only reading is allowed in this question: the query tried "
+                                "to change data, attach a database, change a setting or "
+                                "load an extension.")
+        raise
     return cols, rows
 
 
-def _query_result(setup_sql, query_sql):
-    """Seed a fresh in-memory DB with setup_sql, then run query_sql."""
+def _seed(conn, setup_sql, timeout_ms=SEED_TIMEOUT_MS):
+    if not (setup_sql or "").strip():
+        return
+    conn.set_authorizer(_seed_authorizer)
+    deadline = _set_deadline(conn, timeout_ms)
+    try:
+        conn.executescript(setup_sql)
+    except sqlite3.DatabaseError as e:
+        if _timed_out(e, deadline):
+            raise QueryTimeout(f"The setup script ran longer than {timeout_ms} ms.")
+        raise
+    finally:
+        conn.set_progress_handler(None, 0)
+        conn.set_authorizer(None)
+
+
+def _query_result(setup_sql, query_sql, timeout_ms=QUERY_TIMEOUT_MS):
+    """Seed a fresh in-memory DB with setup_sql, then run query_sql read-only."""
     conn = sqlite3.connect(":memory:")
     try:
-        if (setup_sql or "").strip():
-            conn.executescript(setup_sql)
-        return _run_script(conn, query_sql)
+        _seed(conn, setup_sql)
+        return _run_read_only(conn, query_sql, timeout_ms)
     finally:
         conn.close()
 
@@ -111,8 +222,12 @@ def _outputs_match(actual, expected):
 def judge(job):
     candidate_sql = job.get("candidate_sql") or ""
     reference_sql = job.get("reference_sql")
+    timeout_ms = int(job.get("query_timeout_ms") or QUERY_TIMEOUT_MS)
     raw_cases = job.get("cases") or []
     cases_sorted = sorted(raw_cases, key=lambda c: c.get("ordinal", 0))
+    # Share the output budget between cases, so one huge result can't push the whole
+    # JSON past the sandbox's output cap (which would turn every case into RE).
+    per_case_text = max(1000, min(10000, _RESULT_BUDGET // max(1, len(cases_sorted))))
 
     max_score = float(sum(max(1, int(c.get("weight", 1) or 1)) for c in cases_sorted)) or 0.0
     out_cases, score, passed, total_time = [], 0.0, 0, 0
@@ -122,20 +237,30 @@ def judge(job):
         ordinal = tc.get("ordinal", 0)
         is_hidden = bool(tc.get("is_hidden"))
         t0 = time.perf_counter()
-        try:
-            cand_cols, cand_rows = _query_result(setup, candidate_sql)
-        except Exception as e:
+
+        def fail(verdict, message):
             out_cases.append({
-                "test_case_id": tc.get("id"), "verdict": RE,
+                "test_case_id": tc.get("id"), "verdict": verdict,
                 "time_ms": int((time.perf_counter() - t0) * 1000), "stdout": "",
-                "stderr": str(e)[:10000], "ordinal": ordinal, "is_hidden": is_hidden,
+                "stderr": str(message)[:per_case_text], "ordinal": ordinal, "is_hidden": is_hidden,
             })
+
+        try:
+            cand_cols, cand_rows = _query_result(setup, candidate_sql, timeout_ms)
+        except QueryTimeout as e:
+            fail(TLE, e)
+            continue
+        except TooManyRows as e:
+            fail(WA, e)
+            continue
+        except Exception as e:          # QueryRejected, SQL errors
+            fail(RE, e)
             continue
 
         ref_rows = None
         if (reference_sql or "").strip():
             try:
-                _, ref_rows = _query_result(setup, reference_sql)
+                _, ref_rows = _query_result(setup, reference_sql, timeout_ms)
             except Exception:
                 ref_rows = None
 
@@ -152,7 +277,7 @@ def judge(job):
             score += max(1, int(tc.get("weight", 1) or 1))
         out_cases.append({
             "test_case_id": tc.get("id"), "verdict": verdict, "time_ms": elapsed,
-            "stdout": _format_rows(cand_cols, cand_rows)[:10000], "stderr": "",
+            "stdout": _format_rows(cand_cols, cand_rows)[:per_case_text], "stderr": "",
             "ordinal": ordinal, "is_hidden": is_hidden,
         })
 

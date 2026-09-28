@@ -13,6 +13,7 @@ from src.rate_limit import limiter
 
 logger = logging.getLogger(__name__)
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from src.config.database_config_mysql import get_db
 from src.auth import (
@@ -21,52 +22,92 @@ from src.auth import (
     verify_password, get_password_hash, validate_password_strength
 )
 from src.models.models import User, Company
+from src.tenancy.platform_company import platform_slug
 from src.services.permissions_catalog import get_permissions_for_role
 
 
-def _resolve_company_id(db: Session, request: Request, api_key: Optional[str]) -> Optional[str]:
+def _resolve_company_id(
+    db: Session,
+    request: Request,
+    api_key: Optional[str] = None,
+    company_slug: Optional[str] = None,
+) -> Optional[str]:
     """Resolve the company context for a public auth call.
 
     Preference order:
-      1. ``api_key`` from the request body (e.g. /app?key=... portal flow).
-      2. Tenant subdomain set by ``TenantDomainMiddleware``.
+      1. ``company_slug`` from the request body — the /<slug> portal flow.
+      2. ``api_key`` — deprecated, for links still carrying ?key=.
+      3. Tenant subdomain / custom domain, set by ``TenantDomainMiddleware``.
+
+    **Fails closed.** An identifier that is *supplied but does not resolve* raises 404
+    rather than falling through. Falling through used to mean a typo'd or stale portal
+    link silently dropped tenant scoping: ``_scoped_user_by_email`` then did a global
+    lookup, so a user from one company could sign in through another company's URL. Only
+    an *absent* identifier falls back to the host.
     """
+    if company_slug:
+        normalised = company_slug.strip().lower()
+        # The platform org is not a tenant, so it is not addressable by slug — the same
+        # refusal public_routes makes. Without it here, a slug-scoped login against the
+        # platform org still resolved, which is exactly what that guard claims to stop.
+        if normalised == platform_slug().strip().lower():
+            raise HTTPException(status_code=404, detail="Company not found")
+        company = db.query(Company).filter(
+            func.lower(Company.slug) == normalised,
+            Company.is_active == True,
+        ).first()
+        if not company:
+            raise HTTPException(status_code=404, detail="Company not found")
+        return company.id
+
     if api_key:
         company = db.query(Company).filter(
             Company.api_key == api_key, Company.is_active == True
         ).first()
-        if company:
-            return company.id
+        if not company:
+            raise HTTPException(status_code=404, detail="Company not found")
+        return company.id
+
     return getattr(request.state, "company_id", None)
 
 router = APIRouter(prefix="/api/v1/auth", tags=["Authentication"])
 
 
+# ``company_slug`` is the public company identifier (career.innomaxskills.com/<slug>).
+# ``api_key`` is the deprecated ``sk_live_`` secret the old ?key= links carried; it is
+# accepted only for the deprecation window and should be deleted with them.
+
 class OTPVerifyRequest(BaseModel):
     email: EmailStr
     otp: str
+    company_slug: Optional[str] = None
     api_key: Optional[str] = None
 
 class ResendOTPRequest(BaseModel):
     email: EmailStr
+    company_slug: Optional[str] = None
     api_key: Optional[str] = None
 
 class ForgotPasswordRequest(BaseModel):
     email: EmailStr
+    company_slug: Optional[str] = None
     api_key: Optional[str] = None
 
 class ResetPasswordRequest(BaseModel):
     email: EmailStr
     otp: str
     new_password: str
+    company_slug: Optional[str] = None
     api_key: Optional[str] = None
 
 
 class RegisterRequest(UserCreate):
+    company_slug: Optional[str] = None
     api_key: Optional[str] = None
 
 
 class LoginRequest(UserLogin):
+    company_slug: Optional[str] = None
     api_key: Optional[str] = None
     # Set by the Innomax platform login page. When true, only superadmin and
     # the platform's own (Innomax) users may sign in here — client-company users
@@ -91,8 +132,17 @@ def _scoped_user_by_email(
 
 
 @router.post("/register", status_code=status.HTTP_201_CREATED)
-# @limiter.limit("10/hour")  # disabled: students register in batches from one
-# shared campus IP, so a per-IP cap rejects the whole batch. Re-enable if abuse appears.
+# Sized for a 300+ candidate campus drive, all behind one NAT'd IP. The original 10/hour
+# was removed precisely because a per-IP cap rejected the whole batch; do not "tidy" this
+# back down without knowing the largest drive it has to clear.
+#
+# There is a cap at all because a company is now addressed by a guessable slug rather than
+# a 43-character key, and this endpoint sends OTP mail through the *tenant's own* SMTP
+# sender — unthrottled, that is an email amplifier for any company name someone guesses.
+# Treat it as a guard rail against runaway loops, not a security control: the limiter is
+# in-process across 3 gunicorn workers (so the real ceiling is 1-3x this), and it keys on
+# a client-supplied X-Forwarded-For.
+@limiter.limit("500/hour")
 async def register(request: Request, user_data: RegisterRequest, db: Session = Depends(get_db)):
     """
     Public self-registration — candidates only.
@@ -100,9 +150,9 @@ async def register(request: Request, user_data: RegisterRequest, db: Session = D
     Superadmin is seeded directly in the database — never created through this endpoint.
 
     The candidate is bound to a company when the request includes the company's
-    ``api_key`` (from a company portal at /app?key=...) or arrives on a tenant
-    subdomain. A given email may register at multiple companies, but only once
-    per company.
+    ``company_slug`` (from a company portal at /<slug>), a legacy ``api_key``, or
+    arrives on a tenant subdomain. A given email may register at multiple companies,
+    but only once per company.
     """
     # Only candidates may self-register
     if user_data.role != "candidate":
@@ -112,7 +162,7 @@ async def register(request: Request, user_data: RegisterRequest, db: Session = D
                    "HR, Admin, and Interviewer accounts are created by your company admin.",
         )
 
-    company_id = _resolve_company_id(db, request, user_data.api_key)
+    company_id = _resolve_company_id(db, request, user_data.api_key, user_data.company_slug)
     if company_id is None:
         # Bare HireFlow sign-up (no client portal key / tenant domain) belongs to
         # the platform's own org (Innomax) — so HireFlow candidates share the same
@@ -122,9 +172,9 @@ async def register(request: Request, user_data: RegisterRequest, db: Session = D
         company_id = ensure_platform_company(db).id
 
     try:
-        # Strip api_key before forwarding so create_user only sees fields the
-        # User model knows about.
-        core = UserCreate(**user_data.model_dump(exclude={"api_key"}))
+        # Strip the tenant selectors before forwarding so create_user only sees fields
+        # the User model knows about.
+        core = UserCreate(**user_data.model_dump(exclude={"api_key", "company_slug"}))
         user = create_user(db, core, company_id=company_id)
         return {
             "message": "Account created. A 6-digit OTP has been sent to your email.",
@@ -141,18 +191,28 @@ async def register(request: Request, user_data: RegisterRequest, db: Session = D
 
 
 @router.post("/verify-otp", response_model=Token)
+# High, because a campus batch verifies in one burst right after registering — see the
+# note on /register. Still bounded, so a scripted guess of 6-digit codes is not free.
+@limiter.limit("120/minute")
 async def verify_otp(request: Request, data: OTPVerifyRequest, db: Session = Depends(get_db)):
-    """Verify the OTP sent to the user's email and return an access token."""
-    company_id = _resolve_company_id(db, request, data.api_key)
+    """Verify the OTP sent to the user's email and return an access token.
+
+    Every failure returns the same 400. Distinguishing "no such user" from "already
+    verified" from "wrong code" told an unauthenticated caller which emails are
+    registered with a company — and a company is now addressed by a guessable slug, so
+    that oracle is cheap to point anywhere.
+    """
+    company_id = _resolve_company_id(db, request, data.api_key, data.company_slug)
     user = _scoped_user_by_email(db, data.email, company_id)
+    _INVALID_CODE = HTTPException(status_code=400, detail="Invalid or expired code.")
     if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise _INVALID_CODE
     if user.email_verified:
-        raise HTTPException(status_code=400, detail="Email already verified. Please log in.")
+        raise _INVALID_CODE
     if not user.otp_code or user.otp_code != data.otp:
-        raise HTTPException(status_code=400, detail="Invalid OTP")
+        raise _INVALID_CODE
     if user.otp_expires_at and datetime.utcnow() > user.otp_expires_at:
-        raise HTTPException(status_code=400, detail="OTP has expired. Request a new one.")
+        raise _INVALID_CODE
     user.email_verified = True
     user.otp_code = None
     user.otp_expires_at = None
@@ -164,21 +224,27 @@ async def verify_otp(request: Request, data: OTPVerifyRequest, db: Session = Dep
 @router.post("/resend-otp")
 @limiter.limit("3/minute")
 async def resend_otp(request: Request, data: ResendOTPRequest, db: Session = Depends(get_db)):
-    """Resend a fresh OTP to the given email (rate-limit: only if not already verified)."""
-    company_id = _resolve_company_id(db, request, data.api_key)
+    """Resend a fresh OTP, if the address belongs to an unverified account.
+
+    Always returns the same 200. The old 404 / 400 / 200 split told an unauthenticated
+    caller whether an email was registered with a company and whether it was verified
+    yet — an enumeration oracle, now reachable for any company whose slug can be guessed.
+    """
+    company_id = _resolve_company_id(db, request, data.api_key, data.company_slug)
     user = _scoped_user_by_email(db, data.email, company_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    if user.email_verified:
-        raise HTTPException(status_code=400, detail="Email already verified")
+    SENT = {"message": "If that account exists and is unverified, a code has been sent."}
+    if not user or user.email_verified:
+        return SENT
     otp = set_user_otp(user, db)
     try:
         from src.services.email_service import send_otp_email, resolve_auth_sender
         smtp_config = resolve_auth_sender(db, user.company_id)
-        result = send_otp_email(user.email, user.first_name, otp, smtp_config=smtp_config)
+        send_otp_email(user.email, user.first_name, otp, smtp_config=smtp_config)
     except Exception as e:
-        result = {"sent": False, "error": str(e)}
-    return {"message": "OTP resent", "email": user.email, "email_sent": result.get("sent", False) if isinstance(result, dict) else True}
+        # Logged, not returned: whether the mail left the building is not the caller's
+        # business, and reporting it re-opens the oracle this function just closed.
+        logger.warning(f"resend OTP email to {user.email} failed: {e}")
+    return SENT
 
 @router.post("/login", response_model=Token)
 @limiter.limit("5/minute")
@@ -191,15 +257,15 @@ async def login(
     Authenticate user and return access token.
 
     Rules enforced:
-    - When the request supplies a company ``api_key`` (e.g. /app?key=...), login
-      is scoped to that company so the same email at multiple companies
-      resolves unambiguously.
+    - When the request supplies a ``company_slug`` (the /<slug> portal) or a legacy
+      ``api_key``, login is scoped to that company so the same email at multiple
+      companies resolves unambiguously.
     - On a tenant domain (acme.hireflow.io) only that company's users can log in.
     - Superadmin can only log in from the platform domain (no tenant_company_id on request).
     - Suspended company users are rejected with a clear message.
     """
     try:
-        scope_company_id = _resolve_company_id(db, request, user_credentials.api_key)
+        scope_company_id = _resolve_company_id(db, request, user_credentials.api_key, user_credentials.company_slug)
         user = login_user(
             db,
             user_credentials.email,
@@ -558,12 +624,18 @@ async def verify_token(current_user: User = Depends(get_current_user)):
 @router.post("/forgot-password")
 @limiter.limit("3/minute")
 async def forgot_password(request: Request, data: ForgotPasswordRequest, db: Session = Depends(get_db)):
-    """Send a password-reset OTP to the user's registered email."""
-    company_id = _resolve_company_id(db, request, data.api_key)
+    """Send a password-reset OTP to the user's registered email.
+
+    Both branches return an identical body. The intent was always non-enumeration, but
+    the two responses differed in *shape* — the hit carried an ``email`` key the miss did
+    not — so the endpoint enumerated users anyway. The SPA renders the address the user
+    just typed, so it never needed the echo.
+    """
+    company_id = _resolve_company_id(db, request, data.api_key, data.company_slug)
     user = _scoped_user_by_email(db, data.email, company_id)
-    # Always return success to avoid user enumeration
+    OTP_SENT = {"message": "If that email is registered, an OTP has been sent."}
     if not user:
-        return {"message": "If that email is registered, an OTP has been sent."}
+        return OTP_SENT
     otp = set_user_otp(user, db)
     try:
         from src.services.email_service import send_password_reset_otp, resolve_auth_sender
@@ -571,20 +643,27 @@ async def forgot_password(request: Request, data: ForgotPasswordRequest, db: Ses
         send_password_reset_otp(user.email, user.first_name, otp, smtp_config=smtp_config)
     except Exception as _e:
         logger.warning(f"password-reset OTP email to {user.email} failed: {_e}")
-    return {"message": "If that email is registered, an OTP has been sent.", "email": user.email}
+    return OTP_SENT
 
 
 @router.post("/reset-password")
+@limiter.limit("120/minute")
 async def reset_password(request: Request, data: ResetPasswordRequest, db: Session = Depends(get_db)):
-    """Verify reset OTP and set a new password."""
-    company_id = _resolve_company_id(db, request, data.api_key)
+    """Verify reset OTP and set a new password.
+
+    Every failure returns the same 400, for the same reason as /verify-otp: a 404 for an
+    unknown address told an unauthenticated caller which emails are registered with a
+    company, and a company is now addressed by a guessable slug.
+    """
+    company_id = _resolve_company_id(db, request, data.api_key, data.company_slug)
     user = _scoped_user_by_email(db, data.email, company_id)
+    _INVALID_CODE = HTTPException(status_code=400, detail="Invalid or expired code.")
     if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise _INVALID_CODE
     if not user.otp_code or user.otp_code != data.otp:
-        raise HTTPException(status_code=400, detail="Invalid OTP")
+        raise _INVALID_CODE
     if user.otp_expires_at and datetime.utcnow() > user.otp_expires_at:
-        raise HTTPException(status_code=400, detail="OTP has expired. Request a new one.")
+        raise _INVALID_CODE
     validate_password_strength(data.new_password)
     from src.auth import get_password_hash
     user.password_hash = get_password_hash(data.new_password)

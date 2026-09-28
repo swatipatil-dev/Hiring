@@ -15,8 +15,9 @@ enqueues and waits (``queue.run_in_worker``) rather than executing sandboxes
 itself.
 
 They are deliberately thin: no DB, no persistence, just "run this and hand back
-the dataclass". Every argument and return value is a plain dataclass so RQ can
-pickle them without custom serialisation.
+the result". Arguments and results cross the queue as JSON, not pickle, so they are
+plain dicts here; ``queue.run_in_worker`` rebuilds the dataclasses on the API side.
+Only the functions listed in ``rq_safety.ALLOWED_JOBS`` can be run at all.
 
 Run a worker with (see backend/entrypoint.sh, ROLE=worker):
     rq worker-pool -n 3 judge --url redis://127.0.0.1:6379/5
@@ -24,6 +25,7 @@ Run a worker with (see backend/entrypoint.sh, ROLE=worker):
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime
 
 from src.config.database_config_mysql import db_manager
@@ -31,10 +33,48 @@ from src.models.models import (
     CodeSubmission, CodingProblem, ProblemTestCase, SubmissionTestResult,
 )
 from . import verdict as V
-from .queue import publish_status
+from .queue import publish_status, redis_url_has_password
+from .rq_safety import as_test_case, to_plain
 from .runner import TestCaseInput, judge_submission
 
 logger = logging.getLogger("judge.worker")
+
+
+def _harden_work_root() -> None:
+    """Keep other local accounts out of candidates' job directories.
+
+    Each job directory is world-writable (0777) because the container runs as
+    ``nobody`` and must write its compiled binary there. That is only safe if nobody
+    else on this shared server can reach them, so the root that holds them is made
+    owner-only. Docker's daemon (root) and the container, which mounts one job
+    directory directly, are unaffected.
+    """
+    root = os.getenv("JUDGE_WORK_ROOT")
+    if not root or not os.path.isdir(root):
+        return
+    try:
+        os.chmod(root, 0o700)
+    except OSError as exc:
+        logger.warning("could not restrict %s to its owner: %s", root, exc)
+
+
+def _warn_about_weak_isolation() -> None:
+    if os.getenv("ENVIRONMENT", "").lower() != "production":
+        return
+    if not os.getenv("JUDGE_RUNTIME"):
+        logger.warning(
+            "JUDGE_RUNTIME is not set: candidate code runs under Docker's default runtime, "
+            "sharing the host kernel. Install gVisor and set JUDGE_RUNTIME=runsc "
+            "(docs/CODING_JUDGE.md, 'Security model').")
+    if not redis_url_has_password():
+        logger.error(
+            "the judge queue's Redis URL has no password. On a shared server any local "
+            "account can then queue work for this worker. Set requirepass and put the "
+            "password in REDIS_URL (docs/CPANEL_DEPLOYMENT.md).")
+
+
+_harden_work_root()
+_warn_about_weak_isolation()
 
 
 def _status_payload(sub: CodeSubmission, cases=None) -> dict:
@@ -187,18 +227,19 @@ def run_once_job(language_key: str, source_code: str, stdin: str = "",
     """Scratch 'Run Code' — compile and run once, no test-case comparison."""
     from .runner import run_once
     logger.info("run_once_job: lang=%s bytes=%d", language_key, len(source_code or ""))
-    return run_once(language_key, source_code, stdin,
-                    time_limit_ms=time_limit_ms, memory_limit_mb=memory_limit_mb)
+    return to_plain(run_once(language_key, source_code, stdin,
+                             time_limit_ms=time_limit_ms, memory_limit_mb=memory_limit_mb))
 
 
 def judge_code_job(language_key: str, source_code: str, test_cases,
                    time_limit_ms: int = 5000, memory_limit_mb: int = 256):
-    """Graded run against test cases. `test_cases` is a list of TestCaseInput."""
+    """Graded run against test cases (TestCaseInput fields, as dicts off the queue)."""
     from .runner import judge_submission
     logger.info("judge_code_job: lang=%s cases=%d", language_key, len(test_cases or []))
-    return judge_submission(language_key, source_code, test_cases,
-                            time_limit_ms=time_limit_ms,
-                            memory_limit_mb=memory_limit_mb)
+    return to_plain(judge_submission(language_key, source_code,
+                                     [as_test_case(c) for c in test_cases or []],
+                                     time_limit_ms=time_limit_ms,
+                                     memory_limit_mb=memory_limit_mb))
 
 
 def judge_sql_job(source_code: str, test_cases, reference_sql=None, image=None,
@@ -208,9 +249,10 @@ def judge_sql_job(source_code: str, test_cases, reference_sql=None, image=None,
     from .sql_sandbox import judge_sql_sandboxed
     logger.info("judge_sql_job: cases=%d ref=%s", len(test_cases or []),
                 bool(reference_sql))
-    return judge_sql_sandboxed(source_code, test_cases, reference_sql=reference_sql,
-                               image=image, time_limit_ms=time_limit_ms,
-                               memory_limit_mb=memory_limit_mb)
+    return to_plain(judge_sql_sandboxed(source_code, [as_test_case(c) for c in test_cases or []],
+                                        reference_sql=reference_sql, image=image,
+                                        time_limit_ms=time_limit_ms,
+                                        memory_limit_mb=memory_limit_mb))
 
 
 def hidden_testgen_job(question_text: str, sample_answer: str, category=None,

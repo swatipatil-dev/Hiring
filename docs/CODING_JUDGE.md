@@ -18,8 +18,8 @@ mapped at the end.
 | Models | `src/models/judge_models.py` (`CodingProblem`, `ProblemTestCase`, `CodeSubmission`, `SubmissionTestResult`) — imported into `src/models/models.py` |
 | Migration | `alembic/versions/l2b3c4d5e6f7_add_coding_judge_tables.py` (+ merge `k1a2b3c4d5e6`) |
 | Engine | `src/judge/` — `languages.py`, `sandbox.py`, `verdict.py`, `runner.py`, `queue.py`, `worker.py` |
-| Sandbox images | `judge/images/Dockerfile.{python,cpp,node}`, `judge/worker.Dockerfile` |
-| Infra | `docker-compose.judge.yml`, `scripts/build_judge_images.{ps1,sh}` |
+| Sandbox images | `judge/images/Dockerfile.{python,cpp,node,java}` |
+| Infra | `scripts/build_judge_images.{ps1,sh}`, `deploy/cpanel/hireflow-judge-worker.service` |
 | API | `routes/judge_routes.py` (prefix `/api/v1/judge`), registered in `main.py` |
 | Frontend | `frontend/src/pages/coding/` (ProblemList, ProblemSolve, SubmissionHistory, AdminProblemEditor) + routes in `App.jsx` + Sidebar links |
 | Tests | `test/test_judge_verdict.py` (unit), `test/test_judge_runner_integration.py` (Docker, auto-skips) |
@@ -62,10 +62,54 @@ Every execution runs in a throwaway Docker container (`src/judge/sandbox.py`) wi
 - `--cpus`, `--pids-limit 64` (fork-bomb guard), `--ulimit nofile/fsize`.
 - `--cap-drop ALL`, `--security-opt no-new-privileges`, `--user 65534:65534` (nobody, never root).
 - Host-enforced **wall-clock timeout** → container force-killed → **TLE**.
-- `--rm` cleanup + a kill-by-name reaper for timed-out containers; output size-capped.
+- `--rm` cleanup + a kill-by-name reaper for timed-out containers.
+- Output is read in chunks and anything past 256 KB is discarded as it arrives, so a
+  program printing gigabytes cannot exhaust the worker's memory.
+- Only the job's own temp directory is mounted. No app code, `.env` or other job's
+  files are visible, and only two harmless environment variables are passed in.
 
 **Production hardening (Linux):** set `JUDGE_RUNTIME=runsc` (gVisor) and
 `JUDGE_SECCOMP=/path/profile.json` for kernel-level isolation of untrusted code.
+Install steps: [CPANEL_DEPLOYMENT.md, Step 2.5](CPANEL_DEPLOYMENT.md). The worker
+logs a warning at every start in production while `JUDGE_RUNTIME` is unset.
+
+### Around the sandbox
+
+The container is only one layer. The process that starts containers is in the
+`docker` group, which is root-equivalent, so what reaches it is controlled too:
+
+- **Only the API runs code on candidates' behalf, via the queue.** The API has no
+  Docker access; the worker (`hfjudge`) does. The worker runs only the judge's own
+  entry points (`src/judge/rq_safety.py`, `ALLOWED_JOBS`), and jobs and results cross
+  Redis as JSON — stock RQ would run any function a job names and unpickle its
+  arguments. Redis itself needs a password (CPANEL_DEPLOYMENT.md, Step 2.4).
+- **The worker holds only the secrets it uses** (database, Redis, Gemini).
+  `entrypoint.sh` unsets the rest; it cannot re-read `.env` (0600, API user).
+- **The worker unit** (`hireflow-judge-worker.service`) mounts everything read-only
+  except `/srv/judge_work` (itself 0700), and sets `NoNewPrivileges`, `PrivateDevices`
+  and kernel protections. These do not apply to the containers, which dockerd starts.
+- **SQL** runs in a fresh in-memory SQLite database per case (`sql_harness.py`). The
+  graded query is read-only (`PRAGMA query_only` plus an authorizer): no writes,
+  ATTACH, PRAGMA or extensions, with a 1 s limit per query and a 10,000-row limit.
+  Test-case generation, which runs LLM-written seed SQL in the API process, uses the
+  same harness.
+- **Limits per user:** Run Code 20/minute, graded runs 10/minute and 3 per question
+  per test; source up to 64 KB, custom input up to 1 MB.
+
+### Hidden test cases and answer keys
+
+Candidates never receive `correct_answer`, `sample_answer` (the reference solution) or
+hidden test cases:
+
+- The question-generator routes (`/interviews/*`) are staff-only and company-scoped.
+- A candidate's paper (`/api/v1/mcq/interviews/{id}/questions`) is their own
+  interview only, approved questions only, with `correct_answer` blank and sample test
+  cases only.
+- `/judge/grade-question` and `/judge/run` accept a question only from the
+  candidate's own, unfinished test. Hidden-case output is never returned to them.
+- `/mcq/questions*`, `/mcq/sample` and `/evaluation/*/submit` are staff-only.
+
+`test/test_question_access.py` and `test/test_judge_access.py` pin these.
 
 ---
 

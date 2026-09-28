@@ -9,6 +9,7 @@ Added:   TenantConfig, SubscriptionPlan
 from sqlalchemy import (Column, Integer, String, Float, DateTime, Boolean,
                          Text, ForeignKey, JSON, DECIMAL, Date, UniqueConstraint)
 from sqlalchemy.orm import relationship, declarative_base
+from sqlalchemy.dialects import mysql as mysql_types
 from ..config.database_config_mysql import db_manager
 from ..tenancy import TenantScoped
 
@@ -328,7 +329,13 @@ class JobPosting(Base, TenantScoped):
     salary_min      = Column(DECIMAL(12, 2))
     salary_max      = Column(DECIMAL(12, 2))
     experience_years= Column(Integer)
-    required_skills = Column(Text)    # JSON
+    required_skills = Column(Text)    # JSON — the MANDATORY requirements
+    # JSON. NULL = never specified (the scorer may infer nice-to-haves from the JD text);
+    # "[]" = HR explicitly listed none (no inference).
+    preferred_skills = Column(Text, nullable=True)
+    # The job-description version resume scores are measured against (see
+    # job_description_versions). No FK: the versions table points back at the job.
+    current_jd_version_id = Column(String(36), nullable=True, index=True)
     jd_embedding    = Column(Text)    # JSON
     job_category    = Column(String(20), default="technical")  # technical | non_technical | mixed
     status          = Column(String(20), default="draft")   # draft | pending_approval | active | closed
@@ -344,6 +351,7 @@ class JobPosting(Base, TenantScoped):
     candidates  = relationship("Candidate", back_populates="job")
     ats_results = relationship("ATSResult", back_populates="job")
     offers      = relationship("Offer", back_populates="job")
+    collaborators = relationship("JobHRCollaborator", back_populates="job")
 
 
 # ═══════════════════════════════════════════════════════
@@ -419,8 +427,135 @@ class ATSResult(Base, TenantScoped):
     scoring_breakdown  = Column(Text)     # JSON
     created_at         = Column(DateTime, default=datetime.utcnow)
 
+    # ── Parse quality ── ok | needs_review; NULL = scored before this was recorded.
+    # needs_review keeps the candidate out of every automatic reject and shortlist.
+    parse_status       = Column(String(20), nullable=True)
+    parse_confidence   = Column(Float, nullable=True)
+    parse_issues       = Column(Text, nullable=True)              # JSON list
+    scoring_source     = Column(String(20), nullable=True)        # profile | resume
+    # ── What the score rests on ──
+    evidence_coverage  = Column(Float, nullable=True)             # share of weight with known evidence
+    mandatory_met      = Column(Integer, nullable=True)
+    mandatory_total    = Column(Integer, nullable=True)
+    explanation        = Column(Text().with_variant(mysql_types.MEDIUMTEXT(), "mysql"), nullable=True)
+    # ── Provenance: which rules, which job description, which models ──
+    scoring_rules_version = Column(String(32), nullable=True)
+    jd_version_id      = Column(String(36), nullable=True, index=True)
+    model_version      = Column(String(255), nullable=True)       # JSON
+    input_hash         = Column(String(64), nullable=True)
+    scored_at          = Column(DateTime, nullable=True)
+    # ── HR override. ats_score stays the MODEL score; the effective score is
+    # COALESCE(override_score, ats_score) and is mirrored to Candidate.ats_score.
+    override_score     = Column(Float, nullable=True)
+    override_event_id  = Column(String(36), nullable=True)
+
     candidate = relationship("Candidate", back_populates="ats_result")
     job       = relationship("JobPosting", back_populates="ats_results")
+
+
+class JobDescriptionVersion(Base, TenantScoped):
+    """A snapshot of what a job asked for when resumes were scored against it.
+
+    Created whenever the scoring-relevant parts of a job change (description,
+    requirements, mandatory/preferred skills, experience). Each ATS result records the
+    version it was scored against, so a score can always be traced to the exact job
+    description behind it, and HR can see which scores predate an edit.
+    """
+    __tablename__ = "job_description_versions"
+    __table_args__ = (UniqueConstraint("job_id", "version_no", name="uq_jd_version_job_no"),)
+
+    id               = Column(String(36), primary_key=True, default=_uuid)
+    company_id       = Column(String(36), ForeignKey("companies.id"), nullable=True, index=True)
+    job_id           = Column(String(36), ForeignKey("job_postings.id"), nullable=False, index=True)
+    version_no       = Column(Integer, nullable=False)
+    title            = Column(String(255))
+    description      = Column(Text)
+    requirements     = Column(Text)
+    required_skills  = Column(Text)
+    preferred_skills = Column(Text)
+    experience_years = Column(Integer)
+    fingerprint      = Column(String(64), nullable=False)
+    created_by_id    = Column(String(36), ForeignKey("users.id"), nullable=True)
+    created_at       = Column(DateTime, default=datetime.utcnow)
+
+
+class ATSScoreEvent(Base, TenantScoped):
+    """Append-only history of a resume score: scored, rescored, overridden, cleared.
+    An override must carry a reason; nothing here is ever updated or deleted."""
+    __tablename__ = "ats_score_events"
+
+    id                       = Column(String(36), primary_key=True, default=_uuid)
+    company_id               = Column(String(36), ForeignKey("companies.id"), nullable=True, index=True)
+    ats_result_id            = Column(String(36), nullable=True, index=True)
+    candidate_id             = Column(String(36), nullable=False, index=True)
+    job_id                   = Column(String(36), nullable=False, index=True)
+    event_type               = Column(String(20), nullable=False)   # scored | rescored | override | override_cleared
+    model_score              = Column(Float, nullable=True)
+    previous_effective_score = Column(Float, nullable=True)
+    new_effective_score      = Column(Float, nullable=True)
+    reason                   = Column(Text, nullable=True)
+    actor_user_id            = Column(String(36), ForeignKey("users.id"), nullable=True)
+    scoring_rules_version    = Column(String(32), nullable=True)
+    jd_version_id            = Column(String(36), nullable=True)
+    created_at               = Column(DateTime().with_variant(mysql_types.DATETIME(fsp=6), "mysql"),
+                                      default=datetime.utcnow)
+
+
+class ReviewSample(Base, TenantScoped):
+    """A random, seeded sample of applicants below the shortlist cutoff, drawn for a
+    blind independent review of whether the ranking missed suitable people."""
+    __tablename__ = "review_samples"
+
+    id                      = Column(String(36), primary_key=True, default=_uuid)
+    company_id              = Column(String(36), ForeignKey("companies.id"), nullable=True, index=True)
+    job_id                  = Column(String(36), ForeignKey("job_postings.id"), nullable=False, index=True)
+    created_by_id           = Column(String(36), ForeignKey("users.id"), nullable=True)
+    cutoff_type             = Column(String(20), nullable=False)    # score | top_n
+    cutoff_value            = Column(Float, nullable=False)
+    size                    = Column(Integer, nullable=False)
+    seed                    = Column(Integer, nullable=False)
+    candidate_ids           = Column(Text, nullable=False)          # JSON list
+    below_cutoff_population = Column(Integer, nullable=False)
+    created_at              = Column(DateTime, default=datetime.utcnow)
+
+
+class ScreeningReview(Base, TenantScoped):
+    """A person's independent judgement of an applicant's suitability for a job, with
+    the model's view at that moment snapshotted beside it. Append-only."""
+    __tablename__ = "screening_reviews"
+
+    id                       = Column(String(36), primary_key=True, default=_uuid)
+    company_id               = Column(String(36), ForeignKey("companies.id"), nullable=True, index=True)
+    job_id                   = Column(String(36), ForeignKey("job_postings.id"), nullable=False, index=True)
+    candidate_id             = Column(String(36), ForeignKey("candidates.id"), nullable=False, index=True)
+    reviewer_user_id         = Column(String(36), ForeignKey("users.id"), nullable=True)
+    judgement                = Column(String(20), nullable=False)   # suitable | not_suitable
+    reason                   = Column(Text, nullable=False)
+    blind                    = Column(Boolean, default=False)
+    sample_id                = Column(String(36), nullable=True)
+    model_score_at_review    = Column(Float, nullable=True)
+    effective_score_at_review = Column(Float, nullable=True)
+    rank_at_review           = Column(Integer, nullable=True)
+    parse_status_at_review   = Column(String(20), nullable=True)
+    scoring_rules_version    = Column(String(32), nullable=True)
+    jd_version_id            = Column(String(36), nullable=True)
+    created_at               = Column(DateTime().with_variant(mysql_types.DATETIME(fsp=6), "mysql"),
+                                      default=datetime.utcnow)
+
+
+class MissedCandidateInvestigation(Base, TenantScoped):
+    """Why a suitable applicant ended up below the cutoff, recorded by whoever looked."""
+    __tablename__ = "missed_candidate_investigations"
+
+    id                   = Column(String(36), primary_key=True, default=_uuid)
+    company_id           = Column(String(36), ForeignKey("companies.id"), nullable=True, index=True)
+    job_id               = Column(String(36), ForeignKey("job_postings.id"), nullable=False, index=True)
+    candidate_id         = Column(String(36), ForeignKey("candidates.id"), nullable=False, index=True)
+    review_id            = Column(String(36), nullable=True)
+    cause                = Column(String(40), nullable=False)   # parse_failure | synonym_not_recognised | experience_not_detected | other
+    notes                = Column(Text, nullable=True)
+    investigator_user_id = Column(String(36), ForeignKey("users.id"), nullable=True)
+    created_at           = Column(DateTime, default=datetime.utcnow)
 
 
 class ResumePoolEntry(Base, TenantScoped):
@@ -480,7 +615,8 @@ class ResumePoolEntry(Base, TenantScoped):
     # Match outcome
     best_job_id        = Column(String(36), ForeignKey("job_postings.id"), nullable=True)
     best_score         = Column(DECIMAL(5, 2), index=True)
-    match_results      = Column(Text)                     # JSON: ranked jobs + ATS sub-scores
+    match_results      = Column(Text().with_variant(mysql_types.MEDIUMTEXT(), "mysql"))  # JSON: ranked jobs + ATS sub-scores
+    parse_status       = Column(String(20), nullable=True)    # ok | needs_review
 
     # Applications whose job posting has since been hard-deleted. JSON list shaped like
     # PoolApplication: {candidate_id, job_id, job_title, stage, applied_at, ats_score}.
@@ -624,6 +760,16 @@ class Interview(Base, TenantScoped):
     # round_type is "mcq" (round 1) / "coding" (round 2); NULL = combined single-round test.
     test_round               = Column(Integer, default=1, nullable=True)
     round_type               = Column(String(20), nullable=True)
+    # Retests: an HR-granted retake is a NEW interview row pointing at the attempt it
+    # replaces, so the earlier attempt (and its proctoring record) stays intact.
+    attempt_number           = Column(Integer, default=1, nullable=True)
+    previous_attempt_id      = Column(Integer, ForeignKey("interviews.id"), nullable=True)
+    # Accommodations: JSON {extra_time_percent, audio_monitoring_off, gaze_flags_off,
+    # fullscreen_not_required, notes}. The request is the candidate's own words;
+    # status is requested | approved | declined.
+    accommodations           = Column(Text, nullable=True)
+    accommodation_request    = Column(Text, nullable=True)
+    accommodation_status     = Column(String(20), nullable=True)
     created_at               = Column(DateTime, default=datetime.utcnow)
     updated_at               = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -837,6 +983,60 @@ class JobDeletionArchive(Base, TenantScoped):
     # author_email, created_by, question_count, created_at}.
     tests           = Column(Text, nullable=True)
     created_at      = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class JobTransferHistory(Base, TenantScoped):
+    """One row per hand-over of a job from one HR to another.
+
+    Names and emails are snapshotted beside the ids so the trail still reads after an HR
+    is deactivated. `job_id` is deliberately a plain string, not an FK: the permanent job
+    delete removes children by explicit bulk delete, and an FK here would make that delete
+    fail with MySQL 1451 for any job that was ever transferred.
+    """
+    __tablename__ = "job_transfer_history"
+
+    id                   = Column(String(36), primary_key=True, default=_uuid)
+    company_id           = Column(String(36), ForeignKey("companies.id"), nullable=True, index=True)
+    job_id               = Column(String(36), nullable=False, index=True)
+    job_title            = Column(String(255), nullable=False)
+    # NULL for a job that had no owner yet (admin-created jobs start with hr_id = NULL).
+    from_hr_id           = Column(String(36), ForeignKey("hr_profiles.id"), nullable=True)
+    from_hr_name         = Column(String(255), nullable=True)
+    to_hr_id             = Column(String(36), ForeignKey("hr_profiles.id"), nullable=False)
+    to_hr_name           = Column(String(255), nullable=True)
+    transferred_by_id    = Column(String(36), ForeignKey("users.id"), nullable=True)
+    transferred_by_email = Column(String(255), nullable=True)
+    reason               = Column(Text, nullable=True)
+    offers_moved         = Column(Integer, default=0)
+    interviews_moved     = Column(Integer, default=0)
+    bulk                 = Column(Boolean, default=False)
+    created_at           = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class JobHRCollaborator(Base, TenantScoped):
+    """A co-HR on a job: an HR other than the owner (`job_postings.hr_id`) who has the
+    same access to it. The job itself is never copied — this row is the whole grant.
+
+    The unique constraint is what guarantees an HR is on a job at most once; the owner is
+    kept out by the service layer (see services/job_access.remove_collaborator_if_owner).
+    Access checks must use services/job_access.job_access_filter, which reads this table
+    through a subquery — JOINing it would repeat a job once per co-HR.
+    """
+    __tablename__ = "job_hr_collaborators"
+    __table_args__ = (
+        UniqueConstraint("job_id", "hr_id", name="uq_job_hr_collaborator"),
+    )
+
+    id          = Column(String(36), primary_key=True, default=_uuid)
+    company_id  = Column(String(36), ForeignKey("companies.id"), nullable=True, index=True)
+    job_id      = Column(String(36), ForeignKey("job_postings.id"), nullable=False, index=True)
+    hr_id       = Column(String(36), ForeignKey("hr_profiles.id"), nullable=False, index=True)
+    added_by_id = Column(String(36), ForeignKey("users.id"), nullable=True)
+    created_at  = Column(DateTime, default=datetime.utcnow)
+
+    job      = relationship("JobPosting", back_populates="collaborators")
+    hr       = relationship("HRProfile")
+    added_by = relationship("User")
 
 
 class Notification(Base, TenantScoped):
@@ -1137,6 +1337,48 @@ class ProctoringViolation(Base, TenantScoped):
     cumulative_count= Column(Integer, nullable=True)
 
     session = relationship("ProctoringSession", back_populates="violations")
+
+
+# proctoring_violations rows that record facts about a session rather than flag anything:
+# how identity was established, that the candidate consented, that the browser had no
+# fullscreen. Kept visible in the report but never counted as flags or queued for review.
+# Shared by proctoring/routes.py and routes/hr_routes.py so the two counts cannot drift.
+PROCTORING_MARKER_TYPES = frozenset({"LIVE_ENROLLED", "MONITORING_CONSENT"})
+PROCTORING_UNREVIEWABLE_TYPES = frozenset({"FULLSCREEN_UNAVAILABLE"})
+
+
+class ProctoringReview(Base, TenantScoped):
+    """A reviewer's outcome for one flagged event, or for a whole session (violation_id NULL).
+
+    Append-only: a changed mind is a new row, so the record shows who concluded what and
+    when. The latest row per (session_id, violation_id) is the current outcome.
+    """
+    __tablename__ = "proctoring_reviews"
+
+    id           = Column(String(36), primary_key=True, default=_uuid)
+    company_id   = Column(String(36), ForeignKey("companies.id"), nullable=True, index=True)
+    session_id   = Column(String(36), ForeignKey("proctoring_sessions.id"), nullable=False, index=True)
+    violation_id = Column(String(36), ForeignKey("proctoring_violations.id"), nullable=True, index=True)
+    outcome      = Column(String(20), nullable=False)   # confirmed | dismissed | inconclusive
+    remarks      = Column(Text, nullable=True)
+    reviewer_id  = Column(String(36), ForeignKey("users.id"), nullable=True)
+    # Microsecond precision: "latest review wins", and a plain MySQL DATETIME rounds to the
+    # second, so a changed mind saved within the same second would tie with the original.
+    created_at   = Column(DateTime().with_variant(mysql_types.DATETIME(fsp=6), "mysql"),
+                          default=datetime.utcnow)
+
+
+class AssessmentExplanation(Base, TenantScoped):
+    """The candidate's own account of a test — e.g. why a flag was raised or a test ended.
+    Shown to reviewers alongside the proctoring record. Append-only."""
+    __tablename__ = "assessment_explanations"
+
+    id                = Column(String(36), primary_key=True, default=_uuid)
+    company_id        = Column(String(36), ForeignKey("companies.id"), nullable=True, index=True)
+    interview_id      = Column(Integer, ForeignKey("interviews.id"), nullable=False, index=True)
+    candidate_user_id = Column(String(36), ForeignKey("users.id"), nullable=False)
+    text              = Column(Text, nullable=False)
+    created_at        = Column(DateTime, default=datetime.utcnow)
 
 
 class ProctoringTranscript(Base, TenantScoped):

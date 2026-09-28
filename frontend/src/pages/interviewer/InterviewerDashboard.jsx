@@ -1530,8 +1530,8 @@ export default function InterviewerDashboard() {
               </div>
             </div>
 
-            {/* Stat Cards */}
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16 }}>
+            {/* Stat Cards — four across on desktop, two per row on a phone. */}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(150px, 100%), 1fr))', gap: 16 }}>
               {/* The card reports every meeting assigned, not `upcomingMeetings.length` — that is
                   `myMeetings.slice(0, 5)`, so the old card read "5" whether there were 5 or 50.
                   The sub-line says how many of them the list below actually shows. */}
@@ -1548,7 +1548,7 @@ export default function InterviewerDashboard() {
             </div>
 
             {/* Row 2: Donut + Upcoming Meetings */}
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1.6fr', gap: 16 }}>
+            <div className="stack-mobile" style={{ display: 'grid', gridTemplateColumns: '1fr 1.6fr', gap: 16 }}>
               {/* Test Pipeline donut */}
               <div style={{ background: 'var(--bg-secondary)', borderRadius: 14, padding: 24, border: '1px solid var(--border-subtle)' }}>
                 <div style={{ fontWeight: 700, fontSize: '1rem', marginBottom: 16 }}>Test Pipeline</div>
@@ -1628,7 +1628,7 @@ export default function InterviewerDashboard() {
             </div>
 
             {/* Row 3: Question Bank + Assigned Jobs */}
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+            <div className="stack-mobile" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
               {/* Question bank by type */}
               <div style={{ background: 'var(--bg-secondary)', borderRadius: 14, padding: 24, border: '1px solid var(--border-subtle)' }}>
                 <div style={{ fontWeight: 700, fontSize: '1rem', marginBottom: 4 }}>Question Bank</div>
@@ -1764,7 +1764,7 @@ export default function InterviewerDashboard() {
                     <div key={m.id} className="card" style={{ padding: 0, overflow: 'hidden' }}>
                       <div style={{ display: 'flex' }}>
                         <div style={{ width: 5, background: 'var(--accent-primary)', flexShrink: 0 }} />
-                        <div style={{ flex: 1, padding: '20px 24px' }}>
+                        <div style={{ flex: 1, minWidth: 0, padding: '20px 24px' }}>
                           {/* Header */}
                           <div className="flex-between" style={{ marginBottom: 14 }}>
                             <div>
@@ -1780,7 +1780,7 @@ export default function InterviewerDashboard() {
                           </div>
 
                           {/* Candidate Details */}
-                          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 10, marginBottom: 14 }}>
+                          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(140px, 100%), 1fr))', gap: 10, marginBottom: 14 }}>
                             <div style={{ padding: '8px 12px', background: 'var(--bg-tertiary)', borderRadius: 8 }}>
                               <div style={{ fontSize: '0.63rem', fontWeight: 700, textTransform: 'uppercase', color: 'var(--text-tertiary)', marginBottom: 2 }}>Email</div>
                               <div style={{ fontSize: '0.8rem', wordBreak: 'break-all' }}>{m.candidate_email || '—'}</div>
@@ -1849,7 +1849,7 @@ export default function InterviewerDashboard() {
                                 <button onClick={() => setMeetingFeedback(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '1.1rem', color: 'var(--text-tertiary)' }}>✕</button>
                               </div>
                               <form onSubmit={submitMeetingFeedback}>
-                                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 14 }}>
+                                <div className="stack-mobile" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 14 }}>
                                   {[
                                     { key: 'technical_score', label: 'Technical Skills' },
                                     { key: 'communication_score', label: 'Communication' },
@@ -2150,8 +2150,8 @@ export default function InterviewerDashboard() {
       {/* ═══════════ CREATE TEST TAB ═══════════ */}
       {tab === 'create-test' && (<>
         <div>
-          {/* Step indicator */}
-          <div className="flex gap-8 mb-24">
+          {/* Step indicator — scrolls sideways on narrow screens rather than spilling off. */}
+          <div className="flex gap-8 mb-24 scroll-x-mobile" style={{ whiteSpace: 'nowrap' }}>
             {[
               { n: 1, label: 'Job & Interview' },
               { n: 2, label: 'Skills & Questions' },
@@ -3758,7 +3758,7 @@ export default function InterviewerDashboard() {
 
       {/* ═══════════ REQUEST CANDIDATES TAB ═══════════ */}
       {tab === 'request-candidates' && (
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 380px', gap: 20, alignItems: 'start' }}>
+        <div className="stack-mobile-lg" style={{ display: 'grid', gridTemplateColumns: '1fr 380px', gap: 20, alignItems: 'start' }}>
           {/* Request Form */}
           <div className="card">
             <h3 style={{ marginBottom: 20 }}>Request Candidates</h3>

@@ -162,6 +162,10 @@ class FaceAnalyzer:
         self._registered_lbp = None
         self._registered_geometry = None
         self._registered_sface_embedding = None
+        # (identity_match, similarity) from the last frame that actually ran _match_face
+        # against the CURRENT baseline; None until one has. Skip frames reuse this, never
+        # _last_result — see _apply_identity_check.
+        self._last_identity: Optional[Tuple[bool, float]] = None
 
         # The models themselves are NOT owned here any more. They live in
         # proctoring/model_registry.py and are borrowed for the duration of each
@@ -255,6 +259,8 @@ class FaceAnalyzer:
         """Register the identity baseline. Serialised against analyze() — see _lock."""
         with self._lock:
             with self._borrowed():
+                # A match against the previous baseline says nothing about the new one.
+                self._last_identity = None
                 return self._register_face_unlocked(frame)
 
     # Enrollment quality floors. A baseline is registered ONCE and every later frame is
@@ -379,6 +385,9 @@ class FaceAnalyzer:
         # ──────────── NO FACE DETECTED ────────────
         if not detection.face_landmarks:
             self._consecutive_no_face += 1
+            # Whoever comes back into frame gets compared afresh, not waved through on
+            # the match of the person who left.
+            self._last_identity = None
             self._yaw_history.clear()
             self._pitch_history.clear()
             self._roll_history.clear()
@@ -564,22 +573,38 @@ class FaceAnalyzer:
         # ══════════════════════════════════════════
         #  FACE MATCHING (untouched per user request)
         # ══════════════════════════════════════════
-        # Already set at the top of this method; recomputed here only because
-        # the matching logic below branches on it.
-        has_registration = self._has_registration()
-        if has_registration and self._frame_count % max(self.cfg.skip_frames, 1) == 0:
-            result.identity_match, result.similarity_score = self._match_face(frame, fx_px, fy_px, fw_px, fh_px)
-            if not result.identity_match:
-                result.flags.append("IDENTITY_MISMATCH")
-        elif has_registration:
-            result.identity_match = self._last_result.identity_match
-            result.similarity_score = self._last_result.similarity_score
-            if not result.identity_match:
-                result.flags.append("IDENTITY_MISMATCH")
+        self._apply_identity_check(result, frame, fx_px, fy_px, fw_px, fh_px)
 
         result.processing_time_ms = (time.perf_counter() - t0) * 1000
         self._last_result = result
         return result
+
+    def _apply_identity_check(self, result: FaceAnalysisResult, frame: np.ndarray,
+                              x: int, y: int, w: int, h: int) -> None:
+        """Set identity_match / similarity_score / IDENTITY_MISMATCH on a face frame.
+
+        _match_face runs every `skip_frames` frames; in between, the last real match is
+        reused. That reuse used to copy `_last_result`, which is not the same thing:
+        `_last_result` is simply the previous frame, and any frame that never ran a match
+        (the very first frame of a session, a no-face frame, a frame from before the
+        baseline was registered) carries the dataclass default of identity_match=False,
+        similarity 0.0. Copying it raised IDENTITY_MISMATCH at similarity 0.00 against a
+        candidate who was never compared at all — on frame 1 of nearly every session, and
+        again on the first skipped frame after every look-away.
+
+        Now a skip frame reuses only a match that actually ran against the current
+        baseline during the current stretch of the face being in view, and runs one
+        immediately if there is none. The cache is dropped on enrollment and whenever the
+        face leaves the frame.
+        """
+        if not self._has_registration():
+            return
+        due = self._frame_count % max(self.cfg.skip_frames, 1) == 0
+        if due or self._last_identity is None:
+            self._last_identity = self._match_face(frame, x, y, w, h)
+        result.identity_match, result.similarity_score = self._last_identity
+        if not result.identity_match:
+            result.flags.append("IDENTITY_MISMATCH")
 
     # ══════════════════════════════════════════════════
     #  HELPER METHODS
@@ -745,6 +770,7 @@ class FaceAnalyzer:
 
         if result.face_count == 0:
             self._consecutive_no_face += 1
+            self._last_identity = None  # see _analyze_landmarker
             if self._consecutive_no_face >= self._NO_FACE_CONFIRM:
                 result.face_detected = False
                 result.flags.append("NO_FACE")
@@ -832,18 +858,7 @@ class FaceAnalyzer:
         if result.gaze_deviation_score > self.cfg.gaze_deviation_threshold:
             result.flags.append("SUSPICIOUS_GAZE")
 
-        # Already set at the top of this method; recomputed here only because
-        # the matching logic below branches on it.
-        has_registration = self._has_registration()
-        if has_registration and self._frame_count % max(self.cfg.skip_frames, 1) == 0:
-            result.identity_match, result.similarity_score = self._match_face(frame, fx, fy, fw, fh)
-            if not result.identity_match:
-                result.flags.append("IDENTITY_MISMATCH")
-        elif has_registration:
-            result.identity_match = self._last_result.identity_match
-            result.similarity_score = self._last_result.similarity_score
-            if not result.identity_match:
-                result.flags.append("IDENTITY_MISMATCH")
+        self._apply_identity_check(result, frame, fx, fy, fw, fh)
 
         result.processing_time_ms = (time.perf_counter() - t0) * 1000
         self._last_result = result
@@ -992,3 +1007,4 @@ class FaceAnalyzer:
             self._registered_lbp = None
             self._registered_geometry = None
             self._registered_sface_embedding = None
+            self._last_identity = None

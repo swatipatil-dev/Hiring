@@ -310,13 +310,39 @@ later with `libGL.so.1: cannot open shared object file`.
 
 `[root]`
 
+Redis must have a password here. The coding-judge worker takes its work from Redis
+and is in the `docker` group (root-equivalent, see Step 4); without a password every
+account on this server can write to Redis. The worker also refuses anything but its
+own jobs and reads them as JSON, never pickle (`src/judge/rq_safety.py`), but the
+password is what keeps other accounts out of the queue in the first place.
+
+First make sure nothing else on the server already uses Redis — a password would
+lock it out:
+
+```bash
+rpm -q redis && redis-cli CLIENT LIST | wc -l
+```
+
+`package redis is not installed`, or a count of `1` (that is your own `redis-cli`):
+continue. Anything more: another site uses this Redis. Stop, and give HireFlow its own
+instance on another port instead of adding a password to the shared one.
+
 ```bash
 dnf install -y redis
 sed -i 's/^bind .*/bind 127.0.0.1/' /etc/redis/redis.conf
+REDIS_PW=$(openssl rand -hex 32)
+echo "requirepass $REDIS_PW" >> /etc/redis/redis.conf
+for c in CONFIG DEBUG MODULE FLUSHALL FLUSHDB; do
+  echo "rename-command $c \"\"" >> /etc/redis/redis.conf
+done
 systemctl enable --now redis
+echo "REDIS_URL=redis://:$REDIS_PW@127.0.0.1:6379/0"
 ```
 
-**Check:** `redis-cli ping` replies `PONG`.
+Keep the printed `REDIS_URL=` line — it goes into `.env` in Step 7.
+
+**Check:** `redis-cli ping` replies `NOAUTH Authentication required.`, and
+`redis-cli -a "$REDIS_PW" --no-auth-warning ping` replies `PONG`.
 
 ### 2.5 Docker  `[SERVER-WIDE]`
 
@@ -330,7 +356,33 @@ systemctl enable --now docker
 
 **Check:** `docker run --rm hello-world` prints "Hello from Docker!".
 
-Docker runs candidate code safely isolated. No reboot is needed.
+Docker runs each candidate's code in a throwaway container with no network, a
+read-only filesystem and memory, process and time limits. No reboot is needed.
+
+**Recommended — gVisor.** Containers share the host kernel; gVisor puts a user-space
+kernel between candidate code and the real one, so a kernel exploit in a submission
+does not reach the server that also holds the database and four other accounts:
+
+```bash
+(
+  set -e; cd /tmp
+  URL=https://storage.googleapis.com/gvisor/releases/release/latest/$(uname -m)
+  curl -fsSLO $URL/runsc -fsSLO $URL/runsc.sha512 \
+       -fsSLO $URL/containerd-shim-runsc-v1 -fsSLO $URL/containerd-shim-runsc-v1.sha512
+  sha512sum -c runsc.sha512 -c containerd-shim-runsc-v1.sha512
+  chmod a+rx runsc containerd-shim-runsc-v1
+  mv runsc containerd-shim-runsc-v1 /usr/local/bin/ && rm -f *.sha512
+)
+/usr/local/bin/runsc install && systemctl reload docker
+docker run --rm --runtime=runsc hello-world
+```
+
+These are gVisor's own install steps (gvisor.dev, "Installation"). Some virtual
+servers cannot run it; if the last command fails, leave `JUDGE_RUNTIME` unset — the
+judge works as before, with the warning.
+
+When the last command prints "Hello from Docker!", set `JUDGE_RUNTIME=runsc` in `.env`
+(Step 7). Without it the worker logs a warning at every start.
 
 ---
 
@@ -391,8 +443,11 @@ Then, on that page:
 ```bash
 useradd -r -m -d /opt/hireflow -s /bin/bash hireflow
 useradd -r -s /sbin/nologin -G docker hfjudge
-mkdir -p /srv/judge_work && chown hfjudge:hfjudge /srv/judge_work
+mkdir -p /srv/judge_work && chown hfjudge:hfjudge /srv/judge_work && chmod 700 /srv/judge_work
 ```
+
+`chmod 700` matters: each candidate's job directory inside it must be world-writable
+for the container, so the folder above it is what keeps other accounts out.
 
 **Check:** `id hfjudge` lists `docker` among its groups.
 
@@ -569,6 +624,8 @@ Edit each line (see the nano keys in Step 0). Use `Ctrl+W` to jump to a setting.
 | `SECRET_KEY=` | the key from 7.1 |
 | `DATABASE_URL=` | `mysql+pymysql://innomaxskills_hf:YOURPASSWORD@localhost:3306/innomaxskills_hireflow` |
 | `GEMINI_API_KEY=` | your key from Step 1 |
+| `REDIS_URL=` | the line printed in Step 2.4 (`redis://:PASSWORD@127.0.0.1:6379/0`) |
+| `JUDGE_RUNTIME=` | `runsc` if you installed gVisor in Step 2.5; otherwise leave it out |
 | `SMTP_HOST=` `SMTP_PORT=` `SMTP_USER=` `SMTP_PASS=` `FROM_EMAIL=` | your email provider details |
 | `SUPERADMIN_EMAIL=` `SUPERADMIN_PASSWORD=` | **required on a fresh install** — see below |
 | `PLATFORM_ADMIN_EMAIL=` `PLATFORM_ADMIN_PASSWORD=` | **required on a fresh install** — see below |

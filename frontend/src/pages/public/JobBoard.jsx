@@ -1,14 +1,16 @@
 import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { MapPin, Briefcase, Clock, DollarSign, ChevronRight, Search } from 'lucide-react'
+import { exchangeLegacyKey, getStoredSlug, storeSlug } from '../../utils/tenant'
 
 const API_BASE = '/api/v1'
 
 export default function JobBoard() {
   const navigate = useNavigate()
-  const params  = new URLSearchParams(window.location.search)
-  const apiKey  = params.get('key') || ''
+  const params   = useParams()
+  const [searchParams] = useSearchParams()
 
+  const [slug, setSlug]         = useState(params.companySlug || searchParams.get('c') || '')
   const [company, setCompany]   = useState(null)
   const [jobs, setJobs]         = useState([])
   const [loading, setLoading]   = useState(true)
@@ -17,21 +19,43 @@ export default function JobBoard() {
   const [selected, setSelected] = useState(null)   // job detail modal
 
   useEffect(() => {
-    if (!apiKey) { setError('Missing API key.'); setLoading(false); return }
-    localStorage.setItem('hireflow_company_key', apiKey)
-    fetch(`${API_BASE}/public/jobs?key=${encodeURIComponent(apiKey)}`)
-      .then(r => {
-        if (r.ok) return r.json()
-        // Only an auth/lookup failure means the key is actually bad. A 5xx or
-        // proxy error means the server is unreachable — don't blame the key.
-        if (r.status === 401 || r.status === 403 || r.status === 404) {
-          throw new Error('Invalid or inactive API key')
+    let cancelled = false
+
+    ;(async () => {
+      let active = params.companySlug || searchParams.get('c') || ''
+      if (!active && searchParams.get('key')) {
+        // Legacy link: swap the secret for the slug and scrub it from the address bar.
+        active = (await exchangeLegacyKey(searchParams, sl => `/${sl}/jobs`)) || ''
+      }
+      if (!active) active = getStoredSlug() || ''
+      if (cancelled) return
+      setSlug(active)
+
+      if (!active) {
+        setError('This job board link is missing its company name.')
+        setLoading(false)
+        return
+      }
+
+      try {
+        const r = await fetch(`${API_BASE}/public/jobs?c=${encodeURIComponent(active)}`)
+        if (!r.ok) {
+          // Only a lookup failure means the company is actually wrong. A 5xx or proxy
+          // error means the server is unreachable — don't blame the link.
+          if (r.status === 401 || r.status === 403 || r.status === 404) {
+            throw new Error('This company page is no longer available.')
+          }
+          throw new Error("Couldn't reach the server. Please refresh and try again.")
         }
-        throw new Error("Couldn't reach the server. Please refresh and try again.")
-      })
-      .then(data => {
+        const data = await r.json()
+        if (cancelled) return
         const c = data.company
         setCompany(c)
+        // Stored only once the company actually resolved. The old code wrote the
+        // identifier to localStorage before validating it, so a bad value stuck and
+        // poisoned every later redirect. Never for the platform company: it has no
+        // slug portal, so remembering it would send later redirects to a dead end.
+        if (!c?.is_platform) storeSlug(c?.slug || active)
         setJobs(data.jobs || [])
         // Apply company branding to the public page
         if (c?.name) document.title = `${c.name} — Careers`
@@ -50,14 +74,19 @@ export default function JobBoard() {
             `https://fonts.googleapis.com/css2?family=${encodeURIComponent(c.font_family)}:wght@400;500;600;700&display=swap`
           document.documentElement.style.setProperty('--jb-font', `'${c.font_family}', system-ui, sans-serif`)
         }
-      })
-      .catch(e => setError(
-        e.message === 'Failed to fetch'
-          ? "Couldn't reach the server. Please refresh and try again."
-          : e.message
-      ))
-      .finally(() => setLoading(false))
-  }, [apiKey])
+      } catch (e) {
+        if (!cancelled) setError(
+          e.message === 'Failed to fetch'
+            ? "Couldn't reach the server. Please refresh and try again."
+            : e.message
+        )
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    })()
+
+    return () => { cancelled = true }
+  }, [params.companySlug, searchParams])
 
   const accent  = company?.primary_color || '#2b7cba'
   const filtered = jobs.filter(j =>
@@ -83,9 +112,13 @@ export default function JobBoard() {
   // Same-tab navigation so the browser back-stack stays coherent for the
   // candidate:  career page → portal (login) → dashboard.  Pressing Back then
   // walks back the same way, and the career page is the static floor.
-  const portalPath = (jobId) =>
-    `/portal?key=${encodeURIComponent(apiKey)}${jobId ? `&job_id=${jobId}` : ''}`
+  // The platform company (Innomax) has no slug portal — its candidates use the
+  // platform's own sign-in, which links to registration.
+  const portalPath = (jobId) => company?.is_platform
+    ? '/login'
+    : `/${encodeURIComponent(slug)}/portal${jobId ? `?job_id=${jobId}` : ''}`
   const goApply = (jobId) => navigate(portalPath(jobId))
+  const signInPath = company?.is_platform ? '/login' : `/${encodeURIComponent(slug)}`
 
   if (loading) return (
     <div className="jb-page">
@@ -127,7 +160,7 @@ export default function JobBoard() {
             <div className="jb-count" style={{ background: accent + '18', color: accent }}>
               {filtered.length} {filtered.length === 1 ? 'role' : 'roles'}
             </div>
-            <a href={`/app?key=${encodeURIComponent(apiKey)}`}
+            <a href={signInPath}
               style={{ background: accent, color: '#fff', padding: '8px 18px', borderRadius: 10, fontSize: '0.85rem', fontWeight: 700, textDecoration: 'none', whiteSpace: 'nowrap' }}>
               Sign In
             </a>

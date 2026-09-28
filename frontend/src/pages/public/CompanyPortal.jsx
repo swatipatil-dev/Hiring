@@ -1,14 +1,16 @@
 import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { exchangeLegacyKey, getStoredSlug, storeSlug } from '../../utils/tenant'
 
 const API = '/api/v1'
 
 export default function CompanyPortal() {
-  const params  = new URLSearchParams(window.location.search)
-  const apiKey  = params.get('key') || ''
-  const jobId   = params.get('job_id') || ''
+  const params   = useParams()
+  const [searchParams] = useSearchParams()
+  const jobId    = searchParams.get('job_id') || ''
   const navigate = useNavigate()
 
+  const [slug, setSlug]       = useState(params.companySlug || searchParams.get('c') || '')
   const [company, setCompany] = useState(null)
   const [tab, setTab]         = useState('login')   // 'login' | 'register'
   const [step, setStep]       = useState('form')    // 'form' | 'otp'
@@ -31,18 +33,39 @@ export default function CompanyPortal() {
   const accent = company?.primary_color || '#2b7cba'
 
   useEffect(() => {
-    if (!apiKey) { setLoading(false); return }
-    fetch(`${API}/public/company-info?key=${encodeURIComponent(apiKey)}`)
-      .then(r => r.ok ? r.json() : Promise.reject())
-      .then(d => setCompany(d))
-      .catch(() => setError('Invalid company link.'))
-      .finally(() => setLoading(false))
-  }, [apiKey])
+    let cancelled = false
+
+    ;(async () => {
+      let active = params.companySlug || searchParams.get('c') || ''
+      if (!active && searchParams.get('key')) {
+        // Legacy link: swap the secret for the slug and scrub it from the address bar.
+        const sub = jobId ? `/portal?job_id=${encodeURIComponent(jobId)}` : '/portal'
+        active = (await exchangeLegacyKey(searchParams, sl => `/${sl}${sub}`)) || ''
+      }
+      if (!active) active = getStoredSlug() || ''
+      if (cancelled) return
+      setSlug(active)
+
+      if (!active) { setLoading(false); return }
+      try {
+        const r = await fetch(`${API}/public/company-info?c=${encodeURIComponent(active)}`)
+        if (!r.ok) throw new Error('unresolved')
+        const d = await r.json()
+        if (!cancelled) { setCompany(d); storeSlug(d?.slug || active) }
+      } catch {
+        if (!cancelled) setError('Invalid company link.')
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    })()
+
+    return () => { cancelled = true }
+  }, [params.companySlug, searchParams, jobId])
 
   const saveSession = (data) => {
     localStorage.setItem('hireflow_token', data.access_token)
     localStorage.setItem('hireflow_user', JSON.stringify(data.user))
-    if (apiKey) localStorage.setItem('hireflow_company_key', apiKey)
+    storeSlug(slug)
     navigate('/candidate')
   }
 
@@ -52,7 +75,7 @@ export default function CompanyPortal() {
     try {
       const r = await fetch(`${API}/auth/login`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, password, api_key: apiKey || undefined })
+        body: JSON.stringify({ email, password, company_slug: slug || undefined })
       })
       const data = await r.json()
       if (!r.ok) throw new Error(data.detail || 'Login failed')
@@ -75,7 +98,7 @@ export default function CompanyPortal() {
           email: reg.email, password: reg.password,
           first_name: reg.first_name, last_name: reg.last_name,
           phone: reg.phone, role: 'candidate',
-          api_key: apiKey || undefined,
+          company_slug: slug || undefined,
         })
       })
       const data = await r.json()
@@ -94,7 +117,7 @@ export default function CompanyPortal() {
     try {
       const r = await fetch(`${API}/auth/verify-otp`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: reg.email, otp, api_key: apiKey || undefined })
+        body: JSON.stringify({ email: reg.email, otp, company_slug: slug || undefined })
       })
       const data = await r.json()
       if (!r.ok) throw new Error(data.detail || 'OTP verification failed')
@@ -125,7 +148,7 @@ export default function CompanyPortal() {
             <div style={S.companySub}>Candidate Portal</div>
           </div>
         </div>
-        <a href={`/jobs?key=${apiKey}`} style={{ ...S.backLink, color: accent }}>← View Jobs</a>
+        <a href={`/${encodeURIComponent(slug)}/jobs`} style={{ ...S.backLink, color: accent }}>← View Jobs</a>
       </header>
 
       {/* Card */}

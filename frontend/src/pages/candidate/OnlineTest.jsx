@@ -8,6 +8,7 @@ import {
 } from '../../utils/fullscreen'
 import VoiceAnswer from './VoiceAnswer'
 import ErrorBoundary from '../../components/ErrorBoundary'
+import ExplanationForm from '../../components/ExplanationForm'
 
 // Monaco is loaded lazily and isolated behind an ErrorBoundary so that if it fails
 // to initialize (e.g. its web worker), the exam degrades to a plain code box instead
@@ -180,7 +181,8 @@ const PROCTOR_FLAG_LABELS = {
   NO_FACE: 'No face detected', MULTIPLE_FACES: 'Multiple people detected',
   IDENTITY_MISMATCH: 'Identity mismatch', PHONE_DETECTED: 'Phone detected',
   PHONE_GESTURE: 'Phone-use gesture', MULTIPLE_VOICES: 'Multiple voices',
-  CANDIDATE_LEFT: 'You left the camera view', TAB_SWITCH: 'Tab switch',
+  CANDIDATE_LEFT: 'You left the camera view', TAB_SWITCH: 'You left the test tab',
+  FULLSCREEN_EXIT: 'You left fullscreen',
   HEAD_TURNED: 'Looking away', SUSPICIOUS_GAZE: 'Gaze off-screen',
   LEANING_FORWARD: 'Leaning out of frame', HEAD_DOWN: 'Looking down',
 }
@@ -405,10 +407,17 @@ export default function OnlineTest() {
       // 2. Start proctoring session via REST
       try {
         const user = JSON.parse(localStorage.getItem('hireflow_user') || '{}')
+        // The consent the candidate gave on the instructions page (see
+        // MonitoringDisclosure in TestInstructions.jsx), stored with this session.
+        let monitoringConsent = null
+        try {
+          monitoringConsent = JSON.parse(sessionStorage.getItem(`hf_monitoring_consent_${interviewId}`) || 'null')
+        } catch { /* absent or unreadable: start without it */ }
         const res = await api.post('/proctor/sessions/start', {
           candidate_id: user.id || 'unknown',
           test_id: interviewId,
           interview_id: Number(interviewId),
+          ...(monitoringConsent ? { monitoring_consent: monitoringConsent } : {}),
         })
         // Remember what we created so teardown can release it. StrictMode mounts this
         // effect twice in dev, and navigating away mid-test tears it down at any point —
@@ -667,6 +676,9 @@ export default function OnlineTest() {
         //    Raw audio is analysed in memory and never persisted (AudioProctor docstring).
         const startAudioStream = async () => {
           if (!session.ws_audio_url || !streamRef.current) return
+          // Approved accommodation: microphone monitoring is off for this attempt. The
+          // server ignores audio anyway; not opening the stream means none is sent.
+          if (session.audio_monitoring_off) return
           if (!streamRef.current.getAudioTracks().length) {
             console.warn('Proctor audio: stream carries no audio track')
             return
@@ -785,7 +797,7 @@ export default function OnlineTest() {
           // Show warning flash
           setTabSwitchWarning(true)
           setTimeout(() => setTabSwitchWarning(false), 3000)
-          // Send to backend; backend applies the strike policy and may terminate.
+          // Recorded for the reviewer. Tab switches never end the test (server policy).
           if (proctorSession?.session_id) {
             api.post(`/proctor/sessions/${proctorSession.session_id}/tab-switch`, {
               count: newCount,
@@ -794,7 +806,7 @@ export default function OnlineTest() {
               if (r.data?.terminate) {
                 terminateTest(r.data.reason || 'TAB_SWITCH', r.data.message)
               } else if (r.data?.warning) {
-                setProctorWarning({ severity: 'serious', flag: 'TAB_SWITCH', strike: r.data.strike, max: r.data.max })
+                setProctorWarning({ severity: 'recorded', flag: 'TAB_SWITCH', occurrence: r.data.occurrence })
                 clearTimeout(warningTimerRef.current)
                 warningTimerRef.current = setTimeout(() => setProctorWarning(null), 6000)
               }
@@ -811,9 +823,9 @@ export default function OnlineTest() {
   // Fullscreen enforcement.
   //
   // This cannot stop anyone reaching another tab — Escape and F11 always work and no
-  // page may suppress them. What it does is make leaving conspicuous and costly: the
-  // questions go behind an overlay, and each exit is a strike under the same policy
-  // that governs tab switches, so the fourth one ends the test.
+  // page may suppress them. What it does is make leaving conspicuous: the questions go
+  // behind an overlay, and each exit is recorded for the reviewer, like a tab switch.
+  // Exits never end the test.
   //
   // Entering fullscreen needs a user gesture, so it happens on the Start button in
   // TestInstructions. Here we only observe, and offer a button to get back.
@@ -852,7 +864,7 @@ export default function OnlineTest() {
             if (r.data?.terminate) {
               terminateTest(r.data.reason || 'FULLSCREEN_EXIT', r.data.message)
             } else if (r.data?.warning) {
-              setProctorWarning({ severity: 'serious', flag: 'FULLSCREEN_EXIT', strike: r.data.strike, max: r.data.max })
+              setProctorWarning({ severity: 'recorded', flag: 'FULLSCREEN_EXIT', occurrence: r.data.occurrence })
               clearTimeout(warningTimerRef.current)
               warningTimerRef.current = setTimeout(() => setProctorWarning(null), 6000)
             }
@@ -1340,7 +1352,7 @@ export default function OnlineTest() {
     // Hand the screen back. The test is over; trapping them in fullscreen to read a
     // result they cannot act on is just rude.
     exitFullscreen()
-    setTerminated({ reason, message: message || 'Your test has been ended due to repeated proctoring violations.' })
+    setTerminated({ reason, message: message || 'The test ended early after repeated proctoring warnings.' })
     submitTest()
   }
 
@@ -1468,7 +1480,34 @@ export default function OnlineTest() {
           </svg>
         </div>
         <h2 style={x.doneTitle}>Test Already Submitted</h2>
-        <p style={x.doneSub}>You have already completed this test. Retakes are not allowed.</p>
+        <p style={x.doneSub}>
+          Each attempt can only be submitted once. If something went wrong, tell the hiring
+          team below; they can offer another attempt.
+        </p>
+        <div style={{ margin: '4px 0 18px' }}><ExplanationForm interviewId={interviewId} /></div>
+        <button style={x.doneBtn} onClick={() => navigate('/candidate/interviews')}>Back to Dashboard</button>
+      </div>
+      <style>{kf}</style>
+    </div>
+  )
+
+  // A test the proctor ended early also lands here once it auto-submits. It used to show
+  // the ordinary "Test Submitted" card, so the candidate never saw why it stopped.
+  if (done && terminated) return (
+    <div style={x.screen}>
+      <div style={x.doneCard}>
+        <div style={{ ...x.doneCheck, background: '#fef3c7' }}>
+          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#d97706" strokeWidth="2.5">
+            <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+          </svg>
+        </div>
+        <h2 style={x.doneTitle}>Your test ended early</h2>
+        <p style={x.doneSub}>{terminated.message}</p>
+        <p style={x.doneSub}>
+          Your answers up to that point have been submitted. A person on the hiring team reviews
+          what happened before any decision is made, and can offer another attempt.
+        </p>
+        <div style={{ margin: '4px 0 18px' }}><ExplanationForm interviewId={interviewId} /></div>
         <button style={x.doneBtn} onClick={() => navigate('/candidate/interviews')}>Back to Dashboard</button>
       </div>
       <style>{kf}</style>
@@ -1481,6 +1520,9 @@ export default function OnlineTest() {
         <div style={x.doneCheck}><svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#34a853" strokeWidth="2.5"><polyline points="20 6 9 17 4 12"/></svg></div>
         <h2 style={x.doneTitle}>Test Submitted</h2>
         <p style={x.doneSub}>Thank you for completing the test. Our team will review your results and get back to you soon.</p>
+        {enableWebcamMonitoring && (
+          <div style={{ margin: '4px 0 18px' }}><ExplanationForm interviewId={interviewId} /></div>
+        )}
         <button style={x.doneBtn} onClick={() => navigate('/candidate/interviews')}>Back to Dashboard</button>
       </div>
       <style>{kf}</style>
@@ -1646,9 +1688,14 @@ export default function OnlineTest() {
             <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
           </svg>
           <div style={{ fontSize: 12.5, color: proctorWarning.severity === 'serious' ? '#991b1b' : '#92400e', fontWeight: 600 }}>
+            {/* Only a second person, a phone or a face mismatch can end the test, so only
+                those get the numbered "will end" warning. Everything else is recorded for
+                the reviewer, and the wording says exactly that. */}
             {proctorWarning.severity === 'serious'
               ? `Warning ${proctorWarning.strike}/${proctorWarning.max} — ${PROCTOR_FLAG_LABELS[proctorWarning.flag] || proctorWarning.flag}. The test will end if this continues.`
-              : `${(proctorWarning.flags || []).map(f => PROCTOR_FLAG_LABELS[f] || f).join(', ')} — please face the screen and stay still.`}
+              : proctorWarning.severity === 'recorded'
+                ? `${PROCTOR_FLAG_LABELS[proctorWarning.flag] || proctorWarning.flag} — recorded for the reviewer. Please stay on the test.`
+                : `${(proctorWarning.flags || []).map(f => PROCTOR_FLAG_LABELS[f] || f).join(', ')} — recorded for the reviewer. Please face the screen.`}
           </div>
         </div>
       )}
@@ -1679,8 +1726,7 @@ export default function OnlineTest() {
             </p>
             {fullscreenExits > 0 && (
               <p style={{ margin: '10px 0 0', fontSize: 12.5, color: '#991b1b', fontWeight: 700 }}>
-                Leaving fullscreen is recorded. This is exit {fullscreenExits}; repeated
-                exits will end the test.
+                Leaving fullscreen is recorded for the reviewer. This is exit {fullscreenExits}.
               </p>
             )}
             <button
@@ -1722,8 +1768,12 @@ export default function OnlineTest() {
             <p style={{ margin: 0, fontSize: 13.5, color: '#475569', lineHeight: 1.5 }}>
               {terminated.message}
             </p>
-            <p style={{ margin: '14px 0 0', fontSize: 12, color: '#94a3b8' }}>
-              Your answers so far have been submitted. You may close this window.
+            <p style={{ margin: '12px 0 0', fontSize: 13, color: '#334155', lineHeight: 1.5 }}>
+              Your answers so far have been submitted. A person on the hiring team reviews
+              what happened before any decision is made.
+            </p>
+            <p style={{ margin: '10px 0 0', fontSize: 12, color: '#94a3b8' }}>
+              You may close this window.
             </p>
           </div>
         </div>
@@ -1906,7 +1956,7 @@ export default function OnlineTest() {
                   setAnswers(p => ({ ...p, [idx]: codeVal }))
                   setCodeRunning(true); setRunOutput(null); setGradeData(null); setCodeMsg(''); setCodeTab('result')
                   try {
-                    const { data } = await api.post('/judge/run', { language: curLang, source_code: codeVal, stdin: customInput, question_id: q.id })
+                    const { data } = await api.post('/judge/run', { language: curLang, source_code: codeVal, stdin: customInput, question_id: q.id, interview_id: Number(interviewId) })
                     setRunOutput(data)
                   } catch (e) {
                     setCodeMsg('Run failed: ' + (e.response?.data?.detail || e.message))
@@ -2055,7 +2105,7 @@ export default function OnlineTest() {
                   test whose duration had not loaded rendered 00:00:00 + "Final minute!". */}
               {secs > 0 && secs < 300 && <div style={x.timerWarn}>{secs < 60 ? 'Final minute!' : 'Less than 5 minutes left'}</div>}
             </div>
-            {/* Proctoring: Camera + Mic + Face Match + Cheating Score (only if interviewer enabled webcam monitoring) */}
+            {/* Proctoring: Camera + Mic + Face Match + Assessment Integrity Flags (only if interviewer enabled webcam monitoring) */}
             {enableWebcamMonitoring && (
             <div style={x.proctorCard}>
               <div style={x.proctorHead}>
@@ -2127,8 +2177,8 @@ export default function OnlineTest() {
                         : mismatch   ? { fg: T.danger,  bg: T.dangerSoft, bd: T.danger + '40' }
                         :              { fg: '#b45309', bg: '#fef3c7',    bd: '#f59e0b66' }
                 const label = pending ? (stale ? `Reconnecting… (${Math.round(analysisAge / 1000)}s)` : 'Checking…')
-                            : verified ? 'Face Verified'
-                            : unverified ? 'Identity Unverified'
+                            : verified ? 'Matches your photo'
+                            : unverified ? 'No photo to compare'
                             : noFace ? 'No Face'
                             : mismatch ? 'Face Mismatch!' : 'Re-checking…'
                 return (
@@ -2224,7 +2274,7 @@ export default function OnlineTest() {
                 </div>
               )} */}
 
-              {/* Cheating Score Bar — hidden */}
+              {/* Assessment Integrity Flags Bar — hidden */}
               {/* <div style={{ marginTop: 6 }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 3 }}>
                   <span style={{ fontSize: 10, fontWeight: 600, color: '#555' }}>Trust Score</span>
@@ -2312,7 +2362,7 @@ export default function OnlineTest() {
                   old blanket "no application photo" message. */}
               {!faceRegistered && camReady && faceMatch.detected && !faceMatch.hasReference && (
                 <div style={{ marginTop: 8, fontFamily: T.sans, fontSize: 9.5, color: T.danger, fontWeight: 600, textAlign: 'center', padding: '4px 6px', background: T.dangerSoft, borderRadius: 6 }}>
-                  {enrollHint || 'No application photo found — identity cannot be verified'}
+                  {enrollHint || 'No application photo on file, so your face can’t be compared with one'}
                 </div>
               )}
             </div>
@@ -2734,7 +2784,7 @@ const x = {
   /* Screen states */
   screen: { position: 'fixed', inset: 0, zIndex: 9999, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: T.canvas },
   spin: { width: 32, height: 32, borderRadius: '50%', border: `3px solid ${T.line}`, borderTopColor: T.teal, animation: 'spin .7s linear infinite' },
-  doneCard: { textAlign: 'center', padding: '46px 54px', background: T.paper, borderRadius: 18, border: `1px solid ${T.line}`, boxShadow: T.shLg },
+  doneCard: { textAlign: 'center', maxWidth: 560, padding: '46px 54px', background: T.paper, borderRadius: 18, border: `1px solid ${T.line}`, boxShadow: T.shLg },
   doneCheck: { width: 68, height: 68, borderRadius: '50%', background: T.okSoft, display: 'grid', placeItems: 'center', margin: '0 auto 18px' },
   doneTitle: { fontFamily: T.serif, fontSize: 24, fontWeight: 600, color: T.ink, margin: '0 0 8px' },
   doneSub: { fontFamily: T.sans, fontSize: 14, color: T.ink2, margin: '0 0 26px' },
