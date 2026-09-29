@@ -15,6 +15,9 @@ No ML extras needed — pipeline.py imports only numpy at module scope.
 """
 import pytest
 
+# Runs in CI stage 2 (testing branch), which installs the proctoring extras.
+pytestmark = pytest.mark.proctor
+
 pytest.importorskip("numpy", reason="numpy required for the proctoring pipeline")
 
 from proctoring.pipeline import MODULE_WEIGHTS, ProctorPipeline

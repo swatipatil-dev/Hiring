@@ -267,14 +267,16 @@ Open **http://localhost:3000**.
 ```powershell
 cd backend
 pytest                          # everything
-pytest -m "not slow"            # what CI runs
+pytest -m "not slow and not proctor"   # CI stage 1 (develop)
+pytest -m "slow or proctor"            # CI stage 2 (testing)
 pytest test\test_ats_scoring.py # one file
 
 cd ..\frontend
 npm test                        # vitest, 9 files / 109 tests
 ```
 
-CI runs `pytest -m "not slow"`. The `slow` marker means "needs Ollama or takes over 5s".
+CI runs every test once, split over two stages (see 5.1). `slow` means "needs real
+models / an LLM or takes over 5s"; `proctor` means "needs opencv/mediapipe".
 
 ---
 
@@ -544,19 +546,27 @@ Once `DEPLOY_SSH_KEY` is saved in GitHub, delete your local copy of the private 
 
 # Part 5 — How the pipeline works
 
-Two workflows. `ci.yml` tests every branch; `deploy.yml` ships `main`.
+Two workflows. `ci.yml` tests each stage of `develop → testing → main` once; `deploy.yml`
+ships `main`.
 
 ## 5.1 CI — `.github/workflows/ci.yml`
 
-Runs on **every** push to any branch, and on PRs into `main` / `testing` / `develop`. Four
-jobs in parallel:
+Runs on PRs into and pushes to `develop` / `testing` / `main` (not on feature-branch
+pushes). A `plan` job skips any stage that already passed on the exact same code — how
+that works, and why nothing can be skipped untested, is in docs/CICD_SETUP.md
+"Branch flow".
+
+Stage 1 (develop), four jobs in parallel:
 
 | Job | What it does |
 |---|---|
 | `lint` | `flake8 routes/ src/`. Split out on purpose — a pytest failure used to hide lint entirely |
-| `backend` | `pytest -m "not slow"` against a MySQL 8 service container, with cached judge sandbox images |
+| `backend` | `pytest -m "not slow and not proctor"` against a MySQL 8 service container, with cached judge sandbox images |
 | `migrations` | Proves the schema the code expects matches the schema the migrations produce |
 | `frontend` | `npm install`, `vitest`, and a production `vite build` |
+
+Stage 2 (testing): `stage2` — `pytest -m "slow or proctor"` with the proctoring/ML extras.
+Stage 3 (main): no tests; `ci-result` confirms stages 1 and 2 passed, then deploy runs.
 
 ### Why the `migrations` job checks out the repo twice
 

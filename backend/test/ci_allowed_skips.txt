@@ -1,0 +1,7 @@
+# Tests allowed to skip in CI. Every other skip fails the stage
+# (scripts/ci_check_skips.py), because a skipped test is a test that did not run.
+#
+# One per line: <file>::<test name>  # why it cannot run in CI
+# Keep this short. "It was flaky" is not a reason — fix the test.
+
+test/test_cover_letter.py::test_cover_letter_real_generation  # calls a live Ollama LLM; CI has none

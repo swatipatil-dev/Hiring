@@ -7,6 +7,9 @@ keep an unauthenticated socket from being held open or used as a sink.
 """
 import pytest
 
+# Runs in CI stage 2 (testing branch), which installs the proctoring extras.
+pytestmark = pytest.mark.proctor
+
 # routes.py imports cv2 at module scope; same guard as the other proctor tests.
 pytest.importorskip("cv2", reason="proctoring extras not installed")
 

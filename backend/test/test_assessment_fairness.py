@@ -99,6 +99,7 @@ def test_no_explaining_someone_elses_test(client, candidate2_headers, setup):
     assert r.status_code == 404
 
 
+@pytest.mark.proctor
 def test_explanations_reach_the_report(client, candidate_headers, hr_headers, setup):
     pytest.importorskip("cv2", reason="proctoring extras not installed")
     iv = setup.attempt()
@@ -194,6 +195,7 @@ def test_only_submitted_tests_can_be_retaken(client, hr_headers, setup):
 
 # ── Pipeline enforcement ─────────────────────────────────────────────────────
 
+@pytest.mark.proctor
 def test_pipeline_drops_accommodated_flags():
     pytest.importorskip("cv2", reason="proctoring extras not installed")
     from proctoring.pipeline import ProctorPipeline

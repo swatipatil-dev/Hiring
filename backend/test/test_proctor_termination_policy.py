@@ -15,6 +15,9 @@ from types import SimpleNamespace
 
 import pytest
 
+# Runs in CI stage 2 (testing branch), which installs the proctoring extras.
+pytestmark = pytest.mark.proctor
+
 pytest.importorskip("cv2", reason="proctoring extras not installed")
 
 from proctoring import routes  # noqa: E402

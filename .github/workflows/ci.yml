@@ -1,45 +1,56 @@
 name: HireFlow CI
 
-# Label the run with the branch's role, so the Actions list says what a run means
-# without opening it — "CI · main (PRODUCTION)" reads differently from
-# "CI · develop (integration)".
 run-name: >-
-  CI · ${{ github.ref_name }} ${{
-    github.ref_name == 'main' && '(PRODUCTION — green means this DEPLOYS)'
-    || github.ref_name == 'testing' && '(pre-release)'
-    || github.ref_name == 'develop' && '(integration)'
-    || '(feature)' }}
+  CI · ${{ github.base_ref || github.ref_name }} ${{
+    (github.base_ref || github.ref_name) == 'main' && '(stage 3 · PRODUCTION — green means this DEPLOYS)'
+    || (github.base_ref || github.ref_name) == 'testing' && '(stage 2 · pre-release)'
+    || (github.base_ref || github.ref_name) == 'develop' && '(stage 1 · integration)'
+    || '(manual)' }}${{ github.event_name == 'pull_request' && ' · PR' || '' }}
 
 # Branch flow:  feature -> develop -> testing -> main
 #
-#   feature/*  day-to-day work        CI only
-#   develop    integration            CI only
-#   testing    pre-release / QA       CI only
-#   main       production             CI, then deploy.yml runs if CI is green
+# Every test runs ONCE on the way to production, and none is missed:
 #
-# A green run on main SHIPS. deploy.yml triggers on this workflow completing
-# (workflow_run) and checks the conclusion, so a red run deploys nothing — but a
-# green one needs no further approval.
+#   stage 1  develop   lint, backend (all but `slow`/`proctor`), migrations, frontend
+#   stage 2  testing   backend `slow` + `proctor` tests, with the proctoring/ML extras
+#   stage 3  main      no tests of its own — stages 1 and 2 must have passed on this
+#                      exact code; then deploy.yml ships it
+#
+# The two pytest selections are exact complements, so each test belongs to one
+# stage. Each stage also fails if any test was skipped without an approved reason
+# (backend/scripts/ci_check_skips.py, backend/test/ci_allowed_skips.txt).
+#
+# How a stage is not repeated: when a stage passes, `record-*` uploads an artifact
+# named ci-stage<N>-<tree>, where <tree> is `git rev-parse HEAD^{tree}` — the same
+# for the same code, whatever the commit or branch. The `plan` job looks that up
+# for every stage the target branch needs:
+#   found   -> the stage already passed on this exact code; skipped here
+#   missing -> the stage RUNS here
+# So a normal release tests once (PR into develop runs stage 1; the push after the
+# merge finds the marker; develop -> testing adds stage 2; testing -> main finds
+# both). Anything else — a hotfix pushed straight to main, a merge whose base moved,
+# an expired marker — has no marker for its tree and is tested in full. The
+# fallback is always "run it", never "assume it passed".
+#
+# Feature-branch pushes run no CI: their code is tested on the pull request into
+# develop. workflow_dispatch ignores markers and runs every stage the branch needs
+# (develop: 1; testing/main and any other branch: 1 and 2).
 #
 # `testing` deliberately does NOT deploy: there is one server
 # (career.innomaxskills.com), so deploying it would replace the live site with
-# unreviewed code. See docs/END_TO_END_RUNBOOK.md.
-#
-# Push is every branch, not a fixed list. The previous trigger named `staging`
-# and `develop` — neither of which existed — while missing every branch actually
-# in use, so pushes to real work branches ran no CI at all.
+# unreviewed code. See docs/CICD_SETUP.md.
 on:
   push:
-    branches: ['**']
+    branches: [develop, testing, main]
   pull_request:
-    branches: [main, testing, develop]
+    branches: [develop, testing, main]
   workflow_dispatch:
 
-# GITHUB_TOKEN gets read-only access. Without an explicit block a workflow inherits
-# the repository default, which is commonly read/write — and this one only ever reads
-# the checkout. release.yml is the single workflow here that needs `contents: write`.
+# Read-only, plus reading artifacts so `plan` can find stage markers.
+# release.yml is the single workflow here that needs `contents: write`.
 permissions:
   contents: read
+  actions: read
 
 # A new push to the same branch makes the previous run irrelevant.
 concurrency:
@@ -51,64 +62,64 @@ env:
   NODE_VERSION: "20"
 
 jobs:
-  # ── What changed ────────────────────────────────────────────────────────────
-  # GitHub has no job-level `paths:` filter, so this exports booleans the
-  # expensive jobs gate on. Twenty seconds here saves ten minutes of pytest on a
-  # commit that only touched the frontend or the docs.
-  #
-  # It FAILS OPEN, deliberately and in every ambiguous case — a first push with
-  # no parent, a shallow clone, a diff that errors. A false negative silently
-  # skips tests on code that did change; a false positive costs ten minutes.
-  # Those are not comparable, so the default is always "run everything".
-  changes:
+  # ── Which stages this run must execute ──────────────────────────────────────
+  plan:
     runs-on: ubuntu-latest
     outputs:
-      backend: ${{ steps.filter.outputs.backend }}
-      frontend: ${{ steps.filter.outputs.frontend }}
+      tree: ${{ steps.plan.outputs.tree }}
+      stage1: ${{ steps.plan.outputs.stage1 }}
+      stage2: ${{ steps.plan.outputs.stage2 }}
     steps:
+      # On a pull_request this is the merge commit GitHub builds, i.e. exactly the
+      # code that lands if the PR is merged now.
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2   # the parent commit is what we diff against
+          fetch-depth: 1
 
-      - name: Detect changed areas
-        id: filter
+      - name: Plan stages
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ github.base_ref || github.ref_name }}
+          EVENT: ${{ github.event_name }}
         run: |
-          BASE="${{ github.event.pull_request.base.sha || github.event.before }}"
-          # A brand-new branch reports an all-zero `before`, and a force-push can
-          # name a commit this shallow clone does not have. Both mean "no usable
-          # base" -> run everything.
-          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ] \
-             || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
-            echo "no usable base commit — running everything"
-            echo "backend=true"  >> "$GITHUB_OUTPUT"
-            echo "frontend=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          FILES=$(git diff --name-only "$BASE" HEAD) || {
-            echo "diff failed — running everything"
-            echo "backend=true"  >> "$GITHUB_OUTPUT"
-            echo "frontend=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          }
-          echo "$FILES"
-          # .github/ counts as backend: a workflow edit must be able to prove the
-          # suite it runs still passes.
-          if echo "$FILES" | grep -qE '^(backend/|\.github/)'; then
-            echo "backend=true"  >> "$GITHUB_OUTPUT"
-          else
-            echo "backend=false" >> "$GITHUB_OUTPUT"
-          fi
-          if echo "$FILES" | grep -qE '^(frontend/|\.github/)'; then
-            echo "frontend=true"  >> "$GITHUB_OUTPUT"
-          else
-            echo "frontend=false" >> "$GITHUB_OUTPUT"
-          fi
+          set -euo pipefail
+          TREE=$(git rev-parse 'HEAD^{tree}')
+          echo "tree=$TREE" >> "$GITHUB_OUTPUT"
+          echo "target branch: $TARGET   event: $EVENT   tree: $TREE"
+
+          case "$TARGET" in
+            develop)      NEED="1" ;;
+            testing|main) NEED="1 2" ;;
+            *)            NEED="1 2" ;;   # manual run on any other branch
+          esac
+
+          for N in 1 2; do
+            RUN=false
+            if [[ " $NEED " == *" $N "* ]]; then
+              RUN=true
+              if [ "$EVENT" != "workflow_dispatch" ]; then
+                # Unexpired marker for this exact tree -> the stage already passed.
+                FOUND=$(gh api -X GET "repos/${{ github.repository }}/actions/artifacts" \
+                          -f name="ci-stage$N-$TREE" -f per_page=5 \
+                          --jq '[.artifacts[] | select(.expired == false)] | length' || echo 0)
+                if [ "${FOUND:-0}" -gt 0 ]; then
+                  RUN=false
+                  echo "stage $N: already passed on this code (marker ci-stage$N-$TREE)"
+                fi
+              fi
+            fi
+            [ "$RUN" = true ] && echo "stage $N: RUNS in this workflow"
+            echo "stage$N=$RUN" >> "$GITHUB_OUTPUT"
+          done
+
+  # ════════════════════════ STAGE 1 · integration ════════════════════════════
 
   # ── Lint ────────────────────────────────────────────────────────────────────
-  # Its own job so it reports independently. Previously it ran AFTER pytest in
-  # the same job, which meant a test failure hid lint entirely, and a lint
-  # failure was only ever visible on an otherwise-green run.
+  # Its own job so it reports independently of pytest.
   lint:
+    needs: plan
+    if: needs.plan.outputs.stage1 == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -122,17 +133,13 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-          # Keyed on this workflow, not requirements-ci.txt: the job installs
-          # flake8 and nothing else, so hashing the full requirements file threw
-          # the cache away on every unrelated dependency bump.
+          # Keyed on this workflow: the job installs flake8 and nothing else.
           cache-dependency-path: .github/workflows/ci.yml
 
       - run: pip install flake8
 
-      # Ignore pre-existing cosmetic style issues across the codebase
-      # (whitespace, blank-line counts, comparison style, etc.) while keeping
-      # checks for the things that matter: undefined names (F821), syntax
-      # errors, unused imports of *names* (F-class), etc.
+      # Ignore pre-existing cosmetic style issues across the codebase while keeping
+      # checks for the things that matter: undefined names (F821), syntax errors.
       - name: flake8
         run: |
           flake8 routes/ src/ \
@@ -140,19 +147,11 @@ jobs:
             --ignore=E501,W503,E402,F401,W291,W293,W391,E302,E303,E305,E401,E127,E128,E123,E221,E225,E241,E711,E712,E722,E741,F811,F841,W504 \
             --exclude=src/services/ollama_service.py
 
-  # ── Backend tests ───────────────────────────────────────────────────────────
+  # ── Backend tests (everything except `slow` and `proctor`) ──────────────────
   backend:
+    needs: plan
+    if: needs.plan.outputs.stage1 == 'true'
     runs-on: ubuntu-latest
-    # Skipped on feature-branch pushes: the full suite runs when the branch is
-    # merge-bound (main/develop/testing) or a PR is opened. 9.7 of every 13.5
-    # billable minutes were spent here, most of it on intermediate pushes to a
-    # branch nobody was merging yet. A skipped job still leaves the run green,
-    # so deploy.yml's workflow_run chain is unaffected.
-    needs: changes
-    if: >-
-      needs.changes.outputs.backend == 'true' &&
-      (github.event_name != 'push' ||
-       contains(fromJSON('["main","develop","testing"]'), github.ref_name))
     defaults:
       run:
         working-directory: backend
@@ -192,8 +191,8 @@ jobs:
 
       # The judge integration tests run real code inside hardened Docker
       # containers. ubuntu-latest HAS a Docker daemon, so docker_available() is
-      # True and the skipif guards do NOT fire — meaning if an image is missing,
-      # every sandboxed test fails as RE/CE rather than skipping.
+      # True and the skipif guards do NOT fire — if an image is missing, every
+      # sandboxed test fails as RE/CE rather than skipping.
       #
       # Cached on the Dockerfiles: four uncached `docker build`s on every push
       # was the dominant cost of this workflow.
@@ -228,8 +227,19 @@ jobs:
           done
           mysql -h 127.0.0.1 -u root -p1234 -e "CREATE DATABASE IF NOT EXISTS recruitment_test_db;"
 
-      - name: pytest
-        run: pytest test/ -v --tb=short -m "not slow" --junit-xml=test-results.xml
+      # The exact complement of stage 2's `-m "slow or proctor"`. The proctoring
+      # files are also ignored, not just deselected: they skip at IMPORT time
+      # without opencv, before the marker filter applies, and would show up here
+      # as skips. Every test in them is marked `proctor`, so stage 2 runs them.
+      - name: pytest (stage 1 selection)
+        run: >-
+          pytest test/ -v --tb=short
+          -m "not slow and not proctor"
+          --ignore-glob="test/test_proctor_*.py"
+          --junit-xml=test-results.xml
+
+      - name: No unapproved skips
+        run: python scripts/ci_check_skips.py test-results.xml
 
       - name: Upload test results on failure
         if: failure()
@@ -262,17 +272,9 @@ jobs:
   #
   # When a branch adds no migrations, step 2 is a no-op and step 3 still runs.
   migrations:
+    needs: plan
+    if: needs.plan.outputs.stage1 == 'true'
     runs-on: ubuntu-latest
-    # Skipped on feature-branch pushes: the full suite runs when the branch is
-    # merge-bound (main/develop/testing) or a PR is opened. 9.7 of every 13.5
-    # billable minutes were spent here, most of it on intermediate pushes to a
-    # branch nobody was merging yet. A skipped job still leaves the run green,
-    # so deploy.yml's workflow_run chain is unaffected.
-    needs: changes
-    if: >-
-      needs.changes.outputs.backend == 'true' &&
-      (github.event_name != 'push' ||
-       contains(fromJSON('["main","develop","testing"]'), github.ref_name))
 
     services:
       mysql:
@@ -368,15 +370,11 @@ jobs:
         working-directory: pr/backend
         run: python scripts/schema_diff.py
 
-
   # ── Frontend ────────────────────────────────────────────────────────────────
-  # New. Node was never set up in CI, so 109 vitest tests and the production
-  # build were entirely unverified.
   frontend:
+    needs: plan
+    if: needs.plan.outputs.stage1 == 'true'
     runs-on: ubuntu-latest
-    # 1.4 min, so it stays on every branch — only the no-op case is skipped.
-    needs: changes
-    if: needs.changes.outputs.frontend == 'true'
     defaults:
       run:
         working-directory: frontend
@@ -403,3 +401,137 @@ jobs:
 
       - name: Production build
         run: npm run build
+
+  record-stage1:
+    needs: [plan, lint, backend, migrations, frontend]
+    if: >-
+      needs.plan.outputs.stage1 == 'true' &&
+      needs.lint.result == 'success' && needs.backend.result == 'success' &&
+      needs.migrations.result == 'success' && needs.frontend.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "stage 1 passed for tree ${{ needs.plan.outputs.tree }} (${{ github.sha }})" > marker.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ci-stage1-${{ needs.plan.outputs.tree }}
+          path: marker.txt
+          retention-days: 90
+
+  # ════════════════════════ STAGE 2 · pre-release ════════════════════════════
+  # The tests stage 1 deselects: `slow` (ATS accuracy against real models, LLM)
+  # and `proctor` (need opencv/mediapipe and proctoring/models/*). Before this
+  # stage existed, no CI run executed them at all.
+  stage2:
+    needs: plan
+    if: needs.plan.outputs.stage2 == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: "1234"
+          MYSQL_DATABASE: recruitment_test_db
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost -u root -p1234"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      TEST_DB: recruitment_test_db
+      DB_PASSWORD: "1234"
+      SECRET_KEY: ${{ secrets.SECRET_KEY || 'ci-test-secret-key-32chars-minimum!!' }}
+      DATABASE_URL: mysql+pymysql://root:1234@localhost:3306/recruitment_test_db
+      HF_HOME: /tmp/hf-cache
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements-ci-stage2.txt
+
+      # opencv (pulled in by mediapipe as well) needs the GL and GLib runtime libs.
+      - name: System libraries for opencv
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libgl1 libglib2.0-0
+
+      - run: pip install -r requirements-ci-stage2.txt
+
+      - name: Cache HuggingFace models
+        uses: actions/cache@v4
+        with:
+          path: /tmp/hf-cache
+          key: hf-models-${{ hashFiles('backend/scripts/prefetch_models.py') }}
+
+      - name: Fetch models
+        run: python scripts/prefetch_models.py
+
+      - name: Wait for MySQL
+        run: |
+          for i in {1..15}; do
+            mysql -h 127.0.0.1 -u root -p1234 -e "SELECT 1;" 2>/dev/null && break
+            echo "Waiting for MySQL... ($i)"
+            sleep 3
+          done
+          mysql -h 127.0.0.1 -u root -p1234 -e "CREATE DATABASE IF NOT EXISTS recruitment_test_db;"
+
+      - name: pytest (stage 2 selection)
+        run: >-
+          pytest test/ -v --tb=short
+          -m "slow or proctor"
+          --junit-xml=test-results.xml
+
+      - name: No unapproved skips
+        run: python scripts/ci_check_skips.py test-results.xml
+
+      - name: Upload test results on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage2-test-results
+          path: backend/test-results.xml
+
+  record-stage2:
+    needs: [plan, stage2]
+    if: needs.plan.outputs.stage2 == 'true' && needs.stage2.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "stage 2 passed for tree ${{ needs.plan.outputs.tree }} (${{ github.sha }})" > marker.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ci-stage2-${{ needs.plan.outputs.tree }}
+          path: marker.txt
+          retention-days: 90
+
+  # ── One result for the whole run ────────────────────────────────────────────
+  # The single status check to require in branch protection, and the reason a
+  # skipped stage can never read as green by accident: a stage job may only be
+  # skipped when `plan` decided it had already passed on this exact code.
+  ci-result:
+    needs: [plan, lint, backend, migrations, frontend, record-stage1, stage2, record-stage2]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every required stage passed
+        env:
+          PLAN: ${{ needs.plan.result }}
+          S1: ${{ needs.plan.outputs.stage1 }}
+          S2: ${{ needs.plan.outputs.stage2 }}
+          R1: ${{ needs.record-stage1.result }}
+          R2: ${{ needs.record-stage2.result }}
+        run: |
+          echo "plan=$PLAN  stage1 ran=$S1 (record=$R1)  stage2 ran=$S2 (record=$R2)"
+          [ "$PLAN" = success ] || { echo "::error::plan failed"; exit 1; }
+          if [ "$S1" = true ] && [ "$R1" != success ]; then echo "::error::stage 1 failed"; exit 1; fi
+          if [ "$S2" = true ] && [ "$R2" != success ]; then echo "::error::stage 2 failed"; exit 1; fi
+          echo "all required stages passed on this code"

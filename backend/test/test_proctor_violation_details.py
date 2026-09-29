@@ -10,6 +10,9 @@ from types import SimpleNamespace
 
 import pytest
 
+# Runs in CI stage 2 (testing branch), which installs the proctoring extras.
+pytestmark = pytest.mark.proctor
+
 # Same guard as test_proctor_fullscreen.py: routes.py imports cv2 at module scope and the
 # CI image carries no ML extras.
 pytest.importorskip("cv2", reason="proctoring extras not installed")

@@ -19,6 +19,9 @@ from types import SimpleNamespace
 
 import pytest
 
+# Runs in CI stage 2 (testing branch), which installs the proctoring extras.
+pytestmark = pytest.mark.proctor
+
 # proctoring/routes.py imports cv2 at module scope, and the CI image installs
 # requirements-ci.txt, which deliberately carries no ML extras — so importing this module
 # there raises ModuleNotFoundError and takes the whole collection down with it. Skip

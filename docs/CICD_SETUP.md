@@ -89,45 +89,59 @@ Before relying on it, in this order:
 ## Branch flow
 
 ```
-feature/*  →  develop  →  testing  →  main  →  production
+feature/*  →  PR into develop  →  testing  →  main  →  production
 ```
 
-| Branch | Purpose | CI on push | Deploys |
+Each branch is a **stage**, and every test runs **once** on the way to production:
+
+| Stage | Branch | Runs | Deploys |
 |---|---|---|---|
-| feature branches | day-to-day work | lint + frontend | ✗ |
-| `develop` | integration | ✅ full suite | ✗ |
-| `testing` | pre-release / QA | ✅ full suite | ✗ |
-| `main` | production | ✅ full suite | ✅ **automatically, if CI passes** |
+| 1 · integration | PR into `develop` (and the push after merging) | lint, backend tests except `slow`/`proctor`, migrations, frontend tests + build | ✗ |
+| 2 · pre-release | `testing` | backend `slow` + `proctor` tests, with the proctoring/ML extras (`requirements-ci-stage2.txt`) | ✗ |
+| 3 · production | `main` | no tests of its own — stages 1 and 2 must already have passed on this exact code | ✅ **automatically, if CI passes** |
 
-**A pull request always runs the full suite**, whatever the branch. Feature
-branches get the fast signal on every push and the expensive one when the work
-is merge-bound.
+The two pytest selections are exact complements (`-m "not slow and not proctor"`
+and `-m "slow or proctor"`), so every test belongs to exactly one stage. Before
+stage 2 existed, the `slow` and `proctor` tests ran in no CI run at all.
 
-Why: the backend job is 9.7 of every 13.5 billable minutes, and 82 of 100 runs
-in September were direct pushes — one feature branch alone spent ~390 minutes on
-intermediate commits nobody was merging yet. That exhausted the month's Actions
-allowance by the 19th and stopped CI *and* production deploys dead for the rest
-of the cycle. Running the full suite on a branch's every keystroke bought very
-little and cost the thing outright.
+**No silent skips.** Each stage fails if any test was skipped, unless it is listed
+in `backend/test/ci_allowed_skips.txt` with the reason it cannot run in CI
+(`backend/scripts/ci_check_skips.py`). A new test that needs opencv must be marked
+`@pytest.mark.proctor` (every `test_proctor_*.py` file carries it module-wide);
+left unmarked it skips in stage 1 and fails this check.
 
-The branch list is deliberately still `['**']` — see below. What changed is how
-much of the matrix a run pays for, not whether a run happens.
+### How a stage is not repeated
 
-`backend` and `migrations` also skip when a commit touches no backend code, and
-`frontend` skips when it touches no frontend code. The detection fails **open**:
-a first push, a force-push, or a failed diff all run everything, because a false
-negative silently skips tests on code that changed while a false positive only
-costs minutes.
+When a stage passes, CI uploads an artifact named `ci-stage<N>-<tree>`, where
+`<tree>` is `git rev-parse HEAD^{tree}` — identical for identical code, whatever
+the commit or branch. Every run starts with a `plan` job that looks up the marker
+for each stage the target branch needs:
+
+- **found** → that stage already passed on this exact code and is skipped;
+- **missing** → the stage runs in this workflow.
+
+A normal release therefore tests once: the PR into `develop` runs stage 1, the push
+after merging finds its marker, `develop → testing` adds stage 2, and `testing →
+main` finds both and goes straight to deploy. Anything else — a hotfix pushed
+straight to `main`, a merge whose base moved, a marker past its 90-day retention —
+has no marker for its tree and is tested in full. The fallback is always "run it",
+never "assume it passed".
+
+Promote with plain merges of the whole branch (`develop` into `testing`, `testing`
+into `main`) so the code, and therefore the tree, is unchanged; that is what lets
+the markers match.
+
+**Feature-branch pushes run no CI.** Their code is tested on the pull request into
+`develop`. `workflow_dispatch` ignores markers and runs every stage the branch
+needs, for a manual full run.
+
+`ci-result` is the single job that summarises a run — require it in branch
+protection. A stage job may be skipped only when `plan` found its marker.
 
 **`testing` does not deploy anywhere.** There is exactly one environment —
 `career.innomaxskills.com` on `66.116.207.71`. Deploying `testing` would replace the live
 site that HR and candidates are using with unreviewed code. Until a second host exists,
 `testing` is a review stage, not an environment.
-
-CI runs on **every** branch (`branches: ['**']`), not just these three. A fixed list is what
-previously left real work branches untested — the old trigger named `staging` and `develop`
-when neither existed, so a branch could sit 16 commits behind `main` with nothing ever
-running against it.
 
 `deploy.yml` refuses to run from anything but `main`, checked in the job itself rather than
 left to the trigger. `workflow_dispatch` lets you pick any branch from the Actions UI, and

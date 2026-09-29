@@ -100,7 +100,14 @@ def test_hr_cannot_access_admin_endpoint(client, hr_headers):
 def test_create_offer_for_candidate(client, hr_headers, candidate_headers, db):
     """HR can create an offer — offer status should be 'sent' not 'draft'."""
     import io
-    from src.models.models import Candidate
+    from src.models.models import Candidate, User
+
+    # The stock fixtures put the candidate in the platform org and HR in a separate
+    # "Test Company"; applying across companies is refused (404), which used to turn
+    # this test into a silent skip. A candidate applying here belongs to HR's company.
+    hr = db.query(User).filter(User.email == "hr_test@test.com").first()
+    db.query(User).filter(User.email == "candidate_test@test.com").first().company_id = hr.company_id
+    db.flush()
 
     job_id = _create_job(client, hr_headers, status="active")
 

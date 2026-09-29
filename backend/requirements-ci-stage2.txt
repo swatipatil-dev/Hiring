@@ -1,0 +1,12 @@
+# CI stage 2 (testing branch): everything stage 1 installs, plus the proctoring
+# and ML extras that requirements-ci.txt leaves out. The tests marked `proctor`
+# and `slow` need them; stage 1 deselects those tests so it can stay lean.
+# Pins match requirements.txt.
+-r requirements-ci.txt
+mediapipe>=0.10.0
+transformers==4.35.2
+opencv-python>=4.8.0
+ultralytics>=8.0.0
+deepface>=0.0.79
+webrtcvad-wheels>=2.0.10
+soundfile>=0.12.0

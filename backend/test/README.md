@@ -59,5 +59,11 @@ pytest -m slow
 
 ## CI
 
-The CI pipeline runs `pytest -m "not slow"` — fast tests only.  
-Add `slow` tests to a nightly/scheduled job against a full environment with Ollama.
+CI splits the suite into two stages that together run every test once
+(docs/CICD_SETUP.md, "Branch flow"):
+
+- stage 1 (PR into `develop`): `pytest -m "not slow and not proctor" --ignore-glob="test/test_proctor_*.py"`
+- stage 2 (`testing`): `pytest -m "slow or proctor"`, with `requirements-ci-stage2.txt`
+
+A test that needs opencv/mediapipe must be marked `@pytest.mark.proctor`. Any skip
+fails its stage unless listed in `ci_allowed_skips.txt` with a reason.
