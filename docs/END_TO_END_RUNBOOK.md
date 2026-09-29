@@ -909,11 +909,11 @@ Groups: Database · Security (`SECRET_KEY`, `ALGORITHM`, `ACCESS_TOKEN_EXPIRE_MI
 Vertex AI (`GOOGLE_CLOUD_PROJECT`, `VERTEX_LOCATION`, `GEMINI_MODEL`) · Resume extraction
 (`RESUME_LLM_EXTRACTION`, `RESUME_LLM_CONCURRENCY`, `RESUME_LLM_TEXT_CHARS`) · Embedding
 cache (`ATS_EMBEDDING_CACHE_SIZE`) · File upload · Email/SMTP · Redis · Coding judge ·
-Email queue · Application (`HOST`, `PORT`, `FRONTEND_URL`) · CORS · Rate limiting · ATS
-weights (`ATS_SKILLS_WEIGHT`, `ATS_SEMANTIC_WEIGHT`, `ATS_EXPERIENCE_WEIGHT`,
-`ATS_KEYWORD_WEIGHT`) · Monitoring · Celery · S3 · Webhooks · Feature flags.
+Email queue · Application (`HOST`, `PORT`, `FRONTEND_URL`) · CORS · Rate limiting · Monitoring · Celery · S3 · Webhooks · Feature flags.
 
 Its `DATABASE_URL` example still shows `postgresql://` — that is stale. Use MySQL.
+The `ATS_*_WEIGHT` block in that file is also inert: nothing reads it. The scoring
+rubric lives in `DEFAULT_ATS_WEIGHTS` in `backend/src/services/enhanced_ats_service.py`.
 
 ---
 

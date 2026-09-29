@@ -158,13 +158,21 @@ Submit Application
 ### **Scoring Factors**
 | Factor | Weight | Description |
 |---------|--------|-------------|
-| Skills Match | 30% | Alignment with required skills |
-| Semantic Similarity | 20% | Resume-Job description similarity |
-| Experience Match | 15% | Relevance of work experience |
-| Keyword Match | 10% | Important keyword presence |
-| Education | 10% | Educational background relevance |
-| Certifications | 5% | Relevant certifications |
-| Projects | 10% | Project experience quality |
+| Education | 35% | Degree match (40) + college tier (30) + CGPA (30) |
+| Skills Match | 25% | Required (70) + preferred (30), **each scaled by where the resume evidences it** |
+| Experience | 20% | Relevant years (50) + internships (25) + GitHub/OSS/hackathons (25) |
+| Certifications | 10% | Count and relevance of professional certifications |
+| Projects | 8% | Relevance of projects to the JD |
+| Semantic | 1% | Meaning-level similarity of resume to JD |
+| Keyword | 1% | JD keyword coverage, wherever in the resume it appears |
+
+Source of truth: `DEFAULT_ATS_WEIGHTS` in `backend/src/services/enhanced_ats_service.py`.
+
+**Skills are evidence-weighted.** A required skill used inside a job or a project
+counts in full; the same skill sitting in a comma-separated list is discounted
+(`SKILL_EVIDENCE_WEIGHTS`). A resume whose sections cannot be detected falls back
+to a flat, position-blind match, so unusual formatting is never itself a penalty.
+
 
 ### **Workflow**
 ```

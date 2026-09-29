@@ -1,6 +1,6 @@
 """
 Tests for the recruiter-rubric ATS scoring:
-  weights: education 35 / skills 25 / experience 15 / certification 10 / semantic 5 / project 5 / keyword 5
+  weights: education 35 / skills 25 / experience 20 / certification 10 / project 8 / semantic 1 / keyword 1
   education  = degree(40) + tier(30) + cgpa(30)
   experience = relevant(50) + internships(25) + github/oss/hackathon(25)
   skills     = required(70) + preferred(30)
@@ -28,12 +28,31 @@ def test_weights_match_rubric():
     w = svc.weights
     assert w["education"] == 0.35
     assert w["skills_match"] == 0.25
-    assert w["experience"] == 0.15
+    assert w["experience"] == 0.20
     assert w["certification"] == 0.10
-    assert w["semantic"] == 0.05
-    assert w["project"] == 0.05
-    assert w["keyword"] == 0.05
+    assert w["project"] == 0.08
+    assert w["semantic"] == 0.01
+    assert w["keyword"] == 0.01
     assert round(sum(w.values()), 6) == 1.0
+
+
+def test_weights_express_the_intended_priorities():
+    """Pin the rubric's *intent*, not just today's arithmetic.
+
+    The values above will be retuned; these relationships are the reason the
+    rubric was changed, so breaking one should fail loudly rather than pass
+    because the numbers still add up to 1.0.
+    """
+    w = svc.weights
+    # "Greater importance to demonstrated experience and projects than to
+    # where a keyword appears."
+    assert w["experience"] + w["project"] > w["keyword"] + w["semantic"]
+    # Keyword position is the thing being demoted: nothing may rank below it.
+    assert w["keyword"] == min(w.values())
+    # Experience is the primary lever and must outrank every factor except
+    # education (held by policy) and skills.
+    assert w["experience"] > w["certification"]
+    assert w["experience"] > w["project"]
 
 
 def test_education_subscore_components():

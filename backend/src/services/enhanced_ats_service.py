@@ -23,6 +23,8 @@ from pydantic import BaseModel
 from src.services.institution_tiers import best_tier
 from src.services.pincode_region import is_rural
 from src.services.jd_overlap import jd_copy_overlap
+from src.services.ats_evidence import collect_evidence
+from src.services.ats_text import contains_whole_word
 
 # Resume<->JD verbatim-copy handling. Default is flag-only (no score change);
 # set > 0 to subtract points from flagged candidates.
@@ -68,7 +70,9 @@ CLUSTER_PARTIAL_CREDIT = 0.6  # 60% of full credit for a same-category skill
 #   2026.10-v3  evidence: skills credited by where they are shown (experience/projects >
 #               skills list > related > not found) on the full text; unknown education /
 #               experience parts excluded rather than scored 0; no credit for bare words
-SCORING_RULES_VERSION = "2026.10-v3"
+#   2026.10-v4  weights from DEFAULT_ATS_WEIGHTS (experience 20, project 8, semantic 1,
+#               keyword 1 — was 15/5/5/5), merged in with the per-factor excerpts
+SCORING_RULES_VERSION = "2026.10-v4"
 
 SENTENCE_TRANSFORMERS_AVAILABLE = False
 _SEMANTIC_MODEL = None
@@ -274,6 +278,76 @@ SECTION_SKILL_WEIGHTS: Dict[str, float] = {
     "hobbies": 0.3,
     "other": 0.5,
 }
+
+# How much a required skill is worth depending on where the resume evidences it.
+# A skill named inside a job or a project was *demonstrated*; the same skill in a
+# comma-separated list was *claimed*. Note the ordering is the reverse of
+# SECTION_SKILL_WEIGHTS above, which ranks a bare skills list highest — that
+# table belongs to compute_weighted_skills_score, which the live scorer has
+# never called.
+#
+# Every value is <= 1.0 on purpose: this is a discount on claiming, never a
+# bonus for demonstrating. No candidate's skills sub-score can rise above what
+# the old flat match gave them, which keeps the blast radius of a re-score
+# bounded and checkable against production data.
+SKILL_EVIDENCE_WEIGHTS: Dict[str, float] = {
+    "experience": 1.00,      # proven in a job
+    "projects": 1.00,        # proven in a project
+    "certifications": 0.90,  # externally examined, but not applied work
+    "skills": 0.80,          # claimed in a list
+    "other": 0.80,           # headline / pre-header preamble — also a claim
+    "summary": 0.75,
+    "education": 0.70,
+    "job_preferences": 0.40,
+    "hobbies": 0.40,
+}
+
+# Applied when a skill is credited but cannot be located in any section — a
+# spelling the extractor resolved but the text does not contain verbatim
+# ("Dockerised" -> docker). Treated as claimed rather than demonstrated: if we
+# cannot point at the work, we do not pay for it.
+UNLOCATABLE_EVIDENCE_WEIGHT = SKILL_EVIDENCE_WEIGHTS["skills"]
+
+# Evidence weighting needs at least one of these to be meaningful. Without them
+# the scorer falls back to the flat match rather than penalising a resume for
+# using section headings it does not recognise.
+EVIDENCE_CAPABLE_SECTIONS = frozenset({"experience", "projects", "skills"})
+
+# Bumped whenever the rubric changes in a way that makes scores incomparable
+# with older ones. Stored in scoring_breakdown so a partially re-scored table
+# stays readable and the backfill can tell done from pending.
+#   1 — education-weighted 7-factor rubric (education .35 / skills .25 /
+#       experience .15 / certification .10 / semantic .05 / project .05 /
+#       keyword .05), skills matched flat over the whole document.
+#   2 — experience and projects promoted over keyword placement; skills credit
+#       scaled by the section evidencing each skill.
+ATS_RUBRIC_VERSION = 2
+
+# Factor weights, summing to 1.0. Single source of truth — tests and docs read
+# this rather than restating the numbers.
+#
+# Rationale for version 2: "keyword" is literally *where a word appears* and is
+# cut hardest; "semantic" is the other whole-document word-occurrence factor and
+# is trimmed to match. Both fund experience and projects, which together move
+# from 20% to 28%. Education is held at 35% as an explicit recruiter policy
+# decision, not an oversight. skills_match holds its weight because its
+# *internals* became evidence-sensitive in this same change — moving the weight
+# as well would make the before/after impossible to attribute.
+DEFAULT_ATS_WEIGHTS: Dict[str, float] = {
+    'education': 0.35,     # degree match + college tier + CGPA
+    'skills_match': 0.25,  # required + preferred, discounted by evidence
+    'experience': 0.20,    # relevant exp + internships + github/OSS/hackathons
+    'certification': 0.10,
+    'project': 0.08,
+    'semantic': 0.01,
+    'keyword': 0.01,
+}
+
+# A rubric that does not sum to 1.0 silently rescales every score, so fail at
+# import rather than at the first candidate.
+assert round(sum(DEFAULT_ATS_WEIGHTS.values()), 6) == 1.0, (
+    f"ATS weights must sum to 1.0, got {sum(DEFAULT_ATS_WEIGHTS.values())}"
+)
 
 # Enhanced imports for OCR and DOC processing
 try:
@@ -680,6 +754,15 @@ def normalize_resume_text(text: str, max_tokens: int = 1200) -> str:
         section_tokens = section_text.split()
         if len(section_tokens) > section_budget:
             section_text = " ".join(section_tokens[:section_budget])
+        # Re-emit the header. `detect_sections` CONSUMES the header line (it is
+        # never appended to its buffer), so rejoining bodies alone returned a
+        # document with no headers at all — and callers run `detect_sections`
+        # again on this result. Every resume over the token budget therefore
+        # collapsed to a single "other" section, silently disabling every
+        # section-aware path downstream. Each canonical name is itself an exact
+        # alias in SECTION_HEADERS, so it is re-recognised on the second pass.
+        if section_name != "other":
+            truncated_parts.append(section_name.replace("_", " ").upper())
         truncated_parts.append(section_text)
 
     result = "\n\n".join(truncated_parts)
@@ -707,9 +790,114 @@ def _find_cluster_match(required_skill: str, resume_skills_set: set) -> Optional
     return None
 
 
+def _match_credit(required_norm: str, resume_normalized: set) -> Tuple[float, str, str]:
+    """Base credit for one required skill against the resume's skill set.
+
+    Returns ``(credit, status, matched_token)`` where credit is 1.0 for a direct
+    match, ``CLUSTER_PARTIAL_CREDIT`` for a same-cluster relative, and 0.0 when
+    absent. ``matched_token`` is the resume-side skill that satisfied it, which
+    the evidence pass needs in order to go looking for it in the text.
+
+    Containment is whole-word in both directions rather than a bare substring
+    test. The old ``skill in rs or rs in skill`` credited required "go" to
+    anyone who listed "django" or "mongodb", "java" to "javascript", and
+    "scale" to "scala". Whole-word containment keeps the case the check existed
+    for — required "lambda" satisfied by "aws lambda" — without those.
+    """
+    if required_norm in resume_normalized:
+        return 1.0, "exact", required_norm
+    for resume_skill in resume_normalized:
+        if (contains_whole_word(resume_skill, required_norm)
+                or contains_whole_word(required_norm, resume_skill)):
+            return 1.0, "phrase", resume_skill
+    cluster_hit = _find_cluster_match(required_norm, resume_normalized)
+    if cluster_hit:
+        return CLUSTER_PARTIAL_CREDIT, "cluster", cluster_hit
+    return 0.0, "missing", ""
+
+
+def _best_evidence_section(sections: Dict[str, str], terms: List[str]) -> Tuple[str, float]:
+    """The strongest section any of ``terms`` appears in, as ``(name, weight)``.
+
+    ``max`` over every section the skill occurs in, never first-seen, so the
+    result does not depend on the order sections happen to appear in the
+    document. A skill listed under SKILLS *and* used in an EXPERIENCE bullet
+    earns the experience weight.
+    """
+    best_name, best_weight = "", 0.0
+    for section_name, section_text in (sections or {}).items():
+        if not section_text:
+            continue
+        weight = SKILL_EVIDENCE_WEIGHTS.get(section_name, UNLOCATABLE_EVIDENCE_WEIGHT)
+        if weight <= best_weight:
+            continue
+        if any(contains_whole_word(section_text, term) for term in terms if term):
+            best_name, best_weight = section_name, weight
+    return best_name, best_weight
+
+
+def score_required_skills_with_evidence(
+    sections: Dict[str, str],
+    resume_skills: List[str],
+    required_skills: List[str],
+) -> Tuple[float, List[Dict[str, Any]]]:
+    """Percentage match for ``required_skills``, discounted by where each is evidenced.
+
+    Returns ``(pct, detail)``. Each detail entry is
+    ``{skill, status, section, credit}`` — the required skill, how it matched,
+    the strongest section it was found in, and the credit it finally earned.
+
+    The denominator deduplicates normalised skills. A JD listing both "JS" and
+    "JavaScript" normalises to one skill, and previously capped a perfect
+    candidate at 50 because the numerator deduplicated while the denominator
+    did not.
+    """
+    required_unique: List[str] = list(OrderedDict.fromkeys(
+        normalize_skill(s).lower() for s in (required_skills or []) if str(s).strip()
+    ))
+    if not required_unique:
+        return 100.0, []
+
+    resume_normalized = set(normalize_skill(s).lower() for s in (resume_skills or []))
+    # The resume's own spelling, so the evidence pass can find text that says
+    # "JS" for a skill the scorer normalised to "javascript".
+    raw_by_normalised: Dict[str, str] = {}
+    for raw in (resume_skills or []):
+        raw_by_normalised.setdefault(normalize_skill(raw).lower(), str(raw))
+
+    earned = 0.0
+    detail: List[Dict[str, Any]] = []
+    for skill in required_unique:
+        credit, status, matched = _match_credit(skill, resume_normalized)
+        if credit <= 0:
+            detail.append({"skill": skill, "status": status, "section": "", "credit": 0.0})
+            continue
+        terms = [t for t in (matched, raw_by_normalised.get(matched, ""), skill) if t]
+        section_name, weight = _best_evidence_section(sections, terms)
+        if weight <= 0:
+            section_name, weight = "", UNLOCATABLE_EVIDENCE_WEIGHT
+        final = credit * weight
+        earned += final
+        detail.append({
+            "skill": skill,
+            "status": status,
+            "section": section_name,
+            "credit": round(final, 3),
+        })
+
+    pct = round(min(100.0, (earned / len(required_unique)) * 100), 2)
+    return pct, detail
+
+
 def compute_weighted_skills_score(sections: Dict[str, str], required_skills: List[str]) -> float:
     """
     C4.6 — Calculate skills match score weighted by which section each skill appears in.
+
+    NOT USED BY THE LIVE SCORER — kept for its tests. `enhanced_score_candidate`
+    reaches skills through `score_skills_v2`, which uses
+    `score_required_skills_with_evidence` above. Note this function's
+    SECTION_SKILL_WEIGHTS rank a bare skills list ABOVE experience, the
+    opposite of the live rule.
     Exact matches get full section weight; cluster matches (related tech) get 60% credit.
     """
     if not required_skills:
@@ -856,17 +1044,8 @@ class EnhancedATSScoringService:
             'microsoft office', 'ms office', 'powerpoint', 'word',
         ]
 
-        # Enhanced ATS scoring weights (total must sum to 1.0).
-        # Recruiter-defined rubric: education-weighted hiring model.
-        self.weights = {
-            'education': 0.35,     # degree match + college tier + CGPA
-            'skills_match': 0.25,  # required + preferred skills
-            'experience': 0.15,    # relevant exp + internships + github/OSS/hackathons
-            'certification': 0.10,
-            'semantic': 0.05,
-            'project': 0.05,
-            'keyword': 0.05,
-        }
+        # Enhanced ATS scoring weights — see DEFAULT_ATS_WEIGHTS.
+        self.weights = dict(DEFAULT_ATS_WEIGHTS)
 
         # Education level mapping
         self.education_levels = {
@@ -947,12 +1126,30 @@ class EnhancedATSScoringService:
         return round(total_months / 12.0, 1)
 
     # FIXED: extract_experience_years double-counting & internship exclusion
-    def extract_experience_years(self, text: str) -> float:
+    def extract_experience_years(self, text: str, sections: Optional[Dict[str, str]] = None) -> float:
         """
         Multi-pattern experience extraction with deduplication and internship filtering.
         Rule: Internships of 0 to 8 months are excluded from total work experience calculation.
+
+        Date ranges are harvested from the work-history sections only. Scanned
+        over the whole document, "B.Tech 2018 - 2022" counted as four years of
+        professional experience, as did certification validity windows and
+        project timelines — and because the result is a `max()` against the
+        explicit "N years" phrase, that inflated number usually won. Explicit
+        phrases are still read document-wide: they are self-describing and
+        normally live in the summary.
+
+        Falls back to whole-document scanning when no work-history section was
+        detected, so a resume with unrecognised headings is not silently
+        credited with zero experience.
         """
         text_norm = text.replace("–", "-").replace("—", "-")
+        if sections is None:
+            sections = detect_sections(text)
+        work_bodies = [sections.get(name, "") for name in ("experience", "projects")]
+        work_text = "\n".join(b for b in work_bodies if b)
+        date_range_text = (work_text.replace("–", "-").replace("—", "-")
+                           if work_text.strip() else text_norm)
 
         # --- Explicit year mentions ---
         year_patterns = [
@@ -986,9 +1183,9 @@ class EnhancedATSScoringService:
         current_year = datetime.now().year
         date_range_pattern = r'(\d{4})\s*[-–—]\s*(\d{4}|present|current|now|till date|to date)'
         date_range_years = 0.0
-        for m in re.finditer(date_range_pattern, text_norm, re.IGNORECASE):
+        for m in re.finditer(date_range_pattern, date_range_text, re.IGNORECASE):
             start_str, end_str = m.group(1), m.group(2).strip().lower()
-            snippet = text_norm[max(0, m.start() - 80):min(len(text_norm), m.end() + 80)].lower()
+            snippet = date_range_text[max(0, m.start() - 80):min(len(date_range_text), m.end() + 80)].lower()
             is_intern = 'intern' in snippet or 'trainee' in snippet
             try:
                 start = int(start_str)
@@ -1441,19 +1638,23 @@ class EnhancedATSScoringService:
     def calculate_skills_match(self, resume_skills: List[str], required_skills: List[str]) -> float:
         """
         C4.1 — Normalize both sides before matching.
-        Exact/substring match = 1.0 credit. Same-cluster skill = 0.6 credit.
+        Exact/whole-word-phrase match = 1.0 credit. Same-cluster skill = 0.6 credit.
+
+        Position-blind: this is the fallback for resumes whose sections could
+        not be detected. `score_required_skills_with_evidence` is the section-
+        aware path. Both share `_match_credit`, so they always agree about
+        whether a candidate has a skill — only about what it is worth.
         """
         if not required_skills:
             return 100.0
         resume_normalized = set(normalize_skill(s).lower() for s in resume_skills)
-        required_normalized = [normalize_skill(s).lower() for s in required_skills]
-        total = 0.0
-        for skill in required_normalized:
-            if any(skill in rs or rs in skill for rs in resume_normalized):
-                total += 1.0  # exact / substring match
-            elif _find_cluster_match(skill, resume_normalized):
-                total += CLUSTER_PARTIAL_CREDIT  # related tech in same cluster
-        return round(min(100.0, (total / len(required_normalized)) * 100), 2)
+        required_unique = list(OrderedDict.fromkeys(
+            normalize_skill(s).lower() for s in required_skills if str(s).strip()
+        ))
+        if not required_unique:
+            return 100.0
+        total = sum(_match_credit(skill, resume_normalized)[0] for skill in required_unique)
+        return round(min(100.0, (total / len(required_unique)) * 100), 2)
 
     def calculate_semantic_similarity(self, resume_text: str, job_description: str) -> float:
         """C4.2 — Delegates to module-level compute_semantic_score()."""
@@ -1715,13 +1916,39 @@ class EnhancedATSScoringService:
         }
         return score, detail
 
-    def score_skills_v2(self, resume_skills, required_skills, preferred_skills):
+    def score_skills_v2(self, resume_skills, required_skills, preferred_skills, sections=None):
         """Skills sub-score (0-100) = required(70) + preferred(30).
-        When the JD lists no preferred skills, required carries the full 100."""
-        req_pct = (self.calculate_skills_match(resume_skills, required_skills) / 100.0
-                   if required_skills else 1.0)
+        When the JD lists no preferred skills, required carries the full 100.
+
+        When ``sections`` is supplied and usable, each skill's credit is scaled
+        by where the resume evidences it (SKILL_EVIDENCE_WEIGHTS) — a skill used
+        in a job or project is worth more than one sitting in a list.
+
+        The guard matters: a resume whose headings we failed to recognise falls
+        back to the flat, position-blind match rather than being marked down for
+        its typography. Handled the other way round — scoring unrecognised text
+        as "not demonstrated" — deleting your headings would become a way to
+        lose points, and weighting it as fully demonstrated would make deleting
+        them an exploit.
+        """
+        evidence_capable = bool(sections) and bool(EVIDENCE_CAPABLE_SECTIONS & set(sections))
+        skill_evidence: List[Dict[str, Any]] = []
+        flat_req_pct = (self.calculate_skills_match(resume_skills, required_skills) / 100.0
+                        if required_skills else 1.0)
+
+        if required_skills and evidence_capable:
+            pct, skill_evidence = score_required_skills_with_evidence(
+                sections, resume_skills, required_skills)
+            req_pct = pct / 100.0
+        else:
+            req_pct = flat_req_pct
+
         if preferred_skills:
-            pref_pct = self.calculate_skills_match(resume_skills, preferred_skills) / 100.0
+            if evidence_capable:
+                pref_pct = score_required_skills_with_evidence(
+                    sections, resume_skills, preferred_skills)[0] / 100.0
+            else:
+                pref_pct = self.calculate_skills_match(resume_skills, preferred_skills) / 100.0
             req_sub = round(70.0 * req_pct, 1)
             pref_sub = round(30.0 * pref_pct, 1)
             score = round(req_sub + pref_sub, 2)
@@ -1729,10 +1956,22 @@ class EnhancedATSScoringService:
             req_sub = round(70.0 * req_pct, 1)
             pref_sub = None
             score = round(100.0 * req_pct, 2)
+
+        demonstrated = sum(1 for e in skill_evidence
+                           if e.get('section') in ('experience', 'projects'))
+        credited = sum(1 for e in skill_evidence if e.get('credit', 0) > 0)
         detail = {
             'required_skills': req_sub, 'required_max': 70,
             'preferred_skills': pref_sub, 'preferred_max': 30,
             'has_preferred': bool(preferred_skills),
+            # False means the resume had no recognisable sections and was scored
+            # flat — so a recruiter can tell a weak resume from an unparsed one.
+            'evidence_weighted': evidence_capable,
+            'demonstrated_count': demonstrated,
+            'listed_only_count': credited - demonstrated,
+            # The undiscounted score, so the size of the discount is visible.
+            'required_flat_pct': round(flat_req_pct * 100, 2),
+            'skill_evidence': skill_evidence,
         }
         return score, detail
 
@@ -1890,9 +2129,14 @@ class EnhancedATSScoringService:
         """
         Recruiter-rubric ATS scoring.
 
-        Weighted factors (sum to 1.0): education 35%, skills 25%, experience 15%,
-        certification 10%, semantic 5%, project 5%, keyword 5%. Education, skills,
-        and experience are themselves composed of sub-scores (see score_*_v2).
+        Weighted factors (sum to 1.0): education 35%, skills 25%, experience 20%,
+        certification 10%, project 8%, semantic 1%, keyword 1% — see
+        DEFAULT_ATS_WEIGHTS. Education, skills, and experience are themselves
+        composed of sub-scores (see score_*_v2).
+
+        Skills credit is scaled by where the resume evidences each skill, so a
+        skill used in a job or project outweighs the same skill in a list. See
+        score_skills_v2 and SKILL_EVIDENCE_WEIGHTS.
 
         Structured inputs (``educations``, ``work_experiences``, ``links_text``,
         ``preferred_skills``) make the sub-scores reliable; when absent the scorer
@@ -2015,8 +2259,32 @@ class EnhancedATSScoringService:
         # Preferred skills the candidate is missing (for the dashboard).
         missing_preferred = [c['skill'] for c in preferred_checks if c['level'] == 'not_found']
 
+        # Supporting resume excerpts per factor. Presentation only — it reads
+        # values already computed above and cannot change a score, so a failure
+        # here costs the excerpts, never the scoring run.
+        try:
+            evidence = collect_evidence(
+                resume_text=resume_text,
+                sections=sections,
+                job_description=job_description,
+                matched_skills=matched_skills,
+                cluster_matched_skills=cluster_matched_skills,
+                preferred_skills=preferred_skills or [],
+                resume_skills=resume_result.skills,
+                education=resume_result.education,
+                work_experience=resume_result.work_experience,
+                certifications=resume_result.certifications,
+                projects=resume_result.projects,
+                normalize=normalize_skill,
+            )
+        except Exception as e:
+            logger.warning(f"ATS evidence collection failed, scoring unaffected: {e}")
+            evidence = {}
+
         scoring_breakdown = {
+            'rubric_version': ATS_RUBRIC_VERSION,
             'weights_used': weights,
+            'evidence': evidence,
             'individual_scores': {
                 'education': education_score,
                 'skills_match': skills_score,
