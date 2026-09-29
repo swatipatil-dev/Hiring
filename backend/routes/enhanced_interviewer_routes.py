@@ -31,6 +31,10 @@ import uuid
 import json
 import logging
 
+# Roles that build and run tests. Superadmin is excluded: these routes act inside one
+# company, and a superadmin has none.
+_STAFF_ROLES = ["interviewer", "hr", "admin"]
+
 def _parse_skills(raw_skills):
     """Parse required_skills from various formats (JSON array, comma-separated, list, None)"""
     if isinstance(raw_skills, list):
@@ -356,7 +360,7 @@ class AutoCreateJobRequest(BaseModel):
 async def auto_create_job_from_request(
     data: AutoCreateJobRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_role(_STAFF_ROLES))
 ):
     """Auto-create a job posting when interviewer selects a candidate request to create a test"""
     from src.models.models import HRProfile, InterviewerProfile
@@ -391,13 +395,18 @@ async def auto_create_job_from_request(
     if interviewer_profile and interviewer_profile.department_id:
         dept_id = interviewer_profile.department_id
     elif data.department:
-        dept = db.query(Department).filter(Department.name.ilike(f"%{data.department}%")).first()
+        dept = db.query(Department).filter(
+            Department.company_id == current_user.company_id,
+            Department.name.ilike(f"%{data.department}%"),
+        ).first()
         if dept:
             dept_id = dept.id
 
-    # If no department found, use first available
+    # If no department found, use the company's first one
     if not dept_id:
-        first_dept = db.query(Department).first()
+        first_dept = db.query(Department).filter(
+            Department.company_id == current_user.company_id
+        ).first()
         if first_dept:
             dept_id = first_dept.id
 
@@ -435,6 +444,7 @@ async def auto_create_job_from_request(
 
     # Link any matching candidate request to this job
     matching_cr = db.query(CandidateRequest).filter(
+        CandidateRequest.company_id == current_user.company_id,
         CandidateRequest.job_title.ilike(data.title.strip()),
         CandidateRequest.requested_by == current_user.id,
         CandidateRequest.job_id.is_(None)
@@ -501,10 +511,13 @@ async def get_all_jobs_for_dropdown(
 @router.get("/my-meetings")
 async def get_my_scheduled_meetings(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_role(_STAFF_ROLES))
 ):
     """Get all interviews scheduled for this interviewer (by HR), with candidate + resume details"""
+    # Email is unique per company, not globally, so the same address can exist in
+    # another tenant: the company clause is what stops it matching their meetings.
     meetings = db.query(Interview).filter(
+        Interview.company_id == current_user.company_id,
         Interview.status == "SCHEDULED",
         Interview.candidate_id.isnot(None),
         (Interview.interviewer_email == current_user.email) | (Interview.created_by == current_user.email)
@@ -515,14 +528,16 @@ async def get_my_scheduled_meetings(
         candidate_name = ""
         candidate_email = ""
         candidate_phone = ""
-        resume_path = ""
+        resume_url = None
         ats_score = None
         candidate_skills = []
         if iv.candidate:
             candidate_name = f"{iv.candidate.first_name} {iv.candidate.last_name}"
             candidate_email = iv.candidate.email or ""
             candidate_phone = iv.candidate.phone or ""
-            resume_path = iv.candidate.resume_path or ""
+            # Signed download link, never the storage key (src/services/file_access.py).
+            from src.services.file_access import application_file_url
+            resume_url = application_file_url(iv.candidate, "resume", current_user)
             ats_score = float(iv.candidate.ats_score) if iv.candidate.ats_score else None
             try:
                 candidate_skills = json.loads(iv.candidate.extracted_skills) if iv.candidate.extracted_skills else []
@@ -554,7 +569,7 @@ async def get_my_scheduled_meetings(
             "candidate_phone": candidate_phone,
             "candidate_skills": candidate_skills,
             "ats_score": ats_score,
-            "resume_path": resume_path,
+            "resume_url": resume_url,
             "interview_type": iv.interview_type,
             "difficulty_level": iv.difficulty_level,
             "scheduled_datetime": str(iv.scheduled_datetime) if iv.scheduled_datetime else None,
@@ -676,6 +691,7 @@ async def schedule_interview_for_candidate(
     # Verify the job is assigned to this interviewer
     job = db.query(JobPosting).filter(
         JobPosting.id == request.job_id,
+        JobPosting.company_id == current_user.company_id,
         JobPosting.interviewer_id == profile.id
     ).first()
     if not job:
@@ -684,6 +700,7 @@ async def schedule_interview_for_candidate(
     # Verify candidate belongs to this job
     candidate = db.query(Candidate).filter(
         Candidate.id == request.candidate_id,
+        Candidate.company_id == current_user.company_id,
         Candidate.job_id == request.job_id
     ).first()
     if not candidate:
@@ -704,6 +721,7 @@ async def schedule_interview_for_candidate(
     skills_config = [{"name": s, "weight": 1, "question_count": 2, "difficulty_override": request.difficulty_level} for s in job_skills]
 
     interview = Interview(
+        company_id=job.company_id,
         title=request.title,
         description=f"Interview for {candidate.first_name} {candidate.last_name} - {job.title}",
         job_position=job.title,
@@ -930,13 +948,19 @@ def _build_interview_response(interview) -> "InterviewResponse":
 async def create_interview(
     interview_data: InterviewCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_role(_STAFF_ROLES))
 ):
     """Create a new interview with comprehensive configuration"""
     try:
         # Only one interview per job allowed
         if interview_data.job_id:
+            if not db.query(JobPosting.id).filter(
+                JobPosting.id == interview_data.job_id,
+                JobPosting.company_id == current_user.company_id,
+            ).first():
+                raise HTTPException(status_code=404, detail="Job not found")
             existing = db.query(Interview).filter(
+                Interview.company_id == current_user.company_id,
                 Interview.job_id == interview_data.job_id,
                 Interview.candidate_id.is_(None)
             ).first()
@@ -948,6 +972,7 @@ async def create_interview(
 
         # Create new interview record (id is auto-increment)
         interview = Interview(
+            company_id=current_user.company_id,
             title=interview_data.title,
             description=interview_data.description,
             job_id=interview_data.job_id,
@@ -1019,7 +1044,7 @@ class DraftInterviewCreate(BaseModel):
 async def create_draft_interview(
     data: DraftInterviewCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_role(_STAFF_ROLES))
 ):
     """Create a minimal DRAFT interview for per-skill question generation.
     The full config is applied later via PUT before assembling test sets."""
@@ -1028,7 +1053,10 @@ async def create_draft_interview(
         # passed a candidate-request id). Persisting it would violate the
         # interviews.job_id foreign key; the real job is attached later via PUT.
         if data.job_id:
-            job_exists = db.query(JobPosting.id).filter(JobPosting.id == data.job_id).first()
+            job_exists = db.query(JobPosting.id).filter(
+                JobPosting.id == data.job_id,
+                JobPosting.company_id == current_user.company_id,
+            ).first()
             if not job_exists:
                 data.job_id = None
 
@@ -1036,6 +1064,7 @@ async def create_draft_interview(
         # calls for the same job must reuse the same DRAFT instead of piling up rows.
         if data.job_id:
             existing = db.query(Interview).filter(
+                Interview.company_id == current_user.company_id,
                 Interview.job_id == data.job_id,
                 Interview.candidate_id.is_(None)
             ).first()
@@ -1050,6 +1079,7 @@ async def create_draft_interview(
                 )
 
         interview = Interview(
+            company_id=current_user.company_id,
             title=data.title or "Draft Test",
             job_id=data.job_id if data.job_id else None,
             job_position=data.job_position or None,
@@ -1083,7 +1113,7 @@ async def publish_interview(
     interview_id: int,
     body: PublishTestRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_role(_STAFF_ROLES))
 ):
     """
     Publish a test/interview with HR assignment — validates:
@@ -1097,7 +1127,12 @@ async def publish_interview(
     from src.models.question_models import Question as InterviewQuestion
     from src.models.models import HRProfile, Notification
 
-    interview = db.query(Interview).filter(Interview.id == interview_id).first()
+    # Interview ids are sequential integers, so both lookups are company-scoped:
+    # otherwise any user could publish another company's draft and reassign its job.
+    interview = db.query(Interview).filter(
+        Interview.id == interview_id,
+        Interview.company_id == current_user.company_id,
+    ).first()
     if not interview:
         raise HTTPException(status_code=404, detail="Interview not found")
 
@@ -1114,7 +1149,10 @@ async def publish_interview(
             detail="Interview must be linked to a job before publishing. Set job_id first."
         )
 
-    job = db.query(JobPosting).filter(JobPosting.id == interview.job_id).first()
+    job = db.query(JobPosting).filter(
+        JobPosting.id == interview.job_id,
+        JobPosting.company_id == current_user.company_id,
+    ).first()
     if not job:
         raise HTTPException(status_code=404, detail="Linked job not found")
 
@@ -1123,7 +1161,10 @@ async def publish_interview(
         HRProfile.id == body.hr_id
     ).first()
     if not hr_profile:
-        if db.query(HRProfile).filter(HRProfile.id == body.hr_id).first():
+        if db.query(HRProfile).filter(
+            HRProfile.id == body.hr_id,
+            HRProfile.company_id == current_user.company_id,
+        ).first():
             raise HTTPException(
                 status_code=400,
                 detail="That HR user has been deactivated - pick someone else."
@@ -1154,8 +1195,6 @@ async def publish_interview(
 
     # All validations passed — assign HR and publish
     hr_user = hr_profile.user
-    if not job.company_id:
-        job.company_id = current_user.company_id or hr_user.company_id
     job.hr_id = hr_profile.id
     job.updated_at = datetime.now()
     # If the chosen HR was a co-HR on this job, they are now its owner — never both.
@@ -1163,11 +1202,13 @@ async def publish_interview(
     remove_collaborator_if_owner(db, job)
 
     existing_request = db.query(CandidateRequest).filter(
+        CandidateRequest.company_id == current_user.company_id,
         CandidateRequest.job_id == str(job.id),
         CandidateRequest.requested_by == current_user.id,
     ).first()
     if not existing_request:
         existing_request = db.query(CandidateRequest).filter(
+            CandidateRequest.company_id == current_user.company_id,
             CandidateRequest.job_id.is_(None),
             CandidateRequest.requested_by == current_user.id,
             CandidateRequest.job_title.ilike(job.title.strip()),
@@ -1248,6 +1289,7 @@ async def publish_interview(
     try:
         from src.models.question_models import Question as _IQ, QuestionSetAssignment as _QSA
         sibling_drafts = db.query(Interview).filter(
+            Interview.company_id == current_user.company_id,
             Interview.job_id == job.id,
             Interview.candidate_id.is_(None),
             Interview.status == "DRAFT",
@@ -1311,12 +1353,13 @@ async def get_interviews(
     size: int = Query(10, ge=1, le=100),
     status_filter: Optional[str] = Query(None),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_role(_STAFF_ROLES))
 ):
     """Get all interviews with pagination and filtering"""
     try:
-        # Build query
-        query = db.query(Interview)
+        # Build query — the caller's company only (interview ids are sequential, and
+        # this list used to return every tenant's tests to any logged-in user).
+        query = _company_scope(db.query(Interview), Interview, current_user)
         
         if status_filter:
             # Stored uppercase; normalise so a lowercase filter is not silently empty.
@@ -1374,11 +1417,13 @@ async def get_interviews(
 async def get_interview(
     interview_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_role(_STAFF_ROLES))
 ):
     """Get a specific interview by ID"""
     try:
-        interview = db.query(Interview).filter(Interview.id == interview_id).first()
+        interview = _company_scope(
+            db.query(Interview).filter(Interview.id == interview_id), Interview, current_user
+        ).first()
         
         if not interview:
             raise HTTPException(
@@ -1497,7 +1542,13 @@ async def update_interview(
         if "description" in update_data:
             interview.description = update_data["description"]
         if "job_id" in update_data:
-            interview.job_id = update_data["job_id"] if update_data["job_id"] else None
+            new_job_id = update_data["job_id"] or None
+            if new_job_id and not db.query(JobPosting.id).filter(
+                JobPosting.id == new_job_id,
+                JobPosting.company_id == interview.company_id,
+            ).first():
+                raise HTTPException(status_code=404, detail="Job not found")
+            interview.job_id = new_job_id
         if "notes" in update_data:
             interview.notes = update_data["notes"]
         if "status" in update_data:
@@ -1636,12 +1687,14 @@ async def generate_interview_questions(
     interview_id: int,
     request: InterviewQuestionGeneration,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_role(_STAFF_ROLES))
 ):
     """Generate AI questions for an interview"""
     
     # Get interview details
-    interview = db.query(Interview).filter(Interview.id == interview_id).first()
+    interview = _company_scope(
+            db.query(Interview).filter(Interview.id == interview_id), Interview, current_user
+        ).first()
     if not interview:
         raise HTTPException(status_code=404, detail="Interview not found")
     
@@ -1663,7 +1716,10 @@ async def generate_interview_questions(
         # Auto-resolve skills from linked job if focus_areas not provided
         focus_areas = request.focus_areas or []
         if not focus_areas and interview.job_id:
-            linked_job = db.query(JobPosting).filter(JobPosting.id == interview.job_id).first()
+            linked_job = db.query(JobPosting).filter(
+                JobPosting.id == interview.job_id,
+                JobPosting.company_id == interview.company_id,
+            ).first()
             if linked_job and linked_job.required_skills:
                 focus_areas = json.loads(linked_job.required_skills) if isinstance(linked_job.required_skills, str) else linked_job.required_skills
         if not focus_areas and interview.skills_config_data:
@@ -1732,12 +1788,14 @@ async def generate_interview_questions(
 async def get_interview_questions(
     interview_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_role(_STAFF_ROLES))
 ):
     """Get all questions for an interview"""
     try:
         # Get interview
-        interview = db.query(Interview).filter(Interview.id == interview_id).first()
+        interview = _company_scope(
+            db.query(Interview).filter(Interview.id == interview_id), Interview, current_user
+        ).first()
         if not interview:
             raise HTTPException(status_code=404, detail="Interview not found")
         
@@ -1805,7 +1863,9 @@ async def delete_all_questions(
     """Delete all questions for an interview"""
     try:
         # Get interview
-        interview = db.query(Interview).filter(Interview.id == interview_id).first()
+        interview = _company_scope(
+            db.query(Interview).filter(Interview.id == interview_id), Interview, current_user
+        ).first()
         if not interview:
             raise HTTPException(status_code=404, detail="Interview not found")
         
@@ -1839,7 +1899,9 @@ async def update_question(
 ):
     """Update a specific question"""
     try:
-        interview = db.query(Interview).filter(Interview.id == interview_id).first()
+        interview = _company_scope(
+            db.query(Interview).filter(Interview.id == interview_id), Interview, current_user
+        ).first()
         if not interview:
             raise HTTPException(status_code=404, detail="Interview not found")
         if interview.created_by != current_user.email:
@@ -1912,7 +1974,9 @@ async def regenerate_question(
     """Regenerate a specific question"""
     try:
         # Get interview
-        interview = db.query(Interview).filter(Interview.id == interview_id).first()
+        interview = _company_scope(
+            db.query(Interview).filter(Interview.id == interview_id), Interview, current_user
+        ).first()
         if not interview:
             raise HTTPException(status_code=404, detail="Interview not found")
         
@@ -1965,12 +2029,13 @@ async def regenerate_question(
 @router.get("/stats/questions")
 async def get_question_statistics(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_role(_STAFF_ROLES))
 ):
     """Get question generation statistics"""
     try:
         # Get user's interviews
         interviews = db.query(Interview).filter(
+            Interview.company_id == current_user.company_id,
             Interview.created_by == current_user.email
         ).all()
         
@@ -2255,8 +2320,12 @@ async def list_templates(
     user's company-shared and personal templates. Optionally filter by job_category.
     """
     _require_template_role(current_user)
-    q = db.query(JDTemplate).filter(
-        (JDTemplate.company_id.is_(None)) | (JDTemplate.company_id == current_user.company_id)
+    # Built-ins are platform-wide rows with no company, which the tenant auto-filter
+    # (src/tenancy/events.py) hides from every tenant. This read opts out of it, so the
+    # or_ below is the only scoping: built-ins, or the caller's own company.
+    q = db.query(JDTemplate).execution_options(_tenant_bypass=True).filter(
+        (JDTemplate.company_id.is_(None) & (JDTemplate.is_builtin == True))  # noqa: E712
+        | (JDTemplate.company_id == current_user.company_id)
     )
     if job_category:
         q = q.filter(JDTemplate.job_category == job_category)
@@ -2306,13 +2375,14 @@ async def update_template(
 ):
     """Update a user-owned template. Builtins cannot be edited."""
     _require_template_role(current_user)
-    t = db.query(JDTemplate).filter(JDTemplate.id == template_id).first()
+    t = db.query(JDTemplate).filter(
+        JDTemplate.id == template_id,
+        JDTemplate.company_id == current_user.company_id,
+    ).first()
     if not t:
         raise HTTPException(status_code=404, detail="Template not found")
     if t.is_builtin:
         raise HTTPException(status_code=403, detail="Built-in templates cannot be edited")
-    if t.company_id and t.company_id != current_user.company_id:
-        raise HTTPException(status_code=403, detail="Not your template")
 
     if body.name is not None:
         t.name = body.name.strip()
@@ -2346,13 +2416,14 @@ async def delete_template(
 ):
     """Delete a user-owned template. Builtins cannot be deleted."""
     _require_template_role(current_user)
-    t = db.query(JDTemplate).filter(JDTemplate.id == template_id).first()
+    t = db.query(JDTemplate).filter(
+        JDTemplate.id == template_id,
+        JDTemplate.company_id == current_user.company_id,
+    ).first()
     if not t:
         raise HTTPException(status_code=404, detail="Template not found")
     if t.is_builtin:
         raise HTTPException(status_code=403, detail="Built-in templates cannot be deleted")
-    if t.company_id and t.company_id != current_user.company_id:
-        raise HTTPException(status_code=403, detail="Not your template")
 
     db.delete(t)
     db.commit()
@@ -2381,9 +2452,8 @@ async def save_ai_template(
 # scheduled_datetime and duration_minutes as non-Optional, so a single DRAFT — which leaves
 # both NULL — makes the whole list 500.
 #
-# They are also explicitly tenant-scoped. interview_questions has a company_id column but
-# the ORM model does not declare it, and generator_router.py has no auth at all, so we scope
-# questions by joining to interviews.company_id (same idea as mcq_api._assert_question_in_tenant).
+# They are also explicitly tenant-scoped: questions are scoped by joining to
+# interviews.company_id, the owner of record (same idea as mcq_api._assert_question_in_tenant).
 
 from sqlalchemy import func as _sa_func, text as _sa_text
 from src.auth import require_role as _require_role
@@ -2495,21 +2565,17 @@ def _test_payload(iv, question_count=0):
 
 
 def _company_scope(q, model, current_user):
-    """Scope a query to the caller's company the way the rest of the app does.
+    """Scope a query to the caller's company.
 
-    A plain ``model.company_id == current_user.company_id`` is stricter than the codebase
-    convention and returns nothing in two real cases:
-      * legacy rows where company_id is NULL (the column is nullable), since
-        `company_id = NULL` matches nothing in SQL; and
-      * callers with no company, for whom the tenancy auto-filter
-        (src/tenancy/events.py) skips filtering altogether rather than matching nothing.
-    Tolerating a NULL owner also matches mcq_api._assert_question_in_tenant.
+    A row with a NULL company_id belongs to no tenant and matches nobody: it used to be
+    visible to every company, which exposed drafts, questions and answer keys across
+    tenants. Legacy NULL rows are repaired by scripts/backfill_orphan_company_ids.py,
+    not tolerated here. Only the superadmin, who has no company, reads unscoped; any
+    other company-less caller gets nothing.
     """
     if not current_user.company_id:
-        return q
-    return q.filter(
-        (model.company_id == current_user.company_id) | (model.company_id.is_(None))
-    )
+        return q if current_user.role == "superadmin" else q.filter(False)
+    return q.filter(model.company_id == current_user.company_id)
 
 
 def _owned_templates_query(db, current_user):
@@ -2697,8 +2763,8 @@ async def update_test_settings(
 def _tenant_pool_questions(db, current_user):
     """Pool (bank) questions belonging to the caller's company.
 
-    Scoped by joining interviews.company_id: interview_questions.company_id exists in the
-    DB but is not declared on the ORM model, so SQLAlchemy neither reads nor writes it.
+    Scoped by joining interviews.company_id — the owning interview is the source of
+    truth for a question's tenant (its own company_id is copied from it).
     """
     q = (
         db.query(_Q)
@@ -2787,21 +2853,22 @@ class BankQuestionUpdate(BaseModel):
 
 
 def _get_tenant_question(db, question_id, current_user):
-    """Fetch a question, 404ing if it belongs to another company.
+    """Fetch a question, 404ing unless it belongs to the caller's company.
 
-    Questions carry no usable company_id on the model, so ownership is derived from the
-    interview they hang off (mirrors mcq_api._assert_question_in_tenant).
+    Ownership is the interview the question hangs off. A question with no interview, or
+    whose interview has no company, belongs to no tenant and is refused.
     """
-    q = db.query(_Q).filter(_Q.id == question_id).first()
+    q = (
+        _company_scope(
+            db.query(_Q).join(Interview, _Q.interview_id == Interview.id),
+            Interview,
+            current_user,
+        )
+        .filter(_Q.id == question_id)
+        .first()
+    )
     if not q:
         raise HTTPException(status_code=404, detail="Question not found")
-    # Enforce only when both sides have a company: a NULL owner is legacy data, and a
-    # caller without a company is unfiltered everywhere else too (see _company_scope).
-    if current_user.role != "superadmin" and current_user.company_id:
-        owner_iv = db.query(Interview).filter(Interview.id == q.interview_id).first() if q.interview_id else None
-        owner_company = owner_iv.company_id if owner_iv else None
-        if owner_company and owner_company != current_user.company_id:
-            raise HTTPException(status_code=404, detail="Question not found")
     return q
 
 

@@ -63,6 +63,11 @@ export default function CompanyPortal() {
   }, [params.companySlug, searchParams, jobId])
 
   const saveSession = (data) => {
+    // A staff account with two-factor gets a challenge, not a session; this
+    // candidate portal has no second step, so point them at the right page.
+    if (!data.access_token) {
+      throw new Error('This account uses two-factor sign-in. Please sign in from your company login page.')
+    }
     localStorage.setItem('hireflow_token', data.access_token)
     localStorage.setItem('hireflow_user', JSON.stringify(data.user))
     storeSlug(slug)

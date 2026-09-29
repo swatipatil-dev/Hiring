@@ -69,6 +69,11 @@ grep -c '^CREATE TABLE' /root/predeploy-*.sql | tail -1
 
 A count of `0` means the dump is empty — stop and fix that before running DDL.
 
+Once the nightly backup is installed ([BACKUP_AND_RESTORE.md](BACKUP_AND_RESTORE.md)),
+`systemctl start hireflow-backup.service` takes the same dump plus every uploaded file,
+encrypted and off-site; `journalctl -u hireflow-backup -n 5` must end with `copied
+off-site to …`.
+
 ## 3. Python dependencies — if `requirements-cpanel.txt` changed
 
 ```bash
@@ -119,6 +124,37 @@ migrated database serving traffic is worse than an old one.
 > Then press **Run Code** with `print("hello")` (Step 9). If it fails,
 > `journalctl -u hireflow-judge-worker -n 50` names the path or permission the new
 > unit took away. Optional but recommended: gVisor (Step 2.5 of CPANEL_DEPLOYMENT.md).
+
+> **Release with tenant-isolation enforcement** (the tenant filter now actually runs on
+> every request; background: [TENANT_ISOLATION.md](TENANT_ISOLATION.md)). Rows with a NULL
+> `company_id` vanish from every company's view the moment the new code serves traffic,
+> so fill them **before Step 8**, after `alembic upgrade head` above:
+>
+> ```bash
+> sudo -u hireflow /opt/hireflow/venv/bin/python scripts/backfill_orphan_company_ids.py          # dry run
+> sudo -u hireflow /opt/hireflow/venv/bin/python scripts/backfill_orphan_company_ids.py --apply
+> sudo -u hireflow /opt/hireflow/venv/bin/python scripts/verify_tenant_isolation.py
+> ```
+>
+> `verify_tenant_isolation.py` must end `PASS`. Rows still counted in `total_null` have no
+> parent to inherit a company from; they will be invisible after the restart. Look at
+> them before deploying, don't discover them from a user.
+
+> **Release that moves the email queue to JSON** (`src/mailq/safety.py`). The worker no
+> longer reads pickled jobs, and the queue moves to its own Redis database
+> (`EMAIL_REDIS_DB`, default `1`) unless `EMAIL_REDIS_URL` is set. A job queued by the old
+> code is never sent by the new worker. Before Step 8, check the old queue is empty:
+>
+> ```bash
+> cd /opt/hireflow/backend
+> # The URL the OLD code used: EMAIL_REDIS_URL, else JUDGE_REDIS_URL, else REDIS_URL.
+> OLD_URL=$(sudo -u hireflow /opt/hireflow/venv/bin/python -c 'from dotenv import dotenv_values as d; e = d(".env"); print(e.get("EMAIL_REDIS_URL") or e.get("JUDGE_REDIS_URL") or e.get("REDIS_URL") or "redis://localhost:6379/0")')
+> sudo -u hireflow /opt/hireflow/venv/bin/rq info email --url "$OLD_URL"
+> ```
+>
+> `email` must show `0` jobs, and nothing scheduled (rate-limit and retry deferrals wait up
+> to an hour). If some remain and you can't wait, those messages won't go out; the Email
+> Log shows them as `queued`/`deferred`, so resend them by hand after the deploy.
 
 Two failures worth recognising:
 
@@ -206,6 +242,7 @@ That is what a silent proctoring outage looks like.
 | Start a test, `F12` → Network → **WS** shows `101` | Proctoring failures show as "Checking…" forever |
 | Run Code with `print("hello")` | Proves the judge worker and its queue |
 | Open a candidate CV | Proves storage keys still resolve |
+| `systemctl list-timers hireflow-backup.timer` | Backups are scheduled; see [BACKUP_AND_RESTORE.md](BACKUP_AND_RESTORE.md) |
 
 ---
 
@@ -227,7 +264,9 @@ history fallback (every deep link 404s) and its `Referrer-Policy` header.
 Schema is the part that does not roll back cleanly. Most migrations here are
 additive and guarded, so an older codebase tolerates the newer schema — prefer
 rolling the code back and leaving the database alone. Restore from
-`/root/predeploy-*.sql` only if a migration actually destroyed something.
+`/root/predeploy-*.sql` or the nightly bundle
+([BACKUP_AND_RESTORE.md](BACKUP_AND_RESTORE.md#restoring-for-real)) only if a migration
+actually destroyed something.
 
 ## The four copies that `git pull` does not update
 

@@ -16,6 +16,13 @@ Superadmin side (require_superadmin):
     GET    /api/v1/support/admin/requests/{id}
     POST   /api/v1/support/admin/requests/{id}/messages
     PUT    /api/v1/support/admin/requests/{id}/status
+
+Support access (company admin consents to platform support reading its data):
+    POST   /api/v1/support/access-grants          grant, default 24h, max 7 days
+    GET    /api/v1/support/access-grants          this company's grants
+    DELETE /api/v1/support/access-grants/{id}     revoke now
+    GET    /api/v1/support/access-log             what platform staff did with this
+                                                  company's data (from audit_log)
 """
 
 import os
@@ -31,13 +38,23 @@ from src.config.database_config_mysql import get_db
 from src.auth import AuthMiddleware, get_current_user
 from src.models.models import (
     Company, User, Notification, SupportRequest, SupportMessage,
+    SupportAccessGrant, AuditLog,
 )
 from src.services import email_service
+from src.services.audit_log import (
+    audit_superadmin_request, record_audit, new_grant_expiry, DEFAULT_GRANT_HOURS,
+    MAX_GRANT_HOURS,
+)
 from routes.superadmin_routes import require_superadmin
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/v1/support", tags=["Support"])
+# Superadmin requests on this router are written to audit_log; others pass through.
+router = APIRouter(
+    prefix="/api/v1/support",
+    tags=["Support"],
+    dependencies=[Depends(audit_superadmin_request)],
+)
 
 ALLOWED_CATEGORIES = {"general", "billing", "technical", "feature", "other"}
 ALLOWED_PRIORITIES = {"low", "normal", "high", "urgent"}
@@ -466,3 +483,117 @@ def update_status(
     db.commit()
     db.refresh(req)
     return _to_detail(req, db)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SUPPORT ACCESS GRANTS (company admin)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class GrantCreate(BaseModel):
+    reason: str = Field(..., min_length=3, max_length=500)
+    hours: float = Field(DEFAULT_GRANT_HOURS, gt=0, le=MAX_GRANT_HOURS)
+
+
+def _grant_out(g: SupportAccessGrant) -> dict:
+    now = datetime.utcnow()
+    return {
+        "id": g.id,
+        "reason": g.reason,
+        "granted_by": g.granted_by,
+        "created_at": g.created_at.isoformat() if g.created_at else None,
+        "expires_at": g.expires_at.isoformat() if g.expires_at else None,
+        "revoked_at": g.revoked_at.isoformat() if g.revoked_at else None,
+        "active": g.revoked_at is None and g.expires_at is not None and g.expires_at > now,
+    }
+
+
+@router.post("/access-grants", status_code=201)
+def create_access_grant(
+    payload: GrantCreate,
+    request: Request,
+    current_user: User = Depends(AuthMiddleware.get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """Let platform support read this company's candidate and interview data for a
+    limited time. Every read they make is recorded and visible at /access-log."""
+    grant = SupportAccessGrant(
+        company_id=current_user.company_id,
+        granted_by=current_user.id,
+        reason=payload.reason.strip(),
+        expires_at=new_grant_expiry(payload.hours),
+    )
+    db.add(grant)
+    db.flush()
+    record_audit(db, action="support_access.granted", actor=current_user,
+                 company_id=current_user.company_id, resource=f"grant {grant.id}",
+                 request=request, detail={"hours": payload.hours, "reason": grant.reason},
+                 commit=False)
+    db.commit()
+    db.refresh(grant)
+    return _grant_out(grant)
+
+
+@router.get("/access-grants")
+def list_access_grants(
+    current_user: User = Depends(AuthMiddleware.get_current_admin),
+    db: Session = Depends(get_db),
+):
+    rows = (
+        db.query(SupportAccessGrant)
+        .filter(SupportAccessGrant.company_id == current_user.company_id)
+        .order_by(SupportAccessGrant.created_at.desc())
+        .limit(100)
+        .all()
+    )
+    return [_grant_out(g) for g in rows]
+
+
+@router.delete("/access-grants/{grant_id}")
+def revoke_access_grant(
+    grant_id: str,
+    request: Request,
+    current_user: User = Depends(AuthMiddleware.get_current_admin),
+    db: Session = Depends(get_db),
+):
+    grant = db.query(SupportAccessGrant).filter(
+        SupportAccessGrant.id == grant_id,
+        SupportAccessGrant.company_id == current_user.company_id,
+    ).first()
+    if not grant:
+        raise HTTPException(404, "Grant not found")
+    if grant.revoked_at is None:
+        grant.revoked_at = datetime.utcnow()
+        grant.revoked_by = current_user.id
+        record_audit(db, action="support_access.revoked", actor=current_user,
+                     company_id=current_user.company_id, resource=f"grant {grant.id}",
+                     request=request, commit=False)
+        db.commit()
+        db.refresh(grant)
+    return _grant_out(grant)
+
+
+@router.get("/access-log")
+def company_access_log(
+    limit: int = 100,
+    offset: int = 0,
+    current_user: User = Depends(AuthMiddleware.get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """What platform staff (superadmin) did with this company's data, newest first,
+    plus the grants and revocations made by this company's admins."""
+    limit = max(1, min(limit, 500))
+    q = db.query(AuditLog).filter(AuditLog.company_id == current_user.company_id)
+    total = q.count()
+    rows = q.order_by(AuditLog.created_at.desc(), AuditLog.id.desc()).offset(max(0, offset)).limit(limit).all()
+    return {
+        "total": total,
+        "entries": [{
+            "id": r.id,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "actor_email": r.actor_email,
+            "actor_role": r.actor_role,
+            "action": r.action,
+            "resource": r.resource,
+            "ip": r.ip,
+        } for r in rows],
+    }

@@ -16,12 +16,20 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import DataError, IntegrityError
 
 from src.config.database_config_mysql import get_db
-from src.auth import get_current_user, get_password_hash
-from src.models.models import Company, User, JobPosting, Candidate, Department, SubscriptionPlan
+from src.auth import get_current_user, get_password_hash, validate_password_strength
+from src.models.models import (
+    Company, User, JobPosting, Candidate, Department, SubscriptionPlan, AuditLog,
+)
 from src.schemas.company_profile import COMPANY_PROFILE_FIELDS, serialize_company
+from src.services.audit_log import audit_superadmin_request, active_grant, record_audit
 from src.tenancy.slug import slugify, is_reserved_slug
 
-router = APIRouter(prefix="/api/v1/superadmin", tags=["Super Admin"])
+# Every request a superadmin makes here is written to audit_log before it runs.
+router = APIRouter(
+    prefix="/api/v1/superadmin",
+    tags=["Super Admin"],
+    dependencies=[Depends(audit_superadmin_request)],
+)
 
 
 # ── Guards ────────────────────────────────────────────────────────────────────
@@ -232,6 +240,7 @@ async def create_company(
     _: User = Depends(require_superadmin)
 ):
     """Create a new client company and their first admin user."""
+    validate_password_strength(data.admin_password)
     # Normalize the slug into a safe subdomain (source of truth — mirrors the
     # frontend slugify so a direct API caller gets the same rules as the UI).
     slug = slugify(data.slug)
@@ -400,20 +409,38 @@ async def list_companies(
 @router.get("/companies/{company_id}")
 async def get_company(
     company_id: str,
+    request: Request,
     db: Session = Depends(get_db),
     _: User = Depends(require_superadmin)
 ):
-    """Get a single company's full onboarding profile."""
+    """Get a single company's full onboarding profile.
+
+    The company's admins are always listed — the superadmin manages those accounts.
+    Everyone else (HR, interviewers, candidates) is the client's people data and is
+    listed only while the company has granted support access.
+    """
     company = db.query(Company).filter(Company.id == company_id).first()
     if not company:
         raise HTTPException(status_code=404, detail="Company not found")
-    users = db.query(User).filter(User.company_id == company_id).all()
+    grant = active_grant(db, company_id)
+    users_q = db.query(User).filter(User.company_id == company_id)
+    if grant is None:
+        users_q = users_q.filter(User.role == "admin")
+    else:
+        record_audit(db, action="superadmin.read", actor=_, company_id=company_id,
+                     resource=f"company {company_id} user list", request=request,
+                     detail={"grant_id": grant.id})
+    users = users_q.all()
     sub = db.query(SubscriptionPlan).filter(SubscriptionPlan.company_id == company_id).first()
     payload = serialize_company(company)
     payload["users"] = [
         {"id": u.id, "email": u.email, "role": u.role, "is_active": u.is_active}
         for u in users
     ]
+    payload["support_access"] = {
+        "active": grant is not None,
+        "expires_at": grant.expires_at.isoformat() if grant else None,
+    }
     payload["subscription"] = None if not sub else {
         "plan_name": sub.plan_name,
         "billing_cycle": sub.billing_cycle,
@@ -433,11 +460,20 @@ async def toggle_company(
     db: Session = Depends(get_db),
     _: User = Depends(require_superadmin)
 ):
-    """Enable or disable a client company."""
+    """Enable or disable a client company.
+
+    Suspending also revokes every session its users hold (token_version bump), so
+    nobody stays signed in on a token minted before the suspension.
+    """
     company = db.query(Company).filter(Company.id == company_id).first()
     if not company:
         raise HTTPException(status_code=404, detail="Company not found")
     company.is_active = not company.is_active
+    if not company.is_active:
+        db.query(User).filter(User.company_id == company_id).update(
+            {User.token_version: func.coalesce(User.token_version, 0) + 1},
+            synchronize_session=False,
+        )
     db.commit()
     return {"id": company.id, "is_active": company.is_active}
 
@@ -472,6 +508,7 @@ async def create_company_admin(
     _: User = Depends(require_superadmin),
 ):
     """Add an admin user to an existing client company."""
+    validate_password_strength(data.password)
     company = db.query(Company).filter(Company.id == company_id).first()
     if not company:
         raise HTTPException(status_code=404, detail="Company not found")
@@ -865,4 +902,63 @@ async def remove_custom_domain(
         "status": "removed",
         "removed_domain": removed_domain,
         "message": "Custom domain removed. The company will be accessible via its slug subdomain only.",
+    }
+
+
+# ── Audit log & support access ────────────────────────────────────────────────
+
+@router.get("/audit-log")
+async def get_audit_log(
+    company_id: Optional[str] = None,
+    actor_user_id: Optional[str] = None,
+    action: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_superadmin),
+):
+    """Read the privileged-access audit trail, newest first. Read-only: there is no
+    endpoint that edits or deletes an entry."""
+    limit = max(1, min(limit, 500))
+    q = db.query(AuditLog)
+    if company_id:
+        q = q.filter(AuditLog.company_id == company_id)
+    if actor_user_id:
+        q = q.filter(AuditLog.actor_user_id == actor_user_id)
+    if action:
+        q = q.filter(AuditLog.action == action)
+    total = q.count()
+    rows = q.order_by(AuditLog.created_at.desc(), AuditLog.id.desc()).offset(max(0, offset)).limit(limit).all()
+    return {"total": total, "entries": [_audit_row(r) for r in rows]}
+
+
+@router.get("/companies/{company_id}/support-access")
+async def get_support_access(
+    company_id: str,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_superadmin),
+):
+    """Whether this company currently allows support to read its candidate data."""
+    grant = active_grant(db, company_id)
+    return {
+        "active": grant is not None,
+        "expires_at": grant.expires_at.isoformat() if grant else None,
+        "reason": grant.reason if grant else None,
+    }
+
+
+def _audit_row(r: AuditLog) -> dict:
+    return {
+        "id": r.id,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+        "company_id": r.company_id,
+        "actor_user_id": r.actor_user_id,
+        "actor_email": r.actor_email,
+        "actor_role": r.actor_role,
+        "action": r.action,
+        "resource": r.resource,
+        "method": r.method,
+        "path": r.path,
+        "ip": r.ip,
+        "detail": r.detail,
     }

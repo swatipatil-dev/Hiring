@@ -1830,8 +1830,8 @@ export default function InterviewerDashboard() {
                                 📍 {m.location}
                               </span>
                             )}
-                            {m.resume_path && (
-                              <a href={`/${m.resume_path}`} target="_blank" rel="noreferrer" style={{ padding: '7px 16px', borderRadius: 8, background: '#eef6f3', color: 'var(--accent-primary)', fontSize: '0.82rem', fontWeight: 600, textDecoration: 'none', border: '1px solid #c8e6dc' }}>
+                            {m.resume_url && (
+                              <a href={m.resume_url} target="_blank" rel="noreferrer" style={{ padding: '7px 16px', borderRadius: 8, background: '#eef6f3', color: 'var(--accent-primary)', fontSize: '0.82rem', fontWeight: 600, textDecoration: 'none', border: '1px solid #c8e6dc' }}>
                                 📄 View Resume
                               </a>
                             )}

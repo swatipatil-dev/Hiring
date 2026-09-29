@@ -20,7 +20,7 @@ import uuid
 
 from src.config.database_config_mysql import get_db
 from src.auth import get_current_user, require_role
-from src.services.interview_access import STAFF_ROLES
+from src.services.interview_access import STAFF_ROLES, staff_can_access_interview
 from src.models.models import User
 from src.services.email_service import (
     send_mcq_result, send_offer_accepted, send_offer_rejected, resolve_sender
@@ -33,6 +33,50 @@ router = APIRouter(prefix="/api/v1/evaluation", tags=["Evaluation & Workflow"])
 # solutions) and move the candidate's stage, so they are for staff. Candidates
 # submit through /api/v1/candidate/interviews/{id}/submit, which returns a score only.
 _staff_user = require_role(list(STAFF_ROLES))
+
+
+def _interviewer_is_assigned(db: Session, interview, user: User) -> bool:
+    """An interviewer reaches an interview they run, organised, sit on the panel of, or
+    whose job is assigned to them — not every interview in the company."""
+    email = (user.email or "").strip().lower()
+    if email and email in {
+        (interview.interviewer_email or "").strip().lower(),
+        (interview.created_by or "").strip().lower(),
+    }:
+        return True
+    try:
+        panel = json.loads(interview.panel_members) if interview.panel_members else []
+    except (ValueError, TypeError):
+        panel = []
+    if email and any((m.get("email") or "").strip().lower() == email for m in panel):
+        return True
+    if interview.job_id:
+        from src.models.models import InterviewerProfile, JobPosting
+        return db.query(JobPosting.id).join(
+            InterviewerProfile, JobPosting.interviewer_id == InterviewerProfile.id
+        ).filter(
+            JobPosting.id == interview.job_id,
+            JobPosting.company_id == user.company_id,
+            InterviewerProfile.user_id == user.id,
+        ).first() is not None
+    return False
+
+
+def _staff_interview_or_404(db: Session, interview_id: int, user: User,
+                            assigned_only: bool = True):
+    """The interview if this staff user may act on it, else 404.
+
+    Company always (a NULL-company interview belongs to no tenant and is refused).
+    With `assigned_only`, an interviewer must also be assigned to it: these routes hand
+    back answer keys and move the candidate's stage.
+    """
+    interview = db.query(_InterviewModel).filter(_InterviewModel.id == interview_id).first()
+    if not staff_can_access_interview(user, interview, db):
+        raise HTTPException(404, "Interview not found")
+    if assigned_only and user.role == "interviewer" and \
+            not _interviewer_is_assigned(db, interview, user):
+        raise HTTPException(404, "Interview not found")
+    return interview
 
 
 # ==================== SCHEMAS ====================
@@ -71,18 +115,10 @@ def submit_mcq_test(
 ):
     """Submit MCQ answers and get instant mark sheet."""
 
-    # Tenant guard: the raw SQL below bypasses the before_compile auto-filter,
-    # so we explicitly verify the target Interview belongs to the caller's
-    # company before touching anything.  This blocks IDOR where a Company-A
-    # candidate posts an interview_id from Company B.
-    interview = db.query(_InterviewModel).filter(
-        _InterviewModel.id == submission.interview_id
-    ).first()
-    if not interview:
-        raise HTTPException(404, "Interview not found")
-    if current_user.role != "superadmin" and interview.company_id and \
-       interview.company_id != current_user.company_id:
-        raise HTTPException(404, "Interview not found")
+    # Tenant guard: the raw SQL below bypasses the tenant auto-filter, so verify the
+    # target Interview belongs to the caller's company (and, for an interviewer, is
+    # assigned to them) before touching anything.
+    interview = _staff_interview_or_404(db, submission.interview_id, current_user)
 
     # Who this submission is *about* is decided by the database, never by the
     # request. submission.candidate_name/candidate_email are still accepted for
@@ -169,9 +205,12 @@ def submit_mcq_test(
                 "UPDATE candidates SET current_stage='test_submitted', updated_at=NOW() "
                 "WHERE id=:cid AND current_stage='shortlisted'"
             ), {"cid": candidate.id})
+            # company_id is copied from the candidate: raw SQL skips the insert-time
+            # tenant stamp, and a NULL-company history row is invisible to its tenant.
             db.execute(text(
-                "INSERT INTO candidate_stage_history (id, candidate_id, from_stage, to_stage, notes, created_at) "
-                "SELECT :hid, id, 'shortlisted', 'test_submitted', :notes, NOW() "
+                "INSERT INTO candidate_stage_history "
+                "(id, company_id, candidate_id, from_stage, to_stage, notes, created_at) "
+                "SELECT :hid, company_id, id, 'shortlisted', 'test_submitted', :notes, NOW() "
                 "FROM candidates WHERE id=:cid AND current_stage='test_submitted' LIMIT 1"
             ), {
                 "hid": str(uuid.uuid4()),
@@ -257,15 +296,8 @@ def submit_coding_answer(
 ):
     """Submit coding or pseudocode answer for a question. Returns structured evaluation."""
 
-    # Tenant guard before raw SQL.
-    interview = db.query(_InterviewModel).filter(
-        _InterviewModel.id == submission.interview_id
-    ).first()
-    if not interview:
-        raise HTTPException(404, "Interview not found")
-    if current_user.role != "superadmin" and interview.company_id and \
-       interview.company_id != current_user.company_id:
-        raise HTTPException(404, "Interview not found")
+    # Tenant + assignment guard before raw SQL.
+    interview = _staff_interview_or_404(db, submission.interview_id, current_user)
 
     row = db.execute(text(
         "SELECT question_text, sample_answer, correct_answer, points, difficulty_level "
@@ -352,7 +384,7 @@ def respond_to_offer(
     offer_id: str,
     response: OfferResponse,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role(["candidate"])),
 ):
     """Candidate accepts or rejects an offer."""
 
@@ -369,18 +401,26 @@ def respond_to_offer(
            JOIN job_postings j ON o.job_id = j.id
            LEFT JOIN hr_profiles hp ON o.hr_id = hp.id
            LEFT JOIN users u ON hp.user_id = u.id
-           WHERE o.id = :oid"""
-    ), {"oid": offer_id}).fetchone()
+           WHERE o.id = :oid
+             AND o.company_id = :company_id
+             AND c.company_id = :company_id
+             AND (c.user_id = :uid OR (c.user_id IS NULL AND c.email = :email))"""
+    ), {
+        # Raw SQL skips the tenant auto-filter, so ownership is all in the WHERE: the
+        # offer and the application are in the caller's company, and the application
+        # is theirs. An email match alone is not ownership — the same address can
+        # exist in another company.
+        "oid": offer_id,
+        "company_id": current_user.company_id,
+        "uid": current_user.id,
+        "email": current_user.email,
+    }).fetchone()
 
     if not row:
         raise HTTPException(404, "Offer not found")
 
     (oid, status, salary, start_date, expiry_date,
      fname, lname, c_email, job_title, hr_email) = row
-
-    # Verify the current user owns this offer (must be the candidate)
-    if current_user.email != c_email:
-        raise HTTPException(403, "You are not authorized to respond to this offer")
 
     if status != "sent":
         raise HTTPException(400, f"Offer is already '{status}' and cannot be responded to")
@@ -397,7 +437,9 @@ def respond_to_offer(
     # Update offer and candidate stage fully via ORM
     from src.models.models import Offer, Candidate as CandidateModel, CandidateStageHistory
     cand_obj = None
-    offer_obj = db.query(Offer).filter(Offer.id == offer_id).first()
+    offer_obj = db.query(Offer).filter(
+        Offer.id == offer_id, Offer.company_id == current_user.company_id
+    ).first()
     if offer_obj:
         offer_obj.status = new_status
         offer_obj.responded_at = datetime.now()
@@ -406,6 +448,7 @@ def respond_to_offer(
             prev = cand_obj.current_stage
             cand_obj.current_stage = "hired" if new_status == "accepted" else "offer_rejected"
             db.add(CandidateStageHistory(
+                company_id=cand_obj.company_id,
                 candidate_id=cand_obj.id,
                 from_stage=prev,
                 to_stage=cand_obj.current_stage,
@@ -480,19 +523,12 @@ def respond_to_offer(
 def get_marksheet(
     interview_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(_staff_user),
 ):
     """Get question statistics / mark sheet for an interview."""
 
     # Tenant guard before raw SQL.
-    interview = db.query(_InterviewModel).filter(
-        _InterviewModel.id == interview_id
-    ).first()
-    if not interview:
-        raise HTTPException(404, "Interview not found")
-    if current_user.role != "superadmin" and interview.company_id and \
-       interview.company_id != current_user.company_id:
-        raise HTTPException(404, "Interview not found")
+    _staff_interview_or_404(db, interview_id, current_user, assigned_only=False)
 
     rows = db.execute(text(
         """SELECT question_type, difficulty_level, points,

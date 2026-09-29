@@ -52,6 +52,8 @@ npm run dev
 
 **ORM models**: All in `src/models/models.py` using `declarative_base()`. UUIDs stored as `String(36)`. Key models: User, Department, JobPosting, Candidate, ATSResult, Interview, InterviewFeedback, Offer, CandidateStageHistory.
 
+**Tenancy** (full model in `docs/TENANT_ISOLATION.md`): every company's data carries `company_id`, and a person has a separate `User` per company (no shared cross-company profile). Routes filter by `current_user.company_id` explicitly; as a safety net, `get_current_user` binds the company and `src/tenancy/events.py` adds it to every ORM query on `TenantScoped` models. `get_current_user` must stay `async def` — a sync dependency's contextvar never reaches the endpoint. Raw SQL, background workers and superadmin requests are not auto-filtered. Never add an `OR company_id IS NULL` branch; backfill instead (`scripts/backfill_orphan_company_ids.py`).
+
 **Authentication**: `src/auth.py` — JWT tokens via python-jose, bcrypt password hashing, `HTTPBearer` security scheme. Role-based access via dependency functions.
 
 ### Route Organization
@@ -106,7 +108,7 @@ Uploaded files resolve against `HIREFLOW_DATA_DIR` (default: the `backend/` dire
 
 Additional docs in `docs/`: API documentation, microservice architecture guide, MySQL setup, quickstart guide, and workflow docs.
 
-**Deployment**: `docs/END_TO_END_RUNBOOK.md` is the spine — local setup through to a production deploy, with every command labelled by which machine it runs on; start there and follow its links for depth. `docs/CPANEL_DEPLOYMENT.md` is the first-install runbook, `docs/DEPLOY_UPDATE.md` is what to run when pushing an update to a live deployment (read it before deploying — `git pull` leaves the schema, systemd units, Apache config and built frontend stale, and each has caused an outage), `docs/GCP_DATA_MIGRATION.md` covers moving data between deployments, and `docs/DEPLOYMENT_NOTES.md` is the reference for *why* — non-obvious constraints, silent failure modes, and which config file wins. Read the latter before changing deployment behaviour. Service units and Apache config live in `deploy/cpanel/`.
+**Deployment**: `docs/END_TO_END_RUNBOOK.md` is the spine — local setup through to a production deploy, with every command labelled by which machine it runs on; start there and follow its links for depth. `docs/CPANEL_DEPLOYMENT.md` is the first-install runbook, `docs/DEPLOY_UPDATE.md` is what to run when pushing an update to a live deployment (read it before deploying — `git pull` leaves the schema, systemd units, Apache config and built frontend stale, and each has caused an outage), `docs/GCP_DATA_MIGRATION.md` covers moving data between deployments, `docs/BACKUP_AND_RESTORE.md` covers the nightly encrypted backup (`scripts/backup.py`) and the monthly restore drill (`scripts/restore_drill.py`), and `docs/DEPLOYMENT_NOTES.md` is the reference for *why* — non-obvious constraints, silent failure modes, and which config file wins. Read the latter before changing deployment behaviour. Service units and Apache config live in `deploy/cpanel/`.
 
 Two constraints worth knowing before changing anything there:
 

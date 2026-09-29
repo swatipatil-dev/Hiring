@@ -2375,8 +2375,8 @@ HR Team`,
                         📍 {iv.location}
                       </span>
                     )}
-                    {iv.resume_path && (
-                      <a href={`/${iv.resume_path}`} target="_blank" rel="noreferrer" style={{ padding: '6px 14px', borderRadius: 8, background: '#f0fdf4', color: '#15803d', fontSize: '0.8rem', fontWeight: 600, textDecoration: 'none', border: '1px solid #bbf7d0' }}>
+                    {iv.resume_url && (
+                      <a href={iv.resume_url} target="_blank" rel="noreferrer" style={{ padding: '6px 14px', borderRadius: 8, background: '#f0fdf4', color: '#15803d', fontSize: '0.8rem', fontWeight: 600, textDecoration: 'none', border: '1px solid #bbf7d0' }}>
                         📄 View Resume
                       </a>
                     )}
@@ -5445,8 +5445,8 @@ HR Team`,
                                         <div style={{ fontSize: '0.88rem', marginBottom: 4 }}><strong>Email:</strong> {c.email}</div>
                                         <div style={{ fontSize: '0.88rem', marginBottom: 4 }}><strong>Phone:</strong> {c.phone || 'Not provided'}</div>
                                         <div style={{ fontSize: '0.88rem' }}><strong>Experience:</strong> {c.experience_years ? `${c.experience_years} years` : 'Not stated on the resume'}</div>
-                                        {c.resume_path && (
-                                          <a href={`/${c.resume_path}`} target="_blank" rel="noreferrer"
+                                        {c.resume_url && (
+                                          <a href={c.resume_url} target="_blank" rel="noreferrer"
                                              style={{ display: 'inline-block', marginTop: 10, padding: '6px 14px', borderRadius: 8,
                                                background: '#f0fdf4', color: '#15803d', fontSize: '0.8rem', fontWeight: 600,
                                                textDecoration: 'none', border: '1px solid #bbf7d0' }}>

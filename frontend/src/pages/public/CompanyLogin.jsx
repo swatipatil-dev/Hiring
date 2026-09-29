@@ -28,7 +28,7 @@ export default function CompanyLogin() {
   const [searchParams] = useSearchParams()
   const params   = useParams()
   const navigate = useNavigate()
-  const { loginDirect } = useAuth()
+  const { completeLogin, logout } = useAuth()
 
   const [slug,     setSlug]     = useState(params.companySlug || searchParams.get('c') || '')
   const [company,  setCompany]  = useState(null)
@@ -109,14 +109,21 @@ export default function CompanyLogin() {
   }, [params.companySlug, searchParams])
 
   // ── Helpers ────────────────────────────────────────────────────────────────
-  const saveAndGo = (data) => {
-    const role = (data.user?.role || '').toLowerCase()
+  // Throws (with a message for the caller's error line) if the user cancels the
+  // two-factor step or the account is not a company role.
+  const saveAndGo = async (data) => {
+    // The role is only known up front when no two-factor step is pending.
+    const early = (data.user?.role || '').toLowerCase()
+    if (data.user && !ALLOWED_ROLES.includes(early)) {
+      throw new Error('Access denied. This portal is for company users only.')
+    }
+    const u = await completeLogin(data)
+    const role = (u?.role || '').toLowerCase()
     if (!ALLOWED_ROLES.includes(role)) {
-      setLoginErr('Access denied. This portal is for company users only.')
-      return
+      logout()
+      throw new Error('Access denied. This portal is for company users only.')
     }
     storeSlug(slug)
-    loginDirect(data.access_token, data.user)
     navigate(ROLE_ROUTES[role] || '/candidate')
   }
 
@@ -152,7 +159,7 @@ export default function CompanyLogin() {
         }
         throw new Error(data.detail || 'Login failed')
       }
-      saveAndGo(data)
+      await saveAndGo(data)
     } catch (err) { setLoginErr(err.message) }
     setLoginBusy(false)
   }
@@ -211,7 +218,7 @@ export default function CompanyLogin() {
       })
       const data = await r.json()
       if (!r.ok) throw new Error(data.detail || 'Invalid OTP')
-      saveAndGo(data)
+      await saveAndGo(data)
     } catch (err) { setOtpErr(err.message) }
     setOtpBusy(false)
   }

@@ -1208,7 +1208,10 @@ Each part can be switched off without taking down the rest.
       repository's history, and anyone with access to that repository can read it.
 - [ ] **Back up `/opt/hireflow/backend/.env`** to a password manager. It holds the
       only copy of `SECRET_KEY` and `EMAIL_ENCRYPTION_KEY`, and is not in Git.
-- [ ] Schedule database backups (`BACKUP_DIR` defaults to `/opt/hireflow/backups`).
+- [ ] **Install the nightly backup and run the first restore drill** —
+      [BACKUP_AND_RESTORE.md](BACKUP_AND_RESTORE.md). It covers the database *and*
+      the uploaded files, encrypted and copied off the server. Not done until a
+      restore drill has passed.
 - [ ] Only after several clean days: shut down the old GCP services.
 
 ### Useful commands

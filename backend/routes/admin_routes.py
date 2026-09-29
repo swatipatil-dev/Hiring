@@ -295,16 +295,20 @@ def _visible_users_query(db: Session, company_id: Optional[str]):
     created is ours. Matching on `candidates.company_id` as well is what makes
     those applicants visible under the Candidate category.
 
-    Tenancy note: `src/tenancy/events.py` auto-injects `company_id == <current>`
-    into queries on TenantScoped models *unless the WHERE clause already names
-    `<table>.company_id`. Both arms of the or_ name `users.company_id` and the
-    subquery names `candidates.company_id`, so the auto-filter stands down and
-    the union survives. Do not drop those explicit comparisons — the auto-filter
-    would re-add `AND users.company_id = me` and silently undo the union.
+    Tenancy note: this is a deliberate cross-company read, so it opts out of
+    the tenant auto-filter (`src/tenancy/events.py`), which would otherwise add
+    `AND users.company_id = me` and silently drop the outside applicants. With
+    the filter off, the explicit or_ below is the ONLY scoping — both arms must
+    stay: company members, or users with an application row in this company.
     """
-    query = db.query(User).filter(User.role != "superadmin")
+    query = (
+        db.query(User)
+          .execution_options(_tenant_bypass=True)
+          .filter(User.role != "superadmin")
+    )
     if not company_id:
-        return query
+        # Never unscoped for a tenant user; only a company-less caller lands here.
+        return query.filter(False)
 
     applicant_ids = (
         db.query(Candidate.user_id)
@@ -405,6 +409,9 @@ async def update_user_status(
     was_active = bool(user.is_active)
     user.is_active = is_active
     user.updated_at = datetime.utcnow()
+    if was_active and not is_active:
+        from src.auth import revoke_user_sessions
+        revoke_user_sessions(user)   # reactivation must not revive old tokens
 
     # Deactivation must detach the user from active work, not just flip the flag.
     # src/auth.py refuses their login from here on, so anything still pointing at them
@@ -460,7 +467,10 @@ async def update_user(
 
     # ── Password reset (only when a non-empty password is supplied) ──
     if payload.password:
+        from src.auth import validate_password_strength, revoke_user_sessions
+        validate_password_strength(payload.password)
         user.password_hash = get_password_hash(payload.password)
+        revoke_user_sessions(user)   # an admin reset signs the user out everywhere
 
     # ── Department (company-scoped) ──
     dept_id = None
@@ -516,10 +526,9 @@ async def department_chat(
     msg = req.message.lower().strip()
 
     # Fetch all departments for this company
-    _dept_q = db.query(Department)
-    if current_user.company_id:
-        _dept_q = _dept_q.filter(Department.company_id == current_user.company_id)
-    departments = _dept_q.order_by(Department.name).all()
+    departments = db.query(Department).filter(
+        Department.company_id == current_user.company_id
+    ).order_by(Department.name).all()
     dept_names = [d.name for d in departments]
     dept_map = {d.name.lower(): d for d in departments}
 
@@ -620,11 +629,13 @@ async def department_chat(
 
     # Total stats
     if any(kw in msg for kw in ['total', 'overview', 'summary', 'stats', 'statistic', 'count']):
-        total_users = db.query(func.count(User.id)).scalar() or 0
-        total_jobs = db.query(func.count(JobPosting.id)).scalar() or 0
-        total_candidates = db.query(func.count(Candidate.id)).scalar() or 0
-        total_interviews = db.query(func.count(Interview.id)).scalar() or 0
-        total_offers = db.query(func.count(Offer.id)).scalar() or 0
+        # This company's totals — these counted every tenant on the platform.
+        cid = current_user.company_id
+        total_users = db.query(func.count(User.id)).filter(User.company_id == cid).scalar() or 0
+        total_jobs = db.query(func.count(JobPosting.id)).filter(JobPosting.company_id == cid).scalar() or 0
+        total_candidates = db.query(func.count(Candidate.id)).filter(Candidate.company_id == cid).scalar() or 0
+        total_interviews = db.query(func.count(Interview.id)).filter(Interview.company_id == cid).scalar() or 0
+        total_offers = db.query(func.count(Offer.id)).filter(Offer.company_id == cid).scalar() or 0
         return {"reply": (
             f"**System Overview:**\n\n"
             f"- Departments: {len(departments)}\n"
@@ -771,11 +782,14 @@ async def admin_create_job(
     - **experience_years**: Required years of experience
     - **required_skills**: List of required skills
     """
-    # Validate department
-    department = db.query(Department).filter(Department.id == job_data.department_id).first()
+    # Validate department — the admin's own company only
+    department = db.query(Department).filter(
+        Department.id == job_data.department_id,
+        Department.company_id == current_user.company_id,
+    ).first()
     if not department:
         raise HTTPException(status_code=404, detail="Department not found")
-    
+
     # Create job posting with admin as creator
     db_job = JobPosting(
         title=job_data.title,
@@ -1281,10 +1295,14 @@ async def get_hr_analytics(
 
 @router.get("/config")
 async def get_system_config(
-    current_user: User = Depends(AuthMiddleware.get_current_admin),
+    current_user: User = Depends(require_role(["superadmin"])),
     db: Session = Depends(get_db)
 ):
-    """Get system configuration"""
+    """Get platform configuration (superadmin only).
+
+    SystemConfig is platform-wide — it has no company column — so a client company's
+    admin must not read it, and above all must not overwrite it for every tenant.
+    """
     configs = db.query(SystemConfig).all()
     
     return {
@@ -1296,10 +1314,10 @@ async def get_system_config(
 async def update_system_config(
     config_key: str,
     config_value: dict,
-    current_user: User = Depends(AuthMiddleware.get_current_admin),
+    current_user: User = Depends(require_role(["superadmin"])),
     db: Session = Depends(get_db)
 ):
-    """Update system configuration"""
+    """Update platform configuration (superadmin only; see get_system_config)."""
     config = db.query(SystemConfig).filter(SystemConfig.config_key == config_key).first()
     
     if config:
@@ -1331,14 +1349,16 @@ async def get_system_health(
     except Exception:
         db_status = "unhealthy"
     
-    # Get system statistics
-    total_users = db.query(User).count()
-    active_users = db.query(User).filter(User.is_active == True).count()
-    
+    # Statistics for the admin's own company — these used to count every tenant.
+    cid = current_user.company_id
+    total_users = db.query(User).filter(User.company_id == cid).count()
+    active_users = db.query(User).filter(User.company_id == cid, User.is_active == True).count()
+
     # Get recent activity (last 24 hours)
     yesterday = datetime.utcnow() - timedelta(days=1)
     recent_logins = 0  # This would require login tracking table
     recent_applications = db.query(Candidate).filter(
+        Candidate.company_id == cid,
         Candidate.created_at >= yesterday
     ).count()
     
@@ -1371,18 +1391,28 @@ async def send_test_email(
     current_user: User = Depends(require_role(["admin", "hr"])),
     db: Session = Depends(get_db),
 ):
-    """Admin/HR: send a real SMTP test email and return the actual delivery result.
-    Uses the company's configured SMTP if available, otherwise the global env defaults."""
+    """Admin/HR: send a real SMTP test email through the company's own SMTP and return
+    the actual delivery result.
+
+    A company with no SMTP configured gets a 400, not a send through the platform's
+    mailbox: the fallback let any tenant send as the platform and echoed the platform's
+    SMTP host and account back to them.
+    """
     from src.services import email_service
     smtp_config = email_service.resolve_smtp_for_company(db, current_user.company_id)
+    if not smtp_config:
+        raise HTTPException(
+            status_code=400,
+            detail="Your company has no SMTP configured. Save it under Email settings first.",
+        )
     result = email_service._send(payload.to, payload.subject, payload.body, smtp_config=smtp_config)
     return {
-        "using_company_smtp": smtp_config is not None,
+        "using_company_smtp": True,
         "config": {
-            "smtp_host": (smtp_config or {}).get("host") or email_service.SMTP_HOST,
-            "smtp_port": (smtp_config or {}).get("port") or email_service.SMTP_PORT,
-            "smtp_user": (smtp_config or {}).get("user") or email_service.SMTP_USER,
-            "from_email": (smtp_config or {}).get("from_email") or email_service.FROM_EMAIL,
+            "smtp_host": smtp_config.get("host"),
+            "smtp_port": smtp_config.get("port"),
+            "smtp_user": smtp_config.get("user"),
+            "from_email": smtp_config.get("from_email"),
             "email_enabled": email_service.EMAIL_ENABLED,
         },
         **result,

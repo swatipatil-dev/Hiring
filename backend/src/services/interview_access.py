@@ -7,8 +7,9 @@ Two rules, used by every route that serves questions or runs a candidate's code:
   fallback: an account with no Candidate row owns nothing. The old fallback ("any
   interview in the company that has a candidate") let HR and interviewer accounts,
   which never have Candidate rows, submit and grade any candidate's test.
-- Staff (HR, admin, interviewer) reach interviews in their own company; superadmin
-  reaches all of them.
+- Staff (HR, admin, interviewer) reach interviews in their own company. A superadmin
+  reaches another company's interview only while that company has granted support
+  access (src/services/audit_log.py), and every such read is audited.
 
 Answer keys (``correct_answer``, ``sample_answer``) and hidden test cases are for
 staff only. ``is_staff`` is the single place that decides who counts as staff.
@@ -56,10 +57,24 @@ def candidate_owns_interview(db: Session, user: User, interview_id) -> Optional[
     ).first()
 
 
-def staff_can_access_interview(user: User, interview: Optional[Interview]) -> bool:
-    """Staff reach interviews in their own company; superadmin reaches every company."""
+def staff_can_access_interview(user: User, interview: Optional[Interview],
+                               db: Optional[Session] = None) -> bool:
+    """Staff reach interviews in their own company.
+
+    A superadmin needs an active support-access grant from the interview's company,
+    checked (and audited) through `db`; without a session there is nothing to check
+    the grant against, so the answer is no.
+    """
     if interview is None or not is_staff(user):
         return False
     if user.role == "superadmin":
-        return True
+        if db is None or not interview.company_id:
+            return False
+        from src.services.audit_log import active_grant, record_audit
+        grant = active_grant(db, interview.company_id)
+        record_audit(db, action="superadmin.read" if grant else "support_access.denied",
+                     actor=user, company_id=interview.company_id,
+                     resource=f"interview:{interview.id}",
+                     detail={"grant_id": grant.id} if grant else None)
+        return grant is not None
     return bool(interview.company_id) and interview.company_id == user.company_id

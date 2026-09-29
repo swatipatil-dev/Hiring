@@ -14,7 +14,6 @@ from datetime import timedelta
 logger = logging.getLogger(__name__)
 
 MAX_RETRIES = int(os.getenv("EMAIL_MAX_RETRIES", "5"))
-_QUEUE_NAME = os.getenv("EMAIL_QUEUE", "email")
 
 
 def _decrypt_password(sender: dict) -> str:
@@ -65,15 +64,14 @@ def _log(payload: dict, status: str, attempt: int, result: dict | None = None) -
 
 
 def _reschedule(payload: dict, attempt: int, delay: int, reason: str) -> None:
-    from .queue import get_redis_raw, redis_available
+    from .queue import email_queue, redis_available
+    from .safety import SEND_JOB
     if not redis_available():
         return
     try:
-        from rq import Queue
-        q = Queue(_QUEUE_NAME, connection=get_redis_raw())
-        q.enqueue_in(
+        email_queue().enqueue_in(
             timedelta(seconds=int(delay)),
-            "src.mailq.worker.send_email_job",
+            SEND_JOB,
             payload, attempt,
             job_timeout=60, failure_ttl=86400,
         )
@@ -91,11 +89,18 @@ def send_email_job(payload: dict, attempt: int = 0) -> dict:
     from src.services.email_service import _send
 
     sender = payload.get("sender") or {}
-    account = sender.get("user") or "__default__"
+    account = sender.get("user") or ratelimit.SHARED_ACCOUNT
     limit = payload.get("hourly_limit")
 
     # 1. Rate gate — defer (re-schedule) rather than fail when the window is full.
-    if not ratelimit.reserve(account, limit):
+    #    OTPs get headroom bulk mail can't use; on the shared platform mailbox each
+    #    company also has its own sub-limit (src/mailq/ratelimit.py).
+    claimed = ratelimit.reserve_send(
+        account, limit,
+        company_id=payload.get("company_id"),
+        priority=bool(payload.get("is_otp")),
+    )
+    if claimed is None:
         _reschedule(payload, attempt, ratelimit.seconds_to_next_window(), "rate-limited")
         _log(payload, "deferred", attempt)
         return {"deferred": True, "account": account}
@@ -116,7 +121,7 @@ def send_email_job(payload: dict, attempt: int = 0) -> dict:
     # 3. Retry transient failures; give the reserved slot back first.
     etype = result.get("error_type")
     if etype in ("network", "smtp") and attempt < MAX_RETRIES:
-        ratelimit.release(account)
+        ratelimit.release_send(claimed)
         backoff = min((2 ** attempt) * 60, 3600)
         _reschedule(payload, attempt + 1, backoff, f"retry:{etype}")
         # Still 'queued' as far as delivery goes — a retry is pending, not a loss.

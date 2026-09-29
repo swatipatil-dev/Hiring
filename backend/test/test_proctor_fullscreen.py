@@ -42,6 +42,9 @@ from proctoring.routes import (   # noqa: E402  (must follow the guard above)
 
 TERMINATE_STRIKES = 3
 
+# Every per-session endpoint checks that the caller started the session.
+OWNER = SimpleNamespace(id="fs-owner", role="candidate", company_id="co")
+
 
 def _run(coro):
     """Drive one endpoint coroutine to completion.
@@ -61,13 +64,14 @@ def session():
         "pipeline": SimpleNamespace(cfg=SimpleNamespace(TERMINATE_STRIKES=TERMINATE_STRIKES)),
         "db_session_id": None,
         "strikes": {},
+        "owner_user_id": OWNER.id,
     }
     yield sid
     _sessions.pop(sid, None)
 
 
 def _exit(sid, count):
-    return _run(record_fullscreen_exit(sid, FullscreenExitRequest(count=count)))
+    return _run(record_fullscreen_exit(sid, FullscreenExitRequest(count=count), current_user=OWNER))
 
 
 # ── Warning-only policy ──────────────────────────────────────────────────────
@@ -111,7 +115,7 @@ def test_an_unsupported_browser_is_recorded_but_never_punished(session):
     """iOS Safari has no element fullscreen. A candidate must not lose a job
     application over the phone they own, so this is a note on the report, not a strike."""
     r = _run(record_fullscreen_unavailable(
-        session, FullscreenUnavailableRequest(reason="unsupported")))
+        session, FullscreenUnavailableRequest(reason="unsupported"), current_user=OWNER))
     assert r["recorded"] is True
     assert _sessions[session]["strikes"] == {}, "must not count against them"
     assert not _sessions[session].get("terminated")

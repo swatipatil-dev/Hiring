@@ -47,10 +47,10 @@ def find_open_duplicate_job(db, company_id: Optional[str], title: str,
                             department_id: Optional[str] = None):
     """An open job for this role in this company, or None.
 
-    `company_id` is always applied explicitly. The `before_compile` tenant auto-filter
-    would normally add it, but it is bound from a sync dependency that FastAPI runs in a
-    threadpool, so the contextvar it writes does not reach the async handler — relying on
-    it here is what let this query return another tenant's job.
+    `company_id` is always applied explicitly. The tenant auto-filter
+    (src/tenancy/events.py) adds it too inside an authenticated request, but it was once
+    silently dormant (bound from a sync dependency whose context FastAPI discards) and
+    that is what let this query return another tenant's job. Keep both layers.
     """
     from src.models.models import JobPosting
 

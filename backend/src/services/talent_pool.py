@@ -92,9 +92,8 @@ def person_applied_exists(db, company_id: str, *,
     from src.models.models import Candidate, ResumePoolEntry
 
     def _base():
-        # Naming candidates.company_id explicitly makes the tenant auto-filter's
-        # _query_already_filters_company heuristic skip this query, so we don't get a
-        # second, redundant company predicate injected (src/tenancy/events.py:51).
+        # company_id is applied explicitly: this runs from background paths with no
+        # tenant bound, where the auto-filter (src/tenancy/events.py) does nothing.
         q = db.query(Candidate.id).filter(
             Candidate.company_id == company_id,
             # Never the signup placeholder — without this every registered person

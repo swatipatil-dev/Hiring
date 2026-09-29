@@ -28,8 +28,13 @@ EXPECTED_ME_KEYS = {
     "id", "email", "role", "first_name", "last_name", "phone",
     "gender", "date_of_birth", "is_active", "email_verified",
     "created_at", "updated_at", "company_id", "company_name", "profile",
+    "mfa_enabled",
 }
-FORBIDDEN_ME_KEYS = {"password_hash", "otp_code", "otp_expires_at"}
+FORBIDDEN_ME_KEYS = {
+    "password_hash", "otp_code", "otp_expires_at", "otp_hash", "otp_purpose",
+    "otp_attempts", "token_version", "mfa_secret", "mfa_recovery_codes",
+    "mfa_last_step", "failed_login_count", "locked_until",
+}
 
 
 def _make_superadmin_headers(client, db):
@@ -418,8 +423,10 @@ def test_change_password_clears_pending_reset_otp(client, db, hr_headers):
 
     from src.models.models import User
 
+    from src.auth import _otp_digest
     user = db.query(User).filter(User.email == "hr_test@test.com").first()
-    user.otp_code = "123456"
+    user.otp_hash = _otp_digest(user, "reset", "123456")
+    user.otp_purpose = "reset"
     user.otp_expires_at = datetime.utcnow() + timedelta(minutes=10)
     db.flush()
 
@@ -428,5 +435,5 @@ def test_change_password_clears_pending_reset_otp(client, db, hr_headers):
     assert resp.status_code == 200, resp.text
 
     db.refresh(user)
-    assert user.otp_code is None
+    assert user.otp_hash is None
     assert user.otp_expires_at is None

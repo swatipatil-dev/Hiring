@@ -24,18 +24,6 @@ export default defineConfig({
         target: 'http://localhost:8000',
         changeOrigin: true,
       },
-      '/uploads': {
-        target: 'http://localhost:8000',
-        changeOrigin: true,
-      },
-      '/resumes': {
-        target: 'http://localhost:8000',
-        changeOrigin: true,
-      },
-      '/cover_letters': {
-        target: 'http://localhost:8000',
-        changeOrigin: true,
-      },
       '/interviews': {
         target: 'http://localhost:8000',
         changeOrigin: true,

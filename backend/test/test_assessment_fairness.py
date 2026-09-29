@@ -32,6 +32,10 @@ def setup(db, hr_headers, candidate_headers):
     hr = _hr(db)
     hr_profile = get_hr_profile(db, hr)          # the test HR owns the job below
     cand_user = db.query(User).filter(User.email == CAND_EMAIL).first()
+    # The stock fixtures put the candidate in the platform org and HR in a
+    # separate "Test Company"; a candidate taking this company's test belongs to it.
+    cand_user.company_id = hr.company_id
+    db.flush()
     job = JobPosting(id=str(uuid.uuid4()), company_id=hr.company_id, title="Backend Engineer",
                      description="Build APIs", requirements="Python", status="active",
                      hr_id=hr_profile.id)

@@ -43,8 +43,8 @@ function ReviewCard({ jobId, sampleId, cand, onDone }) {
     <div style={{ ...box, display: 'flex', flexDirection: 'column', gap: 8 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 8 }}>
         <b style={{ fontSize: '0.92rem' }}>{cand.name}</b>
-        {cand.resume_path
-          ? <a href={`/${cand.resume_path}`} target="_blank" rel="noreferrer" style={{ fontSize: '0.8rem' }}>Open resume</a>
+        {cand.resume_url
+          ? <a href={cand.resume_url} target="_blank" rel="noreferrer" style={{ fontSize: '0.8rem' }}>Open resume</a>
           : <span style={{ fontSize: '0.8rem', color: '#9ca3af' }}>No resume file</span>}
       </div>
       {done ? (

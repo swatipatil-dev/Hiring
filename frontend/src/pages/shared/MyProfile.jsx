@@ -9,6 +9,8 @@ import Header from '../../components/Header'
 import { Card } from './profile/ProfileFields'
 import AccountDetailsCard from './profile/AccountDetailsCard'
 import ChangePasswordCard from './profile/ChangePasswordCard'
+import MfaSettingsCard from './profile/MfaSettingsCard'
+import SupportAccessCard from './profile/SupportAccessCard'
 import HRActivitySections from './profile/HRActivitySections'
 
 const ROLE_LABELS = {
@@ -183,6 +185,8 @@ export default function MyProfile() {
 
       {/* B3 — security */}
       {me && <ChangePasswordCard />}
+      {me && me.role !== 'candidate' && <MfaSettingsCard />}
+      {me && me.role === 'admin' && <SupportAccessCard />}
 
       {/* C/D/E — permissions */}
       {permError && (

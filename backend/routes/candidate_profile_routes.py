@@ -40,6 +40,7 @@ CONF_SECTION_PARTIAL = 0.6
 CONF_SCAN = 0.5
 CONF_INFERRED = 0.5
 
+from src.services.file_access import certificate_file_url, profile_file_url
 from src.config.database_config_mysql import get_db
 from src.auth import AuthMiddleware
 from src.models.models import (
@@ -961,7 +962,9 @@ def _serialize_profile(user: User, profile: CandidateProfileExt) -> dict:
         "nationality": profile.nationality,
         "marital_status": profile.marital_status,
         "languages": _json_list(profile.languages),
-        "profile_photo_path": profile.profile_photo_path,
+        # Signed download links for the owner (src/services/file_access.py) — never
+        # storage keys, and None when there is no file.
+        "profile_photo_url": profile_file_url(profile, "photo", user),
         # Location — Current Address
         "current_address_line": profile.current_address_line,
         "current_city": profile.current_city,
@@ -985,9 +988,9 @@ def _serialize_profile(user: User, profile: CandidateProfileExt) -> dict:
         "notice_period": profile.notice_period,
         "open_to_work": profile.open_to_work,
         # Documents
-        "resume_path": profile.resume_path,
-        "cover_letter_path": profile.cover_letter_path,
-        "portfolio_file_path": profile.portfolio_file_path,
+        "resume_url": profile_file_url(profile, "resume", user),
+        "cover_letter_url": profile_file_url(profile, "cover-letter", user),
+        "portfolio_file_url": profile_file_url(profile, "portfolio", user),
         # Sub-sections
         "work_experiences": [
             {
@@ -1041,7 +1044,7 @@ def _serialize_profile(user: User, profile: CandidateProfileExt) -> dict:
                 "does_not_expire": c.does_not_expire,
                 "credential_id": c.credential_id,
                 "credential_url": c.credential_url,
-                "certificate_file_path": c.certificate_file_path,
+                "certificate_file_url": certificate_file_url(c, user),
             }
             for c in profile.certifications
         ],
@@ -1875,7 +1878,7 @@ async def upload_profile_photo(
     profile = _get_or_create_profile(current_user.id, db)
     profile.profile_photo_path = path
     db.commit()
-    return {"message": "Photo uploaded", "path": path}
+    return {"message": "Photo uploaded", "url": profile_file_url(profile, "photo", current_user)}
 
 
 @router.post("/documents/resume")
@@ -1900,7 +1903,8 @@ async def upload_resume(
     profile = _get_or_create_profile(current_user.id, db)
     profile.resume_path = path
     db.commit()
-    return {"message": "Resume uploaded", "path": path, "filename": file.filename}
+    return {"message": "Resume uploaded", "url": profile_file_url(profile, "resume", current_user),
+            "filename": file.filename}
 
 
 @router.post("/documents/cover-letter")
@@ -1926,7 +1930,9 @@ async def upload_cover_letter(
     profile = _get_or_create_profile(current_user.id, db)
     profile.cover_letter_path = path
     db.commit()
-    return {"message": "Cover letter uploaded", "path": path, "filename": file.filename}
+    return {"message": "Cover letter uploaded",
+            "url": profile_file_url(profile, "cover-letter", current_user),
+            "filename": file.filename}
 
 
 # ── Completion ────────────────────────────────────────────────────────────────

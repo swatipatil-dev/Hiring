@@ -60,7 +60,7 @@ def test_blind_sample_is_below_cutoff_reproducible_and_scoreless(client, hr_head
     ids = [c["candidate_id"] for c in r1["candidates"]]
     assert len(ids) == 4 and set(ids) <= below
     assert r1["below_cutoff_population"] == 6
-    assert all(set(c) == {"candidate_id", "name", "resume_path", "my_judgement"} for c in r1["candidates"])
+    assert all(set(c) == {"candidate_id", "name", "resume_url", "my_judgement"} for c in r1["candidates"])
 
     other = client.post(_url(job, "review-samples"), headers=hr_headers,
                         json={"cutoff_score": 50, "size": 4, "seed": 7}).json()

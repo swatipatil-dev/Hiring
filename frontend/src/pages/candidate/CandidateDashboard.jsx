@@ -891,7 +891,7 @@ export default function CandidateDashboard() {
                     Profile Checklist
                   </div>
                   {[
-                    ['Resume uploaded',   !!profile?.resume_path],
+                    ['Resume uploaded',   !!profile?.resume_url],
                     ['Work experience',   (profile?.work_experiences?.length || 0) > 0],
                     ['Skills added',      (profile?.skills?.length || 0) > 0],
                   ].map(([label, ok]) => (
@@ -904,7 +904,7 @@ export default function CandidateDashboard() {
                   ))}
                 </div>
 
-                {!profile?.resume_path && (
+                {!profile?.resume_url && (
                   <div style={{ color: '#9a3412', fontSize: '0.85rem', padding: '8px 12px', background: '#fef2f2', border: '1px solid #fca5a5', borderRadius: 6, marginBottom: 14 }}>
                     You must upload a resume to your profile before using Quick Apply.
                   </div>
@@ -922,7 +922,7 @@ export default function CandidateDashboard() {
                   </button>
                   <button
                     className="btn btn-primary"
-                    disabled={!profile?.resume_path}
+                    disabled={!profile?.resume_url}
                     onClick={() => { setQuickApplyError(''); setQuickApplyStep('photo') }}
                   >
                     Confirm &amp; Continue

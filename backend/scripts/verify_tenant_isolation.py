@@ -49,6 +49,28 @@ CHECKS = [
      "question_set_assignments c JOIN interviews p ON c.interview_id = p.id"),
     ("proctoring_sessions",
      "proctoring_sessions c JOIN interviews p ON c.test_id = p.id"),
+    ("communication_answers",
+     "communication_answers c JOIN interviews p ON c.interview_id = p.id"),
+    ("interview_code_submissions",
+     "interview_code_submissions c JOIN interviews p ON c.interview_id = p.id"),
+    ("assessment_explanations",
+     "assessment_explanations c JOIN interviews p ON c.interview_id = p.id"),
+
+    # — tables whose direct parent is a job
+    ("interviews",
+     "interviews c JOIN job_postings p ON c.job_id = p.id"),
+    ("candidates",
+     "candidates c JOIN job_postings p ON c.job_id = p.id"),
+    ("offers",
+     "offers c JOIN candidates p ON c.candidate_id = p.id"),
+    ("job_description_versions",
+     "job_description_versions c JOIN job_postings p ON c.job_id = p.id"),
+    ("job_hr_collaborators",
+     "job_hr_collaborators c JOIN job_postings p ON c.job_id = p.id"),
+    ("screening_reviews",
+     "screening_reviews c JOIN job_postings p ON c.job_id = p.id"),
+    ("ats_score_events",
+     "ats_score_events c JOIN candidates p ON c.candidate_id = p.id"),
 
     # — tables whose direct parent is `support_requests`
     ("support_messages",
@@ -79,14 +101,15 @@ CHECKS = [
      "proctoring_violations c JOIN proctoring_sessions p ON c.session_id = p.id"),
     ("proctoring_transcripts",
      "proctoring_transcripts c JOIN proctoring_sessions p ON c.session_id = p.id"),
+    ("proctoring_reviews",
+     "proctoring_reviews c JOIN proctoring_sessions p ON c.session_id = p.id"),
+    ("resume_pool_attachments",
+     "resume_pool_attachments c JOIN resume_pool p ON c.entry_id = p.id"),
 
     # — tables that point directly at `companies`
     ("users",                  None),
     ("departments",            None),
     ("job_postings",           None),
-    ("candidates",             None),
-    ("interviews",             None),
-    ("offers",                 None),
     ("candidate_requests",     None),
     ("notifications",          None),
     ("support_requests",       None),
@@ -104,11 +127,19 @@ def main() -> int:
     rows = []
 
     try:
+        from sqlalchemy import inspect
+        insp = inspect(db_manager.engine)
+        existing = set(insp.get_table_names())
         with db_manager.engine.connect() as conn:
             for entry in CHECKS:
                 if len(entry) == 2:
                     table, join = entry
                 else:
+                    continue
+                # A table or column a pending migration adds is skipped, not fatal.
+                if table not in existing or "company_id" not in {
+                        c["name"] for c in insp.get_columns(table)}:
+                    print(f"skip {table}: table or company_id column not present")
                     continue
 
                 # `total` rows in the child table
@@ -160,7 +191,7 @@ def main() -> int:
 
     if total_mismatch or total_null_with_parent:
         print("\nFAIL — cross-company drift detected.  Re-run the backfill scripts:")
-        print("  python scripts/backfill_orphan_company_ids.py")
+        print("  python scripts/backfill_orphan_company_ids.py --apply")
         print("  python scripts/backfill_profile_company_ids.py")
         print("  python scripts/backfill_full_company_ids.py")
         return 1

@@ -1,0 +1,18 @@
+# Schedule for hireflow-backup.service. See that unit and docs/BACKUP_AND_RESTORE.md.
+
+[Unit]
+Description=Run the HireFlow backup nightly
+
+[Timer]
+# 02:30 server time — the quietest hour for an Indian hiring platform. The dump is a
+# consistent snapshot either way (--single-transaction); this only keeps it off peak.
+OnCalendar=*-*-* 02:30:00
+
+# A reboot or outage across 02:30 must not silently skip a night.
+Persistent=true
+
+# Keep off the minute every other cron on this shared box fires at.
+RandomizedDelaySec=20min
+
+[Install]
+WantedBy=timers.target

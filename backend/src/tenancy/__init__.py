@@ -10,9 +10,10 @@ The tenant column on every isolated table is `company_id` (UUID FK to
                      request, plus the `tenant_bypass()` context manager.
 * `mixin.py`       — `TenantScoped` marker class. Models that subclass it are
                      auto-filtered by the SQLAlchemy event hook.
-* `events.py`      — `before_compile` event on `Query` that injects
-                     `Model.company_id == <current_company_id>` on every read
-                     of a `TenantScoped` model when a tenant is bound.
+* `events.py`      — `do_orm_execute` event that adds
+                     `Model.company_id == <current_company_id>` loader criteria
+                     to every ORM select/update/delete of a `TenantScoped`
+                     model when a tenant is bound, plus the insert-time stamp.
 
 The auto-filter is a safety net.  Routes that scope explicitly remain correct;
 routes that *forget* to scope no longer leak.
@@ -34,7 +35,7 @@ from .context import (
 )
 from .mixin import TenantScoped
 
-# Importing events registers the before_compile hook on sqlalchemy.orm.Query.
+# Importing events registers the tenant hooks on sqlalchemy.orm.Session.
 from . import events  # noqa: F401
 
 __all__ = [

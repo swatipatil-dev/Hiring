@@ -16,6 +16,7 @@ production Python 3.11 / pydantic 2.9 stack).
 """
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -26,9 +27,8 @@ from fastapi import (APIRouter, Depends, HTTPException, Query, Request,
                      WebSocket, WebSocketDisconnect, status)
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
-from jose import jwt, JWTError
 
-from src.auth import get_current_user, require_role, SECRET_KEY, ALGORITHM
+from src.auth import get_current_user, require_role, resolve_token_user
 from src.config.database_config_mysql import get_db, db_manager
 from src.models.models import (
     CodingProblem, ProblemTestCase, CodeSubmission, SubmissionTestResult, User,
@@ -141,6 +141,40 @@ _LANG_ALIASES = {"python3": "python", "py": "python", "node": "javascript",
 
 def _is_admin(user: User) -> bool:
     return user.role in _ADMIN_ROLES
+
+
+def _own_company(q, model, user: User):
+    """Scope a query to the caller's company. Superadmin alone is platform-wide.
+
+    Explicit on purpose: the tenant auto-filter adds the same predicate, but it was
+    once dormant for every request and these routes then served any company's
+    reference solutions and hidden tests to any admin or HR account.
+    """
+    if user.role == "superadmin":
+        return q
+    return q.filter(model.company_id == user.company_id)
+
+
+def _problem_or_404(db: Session, problem_id: str, user: User) -> CodingProblem:
+    p = _own_company(db.query(CodingProblem), CodingProblem, user).filter(
+        CodingProblem.id == problem_id
+    ).first()
+    if not p:
+        raise HTTPException(404, "Problem not found")
+    from src.services.audit_log import require_support_access
+    require_support_access(db, None, user, p.company_id, f"coding problem {problem_id}")
+    return p
+
+
+def _shared_secret_matches(presented: Optional[str], env_var: str) -> bool:
+    """Constant-time check of a shared-secret header against its env var.
+
+    An unset secret never matches. Header only: a secret in a query string ends up
+    in access logs, proxy logs and browser history.
+    """
+    expected = os.getenv(env_var, "").strip()
+    return bool(expected and presented
+                and hmac.compare_digest(presented.encode(), expected.encode()))
 
 
 def _problem_dict(p: CodingProblem, *, include_solution: bool) -> dict:
@@ -292,7 +326,7 @@ def _question_for_caller(db: Session, user: User, question_id: str,
         raise HTTPException(404, "Question not found")
     if is_staff(user):
         owner = db.query(Interview).filter(Interview.id == q.interview_id).first()
-        if not staff_can_access_interview(user, owner):
+        if not staff_can_access_interview(user, owner, db):
             raise HTTPException(404, "Question not found")
         return q, None
     if interview_id is None:
@@ -376,6 +410,7 @@ async def grade_question(
                 f"Use Submit Test to finish.",
             )
         sub = InterviewCodeSubmission(
+            company_id=interview.company_id,
             interview_id=interview.id,
             question_id=q.id,
             user_id=current_user.id,
@@ -493,7 +528,13 @@ async def warmup_judge(
     the judge is ready by the time they reach the coding question. No-op unless the
     test actually contains a coding question and ``JUDGE_AUTOSTART=1``."""
     interview = _candidate_owns_interview(db, current_user, body.interview_id)
-    if not interview and current_user.role not in _ADMIN_ROLES:
+    if not interview and current_user.role in _ADMIN_ROLES:
+        # Staff may warm the judge for their own company's tests only; otherwise the
+        # answer below says whether any company's interview has coding questions.
+        interview = _own_company(db.query(Interview), Interview, current_user).filter(
+            Interview.id == body.interview_id
+        ).first()
+    if not interview:
         raise HTTPException(404, "Interview not found")
 
     from src.models.question_models import Question as InterviewQuestion
@@ -515,18 +556,16 @@ async def warmup_judge(
 async def reap_judge(request: Request, db: Session = Depends(get_db)):
     """Stop the judge VM if it's been idle past ``JUDGE_IDLE_STOP_MIN``. Intended to
     be hit periodically by Cloud Scheduler. Auth: the ``JUDGE_REAP_TOKEN`` shared
-    secret (header ``X-Judge-Reap-Token`` or ``?token=``), or an admin/HR JWT."""
-    token = request.headers.get("X-Judge-Reap-Token") or request.query_params.get("token")
-    expected = os.getenv("JUDGE_REAP_TOKEN", "").strip()
-    authorized = bool(expected and token and token == expected)
+    secret (header ``X-Judge-Reap-Token``), or an admin/HR JWT."""
+    authorized = _shared_secret_matches(request.headers.get("X-Judge-Reap-Token"),
+                                        "JUDGE_REAP_TOKEN")
     if not authorized:
         auth = request.headers.get("Authorization", "")
         if auth.startswith("Bearer "):
             try:
-                payload = jwt.decode(auth[7:], SECRET_KEY, algorithms=[ALGORITHM])
-                u = db.query(User).filter(User.id == payload.get("sub")).first()
-                authorized = bool(u and u.role in _ADMIN_ROLES)
-            except JWTError:
+                u, _ = resolve_token_user(db, auth[7:])
+                authorized = u.role in _ADMIN_ROLES
+            except HTTPException:
                 authorized = False
     if not authorized:
         raise HTTPException(401, "Unauthorized")
@@ -556,8 +595,8 @@ async def regrade_pending(
     Idempotent: pass 1 flips ``pending``→``graded`` and pass 2 pops the
     ``pending_regrade`` key, so a second run finds nothing. Safe on a timer.
 
-    Auth: the ``JUDGE_REGRADE_TOKEN`` shared secret (header ``X-Judge-Regrade-Token``
-    or ``?token=``), or an admin/HR JWT — same shape as ``/reap``.
+    Auth: the ``JUDGE_REGRADE_TOKEN`` shared secret (header ``X-Judge-Regrade-Token``),
+    or an admin/HR JWT — same shape as ``/reap``.
 
     **Scope differs by caller, deliberately.** ``Interview`` and
     ``InterviewCodeSubmission`` are tenant-scoped, and the read auto-filter is a
@@ -572,21 +611,19 @@ async def regrade_pending(
     # Both branches bind the tenant contextvar explicitly. There is no
     # get_current_user dependency on this route to do it, and the contextvar is
     # per-thread state that would otherwise carry over from an earlier request.
-    token = request.headers.get("X-Judge-Regrade-Token") or request.query_params.get("token")
-    expected = os.getenv("JUDGE_REGRADE_TOKEN", "").strip()
-    authorized = bool(expected and token and token == expected)
+    authorized = _shared_secret_matches(request.headers.get("X-Judge-Regrade-Token"),
+                                        "JUDGE_REGRADE_TOKEN")
     if authorized:
         set_current_company(None)   # platform-wide sweep
     else:
         auth = request.headers.get("Authorization", "")
         if auth.startswith("Bearer "):
             try:
-                payload = jwt.decode(auth[7:], SECRET_KEY, algorithms=[ALGORITHM])
-                u = db.query(User).filter(User.id == payload.get("sub")).first()
-                authorized = bool(u and u.role in _ADMIN_ROLES)
+                u, _ = resolve_token_user(db, auth[7:])
+                authorized = u.role in _ADMIN_ROLES
                 if authorized:
                     set_current_company(u.company_id if u.role != "superadmin" else None)
-            except JWTError:
+            except HTTPException:
                 authorized = False
     if not authorized:
         raise HTTPException(401, "Unauthorized")
@@ -713,12 +750,14 @@ async def create_problem(
         allowed_languages=body.allowed_languages, starter_code=body.starter_code,
         reference_solution=body.reference_solution, status=body.status,
         is_public=body.is_public, job_id=body.job_id, created_by=current_user.id,
+        company_id=current_user.company_id,
     )
     db.add(problem)
-    db.flush()  # assign id + auto-stamp company_id (before_flush hook)
+    db.flush()  # assign id
 
     for i, tc in enumerate(body.test_cases or []):
         db.add(ProblemTestCase(
+            company_id=problem.company_id,
             problem_id=problem.id, input=tc.input, expected_output=tc.expected_output,
             is_hidden=tc.is_hidden, is_sample=tc.is_sample,
             weight=tc.weight, ordinal=tc.ordinal or i,
@@ -734,8 +773,7 @@ async def list_problems(
     db: Session = Depends(get_db),
     difficulty: Optional[str] = None,
 ):
-    # Tenant auto-filter already scopes to the user's company.
-    q = db.query(CodingProblem)
+    q = _own_company(db.query(CodingProblem), CodingProblem, current_user)
     if difficulty:
         q = q.filter(CodingProblem.difficulty == difficulty)
     if not _is_admin(current_user):
@@ -750,16 +788,15 @@ async def get_problem(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    p = db.query(CodingProblem).filter(CodingProblem.id == problem_id).first()
-    if not p:
-        raise HTTPException(404, "Problem not found")
+    p = _problem_or_404(db, problem_id, current_user)
     if not _is_admin(current_user) and p.status != "published":
         raise HTTPException(404, "Problem not found")
 
     admin = _is_admin(current_user)
     out = _problem_dict(p, include_solution=admin)
     tcs = db.query(ProblemTestCase).filter(
-        ProblemTestCase.problem_id == p.id
+        ProblemTestCase.problem_id == p.id,
+        ProblemTestCase.company_id == p.company_id,
     ).order_by(ProblemTestCase.ordinal).all()
     # candidates only ever see sample (non-hidden) cases
     out["test_cases"] = [
@@ -776,9 +813,7 @@ async def update_problem(
     current_user: User = Depends(require_role(["admin", "hr", "superadmin"])),
     db: Session = Depends(get_db),
 ):
-    p = db.query(CodingProblem).filter(CodingProblem.id == problem_id).first()
-    if not p:
-        raise HTTPException(404, "Problem not found")
+    p = _problem_or_404(db, problem_id, current_user)
     for field, value in body.dict(exclude_unset=True).items():
         setattr(p, field, value)
     p.updated_at = datetime.utcnow()
@@ -794,12 +829,11 @@ async def add_testcases(
     current_user: User = Depends(require_role(["admin", "hr", "superadmin"])),
     db: Session = Depends(get_db),
 ):
-    p = db.query(CodingProblem).filter(CodingProblem.id == problem_id).first()
-    if not p:
-        raise HTTPException(404, "Problem not found")
+    p = _problem_or_404(db, problem_id, current_user)
     created = []
     for i, tc in enumerate(body):
         row = ProblemTestCase(
+            company_id=p.company_id,
             problem_id=p.id, input=tc.input, expected_output=tc.expected_output,
             is_hidden=tc.is_hidden, is_sample=tc.is_sample,
             weight=tc.weight, ordinal=tc.ordinal or i,
@@ -817,8 +851,10 @@ async def list_testcases(
     db: Session = Depends(get_db),
 ):
     """Admin/HR only — includes hidden cases."""
+    p = _problem_or_404(db, problem_id, current_user)
     tcs = db.query(ProblemTestCase).filter(
-        ProblemTestCase.problem_id == problem_id
+        ProblemTestCase.problem_id == p.id,
+        ProblemTestCase.company_id == p.company_id,
     ).order_by(ProblemTestCase.ordinal).all()
     return {"test_cases": [_testcase_dict(tc, reveal=True) for tc in tcs]}
 
@@ -835,13 +871,14 @@ async def submit_code(
     if body.language not in judge_languages.supported_languages():
         raise HTTPException(400, f"Unsupported language '{body.language}'")
 
-    problem = db.query(CodingProblem).filter(CodingProblem.id == body.problem_id).first()
-    if not problem:
+    problem = _problem_or_404(db, body.problem_id, current_user)
+    if not _is_admin(current_user) and problem.status != "published":
         raise HTTPException(404, "Problem not found")
     if problem.allowed_languages and body.language not in problem.allowed_languages:
         raise HTTPException(400, f"Language '{body.language}' not allowed for this problem")
 
     sub = CodeSubmission(
+        company_id=problem.company_id,
         problem_id=problem.id, user_id=current_user.id, language=body.language,
         source_code=body.source_code, contest_id=body.contest_id,
         proctoring_session_id=body.proctoring_session_id,
@@ -880,9 +917,13 @@ async def get_submission(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    sub = db.query(CodeSubmission).filter(CodeSubmission.id == submission_id).first()
+    sub = _own_company(db.query(CodeSubmission), CodeSubmission, current_user).filter(
+        CodeSubmission.id == submission_id
+    ).first()
     if not sub:
         raise HTTPException(404, "Submission not found")
+    from src.services.audit_log import require_support_access
+    require_support_access(db, None, current_user, sub.company_id, f"code submission {submission_id}")
     admin = _is_admin(current_user)
     if not admin and sub.user_id != current_user.id:
         raise HTTPException(403, "Not your submission")
@@ -899,7 +940,7 @@ async def list_submissions(
     problem_id: Optional[str] = None,
     limit: int = Query(50, le=200),
 ):
-    q = db.query(CodeSubmission)
+    q = _own_company(db.query(CodeSubmission), CodeSubmission, current_user)
     if not _is_admin(current_user):
         q = q.filter(CodeSubmission.user_id == current_user.id)
     if problem_id:
@@ -927,19 +968,19 @@ def _ws_authorize(token: Optional[str], submission_id: str):
     """
     if not token:
         raise ValueError("missing token")
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id = payload.get("sub")
-    except JWTError:
-        raise ValueError("invalid token")
 
     db = db_manager.get_db_session()
     try:
-        user = db.query(User).filter(User.id == user_id).first()
-        if not user:
-            raise ValueError("unknown user")
+        try:
+            # The same checks as every HTTP route: revoked, MFA-step, inactive and
+            # suspended-company tokens are all refused, not just forged ones.
+            user, _ = resolve_token_user(db, token)
+        except HTTPException:
+            raise ValueError("invalid token")
         set_current_company(user.company_id if user.role != "superadmin" else None)
-        sub = db.query(CodeSubmission).filter(CodeSubmission.id == submission_id).first()
+        sub = _own_company(db.query(CodeSubmission), CodeSubmission, user).filter(
+            CodeSubmission.id == submission_id
+        ).first()
         if not sub:
             raise ValueError("submission not found")
         if user.role not in _ADMIN_ROLES and sub.user_id != user.id:

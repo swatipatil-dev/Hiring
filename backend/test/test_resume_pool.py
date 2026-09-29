@@ -1003,6 +1003,10 @@ def test_history_survives_a_job_with_no_company(client, db, hr_headers, hr_compa
     auto-filter append `job_postings.company_id = X`, and since `NULL = X` is false
     that turns the outer join inner and silently drops the whole application — the
     person would read as never_applied.
+
+    The orphan job itself is not readable: a row with no company belongs to no
+    tenant, so the filter hides it from every tenant. Only its title is lost;
+    scripts/backfill_orphan_company_ids.py is the fix for the data.
     """
     orphan_job = JobPosting(
         id=_uid(), company_id=None, title="Legacy Role",
@@ -1017,7 +1021,7 @@ def test_history_survives_a_job_with_no_company(client, db, hr_headers, hr_compa
 
     result = client.get("/api/v1/hr/resume-pool", headers=hr_headers).json()["results"][0]
     assert result["application_count"] == 1, "the application was dropped by a join"
-    assert result["applications"][0]["job_title"] == "Legacy Role"
+    assert result["applications"][0]["job_title"] is None
     assert result["outcome"] == "rejected"
 
 

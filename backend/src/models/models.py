@@ -245,8 +245,30 @@ class User(Base, TenantScoped):
     date_of_birth = Column(Date, nullable=True)
     is_active       = Column(Boolean, default=True)
     email_verified  = Column(Boolean, default=False)
+    # Legacy plaintext OTP column — always NULL now; the code is kept only as
+    # otp_hash (src/auth.py set_user_otp). Kept so old rows can be cleared.
     otp_code        = Column(String(6), nullable=True)
     otp_expires_at  = Column(DateTime, nullable=True)
+    otp_hash        = Column(String(64), nullable=True)     # HMAC-SHA256 of the code
+    otp_purpose     = Column(String(20), nullable=True)     # verify | reset
+    otp_attempts    = Column(Integer, nullable=False, default=0, server_default="0")
+    # Wrong codes across every code issued in the last hour. Unlike otp_attempts it
+    # survives a reissue, so requesting fresh codes doesn't buy fresh guesses.
+    otp_recent_failures = Column(Integer, nullable=False, default=0, server_default="0")
+    otp_failures_since  = Column(DateTime, nullable=True)
+    # Bumped to revoke every JWT issued to this user (logout, password change or
+    # reset, deactivation, company suspension). Tokens carry it as the `tv` claim.
+    token_version   = Column(Integer, nullable=False, default=0, server_default="0")
+    # Per-account login lockout, independent of the per-IP rate limit.
+    failed_login_count = Column(Integer, nullable=False, default=0, server_default="0")
+    last_failed_login_at = Column(DateTime, nullable=True)
+    locked_until    = Column(DateTime, nullable=True)
+    # TOTP multi-factor auth. mfa_secret is Fernet-encrypted (src/security.py);
+    # it is set but mfa_enabled stays False while an enrolment is pending.
+    mfa_enabled     = Column(Boolean, nullable=False, default=False, server_default="0")
+    mfa_secret      = Column(String(255), nullable=True)
+    mfa_recovery_codes = Column(Text, nullable=True)        # JSON list of SHA-256 hashes
+    mfa_last_step   = Column(Integer, nullable=True)        # last accepted TOTP step (replay guard)
     created_at      = Column(DateTime, default=datetime.utcnow)
     updated_at      = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -1097,6 +1119,43 @@ class SupportMessage(Base, TenantScoped):
 
     request = relationship("SupportRequest", back_populates="messages")
     sender  = relationship("User")
+
+
+class AuditLog(Base, TenantScoped):
+    """Append-only record of privileged access (superadmin requests, reads of
+    client data, support-access grants). company_id is the tenant whose data
+    was touched, or NULL for platform-level actions. Never updated or deleted —
+    the before_flush guard in src/services/audit_log.py refuses both."""
+    __tablename__ = "audit_log"
+
+    id           = Column(String(36), primary_key=True, default=_uuid)
+    created_at   = Column(DateTime, default=datetime.utcnow, index=True)
+    company_id   = Column(String(36), ForeignKey("companies.id"), nullable=True, index=True)
+    actor_user_id = Column(String(36), nullable=True, index=True)   # no FK: must outlive the user
+    actor_email  = Column(String(255), nullable=True)
+    actor_role   = Column(String(50), nullable=True)
+    action       = Column(String(100), nullable=False)             # e.g. superadmin.request, support_access.denied
+    resource     = Column(String(500), nullable=True)
+    method       = Column(String(10), nullable=True)
+    path         = Column(String(500), nullable=True)
+    ip           = Column(String(64), nullable=True)
+    user_agent   = Column(String(255), nullable=True)
+    detail       = Column(Text, nullable=True)
+
+
+class SupportAccessGrant(Base, TenantScoped):
+    """A company admin's time-limited consent for platform support (superadmin)
+    to read the company's candidate and interview data."""
+    __tablename__ = "support_access_grants"
+
+    id          = Column(String(36), primary_key=True, default=_uuid)
+    company_id  = Column(String(36), ForeignKey("companies.id"), nullable=False, index=True)
+    granted_by  = Column(String(36), ForeignKey("users.id"), nullable=False)
+    reason      = Column(String(500), nullable=True)
+    created_at  = Column(DateTime, default=datetime.utcnow)
+    expires_at  = Column(DateTime, nullable=False)
+    revoked_at  = Column(DateTime, nullable=True)
+    revoked_by  = Column(String(36), ForeignKey("users.id"), nullable=True)
 
 
 # ═══════════════════════════════════════════════════════

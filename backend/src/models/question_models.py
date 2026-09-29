@@ -1,11 +1,17 @@
 """
 QUESTION MODELS — interview_questions, question_set_assignments, candidate_question_history
 TestSet + TestSetQuestion merged into QuestionSetAssignment (interview_id + set_number + order)
+
+Every table here is TenantScoped. A row's company is its interview's company: the
+`_inherit_interview_company` flush hook below copies it on insert, so rows created
+outside a request (question generation workers, scripts, tests) are never NULL-company
+orphans that the tenant filter would hide from their own company.
 """
 
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Boolean, Float
-from sqlalchemy.orm import relationship
-from .models import Base
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Boolean, Float, event, select
+from sqlalchemy.orm import relationship, Session
+from .models import Base, Interview
+from ..tenancy import TenantScoped
 from datetime import datetime
 import enum
 import uuid
@@ -33,10 +39,11 @@ class QuestionStatus(str, enum.Enum):
     MODIFIED  = "modified"
 
 
-class Question(Base):
+class Question(Base, TenantScoped):
     __tablename__ = "interview_questions"
 
     id                   = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    company_id           = Column(String(36), ForeignKey("companies.id"), nullable=True, index=True)
     interview_id         = Column(Integer, ForeignKey("interviews.id"), nullable=True, index=True)
     question_text        = Column(Text, nullable=False)
     question_type        = Column(String(50), nullable=False)
@@ -72,11 +79,12 @@ class Question(Base):
                                     cascade="all, delete-orphan")
 
 
-class QuestionSetAssignment(Base):
+class QuestionSetAssignment(Base, TenantScoped):
     """Replaces TestSet + TestSetQuestion. Each row links a question to an interview set."""
     __tablename__ = "question_set_assignments"
 
     id             = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    company_id     = Column(String(36), ForeignKey("companies.id"), nullable=True, index=True)
     interview_id   = Column(Integer, ForeignKey("interviews.id"), nullable=False, index=True)
     question_id    = Column(String(36), ForeignKey("interview_questions.id"), nullable=False)
     set_number     = Column(Integer, nullable=False, default=1)
@@ -86,18 +94,19 @@ class QuestionSetAssignment(Base):
     question  = relationship("Question", back_populates="set_assignments")
 
 
-class CandidateQuestionHistory(Base):
+class CandidateQuestionHistory(Base, TenantScoped):
     """Tracks which pool questions a candidate has already been assigned (retake prevention)."""
     __tablename__ = "candidate_question_history"
 
     id                 = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    company_id         = Column(String(36), ForeignKey("companies.id"), nullable=True, index=True)
     candidate_id       = Column(String(36), ForeignKey("candidates.id"), nullable=False, index=True)
     source_question_id = Column(String(36), ForeignKey("interview_questions.id"), nullable=False)
     interview_id       = Column(Integer, ForeignKey("interviews.id"), nullable=False)
     assigned_at        = Column(DateTime, default=datetime.utcnow)
 
 
-class CommunicationAnswer(Base):
+class CommunicationAnswer(Base, TenantScoped):
     """
     A candidate's spoken answer to a `communication` question.
 
@@ -109,6 +118,7 @@ class CommunicationAnswer(Base):
     __tablename__ = "communication_answers"
 
     id                  = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    company_id          = Column(String(36), ForeignKey("companies.id"), nullable=True, index=True)
     interview_id        = Column(Integer, ForeignKey("interviews.id"), nullable=False, index=True)
     question_id         = Column(String(36), ForeignKey("interview_questions.id"), nullable=False, index=True)
     candidate_id        = Column(String(36), ForeignKey("candidates.id"), nullable=True, index=True)
@@ -130,3 +140,26 @@ class CommunicationAnswer(Base):
 
     created_at          = Column(DateTime, default=datetime.utcnow)
     updated_at          = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+_INTERVIEW_CHILDREN = (Question, QuestionSetAssignment, CandidateQuestionHistory, CommunicationAnswer)
+
+
+@event.listens_for(Session, "before_flush")
+def _inherit_interview_company(session, flush_context, instances):
+    """Copy the parent interview's company onto new question-family rows that lack one.
+
+    Runs after the generic tenant stamp (src/tenancy/events.py), so it only fills rows
+    created with no tenant bound. An explicit company_id is never overwritten.
+    """
+    for obj in session.new:
+        if not isinstance(obj, _INTERVIEW_CHILDREN) or obj.company_id:
+            continue
+        interview = obj.__dict__.get("interview")
+        if interview is not None:
+            obj.company_id = interview.company_id
+        elif obj.interview_id is not None:
+            obj.company_id = session.execute(
+                select(Interview.company_id).where(Interview.id == obj.interview_id),
+                execution_options={"_tenant_bypass": True},
+            ).scalar()

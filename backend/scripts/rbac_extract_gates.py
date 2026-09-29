@@ -14,10 +14,10 @@ Grep cannot produce that inventory correctly in this codebase:
 * Router-level ``dependencies=[...]`` gate every endpoint in a file without
   appearing on any of them. ``routes/database_management_routes.py:22`` and
   ``routes/ats_routes.py:30`` are both invisible to a per-endpoint grep.
-* Three route files are dead code -- ``routes/enhanced_candidate_routes.py``,
-  ``routes/enhanced_hr_routes.py`` and the root ``ats_routes.py`` (shadowed by
-  ``routes/ats_routes.py``). A file-walker catalogues their 23 endpoints; the
-  live app never registers them.
+* Route files can exist without being registered (three such dead files --
+  ``routes/enhanced_candidate_routes.py``, ``routes/enhanced_hr_routes.py`` and
+  the root ``ats_routes.py`` -- have since been deleted). A file-walker would
+  catalogue their endpoints; the live app never registered them.
 
 So this walks what FastAPI actually built: ``app.routes`` -> ``APIRoute.dependant``,
 recursively, reading role literals out of closures. Prefixes are already applied,

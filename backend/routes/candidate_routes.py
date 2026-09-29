@@ -20,6 +20,7 @@ from src.models.models import (
 from .candidate_profile_routes import (
     _get_or_create_profile, _serialize_profile, build_profile_text
 )
+from src.services.file_access import voice_answer_url
 from src.services.enhanced_ats_service import EnhancedATSScoringService
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from datetime import datetime
@@ -844,10 +845,13 @@ async def get_application_details(
     db: Session = Depends(get_db)
 ):
     """Get detailed information about a specific application"""
+    # A row with a user_id belongs to that account; email is only the identity of
+    # account-less rows (HR types it, so it can collide).
     candidate = db.query(Candidate).filter(
         Candidate.id == application_id,
         Candidate.email == current_user.email,
         Candidate.company_id == current_user.company_id,
+        or_(Candidate.user_id.is_(None), Candidate.user_id == current_user.id),
     ).first()
     
     if not candidate:
@@ -858,9 +862,14 @@ async def get_application_details(
         ATSResult.candidate_id == candidate.id
     ).first()
     
-    # Get stage history
+    # Stage history as the candidate may see it: which stage and when, nothing else.
+    # The table is the company's internal record — staff notes live in it as
+    # from_stage="__note__" rows (advanced_features_routes), and every transition's
+    # `notes` is free text HR types, rejection reasons included. Neither is returned.
     stage_history = db.query(CandidateStageHistory).filter(
-        CandidateStageHistory.candidate_id == candidate.id
+        CandidateStageHistory.candidate_id == candidate.id,
+        CandidateStageHistory.company_id == current_user.company_id,
+        CandidateStageHistory.from_stage != "__note__",
     ).order_by(CandidateStageHistory.created_at.desc()).all()
     
     if not candidate.job:
@@ -902,7 +911,6 @@ async def get_application_details(
             {
                 "from_stage": stage.from_stage,
                 "to_stage": stage.to_stage,
-                "notes": stage.notes,
                 "changed_at": stage.created_at
             }
             for stage in stage_history
@@ -1138,7 +1146,8 @@ async def submit_voice_answer(
     if not question:
         raise HTTPException(status_code=404, detail="Question not found for this interview")
 
-    # Save the recording (WAV) for HR playback — served under /uploads.
+    # Save the recording (WAV) for HR playback — downloaded through
+    # routes/file_routes.py, never served statically.
     ext = Path(audio.filename).suffix.lower() if audio.filename else ".wav"
     if ext not in (".wav", ".webm", ".ogg", ".mp3", ".m4a"):
         ext = ".wav"
@@ -1188,7 +1197,7 @@ async def submit_voice_answer(
         "communication_score": result.communication_score,
         "transcript": transcript,
         "breakdown": result.to_breakdown(),
-        "audio_url": "/" + audio_path,
+        "audio_url": voice_answer_url(record.id, current_user),
     }
 
 
@@ -1488,7 +1497,9 @@ async def submit_interview(
                 "communication_score": comm_score,
                 "points": points,
                 "awarded": awarded,
-                "audio_url": ("/" + rec.audio_path) if rec.audio_path else None,
+                # The row id, not a URL: download links are signed per viewer and
+                # expire (src/services/file_access.py), so none can be stored.
+                "audio_answer_id": rec.id if rec.audio_path else None,
                 "breakdown": breakdown,
             })
 

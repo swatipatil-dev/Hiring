@@ -6,9 +6,11 @@ Handles user registration, login, logout, and token management
 import json
 import logging
 import re
+import time
 from datetime import datetime
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Request, status, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from src.rate_limit import limiter
 
 logger = logging.getLogger(__name__)
@@ -18,10 +20,15 @@ from sqlalchemy.orm import Session
 from src.config.database_config_mysql import get_db
 from src.auth import (
     UserCreate, UserLogin, Token, create_user, login_user,
-    create_token_response, get_current_user, set_user_otp,
-    verify_password, get_password_hash, validate_password_strength
+    create_token_response, get_current_user, set_user_otp, check_user_otp,
+    clear_user_otp, verify_password, get_password_hash, validate_password_strength,
+    revoke_user_sessions, create_mfa_token, decode_mfa_token, mfa_required_for,
+    is_locked, locked_exception, register_login_failure, clear_login_failures,
+    _authenticate_request, SESSION_MAX_HOURS,
 )
 from src.models.models import User, Company
+from src import mfa as totp
+from src.security import encrypt, decrypt
 from src.tenancy.platform_company import platform_slug
 from src.services.permissions_catalog import get_permissions_for_role
 
@@ -118,17 +125,45 @@ class LoginRequest(UserLogin):
 def _scoped_user_by_email(
     db: Session, email: str, company_id: Optional[str]
 ) -> Optional[User]:
-    """Look up a user by email, scoped to a company when provided.
+    """Look up a user by email for the unauthenticated OTP flows (verify, resend,
+    forgot/reset password). Never an arbitrary pick:
 
-    With same-email-different-company now allowed, all by-email lookups
-    (OTP verify/resend, password reset, etc.) must be scoped or they'll pick an
-    arbitrary row. Falls back to a global lookup only when no company context
-    was given (e.g. legacy HireFlow domain login).
+    * With a company context (portal slug, legacy key, tenant domain) the lookup is
+      that company's user — never the superadmin, who cannot be reset or verified
+      through a client portal.
+    * Without one, the email must identify exactly one account. The same address at
+      several companies is ambiguous, and an ambiguous lookup matches nothing rather
+      than whichever row MySQL returns first. The superadmin is reachable only here,
+      on the platform flow.
     """
     q = db.query(User).filter(User.email == email)
     if company_id is not None:
-        q = q.filter(User.company_id == company_id)
-    return q.first()
+        return q.filter(User.company_id == company_id, User.role != "superadmin").first()
+    matches = q.limit(2).all()
+    return matches[0] if len(matches) == 1 else None
+
+
+def _issue_login(user: User, db: Session):
+    """The response to a correct password: the token, or the MFA step before it.
+
+    * MFA enrolled            → {"mfa_required": true, "mfa_token": ...}; the token
+                                 is exchanged at /auth/login/mfa with a code.
+    * MFA required, not set up → {"mfa_enrollment_required": true, "mfa_token": ...};
+                                 the token opens only the enrolment endpoints.
+    * otherwise               → the access token.
+    """
+    if user.mfa_enabled:
+        return {
+            "mfa_required": True,
+            "mfa_token": create_mfa_token(user, "mfa"),
+            "methods": ["totp", "recovery_code"],
+        }
+    if mfa_required_for(user):
+        return {
+            "mfa_enrollment_required": True,
+            "mfa_token": create_mfa_token(user, "mfa_enroll"),
+        }
+    return create_token_response(user, db)
 
 
 @router.post("/register", status_code=status.HTTP_201_CREATED)
@@ -190,7 +225,7 @@ async def register(request: Request, user_data: RegisterRequest, db: Session = D
         )
 
 
-@router.post("/verify-otp", response_model=Token)
+@router.post("/verify-otp")
 # High, because a campus batch verifies in one burst right after registering — see the
 # note on /register. Still bounded, so a scripted guess of 6-digit codes is not free.
 @limiter.limit("120/minute")
@@ -209,16 +244,12 @@ async def verify_otp(request: Request, data: OTPVerifyRequest, db: Session = Dep
         raise _INVALID_CODE
     if user.email_verified:
         raise _INVALID_CODE
-    if not user.otp_code or user.otp_code != data.otp:
-        raise _INVALID_CODE
-    if user.otp_expires_at and datetime.utcnow() > user.otp_expires_at:
+    if not check_user_otp(user, db, data.otp, "verify"):
         raise _INVALID_CODE
     user.email_verified = True
-    user.otp_code = None
-    user.otp_expires_at = None
     db.commit()
     db.refresh(user)
-    return create_token_response(user, db)
+    return _issue_login(user, db)
 
 
 @router.post("/resend-otp")
@@ -235,7 +266,7 @@ async def resend_otp(request: Request, data: ResendOTPRequest, db: Session = Dep
     SENT = {"message": "If that account exists and is unverified, a code has been sent."}
     if not user or user.email_verified:
         return SENT
-    otp = set_user_otp(user, db)
+    otp = set_user_otp(user, db, purpose="verify")
     try:
         from src.services.email_service import send_otp_email, resolve_auth_sender
         smtp_config = resolve_auth_sender(db, user.company_id)
@@ -246,7 +277,7 @@ async def resend_otp(request: Request, data: ResendOTPRequest, db: Session = Dep
         logger.warning(f"resend OTP email to {user.email} failed: {e}")
     return SENT
 
-@router.post("/login", response_model=Token)
+@router.post("/login")
 @limiter.limit("5/minute")
 async def login(
     request: Request,
@@ -263,6 +294,12 @@ async def login(
     - On a tenant domain (acme.hireflow.io) only that company's users can log in.
     - Superadmin can only log in from the platform domain (no tenant_company_id on request).
     - Suspended company users are rejected with a clear message.
+    - Ten wrong passwords in 15 minutes lock the account for 15 minutes
+      (src/auth.py), on top of the per-IP limit above.
+    - MFA users get an intermediate token instead of a session (see _issue_login).
+
+    Every credential failure is the same generic 401, whether the email is unknown,
+    registered at another company, or the password is wrong.
     """
     try:
         scope_company_id = _resolve_company_id(db, request, user_credentials.api_key, user_credentials.company_slug)
@@ -273,27 +310,9 @@ async def login(
             company_id=scope_company_id,
         )
         if not user:
-            # A user may only sign in through their own company's login page.
-            # When the login is scoped to a company (api_key / tenant) and this
-            # email is not registered with that company — but IS registered with
-            # another — guide them to register here instead of a vague
-            # "wrong password". Wrong password for a user that *does* belong to
-            # this company stays generic so we don't reveal which emails exist.
-            if scope_company_id:
-                here = db.query(User).filter(
-                    User.email == user_credentials.email,
-                    User.company_id == scope_company_id,
-                ).first()
-                if not here:
-                    elsewhere = db.query(User).filter(
-                        User.email == user_credentials.email,
-                        User.company_id != scope_company_id,
-                    ).first()
-                    if elsewhere:
-                        raise HTTPException(
-                            status_code=status.HTTP_403_FORBIDDEN,
-                            detail="You're not registered with this company. Please register first to continue.",
-                        )
+            # Deliberately generic. This used to answer "You're not registered with
+            # this company" when the email existed at a *different* company, which
+            # told anyone which addresses have accounts somewhere on the platform.
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Incorrect email or password",
@@ -340,7 +359,7 @@ async def login(
                     detail="You're not a registered user for this company. Please complete your registration to continue.",
                 )
 
-        return create_token_response(user, db)
+        return _issue_login(user, db)
     except HTTPException:
         raise
     except Exception as e:
@@ -350,23 +369,235 @@ async def login(
         )
 
 @router.post("/refresh", response_model=Token)
+@limiter.limit("30/minute")
 async def refresh_token(
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Issue a fresh access token for the currently authenticated user."""
-    return create_token_response(current_user, db)
+    """Issue a fresh access token for the currently authenticated user.
+
+    Refused once SESSION_MAX_HOURS have passed since the user actually signed in
+    (the `auth_time` claim, carried through every refresh), so a stolen token can
+    be kept alive only until then — not forever.
+    """
+    payload = getattr(request.state, "jwt_payload", {}) or {}
+    now = int(time.time())
+    # Tokens minted before auth_time existed start their ceiling now.
+    auth_time = int(payload.get("auth_time") or now)
+    if now - auth_time > SESSION_MAX_HOURS * 3600:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Your session has expired. Sign in again.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return create_token_response(current_user, db, auth_time=auth_time,
+                                 mfa=bool(payload.get("mfa")))
 
 @router.post("/logout")
-async def logout(current_user: User = Depends(get_current_user)):
-    """
-    Logout user (client-side token removal)
+async def logout(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Sign out: revokes every token this user holds, on every device.
 
-    Note: In a stateless JWT system, logout is typically handled client-side
-    by removing the token. This endpoint is provided for completeness and
-    potential future server-side token blacklisting.
+    Tokens are stateless JWTs, so revocation works by bumping the user's
+    token_version, which every token carries as `tv`. That ends all of the
+    user's sessions, not just this one — the safe reading of "sign out" when
+    the reason may be a lost laptop.
     """
+    revoke_user_sessions(current_user)
+    db.commit()
     return {"message": "Successfully logged out"}
+
+
+# ==================== MULTI-FACTOR AUTH ====================
+#
+# TOTP (src/mfa.py). Required for the roles in MFA_REQUIRED_ROLES (default
+# superadmin, admin): they are sent through enrolment at their next sign-in.
+# Optional for everyone else, from the profile page.
+
+_optional_bearer = HTTPBearer(auto_error=False)
+_BAD_CODE = HTTPException(status_code=400, detail="That code is not valid. Try again.")
+
+
+class MfaLoginRequest(BaseModel):
+    mfa_token: str
+    code: str = Field(..., min_length=6, max_length=32)
+
+
+class MfaEnrollRequest(BaseModel):
+    mfa_token: Optional[str] = None     # the enrolment token from /login, if any
+
+
+class MfaConfirmRequest(BaseModel):
+    code: str = Field(..., min_length=6, max_length=10)
+    mfa_token: Optional[str] = None
+
+
+class MfaDisableRequest(BaseModel):
+    password: str
+    code: str = Field(..., min_length=6, max_length=32)
+
+
+class MfaCodeRequest(BaseModel):
+    code: str = Field(..., min_length=6, max_length=32)
+
+
+def _check_second_factor(db: Session, user: User, code: str) -> bool:
+    """A TOTP code (replay-guarded) or an unused recovery code. Commits on success."""
+    secret = decrypt(user.mfa_secret or "")
+    if secret:
+        step = totp.verify_totp(secret, code, last_step=user.mfa_last_step)
+        if step is not None:
+            user.mfa_last_step = step
+            db.commit()
+            return True
+    ok, remaining = totp.consume_recovery_code(user.mfa_recovery_codes, code)
+    if ok:
+        user.mfa_recovery_codes = remaining
+        db.commit()
+        logger.warning("MFA recovery code used by user %s", user.id)
+        return True
+    return False
+
+
+def _enrolment_user(request: Request, body_token: Optional[str],
+                    creds: Optional[HTTPAuthorizationCredentials], db: Session) -> User:
+    """The user enrolling: from the /login enrolment token, or a full session."""
+    if body_token:
+        return decode_mfa_token(db, body_token, "mfa_enroll")
+    if creds is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return _authenticate_request(request, creds, db)
+
+
+@router.post("/login/mfa", response_model=Token)
+@limiter.limit("10/minute")
+async def login_mfa(request: Request, data: MfaLoginRequest, db: Session = Depends(get_db)):
+    """Second sign-in step: exchange the /login MFA token and a code for a session.
+
+    Wrong codes count toward the same per-account lockout as wrong passwords.
+    """
+    user = decode_mfa_token(db, data.mfa_token, "mfa")
+    if not user.mfa_enabled:
+        raise HTTPException(status_code=400, detail="Your sign-in step expired. Sign in again.")
+    if is_locked(user):
+        raise locked_exception()
+    if not _check_second_factor(db, user, data.code):
+        register_login_failure(db, user)
+        raise _BAD_CODE
+    clear_login_failures(db, user)
+    return create_token_response(user, db, mfa=True)
+
+
+@router.get("/mfa/status")
+async def mfa_status(current_user: User = Depends(get_current_user)):
+    return {
+        "enabled": bool(current_user.mfa_enabled),
+        "required": mfa_required_for(current_user),
+        "recovery_codes_remaining": totp.recovery_codes_remaining(current_user.mfa_recovery_codes)
+        if current_user.mfa_enabled else 0,
+    }
+
+
+@router.post("/mfa/enroll/start")
+@limiter.limit("10/minute")
+async def mfa_enroll_start(
+    request: Request,
+    data: MfaEnrollRequest,
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_optional_bearer),
+    db: Session = Depends(get_db),
+):
+    """Begin enrolment: a new secret for the authenticator app. Not active until confirmed."""
+    user = _enrolment_user(request, data.mfa_token, creds, db)
+    if user.mfa_enabled:
+        raise HTTPException(status_code=400, detail="Two-factor authentication is already on.")
+    secret = totp.generate_secret()
+    user.mfa_secret = encrypt(secret)
+    user.mfa_last_step = None
+    db.commit()
+    return {
+        "secret": secret,
+        "otpauth_uri": totp.provisioning_uri(secret, user.email),
+    }
+
+
+@router.post("/mfa/enroll/confirm")
+@limiter.limit("10/minute")
+async def mfa_enroll_confirm(
+    request: Request,
+    data: MfaConfirmRequest,
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_optional_bearer),
+    db: Session = Depends(get_db),
+):
+    """Finish enrolment with a code from the app. Returns one-time recovery codes and a
+    fresh session; every other session this user had is signed out."""
+    user = _enrolment_user(request, data.mfa_token, creds, db)
+    if user.mfa_enabled:
+        raise HTTPException(status_code=400, detail="Two-factor authentication is already on.")
+    secret = decrypt(user.mfa_secret or "")
+    if not secret:
+        raise HTTPException(status_code=400, detail="Start enrolment first.")
+    step = totp.verify_totp(secret, data.code)
+    if step is None:
+        raise _BAD_CODE
+    codes, stored = totp.generate_recovery_codes()
+    user.mfa_enabled = True
+    user.mfa_last_step = step
+    user.mfa_recovery_codes = stored
+    revoke_user_sessions(user)
+    db.commit()
+    db.refresh(user)
+    token = create_token_response(user, db, mfa=True)
+    return {"recovery_codes": codes, **token.model_dump()}
+
+
+@router.post("/mfa/recovery-codes")
+@limiter.limit("5/minute")
+async def mfa_regenerate_recovery_codes(
+    request: Request,
+    data: MfaCodeRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Replace the recovery codes (the old ones stop working). Needs a current code."""
+    if not current_user.mfa_enabled:
+        raise HTTPException(status_code=400, detail="Two-factor authentication is off.")
+    if not _check_second_factor(db, current_user, data.code):
+        raise _BAD_CODE
+    codes, stored = totp.generate_recovery_codes()
+    current_user.mfa_recovery_codes = stored
+    db.commit()
+    return {"recovery_codes": codes}
+
+
+@router.post("/mfa/disable")
+@limiter.limit("5/minute")
+async def mfa_disable(
+    request: Request,
+    data: MfaDisableRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Turn MFA off (optional roles only). Needs the password and a current code."""
+    if mfa_required_for(current_user):
+        raise HTTPException(status_code=400,
+                            detail="Two-factor authentication is required for your role.")
+    if not current_user.mfa_enabled:
+        raise HTTPException(status_code=400, detail="Two-factor authentication is off.")
+    if not verify_password(data.password, current_user.password_hash):
+        raise HTTPException(status_code=400, detail="Password is incorrect.")
+    if not _check_second_factor(db, current_user, data.code):
+        raise _BAD_CODE
+    current_user.mfa_enabled = False
+    current_user.mfa_secret = None
+    current_user.mfa_recovery_codes = None
+    current_user.mfa_last_step = None
+    revoke_user_sessions(current_user)
+    db.commit()
+    db.refresh(current_user)
+    return create_token_response(current_user, db)
 
 def _iso(value):
     """Serialise a date/datetime, or None. Keeps the JSON shape stable rather
@@ -429,8 +660,8 @@ def _serialise_me(db: Session, user: User) -> dict:
     The /auth/me payload. GET and PUT both return this so their shapes can
     never drift apart.
 
-    Built field-by-field on purpose — password_hash, otp_code and
-    otp_expires_at live on the same model and must never be serialised.
+    Built field-by-field on purpose — password_hash, the OTP columns and the
+    MFA secret live on the same model and must never be serialised.
     """
     company_name = None
     if user.company_id:
@@ -457,6 +688,7 @@ def _serialise_me(db: Session, user: User) -> dict:
         "updated_at": _iso(user.updated_at),
         "company_id": user.company_id,
         "company_name": company_name,
+        "mfa_enabled": bool(user.mfa_enabled),
         "profile": _role_profile(user),
     }
 
@@ -544,7 +776,8 @@ class ChangePasswordRequest(BaseModel):
 
     current_password: str
     # max_length because bcrypt only hashes the first 72 bytes (src/auth.py
-    # _bcrypt_bytes) — better to reject a novel than silently truncate it.
+    # _bcrypt_bytes) — better to reject a novel than silently truncate it. The full
+    # rules are validate_password_strength; min_length here rejects the obvious as 422.
     new_password: str = Field(..., min_length=8, max_length=128)
 
 
@@ -567,11 +800,9 @@ async def change_password(
     No enumeration concern: the identity comes from the JWT, and the body
     carries no email or user id.
 
-    Note this CANNOT invalidate tokens already issued. There is no blocklist,
-    no session table and no password_changed_at column, so every JWT minted
-    before now stays valid until it expires. The UI says so rather than
-    implying otherwise. Fixing that properly means a password_changed_at column
-    plus a matching JWT claim checked in get_current_user.
+    Signs out every other session: the change bumps token_version, which voids
+    every token issued before it. The response carries a fresh token for this
+    session so the user stays signed in here.
     """
     if not verify_password(data.current_password, current_user.password_hash):
         raise HTTPException(status_code=400, detail="Current password is incorrect.")
@@ -589,11 +820,16 @@ async def change_password(
     current_user.password_hash = get_password_hash(data.new_password)
     # A reset OTP still sitting on the row must not outlive an authenticated
     # change — otherwise an old emailed code could undo this.
-    current_user.otp_code = None
-    current_user.otp_expires_at = None
+    clear_user_otp(current_user)
+    revoke_user_sessions(current_user)
     db.commit()
+    db.refresh(current_user)
 
-    return {"message": "Password changed successfully."}
+    payload = getattr(request.state, "jwt_payload", {}) or {}
+    token = create_token_response(current_user, db, auth_time=payload.get("auth_time"),
+                                  mfa=bool(payload.get("mfa")))
+    return {"message": "Password changed successfully.",
+            "access_token": token.access_token, "token_type": "bearer"}
 
 
 @router.get("/my-permissions")
@@ -636,7 +872,7 @@ async def forgot_password(request: Request, data: ForgotPasswordRequest, db: Ses
     OTP_SENT = {"message": "If that email is registered, an OTP has been sent."}
     if not user:
         return OTP_SENT
-    otp = set_user_otp(user, db)
+    otp = set_user_otp(user, db, purpose="reset")
     try:
         from src.services.email_service import send_password_reset_otp, resolve_auth_sender
         smtp_config = resolve_auth_sender(db, user.company_id)
@@ -647,27 +883,32 @@ async def forgot_password(request: Request, data: ForgotPasswordRequest, db: Ses
 
 
 @router.post("/reset-password")
-@limiter.limit("120/minute")
+@limiter.limit("20/minute")
 async def reset_password(request: Request, data: ResetPasswordRequest, db: Session = Depends(get_db)):
     """Verify reset OTP and set a new password.
 
     Every failure returns the same 400, for the same reason as /verify-otp: a 404 for an
     unknown address told an unauthenticated caller which emails are registered with a
     company, and a company is now addressed by a guessable slug.
+
+    The code must have been issued for a reset (a signup verification code does not
+    work here), and five wrong guesses void it. A successful reset signs out every
+    existing session and lifts any login lockout.
     """
+    # Checked first: before the lookup, so a weak password gets the same answer for a
+    # known and an unknown email; and before the code is checked, so it doesn't burn it.
+    validate_password_strength(data.new_password)
     company_id = _resolve_company_id(db, request, data.api_key, data.company_slug)
     user = _scoped_user_by_email(db, data.email, company_id)
     _INVALID_CODE = HTTPException(status_code=400, detail="Invalid or expired code.")
     if not user:
         raise _INVALID_CODE
-    if not user.otp_code or user.otp_code != data.otp:
+    if not check_user_otp(user, db, data.otp, "reset"):
         raise _INVALID_CODE
-    if user.otp_expires_at and datetime.utcnow() > user.otp_expires_at:
-        raise _INVALID_CODE
-    validate_password_strength(data.new_password)
-    from src.auth import get_password_hash
     user.password_hash = get_password_hash(data.new_password)
-    user.otp_code = None
-    user.otp_expires_at = None
+    revoke_user_sessions(user)
+    user.failed_login_count = 0
+    user.last_failed_login_at = None
+    user.locked_until = None
     db.commit()
     return {"message": "Password reset successfully. You can now log in."}

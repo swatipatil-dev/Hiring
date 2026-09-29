@@ -34,17 +34,19 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import func, and_, or_, text
+from sqlalchemy import func, and_, or_, select, text
 from sqlalchemy.orm import Session
 
 from src.auth import get_current_user
-from src.config.database_config_mysql import db_manager
+from src.config.database_config_mysql import get_db
 from src.models.models import (
     Candidate, CandidateStageHistory, Department, HRProfile,
     Interview, InterviewFeedback, InterviewerProfile,
     JobPosting, Offer, User, ATSResult, SystemConfig
 )
 from src.models.question_models import Question
+from src.services.job_access import can_access_job, job_access_filter
+from src.services.salary_visibility import can_view_salary, redact_salary
 
 router = APIRouter(prefix="/api/v1/advanced", tags=["Advanced Features"])
 
@@ -52,13 +54,134 @@ PIPELINE_STAGES = ["applied", "screening", "shortlisted", "interview", "assessme
 
 
 # ─── helpers ─────────────────────────────────────────────────────────────────
+#
+# Tenancy: every lookup below names the caller's company explicitly. The tenant
+# auto-filter (src/tenancy/events.py) would add it too, but it was once silently
+# dormant and this file leaked every company's candidates while it was. Within a
+# company, HR reaches only the jobs they own or co-own (src/services/job_access) and
+# an interviewer only the interviews they are on; admins reach the whole company.
 
-def get_db():
-    session = db_manager.SessionLocal()
-    try:
-        yield session
-    finally:
-        session.close()
+def _hr_profile(db: Session, user: User) -> Optional[HRProfile]:
+    return db.query(HRProfile).filter(
+        HRProfile.user_id == user.id,
+        HRProfile.company_id == user.company_id,
+    ).first()
+
+
+def _interviewer_on(user: User):
+    """SQL predicate: interviews this interviewer leads, sits on the panel of, or created."""
+    return or_(
+        Interview.interviewer_email == user.email,
+        Interview.panel_members.like(f'%"{user.email}"%'),
+        Interview.created_by == user.email,
+    )
+
+
+def _accessible_job_ids(db: Session, user: User):
+    """Subquery of job ids the caller may act on within their company."""
+    q = select(JobPosting.id).where(JobPosting.company_id == user.company_id)
+    if user.role == "hr":
+        hp = _hr_profile(db, user)
+        if not hp:
+            return select(JobPosting.id).where(False)
+        q = q.where(job_access_filter(hp.id))
+    return q
+
+
+def _job_or_404(db: Session, job_id: str, user: User) -> JobPosting:
+    """The job, if it is in the caller's company and (for HR) on their team. 404 otherwise,
+    so another company's job ids are indistinguishable from ids that don't exist."""
+    job = db.query(JobPosting).filter(
+        JobPosting.id == job_id,
+        JobPosting.company_id == user.company_id,
+    ).first()
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if user.role == "hr" and not can_access_job(db, job, _hr_profile(db, user)):
+        raise HTTPException(404, "Job not found")
+    return job
+
+
+def _visible_candidates(db: Session, user: User):
+    """Candidate query limited to what the caller may see."""
+    q = db.query(Candidate).filter(Candidate.company_id == user.company_id)
+    if user.role == "hr":
+        # A job-less row is the company-level signup placeholder, not a job's pipeline.
+        q = q.filter(or_(Candidate.job_id.is_(None),
+                         Candidate.job_id.in_(_accessible_job_ids(db, user))))
+    elif user.role == "interviewer":
+        q = q.filter(Candidate.id.in_(
+            select(Interview.candidate_id).where(
+                Interview.company_id == user.company_id, _interviewer_on(user))
+        ))
+    return q
+
+
+def _candidate_or_404(db: Session, candidate_id: str, user: User) -> Candidate:
+    c = _visible_candidates(db, user).filter(Candidate.id == candidate_id).first()
+    if not c:
+        raise HTTPException(404, "Candidate not found")
+    return c
+
+
+def _interview_or_404(db: Session, interview_id: int, user: User) -> Interview:
+    q = db.query(Interview).filter(
+        Interview.id == interview_id,
+        Interview.company_id == user.company_id,
+    )
+    if user.role == "interviewer":
+        q = q.filter(_interviewer_on(user))
+    elif user.role == "hr":
+        hp = _hr_profile(db, user)
+        q = q.filter(or_(
+            Interview.job_id.in_(_accessible_job_ids(db, user)),
+            Interview.assigned_hr_id == (hp.id if hp else None),
+        ))
+    iv = q.first()
+    if not iv:
+        raise HTTPException(404, "Interview not found")
+    return iv
+
+
+def _company_interviews(db: Session, user: User):
+    """Interview query limited to what the caller may see (see _interview_or_404)."""
+    q = db.query(Interview).filter(Interview.company_id == user.company_id)
+    if user.role == "interviewer":
+        q = q.filter(_interviewer_on(user))
+    elif user.role == "hr":
+        hp = _hr_profile(db, user)
+        q = q.filter(or_(
+            Interview.job_id.in_(_accessible_job_ids(db, user)),
+            Interview.assigned_hr_id == (hp.id if hp else None),
+        ))
+    return q
+
+
+def _bank_company_column():
+    """interview_questions.company_id, or None on a schema that predates it.
+
+    Bank questions (interview_id NULL) belong to no interview, so the company column
+    is the only thing that can scope them. Without it the bank fails closed: nothing
+    is listed, and nothing can be saved into a pool every company would share.
+    """
+    return getattr(Question, "company_id", None)
+
+
+def _bank_query(db: Session, user: User):
+    col = _bank_company_column()
+    q = db.query(Question).filter(Question.interview_id == None)  # noqa: E711
+    if col is None:
+        return q.filter(False)
+    return q.filter(col == user.company_id)
+
+
+def _csv_safe(value):
+    """Neutralise spreadsheet formula injection: a cell a spreadsheet would evaluate
+    (starting with = + - @, tab or CR) is prefixed with a quote so it reads as text.
+    Candidate-supplied fields — names, skills, URLs — end up in these cells."""
+    if isinstance(value, str) and value and value[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + value
+    return value
 
 
 def require_roles(*roles):
@@ -136,16 +259,16 @@ def candidate_360_profile(
     • MCQ test summary (total attempted, correct, score %)
     • pipeline health score + next recommended action
     """
-    c = db.query(Candidate).filter(Candidate.id == candidate_id).first()
-    if not c:
-        raise HTTPException(404, "Candidate not found")
+    c = _candidate_or_404(db, candidate_id, current_user)
+    cid = current_user.company_id
 
     job = c.job
 
     # ── ATS breakdown ──────────────────────────────────────────────────────
     ats = db.query(ATSResult).filter(
         ATSResult.candidate_id == candidate_id,
-        ATSResult.job_id == c.job_id
+        ATSResult.job_id == c.job_id,
+        ATSResult.company_id == cid,
     ).first()
     ats_data = None
     if ats:
@@ -165,9 +288,15 @@ def candidate_360_profile(
         }
 
     # ── Stage history + time-per-stage ─────────────────────────────────────
+    # Internal notes are stored as "__note__" history rows; they have their own
+    # visibility-checked endpoint (/notes) and are not stage changes.
     history = (
         db.query(CandidateStageHistory)
-        .filter(CandidateStageHistory.candidate_id == candidate_id)
+        .filter(
+            CandidateStageHistory.candidate_id == candidate_id,
+            CandidateStageHistory.company_id == cid,
+            CandidateStageHistory.from_stage != "__note__",
+        )
         .order_by(CandidateStageHistory.created_at)
         .all()
     )
@@ -185,7 +314,10 @@ def candidate_360_profile(
         })
 
     # ── Interviews + questions attempted ───────────────────────────────────
-    interviews_db = db.query(Interview).filter(Interview.candidate_id == candidate_id).all()
+    interviews_db = db.query(Interview).filter(
+        Interview.candidate_id == candidate_id,
+        Interview.company_id == cid,
+    ).all()
     interviews_out = []
     total_mcq_attempted = total_mcq_correct = 0
     for iv in interviews_db:
@@ -225,7 +357,8 @@ def candidate_360_profile(
 
     # ── Offers ─────────────────────────────────────────────────────────────
     offers_out = []
-    for o in c.offers:
+    show_pay = can_view_salary(current_user, db=db, job=job)
+    for o in (o for o in c.offers if o.company_id == cid):
         days_until_expiry = None
         if o.expiry_date:
             days_until_expiry = (o.expiry_date - datetime.utcnow().date()).days
@@ -234,7 +367,8 @@ def candidate_360_profile(
             "offer_type": o.offer_type,
             "salary": _float(o.salary),
             "bonus": _float(o.bonus),
-            "total_compensation": _float(o.salary) + _float(o.bonus),
+            # Derived from pay, so it goes when pay goes (redact_salary strips by key).
+            **({"total_compensation": _float(o.salary) + _float(o.bonus)} if show_pay else {}),
             "status": o.status,
             "start_date": o.start_date.isoformat() if o.start_date else None,
             "expiry_date": o.expiry_date.isoformat() if o.expiry_date else None,
@@ -267,7 +401,7 @@ def candidate_360_profile(
         health_score -= 10
     health_score = max(0, health_score)
 
-    return {
+    return redact_salary({
         "candidate": {
             "id": c.id,
             "name": f"{c.first_name} {c.last_name}",
@@ -308,7 +442,7 @@ def candidate_360_profile(
             "offer_count": len(offers_out),
             "has_pending_offer": any(o["status"] in ("sent", "draft") for o in offers_out),
         },
-    }
+    }, current_user, db=db, job=job)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -320,11 +454,12 @@ def pipeline_funnel(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles("admin", "hr")),
 ):
-    job = db.query(JobPosting).filter(JobPosting.id == job_id).first()
-    if not job:
-        raise HTTPException(404, "Job not found")
+    job = _job_or_404(db, job_id, current_user)
 
-    candidates = db.query(Candidate).filter(Candidate.job_id == job_id).all()
+    candidates = db.query(Candidate).filter(
+        Candidate.job_id == job_id,
+        Candidate.company_id == current_user.company_id,
+    ).all()
     total = len(candidates)
     cand_ids = [c.id for c in candidates]
 
@@ -340,7 +475,10 @@ def pipeline_funnel(
     # Time-per-stage from history
     history = (
         db.query(CandidateStageHistory)
-        .filter(CandidateStageHistory.candidate_id.in_(cand_ids))
+        .filter(
+            CandidateStageHistory.candidate_id.in_(cand_ids),
+            CandidateStageHistory.company_id == current_user.company_id,
+        )
         .order_by(CandidateStageHistory.candidate_id, CandidateStageHistory.created_at)
         .all()
     )
@@ -427,13 +565,14 @@ def compare_candidates(
     all_skill_sets: List[set] = []
 
     for cid in req.candidate_ids:
-        c = db.query(Candidate).filter(Candidate.id == cid).first()
+        c = _visible_candidates(db, current_user).filter(Candidate.id == cid).first()
         if not c:
             raise HTTPException(404, f"Candidate {cid} not found")
 
         ats = db.query(ATSResult).filter(
             ATSResult.candidate_id == cid,
-            ATSResult.job_id == c.job_id
+            ATSResult.job_id == c.job_id,
+            ATSResult.company_id == current_user.company_id,
         ).first()
         matched = set(s.lower() for s in _safe_json(ats.matched_skills if ats else None))
         missing = set(s.lower() for s in _safe_json(ats.missing_skills if ats else None))
@@ -443,7 +582,8 @@ def compare_candidates(
         feedbacks = (
             db.query(InterviewFeedback)
             .join(Interview, InterviewFeedback.interview_id == Interview.id)
-            .filter(Interview.candidate_id == cid)
+            .filter(Interview.candidate_id == cid,
+                    Interview.company_id == current_user.company_id)
             .all()
         )
         iv_count = len(feedbacks)
@@ -461,7 +601,7 @@ def compare_candidates(
 
         avg_assessment = 0.0  # assessment_rounds removed; use interview feedback scores
 
-        results.append({
+        results.append(redact_salary({
             "candidate_id": c.id,
             "name": f"{c.first_name} {c.last_name}",
             "email": c.email,
@@ -494,7 +634,7 @@ def compare_candidates(
             "applied_at": c.created_at.isoformat() if c.created_at else None,
             "unique_skills": [],  # filled below
             "shared_skills": [],  # filled below
-        })
+        }, current_user, db=db, job=c.job))
 
     # Skill overlap analysis
     if all_skill_sets:
@@ -563,7 +703,7 @@ def bulk_candidate_action(
     # Resolve current user's HR profile for task assignment
     hr_profile = None
     if req.action == "assign_task":
-        hr_profile = db.query(HRProfile).filter(HRProfile.user_id == current_user.id).first()
+        hr_profile = _hr_profile(db, current_user)
         if not hr_profile:
             raise HTTPException(400, "HR profile not found for current user")
         if not req.task_type:
@@ -572,7 +712,7 @@ def bulk_candidate_action(
     updated, failed, tasks_created = [], [], []
     rejected_candidates = []
     for cid in req.candidate_ids:
-        c = db.query(Candidate).filter(Candidate.id == cid).first()
+        c = _visible_candidates(db, current_user).filter(Candidate.id == cid).first()
         if not c:
             failed.append({"candidate_id": cid, "reason": "not found"})
             continue
@@ -591,6 +731,7 @@ def bulk_candidate_action(
             c.updated_at = datetime.utcnow()
             db.add(CandidateStageHistory(
                 id=str(uuid.uuid4()),
+                company_id=c.company_id,
                 candidate_id=cid,
                 from_stage=old_stage,
                 to_stage=new_stage,
@@ -661,7 +802,8 @@ def advanced_search(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles("admin", "hr", "interviewer")),
 ):
-    query = db.query(Candidate)
+    cid = current_user.company_id
+    query = _visible_candidates(db, current_user)
 
     if q:
         like = f"%{q}%"
@@ -674,7 +816,10 @@ def advanced_search(
         query = query.filter(Candidate.job_id == job_id)
     if department_id:
         dept_job_ids = [
-            j.id for j in db.query(JobPosting).filter(JobPosting.department_id == department_id).all()
+            j.id for j in db.query(JobPosting).filter(
+                JobPosting.department_id == department_id,
+                JobPosting.company_id == cid,
+            ).all()
         ]
         query = query.filter(Candidate.job_id.in_(dept_job_ids))
     if stage:
@@ -687,7 +832,8 @@ def advanced_search(
         query = query.filter(Candidate.experience_years >= min_exp)
     if max_exp is not None:
         query = query.filter(Candidate.experience_years <= max_exp)
-    if max_expected_salary is not None:
+    # Filtering on pay is reading pay: a caller who may not see it can't probe it.
+    if max_expected_salary is not None and can_view_salary(current_user):
         query = query.filter(
             or_(Candidate.expected_salary == None, Candidate.expected_salary <= max_expected_salary)
         )
@@ -698,21 +844,26 @@ def advanced_search(
         cids_with_rec = [
             row[0] for row in db.query(Interview.candidate_id)
             .join(InterviewFeedback, InterviewFeedback.interview_id == Interview.id)
-            .filter(InterviewFeedback.hire_recommendation == hire_recommendation)
+            .filter(InterviewFeedback.hire_recommendation == hire_recommendation,
+                    Interview.company_id == cid)
             .distinct()
         ]
         query = query.filter(Candidate.id.in_(cids_with_rec))
     if has_interview is True:
-        iv_cids = [r[0] for r in db.query(Interview.candidate_id).filter(Interview.candidate_id != None).distinct()]
+        iv_cids = [r[0] for r in db.query(Interview.candidate_id).filter(
+            Interview.candidate_id != None, Interview.company_id == cid).distinct()]  # noqa: E711
         query = query.filter(Candidate.id.in_(iv_cids))
     elif has_interview is False:
-        iv_cids = [r[0] for r in db.query(Interview.candidate_id).filter(Interview.candidate_id != None).distinct()]
+        iv_cids = [r[0] for r in db.query(Interview.candidate_id).filter(
+            Interview.candidate_id != None, Interview.company_id == cid).distinct()]  # noqa: E711
         query = query.filter(Candidate.id.notin_(iv_cids))
     if has_offer is True:
-        offer_cids = [r[0] for r in db.query(Offer.candidate_id).distinct()]
+        offer_cids = [r[0] for r in db.query(Offer.candidate_id).filter(
+            Offer.company_id == cid).distinct()]
         query = query.filter(Candidate.id.in_(offer_cids))
     elif has_offer is False:
-        offer_cids = [r[0] for r in db.query(Offer.candidate_id).distinct()]
+        offer_cids = [r[0] for r in db.query(Offer.candidate_id).filter(
+            Offer.company_id == cid).distinct()]
         query = query.filter(Candidate.id.notin_(offer_cids))
     if applied_after:
         query = query.filter(Candidate.created_at >= datetime.strptime(applied_after, "%Y-%m-%d"))
@@ -728,7 +879,7 @@ def advanced_search(
         "name": Candidate.first_name,
     }
     sort_col = sort_map.get(sort_by, Candidate.ats_score)
-    query = query.order_by(sort_col.asc() if order == "asc" else sort_col.desc().nullslast())
+    query = query.order_by(sort_col.asc() if order == "asc" else sort_col.desc())  # MySQL: NULLs sort last in DESC; it has no NULLS LAST
 
     candidates = query.offset((page - 1) * page_size).limit(page_size).all()
 
@@ -738,7 +889,7 @@ def advanced_search(
         "page_size": page_size,
         "total_pages": (total + page_size - 1) // page_size,
         "candidates": [
-            {
+            redact_salary({
                 "id": c.id,
                 "name": f"{c.first_name} {c.last_name}",
                 "email": c.email,
@@ -753,7 +904,7 @@ def advanced_search(
                 "job_id": c.job_id,
                 "job_title": c.job.title if c.job else None,
                 "applied_at": c.created_at.isoformat() if c.created_at else None,
-            }
+            }, current_user, db=db, job=c.job)
             for c in candidates
         ],
     }
@@ -772,22 +923,22 @@ def export_candidates(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles("admin", "hr")),
 ):
-    job = db.query(JobPosting).filter(JobPosting.id == job_id).first()
-    if not job:
-        raise HTTPException(404, "Job not found")
+    job = _job_or_404(db, job_id, current_user)
+    cid = current_user.company_id
 
-    q = db.query(Candidate).filter(Candidate.job_id == job_id)
+    q = db.query(Candidate).filter(Candidate.job_id == job_id, Candidate.company_id == cid)
     if stage:
         q = q.filter(Candidate.current_stage == stage)
     if min_ats is not None:
         q = q.filter(Candidate.ats_score >= min_ats)
-    candidates = q.order_by(Candidate.ats_score.desc().nullslast()).all()
+    candidates = q.order_by(Candidate.ats_score.desc()).all()  # NULLs last in DESC on MySQL
 
     rows = []
     for c in candidates:
         ats = db.query(ATSResult).filter(
             ATSResult.candidate_id == c.id,
-            ATSResult.job_id == c.job_id
+            ATSResult.job_id == c.job_id,
+            ATSResult.company_id == cid,
         ).first()
         iv_score = None
         iv_rec = None
@@ -795,7 +946,7 @@ def export_candidates(
             fb = (
                 db.query(InterviewFeedback)
                 .join(Interview, InterviewFeedback.interview_id == Interview.id)
-                .filter(Interview.candidate_id == c.id)
+                .filter(Interview.candidate_id == c.id, Interview.company_id == cid)
                 .order_by(InterviewFeedback.created_at.desc())
                 .first()
             )
@@ -844,7 +995,7 @@ def export_candidates(
     if rows:
         writer = csv.DictWriter(output, fieldnames=list(rows[0].keys()))
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows({k: _csv_safe(v) for k, v in row.items()} for row in rows)
     output.seek(0)
     return StreamingResponse(
         io.BytesIO(output.getvalue().encode("utf-8-sig")),
@@ -886,8 +1037,11 @@ def save_to_question_bank(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles("admin", "hr", "interviewer")),
 ):
+    if _bank_company_column() is None:
+        raise HTTPException(409, "The question bank is unavailable until the database is migrated.")
     q = Question(
         id=str(uuid.uuid4()),
+        company_id=current_user.company_id,
         interview_id=None,
         question_text=item.question_text,
         question_type=item.question_type,
@@ -920,7 +1074,7 @@ def list_question_bank(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles("admin", "hr", "interviewer")),
 ):
-    query = db.query(Question).filter(Question.interview_id == None)  # noqa
+    query = _bank_query(db, current_user)
     if question_type:
         query = query.filter(Question.question_type == question_type)
     if difficulty_level:
@@ -967,7 +1121,7 @@ def update_bank_question(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles("admin", "hr", "interviewer")),
 ):
-    q = db.query(Question).filter(Question.id == question_id, Question.interview_id == None).first()  # noqa
+    q = _bank_query(db, current_user).filter(Question.id == question_id).first()
     if not q:
         raise HTTPException(404, "Question not found in bank")
     if update.question_text is not None:
@@ -996,7 +1150,7 @@ def delete_bank_question(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles("admin", "hr")),
 ):
-    q = db.query(Question).filter(Question.id == question_id, Question.interview_id == None).first()  # noqa
+    q = _bank_query(db, current_user).filter(Question.id == question_id).first()
     if not q:
         raise HTTPException(404, "Question not found in bank")
     db.delete(q)
@@ -1012,14 +1166,23 @@ def add_bank_question_to_interview(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles("admin", "hr", "interviewer")),
 ):
-    src = db.query(Question).filter(Question.id == question_id).first()
+    # The source must be this company's: a bank question, or a question on one of its
+    # interviews. Copying carries the answer key, so an unscoped source was a way to
+    # read any company's answer keys back out of your own interview.
+    src = _bank_query(db, current_user).filter(Question.id == question_id).first()
+    if src is None:
+        src = (
+            db.query(Question)
+            .join(Interview, Question.interview_id == Interview.id)
+            .filter(Question.id == question_id, Interview.company_id == current_user.company_id)
+            .first()
+        )
     if not src:
         raise HTTPException(404, "Question not found")
-    iv = db.query(Interview).filter(Interview.id == interview_id).first()
-    if not iv:
-        raise HTTPException(404, "Interview not found")
+    iv = _interview_or_404(db, interview_id, current_user)
     new_q = Question(
         id=str(uuid.uuid4()),
+        **({"company_id": iv.company_id} if _bank_company_column() is not None else {}),
         interview_id=interview_id,
         question_text=src.question_text,
         question_type=src.question_type,
@@ -1067,12 +1230,11 @@ def auto_reject(
     if not any([req.ats_threshold, req.min_experience_years]):
         raise HTTPException(400, "Provide at least one rejection rule")
 
-    job = db.query(JobPosting).filter(JobPosting.id == job_id).first()
-    if not job:
-        raise HTTPException(404, "Job not found")
+    job = _job_or_404(db, job_id, current_user)
 
     eligible = db.query(Candidate).filter(
         Candidate.job_id == job_id,
+        Candidate.company_id == current_user.company_id,
         Candidate.current_stage.notin_(["hired", "rejected", "offer"]),
     ).all()
 
@@ -1133,6 +1295,7 @@ def auto_reject(
             c.updated_at = datetime.utcnow()
             db.add(CandidateStageHistory(
                 id=str(uuid.uuid4()),
+                company_id=c.company_id,
                 candidate_id=c.id,
                 from_stage=old,
                 to_stage="rejected",
@@ -1171,8 +1334,9 @@ def interview_calendar(
     sd = datetime.strptime(start_date, "%Y-%m-%d") if start_date else now.replace(hour=0, minute=0, second=0)
     ed = (datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)) if end_date else (sd + timedelta(days=30))
 
+    cid = current_user.company_id
     query = (
-        db.query(Interview)
+        _company_interviews(db, current_user)
         .filter(Interview.scheduled_datetime != None)  # noqa
         .filter(Interview.scheduled_datetime >= sd)
         .filter(Interview.scheduled_datetime < ed)
@@ -1181,16 +1345,16 @@ def interview_calendar(
         query = query.filter(Interview.interviewer_email == interviewer_email)
     if status:
         query = query.filter(Interview.status == status.upper())
-    if current_user.role == "interviewer":
-        query = query.filter(Interview.interviewer_email == current_user.email)
 
     interviews = query.order_by(Interview.scheduled_datetime).all()
 
     # Build events
     events = []
     for iv in interviews:
-        c = db.query(Candidate).filter(Candidate.id == iv.candidate_id).first() if iv.candidate_id else None
-        j = db.query(JobPosting).filter(JobPosting.id == iv.job_id).first() if iv.job_id else None
+        c = db.query(Candidate).filter(
+            Candidate.id == iv.candidate_id, Candidate.company_id == cid).first() if iv.candidate_id else None
+        j = db.query(JobPosting).filter(
+            JobPosting.id == iv.job_id, JobPosting.company_id == cid).first() if iv.job_id else None
         dur = iv.duration_minutes or 60
         start_dt = iv.scheduled_datetime
         end_dt = start_dt + timedelta(minutes=dur)
@@ -1262,7 +1426,8 @@ def hiring_velocity(
     current_user: User = Depends(require_roles("admin", "hr")),
 ):
     since = datetime.utcnow() - timedelta(days=days)
-    job_q = db.query(JobPosting).filter(JobPosting.created_at >= since)
+    cid = current_user.company_id
+    job_q = db.query(JobPosting).filter(JobPosting.created_at >= since, JobPosting.company_id == cid)
     if department_id:
         job_q = job_q.filter(JobPosting.department_id == department_id)
     jobs = job_q.all()
@@ -1271,7 +1436,8 @@ def hiring_velocity(
     if not job_ids:
         return {"message": "No jobs in the window", "metrics": {}}
 
-    all_cands = db.query(Candidate).filter(Candidate.job_id.in_(job_ids)).all()
+    all_cands = db.query(Candidate).filter(
+        Candidate.job_id.in_(job_ids), Candidate.company_id == cid).all()
     hired = [c for c in all_cands if c.current_stage == "hired"]
     rejected = [c for c in all_cands if c.current_stage == "rejected"]
 
@@ -1347,12 +1513,15 @@ def department_dashboard(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles("admin", "hr")),
 ):
-    departments = db.query(Department).all()
+    cid = current_user.company_id
+    departments = db.query(Department).filter(Department.company_id == cid).all()
     result = []
     for dept in departments:
-        jobs = db.query(JobPosting).filter(JobPosting.department_id == dept.id).all()
+        jobs = db.query(JobPosting).filter(
+            JobPosting.department_id == dept.id, JobPosting.company_id == cid).all()
         job_ids = [j.id for j in jobs]
-        cands = db.query(Candidate).filter(Candidate.job_id.in_(job_ids)).all() if job_ids else []
+        cands = db.query(Candidate).filter(
+            Candidate.job_id.in_(job_ids), Candidate.company_id == cid).all() if job_ids else []
         hired = [c for c in cands if c.current_stage == "hired"]
         ats_vals = [_float(c.ats_score) for c in cands if c.ats_score]
 
@@ -1362,11 +1531,14 @@ def department_dashboard(
 
         # Interviews scheduled for this dept
         cand_ids = [c.id for c in cands]
-        iv_count = db.query(Interview).filter(Interview.candidate_id.in_(cand_ids)).count() if cand_ids else 0
-        offer_count = db.query(Offer).filter(Offer.candidate_id.in_(cand_ids)).count() if cand_ids else 0
+        iv_count = db.query(Interview).filter(
+            Interview.candidate_id.in_(cand_ids), Interview.company_id == cid).count() if cand_ids else 0
+        offer_count = db.query(Offer).filter(
+            Offer.candidate_id.in_(cand_ids), Offer.company_id == cid).count() if cand_ids else 0
         offer_accepted = (
             db.query(Offer)
-            .filter(Offer.candidate_id.in_(cand_ids), Offer.status == "accepted")
+            .filter(Offer.candidate_id.in_(cand_ids), Offer.company_id == cid,
+                    Offer.status == "accepted")
             .count()
             if cand_ids else 0
         )
@@ -1376,6 +1548,8 @@ def department_dashboard(
             User, InterviewerProfile.user_id == User.id
         ).filter(
             InterviewerProfile.department_id == dept.id,
+            InterviewerProfile.company_id == cid,
+            User.company_id == cid,
             User.is_active == True,  # noqa: E712
         ).all()
 
@@ -1426,9 +1600,8 @@ def candidate_scorecard(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles("admin", "hr", "interviewer")),
 ):
-    c = db.query(Candidate).filter(Candidate.id == candidate_id).first()
-    if not c:
-        raise HTTPException(404, "Candidate not found")
+    c = _candidate_or_404(db, candidate_id, current_user)
+    cid = current_user.company_id
 
     ats_score = _float(c.ats_score)
 
@@ -1436,7 +1609,7 @@ def candidate_scorecard(
     feedbacks = (
         db.query(InterviewFeedback)
         .join(Interview, InterviewFeedback.interview_id == Interview.id)
-        .filter(Interview.candidate_id == candidate_id)
+        .filter(Interview.candidate_id == candidate_id, Interview.company_id == cid)
         .all()
     )
     hire_votes: Dict[str, int] = defaultdict(int)
@@ -1464,7 +1637,8 @@ def candidate_scorecard(
     # Skill gap analysis
     ats = db.query(ATSResult).filter(
         ATSResult.candidate_id == candidate_id,
-        ATSResult.job_id == c.job_id
+        ATSResult.job_id == c.job_id,
+        ATSResult.company_id == cid,
     ).first()
     required = _safe_json(c.job.required_skills) if c.job else []
     matched = _safe_json(ats.matched_skills) if ats else []
@@ -1476,7 +1650,8 @@ def candidate_scorecard(
     if c.job_id and c.ats_score:
         all_scores = [
             _float(x.ats_score) for x in
-            db.query(Candidate).filter(Candidate.job_id == c.job_id, Candidate.ats_score != None).all()
+            db.query(Candidate).filter(Candidate.job_id == c.job_id, Candidate.company_id == cid,
+                                       Candidate.ats_score != None).all()  # noqa: E711
         ]
         if all_scores:
             rank = sum(1 for s in all_scores if s < ats_score)
@@ -1545,6 +1720,9 @@ class NoteCreate(BaseModel):
     visibility: str = "hr"   # "hr" | "all" | "interviewer"
 
 
+NOTE_VISIBILITIES = {"hr", "all", "interviewer"}
+
+
 @router.post("/candidates/{candidate_id}/notes", summary="Add Internal Note to Candidate")
 def add_candidate_note(
     candidate_id: str,
@@ -1552,13 +1730,14 @@ def add_candidate_note(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles("admin", "hr", "interviewer")),
 ):
-    c = db.query(Candidate).filter(Candidate.id == candidate_id).first()
-    if not c:
-        raise HTTPException(404, "Candidate not found")
+    if body.visibility not in NOTE_VISIBILITIES:
+        raise HTTPException(400, f"visibility must be one of {sorted(NOTE_VISIBILITIES)}")
+    c = _candidate_or_404(db, candidate_id, current_user)
 
     # Store note as a stage-history entry with a special from_stage="note"
     note_entry = CandidateStageHistory(
         id=str(uuid.uuid4()),
+        company_id=c.company_id,
         candidate_id=candidate_id,
         from_stage="__note__",
         to_stage=body.visibility,
@@ -1582,19 +1761,17 @@ def get_candidate_notes(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles("admin", "hr", "interviewer")),
 ):
-    c = db.query(Candidate).filter(Candidate.id == candidate_id).first()
-    if not c:
-        raise HTTPException(404, "Candidate not found")
+    c = _candidate_or_404(db, candidate_id, current_user)
 
-    notes = (
-        db.query(CandidateStageHistory)
-        .filter(
-            CandidateStageHistory.candidate_id == candidate_id,
-            CandidateStageHistory.from_stage == "__note__",
-        )
-        .order_by(CandidateStageHistory.created_at.desc())
-        .all()
+    notes_q = db.query(CandidateStageHistory).filter(
+        CandidateStageHistory.candidate_id == candidate_id,
+        CandidateStageHistory.company_id == c.company_id,
+        CandidateStageHistory.from_stage == "__note__",
     )
+    # A note's visibility is stored in to_stage. "hr" notes are not for interviewers.
+    if current_user.role == "interviewer":
+        notes_q = notes_q.filter(CandidateStageHistory.to_stage.in_(["all", "interviewer"]))
+    notes = notes_q.order_by(CandidateStageHistory.created_at.desc()).all()
     return {
         "candidate_id": candidate_id,
         "notes": [
@@ -1619,9 +1796,8 @@ def job_timeline(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles("admin", "hr")),
 ):
-    job = db.query(JobPosting).filter(JobPosting.id == job_id).first()
-    if not job:
-        raise HTTPException(404, "Job not found")
+    job = _job_or_404(db, job_id, current_user)
+    cid = current_user.company_id
 
     events = []
 
@@ -1635,7 +1811,9 @@ def job_timeline(
     })
 
     # All candidate applications
-    candidates = db.query(Candidate).filter(Candidate.job_id == job_id).order_by(Candidate.created_at).all()
+    candidates = db.query(Candidate).filter(
+        Candidate.job_id == job_id, Candidate.company_id == cid,
+    ).order_by(Candidate.created_at).all()
     for c in candidates:
         events.append({
             "event": "application_received",
@@ -1651,6 +1829,7 @@ def job_timeline(
         db.query(CandidateStageHistory)
         .filter(
             CandidateStageHistory.candidate_id.in_(cand_ids),
+            CandidateStageHistory.company_id == cid,
             CandidateStageHistory.from_stage != "__note__",
         )
         .order_by(CandidateStageHistory.created_at)
@@ -1668,7 +1847,7 @@ def job_timeline(
 
     # Interviews scheduled
     for c in candidates:
-        ivs = db.query(Interview).filter(Interview.candidate_id == c.id).all()
+        ivs = db.query(Interview).filter(Interview.candidate_id == c.id, Interview.company_id == cid).all()
         for iv in ivs:
             events.append({
                 "event": "interview_scheduled",
@@ -1680,7 +1859,7 @@ def job_timeline(
 
     # Offers
     for c in candidates:
-        for o in c.offers:
+        for o in (o for o in c.offers if o.company_id == cid):
             events.append({
                 "event": "offer_created",
                 "label": f"Offer to {cand_map.get(c.id, '?')}: {o.offer_type}",
@@ -1715,23 +1894,29 @@ def executive_overview(
     last_30 = now - timedelta(days=30)
     last_7 = now - timedelta(days=7)
 
-    total_jobs = db.query(JobPosting).count()
-    active_jobs = db.query(JobPosting).filter(JobPosting.status == "active").count()
-    total_candidates = db.query(Candidate).count()
-    new_this_week = db.query(Candidate).filter(Candidate.created_at >= last_7).count()
-    new_this_month = db.query(Candidate).filter(Candidate.created_at >= last_30).count()
-    hired_this_month = db.query(Candidate).filter(
+    cid = current_user.company_id
+    jobs_q = db.query(JobPosting).filter(JobPosting.company_id == cid)
+    cands_q = db.query(Candidate).filter(Candidate.company_id == cid)
+    ivs_q = db.query(Interview).filter(Interview.company_id == cid)
+    offers_q = db.query(Offer).filter(Offer.company_id == cid)
+
+    total_jobs = jobs_q.count()
+    active_jobs = jobs_q.filter(JobPosting.status == "active").count()
+    total_candidates = cands_q.count()
+    new_this_week = cands_q.filter(Candidate.created_at >= last_7).count()
+    new_this_month = cands_q.filter(Candidate.created_at >= last_30).count()
+    hired_this_month = cands_q.filter(
         Candidate.current_stage == "hired", Candidate.updated_at >= last_30
     ).count()
-    total_interviews = db.query(Interview).count()
-    pending_interviews = db.query(Interview).filter(Interview.status == "SCHEDULED").count()
-    total_offers = db.query(Offer).count()
-    accepted_offers = db.query(Offer).filter(Offer.status == "accepted").count()
-    pending_offers = db.query(Offer).filter(Offer.status == "sent").count()
+    total_interviews = ivs_q.count()
+    pending_interviews = ivs_q.filter(Interview.status == "SCHEDULED").count()
+    total_offers = offers_q.count()
+    accepted_offers = offers_q.filter(Offer.status == "accepted").count()
+    pending_offers = offers_q.filter(Offer.status == "sent").count()
 
     # ATS score distribution
     score_ranges = {"0-25": 0, "25-50": 0, "50-75": 0, "75-100": 0}
-    for c in db.query(Candidate).filter(Candidate.ats_score != None).all():
+    for c in cands_q.filter(Candidate.ats_score != None).all():  # noqa: E711
         s = _float(c.ats_score)
         if s < 25:
             score_ranges["0-25"] += 1
@@ -1744,14 +1929,15 @@ def executive_overview(
 
     # Stage distribution
     stage_dist: Dict[str, int] = defaultdict(int)
-    for c in db.query(Candidate).all():
+    for c in cands_q.all():
         stage_dist[c.current_stage or "applied"] += 1
 
     # Top 5 active jobs by applicant count
     top_jobs = (
         db.query(JobPosting, func.count(Candidate.id).label("cnt"))
-        .join(Candidate, Candidate.job_id == JobPosting.id, isouter=True)
-        .filter(JobPosting.status == "active")
+        .join(Candidate, and_(Candidate.job_id == JobPosting.id, Candidate.company_id == cid),
+              isouter=True)
+        .filter(JobPosting.status == "active", JobPosting.company_id == cid)
         .group_by(JobPosting.id)
         .order_by(func.count(Candidate.id).desc())
         .limit(5)
@@ -1808,9 +1994,7 @@ def reschedule_interview(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles("admin", "hr", "interviewer")),
 ):
-    iv = db.query(Interview).filter(Interview.id == interview_id).first()
-    if not iv:
-        raise HTTPException(404, "Interview not found")
+    iv = _interview_or_404(db, interview_id, current_user)
 
     try:
         new_dt = datetime.fromisoformat(req.new_datetime)
@@ -1830,6 +2014,7 @@ def reschedule_interview(
             db.query(Interview)
             .filter(
                 Interview.interviewer_email == iv.interviewer_email,
+                Interview.company_id == iv.company_id,
                 Interview.id != interview_id,
                 Interview.scheduled_datetime != None,  # noqa
                 Interview.status.notin_(["CANCELLED", "COMPLETED"]),
@@ -1893,14 +2078,18 @@ def clone_job(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles("admin", "hr")),
 ):
-    src = db.query(JobPosting).filter(JobPosting.id == job_id).first()
-    if not src:
-        raise HTTPException(404, "Job not found")
+    src = _job_or_404(db, job_id, current_user)
+    if req.new_department_id and not db.query(Department.id).filter(
+        Department.id == req.new_department_id,
+        Department.company_id == current_user.company_id,
+    ).first():
+        raise HTTPException(404, "Department not found")
 
-    hr_profile = db.query(HRProfile).filter(HRProfile.user_id == current_user.id).first()
+    hr_profile = _hr_profile(db, current_user)
 
     new_job = JobPosting(
         id=str(uuid.uuid4()),
+        company_id=current_user.company_id,
         title=req.new_title or f"{src.title} (Copy)",
         description=src.description,
         requirements=src.requirements,
@@ -1939,15 +2128,14 @@ def skill_gap_report(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles("admin", "hr")),
 ):
-    job = db.query(JobPosting).filter(JobPosting.id == job_id).first()
-    if not job:
-        raise HTTPException(404, "Job not found")
+    job = _job_or_404(db, job_id, current_user)
 
     required_skills = _safe_json(job.required_skills)
     if not required_skills:
         return {"message": "No required skills defined for this job"}
 
-    q = db.query(Candidate).filter(Candidate.job_id == job_id)
+    q = db.query(Candidate).filter(
+        Candidate.job_id == job_id, Candidate.company_id == current_user.company_id)
     if stage:
         q = q.filter(Candidate.current_stage == stage)
     candidates = q.all()

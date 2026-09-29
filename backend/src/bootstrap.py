@@ -32,6 +32,23 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _password_ok(password: str, var: str) -> bool:
+    """Apply the same password rules as every other path; log and refuse if weak.
+
+    A seeded superadmin with a weak password is the single most valuable account on
+    the platform, so a weak *_PASSWORD skips the seed rather than creating it.
+    """
+    from fastapi import HTTPException
+    from src.auth import validate_password_strength
+    try:
+        validate_password_strength(password)
+        return True
+    except HTTPException as exc:
+        logger.error("%s rejected (%s) — account not seeded. Set a stronger value.",
+                     var, exc.detail)
+        return False
+
+
 def _get_or_create_platform_company(session):
     """Return the platform's own company (by slug), creating it if missing.
 
@@ -53,6 +70,8 @@ def bootstrap_superadmin() -> None:
     password = os.getenv("SUPERADMIN_PASSWORD")
     if not email or not password:
         return  # feature disabled unless both are set
+    if not _password_ok(password, "SUPERADMIN_PASSWORD"):
+        return
 
     from src.config.database_config_mysql import db_manager
     from src.models.models import User
@@ -100,6 +119,8 @@ def bootstrap_platform_admin() -> None:
     password = os.getenv("PLATFORM_ADMIN_PASSWORD")
     if not email or not password:
         return  # feature disabled unless both are set
+    if not _password_ok(password, "PLATFORM_ADMIN_PASSWORD"):
+        return
 
     from src.config.database_config_mysql import db_manager
     from src.models.models import User

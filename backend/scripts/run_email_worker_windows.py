@@ -6,8 +6,11 @@ scheduler so deferred sends (rate-limited / retry-backoff) actually fire.
 
 Run from the repo root with Redis up:
     python scripts/run_email_worker_windows.py
-Env: EMAIL_REDIS_URL / REDIS_URL (default redis://localhost:6379/0),
+Env: EMAIL_REDIS_URL, or REDIS_URL + EMAIL_REDIS_DB (default db 1) — resolved
+     exactly as the API does (src/mailq/queue.resolve_redis_url);
      EMAIL_QUEUE (default email).
+
+Jobs are JSON and only the send job runs (src/mailq/safety.py), as in production.
 """
 import os
 import sys
@@ -19,7 +22,10 @@ import redis
 from rq import Queue, SimpleWorker
 from rq.timeouts import TimerDeathPenalty
 
-REDIS_URL = os.getenv("EMAIL_REDIS_URL", os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+from src.mailq.queue import resolve_redis_url
+from src.mailq.safety import SERIALIZER, SafeEmailJob
+
+REDIS_URL = resolve_redis_url()
 QUEUE = os.getenv("EMAIL_QUEUE", "email")
 
 
@@ -29,7 +35,10 @@ class WindowsEmailWorker(SimpleWorker):
 
 def main() -> None:
     conn = redis.from_url(REDIS_URL)
-    worker = WindowsEmailWorker([Queue(QUEUE, connection=conn)], connection=conn)
+    worker = WindowsEmailWorker(
+        [Queue(QUEUE, connection=conn, serializer=SERIALIZER)],
+        connection=conn, serializer=SERIALIZER, job_class=SafeEmailJob,
+    )
     print(f"[email-worker] listening on '{QUEUE}' via {REDIS_URL} "
           f"(SimpleWorker + TimerDeathPenalty, scheduler on)")
     worker.work(with_scheduler=True)

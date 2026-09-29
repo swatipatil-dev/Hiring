@@ -84,10 +84,30 @@ if [ "$ROLE" = "proctor" ]; then
 fi
 
 if [ "$ROLE" = "email-worker" ]; then
-    echo "Starting email RQ worker (with scheduler)..."
     # --with-scheduler is required so deferred (rate-limited/retry) sends fire.
+    #
+    # This process holds the key that decrypts every company's mailbox password, so
+    # like the judge it only runs what it must (src/mailq/safety.py):
+    #
+    # --job-class   refuses any job that is not the email send job.
+    # --serializer  jobs arrive as JSON, not pickle — unpickling alone can execute
+    #               code. The API enqueues with the same serializer, so the two must
+    #               be deployed together (drain the queue first: docs/DEPLOY_UPDATE.md).
+    #
+    # The Redis URL comes from the same function the API uses, so both agree on the
+    # email queue's own database (EMAIL_REDIS_DB, default 1) rather than the judge's.
+    # A standalone assignment, so `set -e` stops here if it fails instead of letting
+    # rq fall back to localhost db 0.
+    EMAIL_QUEUE_URL="$(python -c 'from src.mailq.queue import resolve_redis_url; print(resolve_redis_url())')"
+    # Secrets it never uses. It keeps DATABASE_URL (delivery log), EMAIL_ENCRYPTION_KEY
+    # (queued mailbox passwords) and the SMTP/Innomax mailbox credentials it sends with.
+    unset SECRET_KEY JUDGE_REGRADE_TOKEN SUPERADMIN_PASSWORD PLATFORM_ADMIN_PASSWORD \
+          GEMINI_API_KEY
+    echo "Starting email RQ worker (with scheduler)..."
     exec rq worker "${EMAIL_QUEUE:-email}" --with-scheduler \
-        --url "${EMAIL_REDIS_URL:-${JUDGE_REDIS_URL:-${REDIS_URL:-redis://localhost:6379/0}}}"
+        --job-class src.mailq.safety.SafeEmailJob \
+        --serializer rq.serializers.JSONSerializer \
+        --url "$EMAIL_QUEUE_URL"
     exit 1   # see the note above: a role branch must never fall through
 fi
 

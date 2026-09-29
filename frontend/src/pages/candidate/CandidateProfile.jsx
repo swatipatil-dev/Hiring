@@ -370,7 +370,7 @@ export default function CandidateProfile() {
     certifications: (profile.certifications || []).length > 0,
     projects:       (profile.projects || []).length > 0,
     preferences:    !!(profile.preferences?.preferred_job_roles?.length || profile.preferences?.preferred_job_type || profile.preferences?.work_mode_preference || profile.preferences?.expected_salary_min),
-    documents:      !!(profile.resume_path || profile.linkedin_url),
+    documents:      !!(profile.resume_url || profile.linkedin_url),
   }
 
   return (
@@ -644,8 +644,8 @@ function PersonalSection({ profile, reload, flash }) {
           border: '3px solid #fff', boxShadow: `0 0 0 2px ${TEAL_MID}`,
           overflow: 'hidden',
         }}>
-          {profile.profile_photo_path
-            ? <img src={`/${profile.profile_photo_path}`} alt="Profile" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+          {profile.profile_photo_url
+            ? <img src={profile.profile_photo_url} alt="Profile" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
             : <span style={{ color: '#fff', fontWeight: 700, fontSize: 22, letterSpacing: 0.5 }}>{initials}</span>
           }
         </div>
@@ -664,7 +664,7 @@ function PersonalSection({ profile, reload, flash }) {
             onMouseLeave={e => { e.currentTarget.style.filter = 'none' }}
             >
               <Upload size={13} strokeWidth={2} />
-              {profile.profile_photo_path ? 'Change Photo' : 'Upload Photo'}
+              {profile.profile_photo_url ? 'Change Photo' : 'Upload Photo'}
             </button>
             <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>JPG or PNG, max 2MB</span>
           </div>
@@ -1670,7 +1670,7 @@ function DocumentsSection({ profile, reload, flash }) {
 
   const handleAutoFill = async (fileOverride) => {
     const file = (fileOverride && fileOverride.target ? null : fileOverride) || autoFillRef.current?.files[0]
-    if (!file && !profile.resume_path) {
+    if (!file && !profile.resume_url) {
       autoFillRef.current?.click()
       return
     }
@@ -1759,7 +1759,7 @@ function DocumentsSection({ profile, reload, flash }) {
               <div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                   <div style={{ fontWeight: 600, fontSize: '0.9rem' }}>Resume / CV</div>
-                  {!profile.resume_path && (
+                  {!profile.resume_url && (
                     <span style={{
                       fontSize: '0.68rem',
                       fontWeight: 700,
@@ -1773,13 +1773,13 @@ function DocumentsSection({ profile, reload, flash }) {
                     }}>Required</span>
                   )}
                 </div>
-                {profile.resume_path
-                  ? <div style={{ fontSize: '0.8rem', color: '#22c55e', marginTop: 4 }}>Uploaded · <a href={`/${profile.resume_path}`} target="_blank" rel="noreferrer" style={{ color: 'inherit' }}>Preview</a></div>
+                {profile.resume_url
+                  ? <div style={{ fontSize: '0.8rem', color: '#22c55e', marginTop: 4 }}>Uploaded · <a href={profile.resume_url} target="_blank" rel="noreferrer" style={{ color: 'inherit' }}>Preview</a></div>
                   : <div style={{ fontSize: '0.8rem', color: 'var(--text-tertiary)', marginTop: 4 }}>PDF only, max 5 MB</div>
                 }
               </div>
               <button className="btn btn-secondary btn-sm" onClick={() => resumeRef.current?.click()}>
-                <Upload size={13} /> {profile.resume_path ? 'Replace' : 'Upload'}
+                <Upload size={13} /> {profile.resume_url ? 'Replace' : 'Upload'}
               </button>
             </div>
             <input ref={resumeRef} type="file" accept=".pdf" style={{ display: 'none' }}
@@ -1801,7 +1801,7 @@ function DocumentsSection({ profile, reload, flash }) {
               </div>
               <button className="btn btn-sm" style={{ background: TEAL, color: '#fff', border: `1px solid ${TEAL}` }}
                 onClick={() => {
-                  if (profile.resume_path) {
+                  if (profile.resume_url) {
                     handleAutoFill()
                   } else {
                     autoFillRef.current?.click()
@@ -1827,13 +1827,13 @@ function DocumentsSection({ profile, reload, flash }) {
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
               <div>
                 <div style={{ fontWeight: 600, fontSize: '0.9rem' }}>Cover Letter</div>
-                {profile.cover_letter_path
-                  ? <div style={{ fontSize: '0.8rem', color: '#22c55e', marginTop: 4 }}>Uploaded · <a href={`/${profile.cover_letter_path}`} target="_blank" rel="noreferrer" style={{ color: 'inherit' }}>Preview</a></div>
+                {profile.cover_letter_url
+                  ? <div style={{ fontSize: '0.8rem', color: '#22c55e', marginTop: 4 }}>Uploaded · <a href={profile.cover_letter_url} target="_blank" rel="noreferrer" style={{ color: 'inherit' }}>Preview</a></div>
                   : <div style={{ fontSize: '0.8rem', color: 'var(--text-tertiary)', marginTop: 4 }}>PDF / DOC / DOCX, max 5 MB (optional)</div>
                 }
               </div>
               <button className="btn btn-secondary btn-sm" onClick={() => clRef.current?.click()}>
-                <Upload size={13} /> {profile.cover_letter_path ? 'Replace' : 'Upload'}
+                <Upload size={13} /> {profile.cover_letter_url ? 'Replace' : 'Upload'}
               </button>
             </div>
             <input ref={clRef} type="file" accept=".pdf,.doc,.docx" style={{ display: 'none' }}

@@ -31,6 +31,7 @@ from src.services.ats_scoring_pipeline import (
     build_inputs_for_candidate, effective_score, persist_ats_result, score_for_job,
 )
 from src.services.enhanced_ats_service import SCORING_RULES_VERSION
+from src.services.file_access import application_file_url
 from src.services.jd_versions import staleness
 from src.services.job_access import can_access_job
 
@@ -341,14 +342,15 @@ class SampleRequest(BaseModel):
     seed: Optional[int] = None
 
 
-def _blinded(db, sample: ReviewSample, reviewer_id: str):
+def _blinded(db, sample: ReviewSample, reviewer):
     ids = json.loads(sample.candidate_ids or "[]")
-    cands = {c.id: c for c in db.query(Candidate).filter(Candidate.id.in_(ids)).all()} if ids else {}
+    cands = {c.id: c for c in db.query(Candidate).filter(
+        Candidate.id.in_(ids), Candidate.company_id == sample.company_id).all()} if ids else {}
     mine = {r.candidate_id: r for r in db.query(ScreeningReview).filter(
-        ScreeningReview.sample_id == sample.id, ScreeningReview.reviewer_user_id == reviewer_id).all()}
+        ScreeningReview.sample_id == sample.id, ScreeningReview.reviewer_user_id == reviewer.id).all()}
     # No score, rank or explanation: the reviewer judges the resume alone.
     return [{"candidate_id": cid, "name": f"{cands[cid].first_name} {cands[cid].last_name}".strip(),
-             "resume_path": cands[cid].resume_path,
+             "resume_url": application_file_url(cands[cid], "resume", reviewer),
              "my_judgement": mine[cid].judgement if cid in mine else None}
             for cid in ids if cid in cands]
 
@@ -364,17 +366,18 @@ async def create_review_sample(job_id: str, body: SampleRequest,
                             reviewer_id=current_user.id)
     db.commit()
     return {"sample_id": sample.id, "seed": sample.seed, "below_cutoff_population": sample.below_cutoff_population,
-            "candidates": _blinded(db, sample, current_user.id)}
+            "candidates": _blinded(db, sample, current_user)}
 
 
 @router.get("/review-samples/{sample_id}")
 async def get_review_sample(sample_id: str, current_user: User = Depends(AuthMiddleware.get_current_hr),
                             db: Session = Depends(get_db)):
-    sample = db.query(ReviewSample).filter(ReviewSample.id == sample_id).first()
+    sample = db.query(ReviewSample).filter(
+        ReviewSample.id == sample_id, ReviewSample.company_id == current_user.company_id).first()
     if not sample:
         raise HTTPException(status_code=404, detail="Sample not found")
     _job(db, current_user, sample.job_id)
-    return {"sample_id": sample.id, "job_id": sample.job_id, "candidates": _blinded(db, sample, current_user.id)}
+    return {"sample_id": sample.id, "job_id": sample.job_id, "candidates": _blinded(db, sample, current_user)}
 
 
 class ScreeningReviewRequest(BaseModel):

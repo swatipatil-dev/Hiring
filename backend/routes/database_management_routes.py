@@ -8,9 +8,12 @@ from sqlalchemy.orm import Session
 from typing import List, Optional, Dict, Any
 from src.config.database_config_mysql import get_db, db_manager
 from src.auth import require_role
-from pydantic import BaseModel, Field
+from src.services.audit_log import audit_superadmin_request
+from pydantic import BaseModel, ConfigDict, Field
 from datetime import datetime
 import logging
+import os
+import re
 
 # Every endpoint in this router exposes raw database state (health, structure,
 # row counts, query execution, backups). These are platform-operator tools
@@ -19,7 +22,7 @@ import logging
 router = APIRouter(
     prefix="/api/v1/database",
     tags=["Database Management"],
-    dependencies=[Depends(require_role(["superadmin"]))],
+    dependencies=[Depends(require_role(["superadmin"])), Depends(audit_superadmin_request)],
 )
 
 # Pydantic Models
@@ -45,7 +48,10 @@ class QueryResponse(BaseModel):
     execution_time: float
 
 class BackupRequest(BaseModel):
-    backup_path: Optional[str] = Field(None, description="Custom backup path")
+    # No path: the destination is always db_manager.default_backup_path(). A
+    # client-chosen path let the caller pick where on the server a dump of every
+    # tenant's data was written. extra="forbid" rejects a stale client still sending it.
+    model_config = ConfigDict(extra="forbid")
 
 class BackupResponse(BaseModel):
     success: bool
@@ -114,32 +120,57 @@ async def get_connection_stats():
 
 # ==================== QUERY EXECUTION ====================
 
+# Raw SQL reads every tenant's data, credentials included, so the console is off
+# unless an operator deliberately turns it on for a maintenance window. Even then it is
+# read-only, single-statement, and blind to credential columns.
+_FORBIDDEN_SQL = re.compile(
+    r"\b(DROP|DELETE|TRUNCATE|ALTER|CREATE|INSERT|UPDATE|REPLACE|GRANT|REVOKE|RENAME|"
+    r"HANDLER|LOCK|UNLOCK|CALL|DO|SET|LOAD_FILE|OUTFILE|DUMPFILE|INTO|SLEEP|BENCHMARK|"
+    r"GET_LOCK|LOAD)\b",
+    re.IGNORECASE,
+)
+_SENSITIVE_COLUMNS = re.compile(
+    r"\b(password_hash|otp_code|otp_hash|mfa_secret|mfa_recovery_codes|smtp_password|"
+    r"smtp_pass|app_password|api_key|encrypted_password|password)\b|(?<!\()\*(?!\))",
+    re.IGNORECASE,
+)
+
+
+def raw_sql_console_enabled() -> bool:
+    return os.getenv("ENABLE_RAW_SQL_CONSOLE", "").strip().lower() in ("1", "true", "yes")
+
+
+def check_console_query(query: str) -> None:
+    """Raise 400 unless `query` is a single read-only SELECT naming no credential
+    column (and no `*`, which would include them)."""
+    q = (query or "").strip().rstrip(";").strip()
+    if not q.upper().startswith("SELECT"):
+        raise HTTPException(status_code=400, detail="Only SELECT queries are allowed.")
+    if ";" in q or "--" in q or "/*" in q or "#" in q:
+        raise HTTPException(status_code=400, detail="One statement, without comments.")
+    bad = _FORBIDDEN_SQL.search(q)
+    if bad:
+        raise HTTPException(status_code=400, detail=f"Keyword not allowed: {bad.group(0).upper()}")
+    if _SENSITIVE_COLUMNS.search(q):
+        raise HTTPException(status_code=400,
+                            detail="Credential columns and SELECT * are not available here.")
+
+
 @router.post("/query", response_model=QueryResponse)
 async def execute_query(
     request: QueryRequest,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
-    """Execute raw SQL query with safety checks"""
-    start_time = datetime.utcnow()
-    
-    # Basic SQL injection protection
-    dangerous_keywords = ['DROP', 'DELETE', 'TRUNCATE', 'ALTER', 'CREATE', 'INSERT', 'UPDATE']
-    query_upper = request.query.upper()
-    
-    for keyword in dangerous_keywords:
-        if keyword in query_upper:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Dangerous SQL keyword detected: {keyword}. Only SELECT queries are allowed."
-            )
-    
-    if not query_upper.strip().startswith('SELECT'):
+    """Execute a read-only query — only when ENABLE_RAW_SQL_CONSOLE is set."""
+    if not raw_sql_console_enabled():
         raise HTTPException(
-            status_code=400,
-            detail="Only SELECT queries are allowed for security reasons."
+            status_code=404,
+            detail="The SQL console is disabled. Set ENABLE_RAW_SQL_CONSOLE=true to enable it.",
         )
-    
+    start_time = datetime.utcnow()
+    check_console_query(request.query)
+
     try:
         # Log query execution
         logging.info(f"Executing query: {request.query[:100]}...")
@@ -268,8 +299,8 @@ async def get_table_details(
 
 @router.post("/backup", response_model=BackupResponse)
 async def create_database_backup(
-    request: BackupRequest,
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
+    request: Optional[BackupRequest] = None,
 ):
     """Create database backup"""
     try:
@@ -279,7 +310,7 @@ async def create_database_backup(
         # will actually be written. The backup itself runs in the background, so
         # recomputing a path here (different directory, different timestamp)
         # would send the caller looking for a file that never exists.
-        backup_path = request.backup_path or db_manager.default_backup_path()
+        backup_path = db_manager.default_backup_path()
 
         def backup_task():
             # backup_database raises on failure and removes any partial file, so the

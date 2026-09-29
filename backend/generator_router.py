@@ -1253,12 +1253,14 @@ async def generate_skill_questions(
 
         # Existing bank masters for this skill — skip storing any generated question whose
         # normalized text already exists so regenerating a skill never piles up duplicates.
+        # This company's bank only: another tenant's questions must neither be read nor
+        # suppress this company's own generation.
         existing = {
             _normalize_text(t)
-            for (t,) in db.query(QuestionModel.question_text).filter(
+            for (t,) in _in_caller_company(db.query(QuestionModel.question_text).filter(
                 QuestionModel.is_pool_question == True,
                 QuestionModel.skill_name == request.skill_name,
-            )
+            ), current_user)
         }
 
         # Validate, enforce type, and save to DB

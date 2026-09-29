@@ -61,15 +61,26 @@ class InterviewFeedbackResponse(BaseModel):
 # ==================== HELPER FUNCTIONS ====================
 
 def get_interviewer_profile(db: Session, user: User) -> InterviewerProfile:
-    """Get interviewer profile for user, auto-creating if absent"""
-    interviewer_profile = db.query(InterviewerProfile).filter(
-        InterviewerProfile.user_id == user.id
-    ).first()
+    """Get interviewer profile for user, auto-creating if absent.
+
+    Looked up outside the tenant filter for the same reason as
+    hr_routes.get_hr_profile: one profile per user, and a legacy NULL-company
+    row must be re-homed rather than duplicated.
+    """
+    from src.tenancy import tenant_bypass
+    with tenant_bypass():
+        interviewer_profile = db.query(InterviewerProfile).filter(
+            InterviewerProfile.user_id == user.id
+        ).first()
+    if interviewer_profile and interviewer_profile.company_id != user.company_id:
+        interviewer_profile.company_id = user.company_id
+        db.commit()
     if not interviewer_profile:
         from src.models.models import Department
         dept = db.query(Department).filter(Department.company_id == user.company_id).first() if user.company_id else None
         interviewer_profile = InterviewerProfile(
             user_id=user.id,
+            company_id=user.company_id,
             department_id=dept.id if dept else None,
             employee_id=f"IV-{str(user.id)[:8]}"
         )
@@ -291,7 +302,8 @@ async def get_interview_candidate_info(
     from src.models.models import ATSResult
     ats_result = db.query(ATSResult).filter(
         ATSResult.candidate_id == candidate.id,
-        ATSResult.job_id == interview.job_id
+        ATSResult.job_id == interview.job_id,
+        ATSResult.company_id == current_user.company_id,
     ).first()
     
     return {

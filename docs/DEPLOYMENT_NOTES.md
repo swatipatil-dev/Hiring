@@ -106,8 +106,9 @@ Both queue modules keep **two** clients, and the distinction is load-bearing:
 | `get_redis()` | `True` | our own keys — pub/sub JSON, rate-limit counters, `llen` probes |
 | `get_redis_raw()` | `False` | every `rq.Queue` and `rq.job.Job` |
 
-RQ stores job arguments and results as **pickle**. Hand it the decoding client and
-every read tries to UTF-8 decode binary data:
+RQ stores job data as binary — pickle by default, and zlib-compressed even with the
+JSON serializer both queues now use (`src/judge/rq_safety.py`, `src/mailq/safety.py`).
+Hand it the decoding client and every read tries to UTF-8 decode binary data:
 
 ```
 'utf-8' codec can't decode byte 0x9c in position 1: invalid start byte
@@ -121,6 +122,22 @@ tests pass either way.
 
 The CLI workers (`rq worker-pool --url …`) build their own connection and default
 to no decoding, so only the in-process call sites matter.
+
+### Both RQ workers run only their own jobs, from JSON
+
+Stock RQ runs any importable function a job names, with pickled arguments; unpickling
+alone executes code. So anyone who can write to Redis could run code as a worker. The
+judge worker is root-equivalent (docker group), and the email worker holds the key that
+decrypts every company's mailbox password. Both are started with `--job-class` (an
+allow-list: `ALLOWED_JOBS` in `src/judge/rq_safety.py` / `src/mailq/safety.py`) and
+`--serializer rq.serializers.JSONSerializer`, and the API enqueues with the same
+serializer. **API and workers must be deployed together**: each side refuses the other's
+old format.
+
+The email queue also has its own Redis database (`EMAIL_REDIS_DB`, default 1), resolved
+by `src/mailq/queue.resolve_redis_url()`. `entrypoint.sh` calls that same function
+rather than rebuilding the URL in shell, so the API and the worker can't disagree about
+which database the queue is in.
 
 ### `.env` is not readable by every service user
 
@@ -288,6 +305,13 @@ ls -lh /opt/hireflow/backups/
 
 So for a backup something depends on — before a migration, before a schema change —
 run `mysqldump` yourself and read the exit code, rather than trusting a 200.
+
+The routine backup is neither of these: `hireflow-backup.timer` runs
+`scripts/backup.py` nightly (database **and** uploaded files, encrypted, off-site,
+checksummed, with a row-count manifest), and `scripts/restore_drill.py` proves a bundle
+restores. See [BACKUP_AND_RESTORE.md](BACKUP_AND_RESTORE.md). It passes the credentials
+through a 0600 option file with `protocol=tcp`, for the same reason the API's backup uses
+`--protocol=TCP`: the app connects over TCP, so that is the grant known to work.
 
 ---
 

@@ -16,6 +16,8 @@ from src.models.models import (
     CandidateRequest, Notification, ResumePoolEntry, ResumePoolAttachment,
     MailTemplate, JobHRCollaborator
 )
+from src.services.file_access import (application_file_url, content_disposition,
+                                      file_headers, voice_answer_url)
 from src.services.resume_pool_import import (
     import_registered_users, import_orphan_candidates,
     count_importable_users, count_orphan_candidates,
@@ -197,8 +199,8 @@ class ATSCandidateResponse(BaseModel):
     extracted_skills: List[str] = []
     experience_years: Optional[int] = 0
     applied_at: Optional[datetime] = None
-    resume_path: Optional[str] = None
-    photo_path: Optional[str] = None
+    # Signed download links (src/services/file_access.py), never storage keys.
+    resume_url: Optional[str] = None
     photo_url: Optional[str] = None
     plagiarism_flag: bool = False
     jd_overlap: Optional[float] = None
@@ -391,12 +393,24 @@ class OfferCreate(BaseModel):
 # ==================== HELPER FUNCTIONS ====================
 
 def get_hr_profile(db: Session, user: User) -> HRProfile:
-    """Get HR profile for user, auto-creating if absent"""
-    hr_profile = db.query(HRProfile).filter(HRProfile.user_id == user.id).first()
+    """Get HR profile for user, auto-creating if absent.
+
+    Looked up by user_id outside the tenant filter: a profile is one per user
+    (unique user_id), and a legacy row with a NULL company_id is invisible to
+    the filter, so a scoped lookup would miss it and the insert below would hit
+    the unique key. Such a row is re-homed to the user's company instead.
+    """
+    from src.tenancy import tenant_bypass
+    with tenant_bypass():
+        hr_profile = db.query(HRProfile).filter(HRProfile.user_id == user.id).first()
+    if hr_profile and hr_profile.company_id != user.company_id:
+        hr_profile.company_id = user.company_id
+        db.commit()
     if not hr_profile:
         dept = db.query(Department).filter(Department.company_id == user.company_id).first() if user.company_id else None
         hr_profile = HRProfile(
             user_id=user.id,
+            company_id=user.company_id,
             department_id=dept.id if dept else None,
             employee_id=f"HR-{str(user.id)[:8]}"
         )
@@ -416,6 +430,9 @@ async def get_tests_for_job(
     DRAFT interviews are work-in-progress (incomplete config / no questions yet) and
     must never appear as assignable tests in the HR dropdown — only finalized ones.
     """
+    job = _company_job_or_404(db, job_id, current_user)
+    _require_job_team(db, job, current_user)
+
     # A test belongs to a job ONLY by its exact job_id link. We used to also pull in
     # tests with no job_id whose job_title string matched — but that made a new test
     # bleed onto a different (e.g. old, same-titled) job. Exact link only.
@@ -515,6 +532,14 @@ def create_job_response(job: JobPosting, test: Optional[Interview] = None,
         elif any(c["hr_id"] == str(viewer_hr_id) for c in collaborators):
             my_role = "collaborator"
 
+    # Pay figures follow src/services/salary_visibility: an HR sees them only on a job
+    # they own or co-own (or one nobody owns yet — the same exception as the job-team
+    # check). Callers already gate on job access; this is the second layer.
+    show_salary = not (
+        viewer is not None and viewer.role == "hr" and job.hr_id
+        and my_role not in ("owner", "collaborator")
+    )
+
     interviewer_email = None
     interviewer_name = None
     if hasattr(job, 'interviewer') and job.interviewer:
@@ -531,8 +556,8 @@ def create_job_response(job: JobPosting, test: Optional[Interview] = None,
         department_id=str(job.department_id) if job.department_id else None,
         location=job.location or "",
         employment_type=job.employment_type or "",
-        salary_min=float(job.salary_min) if job.salary_min else None,
-        salary_max=float(job.salary_max) if job.salary_max else None,
+        salary_min=float(job.salary_min) if show_salary and job.salary_min else None,
+        salary_max=float(job.salary_max) if show_salary and job.salary_max else None,
         experience_years=job.experience_years or 0,
         required_skills=_parse_skills(job.required_skills),
         preferred_skills=(_parse_skills(job.preferred_skills) if job.preferred_skills is not None else None),
@@ -551,8 +576,16 @@ def create_job_response(job: JobPosting, test: Optional[Interview] = None,
     )
 
 def update_candidate_stage(db: Session, candidate_id: str, new_stage: str, changed_by_id: str, notes: str = None):
-    """Update candidate stage and create history record"""
-    candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
+    """Update candidate stage and create history record.
+
+    Scoped to the actor's company: every caller has already authorised the candidate,
+    but this is the write, so it re-checks rather than trusting an id.
+    """
+    actor = db.query(User).filter(User.id == changed_by_id).first()
+    candidate = db.query(Candidate).filter(
+        Candidate.id == candidate_id,
+        Candidate.company_id == (actor.company_id if actor else None),
+    ).first()
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
     
@@ -562,6 +595,7 @@ def update_candidate_stage(db: Session, candidate_id: str, new_stage: str, chang
     
     # Create stage history
     stage_history = CandidateStageHistory(
+        company_id=candidate.company_id,
         candidate_id=candidate_id,
         from_stage=old_stage,
         to_stage=new_stage,
@@ -2468,7 +2502,10 @@ async def download_pool_attachment(
     return StreamingResponse(
         open_binary(att.file_path),
         media_type=att.content_type or "application/octet-stream",
-        headers={"Content-Disposition": f'attachment; filename="{att.filename or "file"}"'},
+        # Always a download: an uploaded .html/.svg shown inline would run script on
+        # our origin. file_headers escapes the name (a " in it broke the header).
+        headers={**file_headers(att.filename or "file", "application/octet-stream"),
+                 "Content-Disposition": content_disposition(att.filename or "file", False)},
     )
 
 
@@ -2624,7 +2661,8 @@ async def download_pool_resume(
     return StreamingResponse(
         open_binary(entry.resume_path),
         media_type=media_type,
-        headers={"Content-Disposition": f'attachment; filename="{entry.filename or "resume" + ext}"'},
+        headers={**file_headers(entry.filename or "resume" + ext, media_type),
+                 "Content-Disposition": content_disposition(entry.filename or "resume" + ext, False)},
     )
 
 
@@ -2886,6 +2924,7 @@ async def approve_job(
     ).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    _require_job_team(db, job, current_user)
     if job.status == "active":
         raise HTTPException(status_code=400, detail="Job is already active")
     if job.status == "closed":
@@ -2945,6 +2984,7 @@ async def assign_interviewer_to_job(
     ).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    _require_job_team(db, job, current_user)
     interviewer = active_interviewer_query(db, current_user.company_id).filter(
         InterviewerProfile.id == interviewer_id,
         User.company_id == current_user.company_id
@@ -3026,6 +3066,23 @@ def _require_job_owner_or_admin(db: Session, job: JobPosting, current_user: User
     if not is_job_owner(job, get_hr_profile(db, current_user)):
         raise HTTPException(status_code=403,
                             detail="Only the job's owner HR or an admin can do this.")
+
+
+def _require_job_team(db: Session, job: Optional[JobPosting], current_user: User) -> None:
+    """Day-to-day work on a job — editing it, inviting, scheduling, offering — is for
+    its team: the owner HR and co-HRs, or an admin. Being in the same company is not
+    enough; the HR job list is already scoped this way (job_access_filter), and the
+    actions behind it now are too.
+
+    Same exception as _require_job_owner_or_admin: a job nobody owns yet (hr_id NULL,
+    e.g. an interviewer's draft awaiting approval) stays open to any HR in the company.
+    Callers pass a job already scoped to the caller's company.
+    """
+    if current_user.role == "admin" or job is None or not job.hr_id:
+        return
+    if not can_access_job(db, job, get_hr_profile(db, current_user)):
+        raise HTTPException(status_code=403,
+                            detail="You are not on this job's HR team.")
 
 
 def _assignable_hr_or_error(db: Session, hr_id: str, current_user: User) -> HRProfile:
@@ -3310,6 +3367,7 @@ async def update_job(
     ).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    _require_job_team(db, job, current_user)
     # Snapshot the job as it was, then again after the edit. A new version appears only
     # when something scoring reads changed, and scores measured against the old one are
     # then shown as "scored against an earlier job description".
@@ -3345,6 +3403,7 @@ async def delete_job(
     ).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    _require_job_team(db, job, current_user)
     job.status = "closed"
     job.updated_at = datetime.utcnow()
     db.commit()
@@ -3389,6 +3448,7 @@ async def reopen_job(
     ).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    _require_job_team(db, job, current_user)
     if job.status != "closed":
         raise HTTPException(status_code=400, detail="Only a closed job can be reopened")
     job.status = "active"
@@ -4002,6 +4062,7 @@ async def send_test_invite_and_reject(
     ).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    _require_job_team(db, job, current_user)
 
     all_candidates = db.query(Candidate).filter(Candidate.job_id == job_id).all()
     _frontend_base = os.getenv("FRONTEND_URL", "http://localhost:3001")
@@ -4010,7 +4071,7 @@ async def send_test_invite_and_reject(
     # Get the source test template if test_id provided
     source_test = None
     if request.test_id:
-        source_test = db.query(Interview).filter(Interview.id == request.test_id).first()
+        source_test = _company_template_or_404(db, request.test_id, current_user)
 
     # Proctoring override for this batch, if HR reconfigured it in the review modal.
     # exclude_none keeps flags HR did not touch on the template's own value.
@@ -4171,21 +4232,44 @@ class SendRound2InviteRequest(BaseModel):
     mailbox_id: Optional[str] = None
 
 
-def _resolve_source_template(db, job_id, round1_iv):
+def _company_template_or_404(db, test_id, current_user) -> Interview:
+    """A test template (candidate_id IS NULL) in the caller's company, or 404.
+
+    Test ids are sequential integers. Loaded by id alone, a template from another
+    company would be cloned — questions and answer keys included — into this
+    company's candidate test, where HR can then read it back.
+    """
+    t = db.query(Interview).filter(
+        Interview.id == test_id,
+        Interview.company_id == current_user.company_id,
+        Interview.candidate_id.is_(None),
+    ).first()
+    if not t:
+        raise HTTPException(status_code=404, detail="Test not found")
+    return t
+
+
+def _resolve_source_template(db, job_id, round1_iv, company_id):
     """Find the test template (candidate_id IS NULL) a per-candidate test was cloned
-    from: prefer the id stashed in the Round 1 test's config, else newest job template."""
+    from: prefer the id stashed in the Round 1 test's config, else newest job template.
+    The stashed id is data, so it is only trusted inside the caller's company."""
     import json as _json
     if round1_iv is not None and round1_iv.interview_config_data:
         try:
             cfg = _json.loads(round1_iv.interview_config_data)
             sid = cfg.get("_source_test_id") if isinstance(cfg, dict) else None
             if sid:
-                t = db.query(Interview).filter(Interview.id == sid).first()
+                t = db.query(Interview).filter(
+                    Interview.id == sid,
+                    Interview.company_id == company_id,
+                    Interview.candidate_id.is_(None),
+                ).first()
                 if t:
                     return t
         except Exception:
             pass
     return db.query(Interview).filter(
+        Interview.company_id == company_id,
         Interview.job_id == job_id,
         Interview.candidate_id.is_(None),
         Interview.is_scheduled_interview == False,  # noqa: E712
@@ -4210,6 +4294,9 @@ async def send_round2_invite(
     ).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    _require_job_team(db, job, current_user)
+    explicit_source = (_company_template_or_404(db, body.source_test_id, current_user)
+                       if body.source_test_id else None)
 
     _frontend_base = os.getenv("FRONTEND_URL", "http://localhost:3001")
     test_link = body.test_link or f"{_frontend_base}/candidate/interviews"
@@ -4252,8 +4339,8 @@ async def send_round2_invite(
             skipped.append({"candidate_id": cid, "reason": "Round 2 already sent"})
             continue
 
-        source_test = (db.query(Interview).filter(Interview.id == body.source_test_id).first()
-                       if body.source_test_id else None) or _resolve_source_template(db, job_id, round1)
+        source_test = explicit_source or _resolve_source_template(
+            db, job_id, round1, current_user.company_id)
         if not source_test:
             skipped.append({"candidate_id": cid, "reason": "source test template not found"})
             continue
@@ -4320,14 +4407,16 @@ async def get_all_feedback(
         .outerjoin(InterviewerProfile, InterviewFeedback.interviewer_id == InterviewerProfile.id)
         .outerjoin(IVUser, InterviewerProfile.user_id == IVUser.id)
     )
-    if current_user.company_id:
-        fb_q = fb_q.filter(
-            or_(
-                Interview.company_id == current_user.company_id,
-                JobPosting.company_id == current_user.company_id,
-                IVUser.company_id == current_user.company_id,
-            )
-        )
+    # Scoped by the interview's own company. The interviewer's company is not a
+    # scope: matching on it would admit feedback on another company's interview by
+    # anyone who happens to share an interviewer's company.
+    fb_q = fb_q.filter(
+        Interview.company_id == current_user.company_id,
+        InterviewFeedback.company_id == current_user.company_id,
+    )
+    # HR sees feedback for the jobs they are on; admins see the whole company.
+    if current_user.role != "admin":
+        fb_q = fb_q.filter(job_access_filter(get_hr_profile(db, current_user).id))
     feedbacks = fb_q.order_by(InterviewFeedback.created_at.desc()).all()
 
     results = []
@@ -4616,14 +4705,26 @@ async def get_test_results(
     db: Session = Depends(get_db)
 ):
     """Get completed and pending (SCHEDULED) test results grouped by job, with scores and red flags"""
+    # Tests in the caller's company; an HR sees only the jobs they are on, as on
+    # GET /interviews. Candidate contact details, scores and accommodation requests
+    # are in every row, so this must never be the whole table.
+    def _scoped():
+        q = db.query(Interview).filter(Interview.company_id == current_user.company_id)
+        if current_user.role != "admin":
+            q = q.join(JobPosting, Interview.job_id == JobPosting.id).filter(
+                JobPosting.company_id == current_user.company_id,
+                job_access_filter(get_hr_profile(db, current_user).id),
+            )
+        return q
+
     # COMPLETED: all finished tests (exclude scheduled meeting records)
-    completed_ivs = db.query(Interview).filter(
+    completed_ivs = _scoped().filter(
         Interview.status == "COMPLETED",
         Interview.is_scheduled_interview == False,  # noqa: E712
     ).order_by(Interview.updated_at.desc()).all()
 
     # SCHEDULED: only candidate-assigned pending test invites (exclude meetings and template drafts)
-    scheduled_ivs = db.query(Interview).filter(
+    scheduled_ivs = _scoped().filter(
         Interview.status == "SCHEDULED",
         Interview.candidate_id.isnot(None),
         Interview.is_scheduled_interview == False,  # noqa: E712
@@ -4856,12 +4957,23 @@ async def grant_retest(
     if pending:
         raise HTTPException(status_code=409, detail="A retest for this attempt is already waiting for the candidate.")
 
-    template = db.query(Interview).filter(Interview.id == source_template_id(attempt)).first() \
-        if source_template_id(attempt) else None
+    # The template id is read out of the attempt's config, so it is only trusted inside
+    # the caller's company.
+    template = db.query(Interview).filter(
+        Interview.id == source_template_id(attempt),
+        Interview.company_id == current_user.company_id,
+        Interview.candidate_id.is_(None),
+    ).first() if source_template_id(attempt) else None
     if not template:
         raise HTTPException(status_code=409, detail="The original test template for this attempt no longer exists, so it can't be retaken. Send a new test instead.")
-    candidate = db.query(Candidate).filter(Candidate.id == attempt.candidate_id).first()
-    job = attempt.job or (db.query(JobPosting).filter(JobPosting.id == attempt.job_id).first() if attempt.job_id else None)
+    candidate = db.query(Candidate).filter(
+        Candidate.id == attempt.candidate_id,
+        Candidate.company_id == current_user.company_id,
+    ).first()
+    job = attempt.job or (db.query(JobPosting).filter(
+        JobPosting.id == attempt.job_id,
+        JobPosting.company_id == current_user.company_id,
+    ).first() if attempt.job_id else None)
     if not candidate or not job:
         raise HTTPException(status_code=409, detail="The candidate or job for this attempt no longer exists.")
 
@@ -4994,9 +5106,9 @@ async def get_test_result_answers(
     """
     from src.models.question_models import Question as InterviewQuestion, CommunicationAnswer
 
-    interview = db.query(Interview).filter(Interview.id == interview_id).first()
-    if not interview:
-        raise HTTPException(status_code=404, detail="Test not found")
+    # Company- and job-team-scoped: this returns answers, transcripts, recordings and
+    # every question's correct answer, and test ids are sequential.
+    interview = _hr_attempt(db, current_user, interview_id)
 
     try:
         stored = json.loads(interview.answers_json) if interview.answers_json else []
@@ -5032,7 +5144,8 @@ async def get_test_result_answers(
                 "transcript": a.get("transcript") or (rec.transcript if rec else None),
                 "communication_score": a.get("communication_score") or (rec.communication_score if rec else None),
                 "awarded": a.get("awarded"),
-                "audio_url": a.get("audio_url") or (("/" + rec.audio_path) if rec and rec.audio_path else None),
+                # Always from the row: answers_json may hold a legacy "/uploads/..." path.
+                "audio_url": voice_answer_url(rec.id, current_user) if rec and rec.audio_path else None,
                 "breakdown": a.get("breakdown") or (
                     json.loads(rec.breakdown_json) if rec and rec.breakdown_json else {}
                 ),
@@ -5081,6 +5194,7 @@ async def test_result_action(
     ).first()
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
+    _require_job_team(db, candidate.job, current_user)
 
     if body.action == "select":
         update_candidate_stage(db, body.candidate_id, "interview", current_user.id, "Selected after test — moved to Phone Screen")
@@ -5155,6 +5269,7 @@ async def hr_schedule_interview(
     ).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    _require_job_team(db, job, current_user)
 
     # Panel roster — shared with PUT /hr/interviews/{id}/panel so the two cannot drift.
     # Order is HR's selection order (first = lead); a deactivated pick raises 400.
@@ -5387,6 +5502,7 @@ async def update_interview_panel(
         )
 
     job = interview.job
+    _require_job_team(db, job, current_user)
     old_panel = parse_panel(interview)
     new_panel = build_panel(
         db,
@@ -5646,9 +5762,8 @@ async def get_job_candidates_enhanced(
                     extracted_skills=json.loads(candidate.extracted_skills) if isinstance(candidate.extracted_skills, str) else (candidate.extracted_skills or []),
                     experience_years=candidate.experience_years,
                     applied_at=candidate.created_at,
-                    resume_path=candidate.resume_path,
-                    photo_path=candidate.photo_path,
-                    photo_url=f"/{candidate.photo_path}" if candidate.photo_path else None,
+                    resume_url=application_file_url(candidate, "resume", current_user),
+                    photo_url=application_file_url(candidate, "photo", current_user),
                     plagiarism_flag=plagiarism_flag,
                     jd_overlap=jd_overlap,
                     education_score=edu_score,
@@ -5960,12 +6075,18 @@ async def schedule_interview(
     - **duration_minutes**: Interview duration in minutes
     - **meeting_link**: Optional meeting link
     """
-    # Validate candidate
-    candidate = db.query(Candidate).filter(Candidate.id == interview_data.candidate_id).first()
+    # Validate candidate — in the caller's company, on a job the caller is on. Looked up
+    # by id alone, this scheduled interviews on another company's candidate, moved their
+    # pipeline stage and emailed them from that company's own mail server.
+    candidate = db.query(Candidate).filter(
+        Candidate.id == interview_data.candidate_id,
+        Candidate.company_id == current_user.company_id,
+    ).first()
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
     if not candidate.job_id:
         raise HTTPException(status_code=400, detail="Candidate has no associated job — cannot schedule interview")
+    _require_job_team(db, candidate.job, current_user)
 
     # Check if an interview already exists for this specific candidate + job combination
     existing = db.query(Interview).filter(
@@ -5990,7 +6111,10 @@ async def schedule_interview(
     
     # Create interview
     _mode = "online" if interview_data.meeting_link else "offline"
-    job_for_default = db.query(JobPosting).filter(JobPosting.id == candidate.job_id).first()
+    job_for_default = db.query(JobPosting).filter(
+        JobPosting.id == candidate.job_id,
+        JobPosting.company_id == current_user.company_id,
+    ).first()
     resolved_type = interview_data.interview_type or _interview_type_from_job_category(
         getattr(job_for_default, "job_category", None) if job_for_default else None
     )
@@ -6174,13 +6298,13 @@ async def get_scheduled_interviews(
         candidate_name = "—"
         candidate_email = ""
         candidate_phone = ""
-        resume_path = ""
+        resume_url = None
         candidate_id = iv.candidate_id
         if iv.candidate:
             candidate_name = f"{iv.candidate.first_name} {iv.candidate.last_name}"
             candidate_email = iv.candidate.email or ""
             candidate_phone = iv.candidate.phone or ""
-            resume_path = iv.candidate.resume_path or ""
+            resume_url = application_file_url(iv.candidate, "resume", current_user)
         job_title = iv.job_title or (iv.job.title if iv.job else "—")
 
         # Detect mode from notes
@@ -6202,7 +6326,7 @@ async def get_scheduled_interviews(
             "candidate_name": candidate_name,
             "candidate_email": candidate_email,
             "candidate_phone": candidate_phone,
-            "resume_path": resume_path,
+            "resume_url": resume_url,
             "job_title": job_title,
             "interview_type": iv.interview_type,
             "scheduled_datetime": iv.scheduled_datetime,
@@ -6247,12 +6371,18 @@ async def create_offer(
     - **expiry_date**: Offer expiry date
     - **terms**: Offer terms and conditions
     """
-    # Validate candidate
-    candidate = db.query(Candidate).filter(Candidate.id == offer_data.candidate_id).first()
+    # Validate candidate — in the caller's company, on a job the caller is on. By id
+    # alone this sent a forged offer letter to another company's candidate from that
+    # company's own mail server.
+    candidate = db.query(Candidate).filter(
+        Candidate.id == offer_data.candidate_id,
+        Candidate.company_id == current_user.company_id,
+    ).first()
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
     if not candidate.job_id:
         raise HTTPException(status_code=400, detail="Candidate has no associated job — cannot create offer")
+    _require_job_team(db, candidate.job, current_user)
     
     # Get HR profile
     hr_profile = get_hr_profile(db, current_user)
@@ -6375,9 +6505,10 @@ async def get_offers(
     db: Session = Depends(get_db)
 ):
     """Get offers created by HR"""
-    query = db.query(Offer).join(Candidate).join(JobPosting)
-    if current_user.company_id:
-        query = query.filter(JobPosting.company_id == current_user.company_id)
+    query = db.query(Offer).join(Candidate).join(JobPosting).filter(
+        JobPosting.company_id == current_user.company_id,
+        Offer.company_id == current_user.company_id,
+    )
 
     if current_user.role != "admin":
         hr_profile = get_hr_profile(db, current_user)
@@ -6523,13 +6654,18 @@ async def get_candidate_stage_history(
     db: Session = Depends(get_db)
 ):
     """Return stage history + current stage for a candidate — used by HR pipeline stage tracker."""
-    candidate = db.query(Candidate).filter(Candidate.id == candidate_id).first()
+    candidate = db.query(Candidate).filter(
+        Candidate.id == candidate_id,
+        Candidate.company_id == current_user.company_id,
+    ).first()
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
+    _require_job_team(db, candidate.job, current_user)
 
     history = (
         db.query(CandidateStageHistory)
-        .filter(CandidateStageHistory.candidate_id == candidate_id)
+        .filter(CandidateStageHistory.candidate_id == candidate_id,
+                CandidateStageHistory.company_id == current_user.company_id)
         .order_by(CandidateStageHistory.created_at.asc())
         .all()
     )
@@ -6560,9 +6696,10 @@ async def get_all_candidate_requests(
     """HR views all candidate requests from interviewers"""
     cr_q = db.query(CandidateRequest).join(
         User, CandidateRequest.requested_by == User.id
+    ).filter(
+        CandidateRequest.company_id == current_user.company_id,
+        User.company_id == current_user.company_id,
     )
-    if current_user.company_id:
-        cr_q = cr_q.filter(User.company_id == current_user.company_id)
     requests = cr_q.order_by(CandidateRequest.created_at.desc()).all()
     result = []
     for r in requests:
@@ -6581,14 +6718,17 @@ async def get_my_candidate_requirements(
 
     # Get all jobs assigned to this HR — tenant-scoped so legacy NULL-company rows
     # don't surface for users who do have a company_id (would otherwise 404 on update).
-    my_jobs_q = db.query(JobPosting).filter(job_access_filter(hr_profile.id))
-    if current_user.company_id:
-        my_jobs_q = my_jobs_q.filter(JobPosting.company_id == current_user.company_id)
-    my_jobs = my_jobs_q.all()
+    my_jobs = db.query(JobPosting).filter(
+        job_access_filter(hr_profile.id),
+        JobPosting.company_id == current_user.company_id,
+    ).all()
     my_job_titles = {j.title.strip().lower(): j for j in my_jobs}
 
-    # Get all candidate requests and match by job title
-    all_requests = db.query(CandidateRequest).order_by(CandidateRequest.created_at.desc()).all()
+    # This company's candidate requests, matched to jobs by id then title. Every request
+    # also comes back as "unmatched" below, so this must never be the whole table.
+    all_requests = db.query(CandidateRequest).filter(
+        CandidateRequest.company_id == current_user.company_id,
+    ).order_by(CandidateRequest.created_at.desc()).all()
 
     my_job_ids = {str(j.id) for j in my_jobs}
 
@@ -6661,7 +6801,10 @@ async def update_candidate_request_status(
     db: Session = Depends(get_db)
 ):
     """HR updates status of a candidate request (approve/reject/fulfill)"""
-    cr = db.query(CandidateRequest).filter(CandidateRequest.id == request_id).first()
+    cr = db.query(CandidateRequest).filter(
+        CandidateRequest.id == request_id,
+        CandidateRequest.company_id == current_user.company_id,
+    ).first()
     if not cr:
         raise HTTPException(status_code=404, detail="Candidate request not found")
 

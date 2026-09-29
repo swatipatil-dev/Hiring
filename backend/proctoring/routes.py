@@ -4,9 +4,11 @@ Includes face-matching against the candidate's registered photo.
 """
 import asyncio
 import base64
+import hmac
 import json
 import logging
 import os
+import secrets
 import sys
 import time
 import uuid
@@ -23,11 +25,10 @@ import numpy as np
 import cv2
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, HTTPException, Response
 from pydantic import BaseModel
-from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from src.config.database_config_mysql import get_db
-from src.auth import require_role
+from src.auth import get_current_user, require_role
 
 from .config import ProctorConfig
 from .runtime import inference_slots
@@ -63,7 +64,9 @@ class MonitoringConsent(BaseModel):
 
 
 class StartSessionRequest(BaseModel):
-    candidate_id: str
+    # Ignored: the session belongs to the authenticated candidate. Still accepted so
+    # an older client that sends it keeps working.
+    candidate_id: Optional[str] = None
     test_id: Union[int, str]   # accepts string from URL params, stored as int FK
     interview_id: Optional[int] = None
     monitoring_consent: Optional[MonitoringConsent] = None
@@ -511,7 +514,7 @@ async def _terminate_session(session_id: str, entry: dict, ws, reason: str):
         })
     except Exception:
         pass
-    logger.warning("Proctoring session %s TERMINATED: %s", session_id, reason)
+    logger.warning("Proctoring session %s… TERMINATED: %s", _log_sid(session_id), reason)
 
 
 async def _evaluate_strikes(session_id: str, entry: dict, result, ws):
@@ -575,10 +578,65 @@ async def _evaluate_strikes(session_id: str, entry: dict, result, ws):
             pass
 
 
+# ---------- Access ----------
+#
+# A session belongs to the candidate who started it. Every per-session endpoint and
+# WebSocket checks that, so knowing a session id is not enough to stop someone's test,
+# inject violations into their report, enroll a different face or read their logs. The
+# WebSockets can't carry the Bearer header from a browser, so start_session hands the
+# owner a random per-session token inside ws_video_url / ws_audio_url.
+
+_CANDIDATE = require_role(["candidate"])
+_STAFF_READ_ROLES = ("hr", "admin", "interviewer")
+
+
+def _log_sid(session_id: str) -> str:
+    """Enough of a session id to correlate log lines, never enough to use one."""
+    return str(session_id)[:8]
+
+
+def _owned_entry(session_id: str, user) -> dict:
+    """The live session if `user` started it; 404 otherwise (same as not existing)."""
+    entry = _sessions.get(session_id)
+    owner = entry.get("owner_user_id") if entry else None
+    if not owner or str(owner) != str(getattr(user, "id", "")):
+        raise HTTPException(404, "Session not found")
+    return entry
+
+
+def _readable_entry(session_id: str, user) -> dict:
+    """The live session for its owner, or for staff of the interview's company."""
+    entry = _sessions.get(session_id)
+    if entry:
+        if entry.get("owner_user_id") and str(entry["owner_user_id"]) == str(user.id):
+            return entry
+        role = (getattr(user, "role", "") or "").lower()
+        if role == "superadmin":
+            return entry
+        if (role in _STAFF_READ_ROLES and entry.get("company_id")
+                and str(entry["company_id"]) == str(user.company_id)):
+            return entry
+    raise HTTPException(404, "Session not found")
+
+
+def _ws_authorized(ws: WebSocket, entry: dict) -> bool:
+    expected = entry.get("ws_token")
+    supplied = ws.query_params.get("token") or ""
+    return bool(expected) and hmac.compare_digest(str(supplied), str(expected))
+
+
+def _owned_interview_company(user, interview_id: int):
+    """(found, company_id) for an interview this candidate owns. Blocking."""
+    from src.services.interview_access import candidate_owns_interview
+    with _db_session() as db:
+        iv = candidate_owns_interview(db, user, interview_id)
+        return (iv is not None, iv.company_id if iv is not None else None)
+
+
 # ---------- REST Endpoints ----------
 
 @router.post("/warmup")
-async def warmup():
+async def warmup(current_user=Depends(get_current_user)):
     """
     Build the shared inference models ahead of time.
 
@@ -679,7 +737,7 @@ def _register_reference_face(session_id: str, candidate_id: str, interview_id: O
 
 
 @router.post("/sessions/start", response_model=StartSessionResponse)
-async def start_session(req: StartSessionRequest):
+async def start_session(req: StartSessionRequest, current_user=Depends(_CANDIDATE)):
     """Start a new proctoring session.
 
     Everything expensive is either pre-warmed (the pipeline, see warmup.py) or moved off
@@ -690,6 +748,35 @@ async def start_session(req: StartSessionRequest):
     The critical path is now one pool pop plus one INSERT.
     """
     from .warmup import acquire
+
+    # The session is the caller's, for an interview that is theirs. Both used to come
+    # from the request body, unauthenticated: anyone could plant sessions and violations
+    # in any company's report, or probe a candidate's application photo via verify-face.
+    try:
+        test_id = req.test_id_int
+    except (TypeError, ValueError):
+        raise HTTPException(422, "test_id must be an interview id")
+    if req.interview_id is not None and req.interview_id != test_id:
+        raise HTTPException(422, "test_id and interview_id disagree")
+    found, company_id = await asyncio.to_thread(_owned_interview_company, current_user, test_id)
+    if not found:
+        raise HTTPException(404, "Interview not found")
+    req.candidate_id = str(current_user.id)
+    req.interview_id = test_id
+
+    # One live session per candidate. A reload or a second tab replaces the old
+    # session rather than adding one; without this a single candidate could call
+    # start MAX_SESSIONS times and hold every slot (503 for everyone) until the
+    # idle reaper freed them 15 minutes later.
+    for old_sid, old in list(_sessions.items()):
+        if old.get("owner_user_id") == str(current_user.id):
+            stale = _sessions.pop(old_sid, None)
+            if stale:
+                try:
+                    stale["pipeline"].shutdown()
+                except Exception:
+                    pass
+                logger.info("Replaced proctoring session %s… for the same candidate", old_sid[:8])
 
     # Refuse cleanly at capacity instead of accepting everyone and degrading every
     # session at once. An over-subscribed box drops frames for candidates already
@@ -703,7 +790,9 @@ async def start_session(req: StartSessionRequest):
             headers={"Retry-After": "30"},
         )
 
-    session_id = str(uuid.uuid4())[:8]
+    # The full uuid4: an 8-character prefix was 32 bits, and it was logged.
+    session_id = str(uuid.uuid4())
+    ws_token = secrets.token_urlsafe(32)
 
     # Cheap now: the analyzers hold counters, and the models come from the shared
     # pool. Still off the loop, because the very first session may build a model set.
@@ -717,6 +806,10 @@ async def start_session(req: StartSessionRequest):
         "pipeline": pipeline,
         "db_session_id": None,
         "candidate_id": req.candidate_id,
+        "owner_user_id": str(current_user.id),
+        "company_id": company_id,
+        "interview_id": test_id,
+        "ws_token": ws_token,
         # Registration now completes asynchronously; `enrollment_pending` tells the client
         # "a reference photo may still be loading — do NOT self-enroll yet".
         "face_registered": False,
@@ -755,13 +848,13 @@ async def start_session(req: StartSessionRequest):
     # must already exist: the helper mutates it.
     _fire_and_forget(_register_reference_face, session_id, req.candidate_id, req.interview_id)
 
-    logger.info("Proctoring session started: %s (candidate=%s, test=%s, enrollment pending)",
-                session_id, req.candidate_id, req.test_id)
+    logger.info("Proctoring session started: %s… (test=%s, enrollment pending)",
+                _log_sid(session_id), test_id)
 
     return StartSessionResponse(
         session_id=session_id,
-        ws_video_url=f"/api/v1/proctor/ws/video/{session_id}",
-        ws_audio_url=f"/api/v1/proctor/ws/audio/{session_id}",
+        ws_video_url=f"/api/v1/proctor/ws/video/{session_id}?token={ws_token}",
+        ws_audio_url=f"/api/v1/proctor/ws/audio/{session_id}?token={ws_token}",
         status="active",
         face_registered=False,
         enrollment_pending=True,
@@ -770,8 +863,9 @@ async def start_session(req: StartSessionRequest):
 
 
 @router.post("/sessions/{session_id}/stop")
-async def stop_session(session_id: str):
+async def stop_session(session_id: str, current_user=Depends(_CANDIDATE)):
     """Stop a proctoring session and return summary."""
+    _owned_entry(session_id, current_user)
     entry = _sessions.pop(session_id, None)
     if not entry:
         raise HTTPException(404, "Session not found")
@@ -805,11 +899,9 @@ async def stop_session(session_id: str):
 
 
 @router.get("/sessions/{session_id}/status", response_model=SessionStatusResponse)
-async def session_status(session_id: str):
+async def session_status(session_id: str, current_user=Depends(get_current_user)):
     """Get live status of a proctoring session."""
-    entry = _sessions.get(session_id)
-    if not entry:
-        raise HTTPException(404, "Session not found")
+    entry = _readable_entry(session_id, current_user)
 
     pipeline = entry["pipeline"]
     summary = pipeline.get_summary()
@@ -830,11 +922,9 @@ async def session_status(session_id: str):
 
 
 @router.post("/sessions/{session_id}/register-face")
-async def register_face_endpoint(session_id: str):
+async def register_face_endpoint(session_id: str, current_user=Depends(_CANDIDATE)):
     """Register face from next video frame (fallback if no stored photo)."""
-    entry = _sessions.get(session_id)
-    if not entry:
-        raise HTTPException(404, "Session not found")
+    entry = _owned_entry(session_id, current_user)
     return {
         "session_id": session_id,
         "face_registered": entry["face_registered"],
@@ -848,7 +938,8 @@ class EnrollFaceRequest(BaseModel):
 
 
 @router.post("/sessions/{session_id}/enroll-face")
-async def enroll_face_endpoint(session_id: str, req: EnrollFaceRequest):
+async def enroll_face_endpoint(session_id: str, req: EnrollFaceRequest,
+                               current_user=Depends(_CANDIDATE)):
     """One-time LIVE enrollment for candidates with no application photo.
 
     Registers the supplied snapshot as this session's identity baseline so face
@@ -856,9 +947,7 @@ async def enroll_face_endpoint(session_id: str, req: EnrollFaceRequest):
     whoever is present at enrollment), so the session is flagged LIVE_ENROLLED for
     HR review. Used only when start_session found no stored reference photo.
     """
-    entry = _sessions.get(session_id)
-    if not entry:
-        raise HTTPException(404, "Session not found")
+    entry = _owned_entry(session_id, current_user)
 
     if entry.get("face_registered"):
         return {"session_id": session_id, "face_registered": True, "live_enrolled": False,
@@ -961,18 +1050,28 @@ async def get_proctoring_results(
     alive), this reads persisted ProctoringSession + ProctoringViolation rows, so
     it works after the test has ended. Tenant-scoped to the caller's company.
     """
-    from src.models.models import ProctoringSession, ProctoringViolation, ProctoringReview, User
+    from src.models.models import (
+        AssessmentExplanation, Interview, ProctoringSession, ProctoringViolation,
+        ProctoringReview, User,
+    )
 
-    sessions_q = db.query(ProctoringSession).filter(ProctoringSession.test_id == interview_id)
-    if current_user.company_id:
-        # Scope to this tenant, but also include legacy rows written before sessions
-        # carried a company_id — the interview_id already scopes these to this tenant,
-        # and without this they'd stay invisible to HR/interviewer review.
-        sessions_q = sessions_q.filter(or_(
-            ProctoringSession.company_id == current_user.company_id,
-            ProctoringSession.company_id.is_(None),
-        ))
-    sessions = sessions_q.order_by(ProctoringSession.started_at.desc()).all()
+    # The interview first, scoped to the caller's company: everything below hangs off
+    # it. Sessions with no company_id are not "probably this tenant's" — a NULL row
+    # belongs to no tenant, and scripts/backfill_orphan_company_ids.py is the fix.
+    iv_q = db.query(Interview).filter(Interview.id == interview_id)
+    if current_user.role != "superadmin":
+        iv_q = iv_q.filter(Interview.company_id == current_user.company_id)
+    iv = iv_q.first()
+    if iv is None:
+        raise HTTPException(404, "Interview not found")
+    from src.services.audit_log import require_support_access
+    require_support_access(db, None, current_user, iv.company_id,
+                           f"proctoring results for interview {interview_id}")
+
+    sessions = db.query(ProctoringSession).filter(
+        ProctoringSession.test_id == interview_id,
+        ProctoringSession.company_id == iv.company_id,
+    ).order_by(ProctoringSession.started_at.desc()).all()
 
     out_sessions = []
     for s in sessions:
@@ -1046,11 +1145,10 @@ async def get_proctoring_results(
 
     # The attempt itself: which try this is, the adjustments it ran with, and the
     # candidate's own explanation — context a reviewer needs next to the flags.
-    from src.models.models import Interview, AssessmentExplanation
     from src.services.assessment_fairness import approved_accommodations, describe
-    iv = db.query(Interview).filter(Interview.id == interview_id).first()
     explanations = db.query(AssessmentExplanation).filter(
-        AssessmentExplanation.interview_id == interview_id
+        AssessmentExplanation.interview_id == iv.id,
+        AssessmentExplanation.company_id == iv.company_id,
     ).order_by(AssessmentExplanation.created_at).all()
 
     return {
@@ -1131,9 +1229,14 @@ async def record_review(
         raise HTTPException(422, "Say what you saw when confirming a flag")
 
     session = db.query(ProctoringSession).filter(ProctoringSession.id == req.session_id).first()
-    if not session or (current_user.company_id and session.company_id
-                       and session.company_id != current_user.company_id):
+    if not session or not session.company_id or (
+            current_user.role != "superadmin" and session.company_id != current_user.company_id):
         raise HTTPException(404, "Proctoring session not found")
+    # A superadmin's outcome can count against a candidate, so it needs the same
+    # support-access grant as reading the report, and it is audited.
+    from src.services.audit_log import require_support_access
+    require_support_access(db, None, current_user, session.company_id,
+                           f"proctoring_review:{session.id}")
 
     ids = list(dict.fromkeys(req.violation_ids or []))   # de-duplicated, order kept
     if ids:
@@ -1177,14 +1280,14 @@ async def get_evidence_image(
 
     # Confirm the session belongs to the caller's company before serving any bytes.
     sess_q = db.query(ProctoringSession).filter(ProctoringSession.id == session_id)
-    if current_user.company_id:
-        # Also accept legacy NULL-company sessions (the UUID session_id is unguessable).
-        sess_q = sess_q.filter(or_(
-            ProctoringSession.company_id == current_user.company_id,
-            ProctoringSession.company_id.is_(None),
-        ))
-    if not sess_q.first():
+    if current_user.role != "superadmin":
+        sess_q = sess_q.filter(ProctoringSession.company_id == current_user.company_id)
+    _sess = sess_q.first()
+    if not _sess:
         raise HTTPException(404, "Session not found")
+    from src.services.audit_log import require_support_access
+    require_support_access(db, None, current_user, _sess.company_id,
+                           f"proctoring evidence {session_id}/{filename}")
 
     # Reject path traversal — only a bare filename under this session's evidence dir.
     if "/" in filename or "\\" in filename or ".." in filename:
@@ -1212,7 +1315,10 @@ async def get_evidence_image(
     except Exception as e:
         logger.error("Failed to read evidence %s: %s", key, e)
         raise HTTPException(500, "Failed to read evidence")
-    return Response(content=data, media_type="image/jpeg")
+    return Response(content=data, media_type="image/jpeg", headers={
+        "X-Content-Type-Options": "nosniff",
+        "Cache-Control": "private, no-store",
+    })
 
 
 class VerifyFaceRequest(BaseModel):
@@ -1220,11 +1326,10 @@ class VerifyFaceRequest(BaseModel):
 
 
 @router.post("/sessions/{session_id}/verify-face")
-async def verify_face_endpoint(session_id: str, req: VerifyFaceRequest):
+async def verify_face_endpoint(session_id: str, req: VerifyFaceRequest,
+                               current_user=Depends(_CANDIDATE)):
     """Compare a live frame to the registered face encoding. Returns match result."""
-    entry = _sessions.get(session_id)
-    if not entry:
-        raise HTTPException(404, "Session not found")
+    entry = _owned_entry(session_id, current_user)
 
     pipeline = entry["pipeline"]
     if not entry["face_registered"]:
@@ -1268,11 +1373,10 @@ class BehaviorCheckRequest(BaseModel):
 
 
 @router.post("/sessions/{session_id}/behavior-check")
-async def behavior_check(session_id: str, req: BehaviorCheckRequest):
+async def behavior_check(session_id: str, req: BehaviorCheckRequest,
+                         current_user=Depends(_CANDIDATE)):
     """Receive behavioral feature vector and run anomaly detection."""
-    entry = _sessions.get(session_id)
-    if not entry:
-        raise HTTPException(404, "Session not found")
+    entry = _owned_entry(session_id, current_user)
 
     pipeline = entry["pipeline"]
     payload = {
@@ -1292,10 +1396,10 @@ async def behavior_check(session_id: str, req: BehaviorCheckRequest):
 
 
 @router.get("/sessions/{session_id}/logs")
-async def get_session_logs(session_id: str):
+async def get_session_logs(session_id: str, current_user=Depends(get_current_user)):
     """Fetch cheating violation logs for a proctoring session."""
-    entry = _sessions.get(session_id)
-    db_session_id = entry.get("db_session_id") if entry else None
+    entry = _readable_entry(session_id, current_user)
+    db_session_id = entry.get("db_session_id")
 
     if not db_session_id:
         raise HTTPException(404, "Session not found or no DB record")
@@ -1335,16 +1439,15 @@ class TabSwitchRequest(BaseModel):
 
 
 @router.post("/sessions/{session_id}/tab-switch")
-async def record_tab_switch(session_id: str, req: TabSwitchRequest):
+async def record_tab_switch(session_id: str, req: TabSwitchRequest,
+                            current_user=Depends(_CANDIDATE)):
     """Record a tab switch for the reviewer. Warns the candidate; never ends the test.
 
     Tab switches used to count as strikes (4th ended the test). A notification that steals
     focus, a password manager, an accessibility tool — all look identical from here, so the
     event is evidence for a person to weigh, not grounds to stop the assessment.
     """
-    entry = _sessions.get(session_id)
-    if not entry:
-        raise HTTPException(404, "Session not found")
+    entry = _owned_entry(session_id, current_user)
 
     n = entry["strikes"].get("TAB_SWITCH", 0) + 1   # a running count, not a strike toward ending
     entry["strikes"]["TAB_SWITCH"] = n
@@ -1356,7 +1459,7 @@ async def record_tab_switch(session_id: str, req: TabSwitchRequest):
             details={"tab_switch_count": req.count, "occurrence": n, "timestamp": req.timestamp},
         )
 
-    logger.info("Tab switch #%d recorded for session %s", n, session_id)
+    logger.info("Tab switch #%d recorded for session %s…", n, _log_sid(session_id))
     return {
         "session_id": session_id,
         "tab_switch_count": req.count,
@@ -1376,7 +1479,8 @@ class FullscreenUnavailableRequest(BaseModel):
 
 
 @router.post("/sessions/{session_id}/fullscreen-exit")
-async def record_fullscreen_exit(session_id: str, req: FullscreenExitRequest):
+async def record_fullscreen_exit(session_id: str, req: FullscreenExitRequest,
+                                 current_user=Depends(_CANDIDATE)):
     """Record a fullscreen exit for the reviewer. Warns the candidate; never ends the test.
 
     Deliberately its own flag rather than reusing TAB_SWITCH: HR's report should be able
@@ -1384,9 +1488,7 @@ async def record_fullscreen_exit(session_id: str, req: FullscreenExitRequest):
     browser events, so sharing a counter would double-count a single act on the browsers
     where leaving fullscreen also backgrounds the tab.
     """
-    entry = _sessions.get(session_id)
-    if not entry:
-        raise HTTPException(404, "Session not found")
+    entry = _owned_entry(session_id, current_user)
 
     n = entry["strikes"].get("FULLSCREEN_EXIT", 0) + 1
     entry["strikes"]["FULLSCREEN_EXIT"] = n
@@ -1398,7 +1500,7 @@ async def record_fullscreen_exit(session_id: str, req: FullscreenExitRequest):
             details={"exit_count": req.count, "occurrence": n, "timestamp": req.timestamp},
         )
 
-    logger.info("Fullscreen exit #%d recorded for session %s", n, session_id)
+    logger.info("Fullscreen exit #%d recorded for session %s…", n, _log_sid(session_id))
     return {
         "session_id": session_id,
         "exit_count": req.count,
@@ -1409,7 +1511,8 @@ async def record_fullscreen_exit(session_id: str, req: FullscreenExitRequest):
 
 
 @router.post("/sessions/{session_id}/fullscreen-unavailable")
-async def record_fullscreen_unavailable(session_id: str, req: FullscreenUnavailableRequest):
+async def record_fullscreen_unavailable(session_id: str, req: FullscreenUnavailableRequest,
+                                        current_user=Depends(_CANDIDATE)):
     """Note that this browser could not go fullscreen. Never a strike.
 
     iOS Safari has no Element.requestFullscreen at all, and a candidate should not lose a
@@ -1417,9 +1520,7 @@ async def record_fullscreen_unavailable(session_id: str, req: FullscreenUnavaila
     report says "this run was not fullscreen-monitored" instead of looking identical to
     one that was.
     """
-    entry = _sessions.get(session_id)
-    if not entry:
-        raise HTTPException(404, "Session not found")
+    entry = _owned_entry(session_id, current_user)
 
     db_session_id = entry.get("db_session_id")
     if db_session_id:
@@ -1428,7 +1529,7 @@ async def record_fullscreen_unavailable(session_id: str, req: FullscreenUnavaila
             score_impact=0,
             details={"reason": req.reason or "unsupported"},
         )
-    logger.info("Fullscreen unavailable for session %s: %s", session_id, req.reason)
+    logger.info("Fullscreen unavailable for session %s…: %s", _log_sid(session_id), req.reason)
     return {"session_id": session_id, "recorded": True}
 
 
@@ -1504,10 +1605,14 @@ async def ws_video(ws: WebSocket, session_id: str):
             "Proctor WS 4004 on %s: session=%s not in THIS process (pid=%s, %d live "
             "session(s)). Proctoring must run as ONE worker — check WEB_CONCURRENCY "
             "in hireflow-proctor.service and the proxy's WebSocket route.",
-            getattr(getattr(ws, "url", None), "path", "?"),
-            session_id, os.getpid(), len(_sessions),
+            "/".join(str(getattr(getattr(ws, "url", None), "path", "?")).split("/")[:-1]),
+            _log_sid(session_id), os.getpid(), len(_sessions),
         )
         await ws.close(code=4004, reason="Session not found")
+        return
+    if not _ws_authorized(ws, entry):
+        # 4401: authenticated with the session's token, or not at all.
+        await ws.close(code=4401, reason="Unauthorized")
         return
 
     entry["last_seen"] = time.time()
@@ -1526,7 +1631,7 @@ async def ws_video(ws: WebSocket, session_id: str):
     decode_failures = 0       # counted so the log line below can be rate-limited
 
     logger.info("Video WS connected: session=%s (face_pre_registered=%s)",
-                session_id, announced_registered)
+                _log_sid(session_id), announced_registered)
 
     try:
         while True:
@@ -1597,7 +1702,7 @@ async def ws_video(ws: WebSocket, session_id: str):
 
                 # Debug: log identity match status every 25 frames
                 if entry["frame_count"] % 25 == 1:
-                    _log(f"[MATCH] session={session_id} frame={entry['frame_count']} identity_match={face_data.get('identity_match', 'N/A')} similarity={face_data.get('similarity_score', 'N/A')} flags={result.flags}")
+                    _log(f"[MATCH] session={_log_sid(session_id)}… frame={entry['frame_count']} identity_match={face_data.get('identity_match', 'N/A')} similarity={face_data.get('similarity_score', 'N/A')} flags={result.flags}")
                 response = {
                     "event": "analysis",
                     # Lets the client know when the stored-photo lookup has resolved, so it
@@ -1715,7 +1820,7 @@ async def ws_video(ws: WebSocket, session_id: str):
 
     except WebSocketDisconnect:
         logger.info("Video WS disconnected: session=%s (frames=%d, decode_failures=%d)",
-                    session_id, entry.get("frame_count", 0), decode_failures)
+                    _log_sid(session_id), entry.get("frame_count", 0), decode_failures)
     except Exception as e:
         # receive_text() raises here — OUTSIDE the per-frame try — if the client
         # sends a binary frame. It is not a WebSocketDisconnect, so without this
@@ -1755,14 +1860,18 @@ async def ws_audio(ws: WebSocket, session_id: str):
             "Proctor WS 4004 on %s: session=%s not in THIS process (pid=%s, %d live "
             "session(s)). Proctoring must run as ONE worker — check WEB_CONCURRENCY "
             "in hireflow-proctor.service and the proxy's WebSocket route.",
-            getattr(getattr(ws, "url", None), "path", "?"),
-            session_id, os.getpid(), len(_sessions),
+            "/".join(str(getattr(getattr(ws, "url", None), "path", "?")).split("/")[:-1]),
+            _log_sid(session_id), os.getpid(), len(_sessions),
         )
         await ws.close(code=4004, reason="Session not found")
         return
+    if not _ws_authorized(ws, entry):
+        # 4401: authenticated with the session's token, or not at all.
+        await ws.close(code=4401, reason="Unauthorized")
+        return
 
     pipeline = entry["pipeline"]
-    logger.info("Audio WS connected: session=%s", session_id)
+    logger.info("Audio WS connected: session=%s", _log_sid(session_id))
 
     try:
         while True:
@@ -1771,7 +1880,7 @@ async def ws_audio(ws: WebSocket, session_id: str):
                 continue   # accommodation: audio is not analysed, whatever the client sends
             pipeline.ingest_audio(data)
     except WebSocketDisconnect:
-        logger.info("Audio WS disconnected: session=%s", session_id)
+        logger.info("Audio WS disconnected: session=%s", _log_sid(session_id))
 
 
 @router.websocket("/ws/behavioral/{session_id}")
@@ -1793,14 +1902,18 @@ async def ws_behavioral(ws: WebSocket, session_id: str):
             "Proctor WS 4004 on %s: session=%s not in THIS process (pid=%s, %d live "
             "session(s)). Proctoring must run as ONE worker — check WEB_CONCURRENCY "
             "in hireflow-proctor.service and the proxy's WebSocket route.",
-            getattr(getattr(ws, "url", None), "path", "?"),
-            session_id, os.getpid(), len(_sessions),
+            "/".join(str(getattr(getattr(ws, "url", None), "path", "?")).split("/")[:-1]),
+            _log_sid(session_id), os.getpid(), len(_sessions),
         )
         await ws.close(code=4004, reason="Session not found")
         return
+    if not _ws_authorized(ws, entry):
+        # 4401: authenticated with the session's token, or not at all.
+        await ws.close(code=4401, reason="Unauthorized")
+        return
 
     pipeline = entry["pipeline"]
-    logger.info("Behavioral WS connected: session=%s", session_id)
+    logger.info("Behavioral WS connected: session=%s", _log_sid(session_id))
 
     try:
         while True:
@@ -1811,4 +1924,4 @@ async def ws_behavioral(ws: WebSocket, session_id: str):
             except json.JSONDecodeError:
                 pass
     except WebSocketDisconnect:
-        logger.info("Behavioral WS disconnected: session=%s", session_id)
+        logger.info("Behavioral WS disconnected: session=%s", _log_sid(session_id))

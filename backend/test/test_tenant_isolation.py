@@ -95,84 +95,197 @@ def _make_interview(db, company_id: str, job_id: str = None) -> int:
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# Unit — SQLAlchemy before_compile auto-filter
+# Unit — read-side auto-filter (do_orm_execute + with_loader_criteria)
+#
+# These run real queries against rows in two companies and assert on which rows
+# come back. They used to assert on str(query), which passed while the filter
+# missed db.get(), select(), lazy loads and bulk deletes entirely.
 # ───────────────────────────────────────────────────────────────────────────
 
-@pytest.mark.security
-def test_autofilter_off_when_no_tenant_bound():
-    """With contextvar = None the hook must NOT inject a WHERE clause."""
+@pytest.fixture()
+def bound_tenant():
+    """Bind a tenant for the duration of a test and always unbind afterwards."""
     from src.tenancy import set_current_company
-    from src.models.models import JobPosting
-    from src.config.database_config_mysql import db_manager
+
+    def _bind(company_id):
+        set_current_company(company_id)
+
+    yield _bind
+    set_current_company(None)
+
+
+@pytest.fixture()
+def two_tenant_rows(db):
+    """One company, job and HR profile per tenant, created with no tenant bound."""
+    from src.models.models import HRProfile
+    from src.tenancy import set_current_company
 
     set_current_company(None)
-    sess = db_manager.get_db_session()
-    try:
-        sql = str(sess.query(JobPosting))
-        assert "company_id = " not in sql.replace("\n", "")
-    finally:
-        sess.close()
+    a_id = _make_company(db, name="Filter A")
+    b_id = _make_company(db, name="Filter B")
+    a_job = _make_job(db, a_id, title="A job")
+    b_job = _make_job(db, b_id, title="B job")
+    a_hr = _make_user(db, f"hr_a_{uuid.uuid4().hex[:6]}@t.com", "hr", company_id=a_id)
+    b_hr = _make_user(db, f"hr_b_{uuid.uuid4().hex[:6]}@t.com", "hr", company_id=b_id)
+    for uid, cid in ((a_hr, a_id), (b_hr, b_id)):
+        db.add(HRProfile(id=str(uuid.uuid4()), user_id=uid, company_id=cid,
+                         employee_id=f"E-{uuid.uuid4().hex[:8]}"))
+    db.flush()
+    db.expire_all()
+    return {"a": a_id, "b": b_id, "a_job": a_job, "b_job": b_job,
+            "a_hr": a_hr, "b_hr": b_hr}
 
 
 @pytest.mark.security
-def test_autofilter_on_when_tenant_bound():
-    """Binding a company_id must inject `company_id = <bound>` into the query."""
+def test_autofilter_off_when_no_tenant_bound(db, two_tenant_rows):
+    from src.models.models import JobPosting
+    ids = {j.id for j in db.query(JobPosting).all()}
+    assert {two_tenant_rows["a_job"], two_tenant_rows["b_job"]} <= ids
+
+
+@pytest.mark.security
+def test_autofilter_scopes_every_orm_access_path(db, two_tenant_rows, bound_tenant):
+    """Every way the ORM can load a row is scoped, not just db.query()."""
+    from sqlalchemy import select, func
+    from src.models.models import JobPosting, HRProfile, User
+
+    t = two_tenant_rows
+    bound_tenant(t["a"])
+
+    assert db.query(JobPosting).filter(JobPosting.id == t["b_job"]).first() is None
+    assert db.get(JobPosting, t["b_job"]) is None
+    assert db.query(JobPosting).get(t["b_job"]) is None
+    assert db.execute(
+        select(JobPosting).where(JobPosting.id == t["b_job"])
+    ).scalars().first() is None
+    listed = {j.id for j in db.scalars(select(JobPosting)).all()}
+    assert t["a_job"] in listed and t["b_job"] not in listed
+    assert db.query(func.count(JobPosting.id)).scalar() == 1
+    # Column-only queries and joins on another scoped model.
+    assert (t["b_job"],) not in db.query(JobPosting.id).all()
+    joined = db.query(HRProfile).join(User, User.id == HRProfile.user_id).all()
+    assert {p.user_id for p in joined} == {t["a_hr"]}
+    # Own rows still load.
+    assert db.get(JobPosting, t["a_job"]) is not None
+
+
+@pytest.mark.security
+def test_autofilter_blocks_bulk_update_and_delete(db, two_tenant_rows, bound_tenant):
+    """A bulk .update()/.delete() by id must not touch another tenant's row."""
+    from src.models.models import JobPosting
     from src.tenancy import set_current_company
-    from src.models.models import JobPosting
-    from src.config.database_config_mysql import db_manager
 
-    set_current_company("FAKE-COMPANY-UUID-1234")
-    try:
-        sess = db_manager.get_db_session()
-        try:
-            sql = str(sess.query(JobPosting))
-            assert "job_postings.company_id" in sql
-            assert "WHERE" in sql.upper()
-        finally:
-            sess.close()
-    finally:
-        set_current_company(None)
+    t = two_tenant_rows
+    bound_tenant(t["a"])
+    assert db.query(JobPosting).filter(JobPosting.id == t["b_job"]).update(
+        {"title": "hijacked"}, synchronize_session=False) == 0
+    assert db.query(JobPosting).filter(JobPosting.id == t["b_job"]).delete(
+        synchronize_session=False) == 0
+
+    set_current_company(None)
+    db.expire_all()
+    assert db.get(JobPosting, t["b_job"]).title == "B job"
 
 
 @pytest.mark.security
-def test_tenant_bypass_clears_filter():
-    """`tenant_bypass()` must remove the auto-filter inside its block."""
-    from src.tenancy import set_current_company, tenant_bypass
+def test_autofilter_ignores_explicit_other_company_filter(db, two_tenant_rows, bound_tenant):
+    """Naming another company's id in a filter must not escape the tenant."""
     from src.models.models import JobPosting
-    from src.config.database_config_mysql import db_manager
-
-    set_current_company("FAKE-COMPANY-UUID-5678")
-    try:
-        sess = db_manager.get_db_session()
-        try:
-            with tenant_bypass():
-                sql = str(sess.query(JobPosting))
-                assert "WHERE" not in sql.upper() or "company_id = " not in sql.replace("\n", "")
-        finally:
-            sess.close()
-    finally:
-        set_current_company(None)
+    t = two_tenant_rows
+    bound_tenant(t["a"])
+    assert db.query(JobPosting).filter(JobPosting.company_id == t["b"]).all() == []
 
 
 @pytest.mark.security
-def test_autofilter_is_idempotent_when_filter_present():
-    """Explicit `.filter(company_id == ...)` must not be duplicated by the hook."""
-    from src.tenancy import set_current_company
-    from src.models.models import JobPosting
-    from src.config.database_config_mysql import db_manager
+def test_autofilter_scopes_relationship_lazy_loads(db, two_tenant_rows, bound_tenant):
+    """A relationship reached from a bypass-loaded row doesn't pull another tenant's row."""
+    from src.models.models import User
+    from src.tenancy import tenant_bypass
 
-    set_current_company("FAKE-COMPANY-UUID-9999")
-    try:
-        sess = db_manager.get_db_session()
-        try:
-            q = sess.query(JobPosting).filter(JobPosting.company_id == "FAKE-COMPANY-UUID-9999")
-            sql = str(q)
-            # Exactly one company_id predicate, not two.
-            assert sql.count("job_postings.company_id =") == 1
-        finally:
-            sess.close()
-    finally:
-        set_current_company(None)
+    t = two_tenant_rows
+    bound_tenant(t["a"])
+    with tenant_bypass():
+        b_user = db.get(User, t["b_hr"])
+    # Loaded under bypass; the lazy load of its profile runs with tenant A bound.
+    assert b_user.hr_profile is None
+    assert db.get(User, t["a_hr"]).hr_profile is not None
+
+
+@pytest.mark.security
+def test_autofilter_does_not_break_refresh_of_bypass_loaded_row(db, two_tenant_rows, bound_tenant):
+    """Expiring a row loaded under tenant_bypass() must not raise ObjectDeletedError."""
+    from src.models.models import JobPosting
+    from src.tenancy import tenant_bypass
+
+    t = two_tenant_rows
+    bound_tenant(t["a"])
+    with tenant_bypass():
+        b_job = db.get(JobPosting, t["b_job"])
+    db.expire(b_job)
+    assert b_job.title == "B job"
+
+
+@pytest.mark.security
+def test_tenant_filter_switches_company(db, two_tenant_rows, bound_tenant):
+    """The cached lambda criteria must pick up the newly bound company each time."""
+    from src.models.models import JobPosting
+    t = two_tenant_rows
+    bound_tenant(t["a"])
+    assert {j.id for j in db.query(JobPosting).all()} == {t["a_job"]}
+    bound_tenant(t["b"])
+    db.expire_all()
+    assert {j.id for j in db.query(JobPosting).all()} == {t["b_job"]}
+
+
+@pytest.mark.security
+def test_tenant_bypass_clears_filter(db, two_tenant_rows, bound_tenant):
+    from src.models.models import JobPosting
+    from src.tenancy import tenant_bypass
+    t = two_tenant_rows
+    bound_tenant(t["a"])
+    with tenant_bypass():
+        assert db.get(JobPosting, t["b_job"]) is not None
+    assert db.query(JobPosting).execution_options(_tenant_bypass=True).filter(
+        JobPosting.id == t["b_job"]).first() is not None
+
+
+@pytest.mark.security
+def test_tenant_binding_reaches_endpoint(db, two_tenant_rows):
+    """get_current_user must bind the tenant where the endpoint can see it.
+
+    It was a sync dependency; FastAPI ran it in a threadpool on a copy of the
+    context and discarded the value, so the filter never ran in any request.
+    Checked for sync and async endpoints and through require_role.
+    """
+    from fastapi import FastAPI, Depends
+    from fastapi.testclient import TestClient
+    from src.auth import get_current_user, require_role, create_access_token
+    from src.config.database_config_mysql import get_db
+    from src.models.models import JobPosting
+    from src.tenancy import get_current_company
+
+    mini = FastAPI()
+
+    @mini.get("/sync")
+    def _sync(u=Depends(get_current_user), s=Depends(get_db)):
+        return {"bound": get_current_company(),
+                "jobs": [j.id for j in s.query(JobPosting).all()]}
+
+    @mini.get("/async")
+    async def _async(u=Depends(require_role(["hr"]))):
+        return {"bound": get_current_company()}
+
+    def _db():
+        yield db
+
+    mini.dependency_overrides[get_db] = _db
+    t = two_tenant_rows
+    headers = {"Authorization": f"Bearer {create_access_token({'sub': t['a_hr']})}"}
+    with TestClient(mini) as c:
+        body = c.get("/sync", headers=headers).json()
+        assert body["bound"] == t["a"]
+        assert body["jobs"] == [t["a_job"]]
+        assert c.get("/async", headers=headers).json()["bound"] == t["a"]
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -487,14 +600,16 @@ def test_mcq_submit_sends_nothing_when_interview_has_no_candidate(
 
 @pytest.mark.security
 def test_marksheet_blocks_cross_tenant_interview(client, two_companies):
-    """Company-A user cannot read marksheet of Company-B's interview."""
+    """Company-A user cannot read marksheet of Company-B's interview.
+
+    Staff-only: a candidate is refused outright, and another company's admin gets 404.
+    """
     a = two_companies["a"]
     b = two_companies["b"]
 
-    resp = client.get(
-        f"/api/v1/evaluation/marksheet/{b['interview_id']}",
-        headers=a["candidate"],
-    )
+    url = f"/api/v1/evaluation/marksheet/{b['interview_id']}"
+    assert client.get(url, headers=a["candidate"]).status_code == 403
+    resp = client.get(url, headers=a["admin"])
     assert resp.status_code == 404, resp.text
 
 
@@ -594,83 +709,6 @@ def test_mcq_api_blocks_cross_tenant_interview(client, two_companies):
         headers=a["candidate"],
     )
     assert resp.status_code == 404, resp.text
-
-
-@pytest.mark.security
-def test_interview_questions_query_is_autofiltered():
-    """Direct ORM query against InterviewQuestion would auto-scope if a model
-    existed; for the raw-SQL pattern, the model-level check is on the parent
-    Interview class.  Verify Interview's auto-filter still fires correctly
-    (Interview is TenantScoped)."""
-    from src.tenancy import set_current_company
-    from src.models.models import Interview
-    from src.config.database_config_mysql import db_manager
-
-    set_current_company("BOUND-CID")
-    try:
-        sess = db_manager.get_db_session()
-        try:
-            sql = str(sess.query(Interview))
-            assert "interviews.company_id" in sql
-        finally:
-            sess.close()
-    finally:
-        set_current_company(None)
-
-
-@pytest.mark.security
-def test_candidate_profile_ext_is_tenantscoped():
-    """CandidateProfileExt and its children gained company_id in g7b8c9d0e1f2.
-    Confirm the auto-filter activates for the parent table."""
-    from src.tenancy import set_current_company
-    from src.models.models import (
-        CandidateProfileExt, CandidateSkill, CandidateEducation,
-        ProctoringViolation,
-    )
-    from src.config.database_config_mysql import db_manager
-
-    set_current_company("BOUND-CID")
-    try:
-        sess = db_manager.get_db_session()
-        try:
-            for model, table in (
-                (CandidateProfileExt, "candidate_profile_ext"),
-                (CandidateSkill, "candidate_skills"),
-                (CandidateEducation, "candidate_education"),
-                (ProctoringViolation, "proctoring_violations"),
-            ):
-                sql = str(sess.query(model))
-                assert f"{table}.company_id" in sql, (
-                    f"{model.__name__} not auto-filtered — TenantScoped marker missing?"
-                )
-        finally:
-            sess.close()
-    finally:
-        set_current_company(None)
-
-
-@pytest.mark.security
-def test_hrprofile_query_is_autofiltered_by_tenant():
-    """Direct ORM query against HRProfile must be auto-scoped when a tenant
-    is bound — the architectural fix that prevents future /hr-list-style
-    leaks."""
-    from src.tenancy import set_current_company
-    from src.models.models import HRProfile
-    from src.config.database_config_mysql import db_manager
-
-    set_current_company("BOUND-COMPANY-ID")
-    try:
-        sess = db_manager.get_db_session()
-        try:
-            sql = str(sess.query(HRProfile))
-            assert "hr_profiles.company_id" in sql, (
-                "HRProfile is not TenantScoped — auto-filter did not inject "
-                "a company_id predicate."
-            )
-        finally:
-            sess.close()
-    finally:
-        set_current_company(None)
 
 
 @pytest.mark.security

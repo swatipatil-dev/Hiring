@@ -73,7 +73,8 @@ class MCQQuestionCreate(BaseModel):
 def _assert_interview_in_tenant(db: Session, interview_id, current_user: User) -> Interview:
     """Resolve an interview by id and raise 404 if it doesn't belong to the
     caller's company.  Superadmin (company_id is None) is exempt — they keep
-    their cross-tenant access for platform-level inspection.
+    their cross-tenant access for platform-level inspection.  An interview with
+    no company belongs to no tenant and is refused to everyone else.
     """
     try:
         iv_id = int(interview_id)
@@ -83,9 +84,13 @@ def _assert_interview_in_tenant(db: Session, interview_id, current_user: User) -
     interview = db.query(Interview).filter(Interview.id == iv_id).first()
     if not interview:
         raise HTTPException(status_code=404, detail="Interview not found")
-    if current_user.role != "superadmin" and interview.company_id and \
-       interview.company_id != current_user.company_id:
+    if current_user.role != "superadmin" and (
+        not interview.company_id or interview.company_id != current_user.company_id
+    ):
         raise HTTPException(status_code=404, detail="Interview not found")
+    # Superadmin: only under the company's support-access grant, and audited.
+    from src.services.audit_log import require_support_access
+    require_support_access(db, None, current_user, interview.company_id, f"interview {iv_id} (mcq)")
     return interview
 
 
@@ -106,8 +111,10 @@ def _assert_question_in_tenant(db: Session, question_id: str, current_user: User
         return
     q_company = row[0]
     iv_company = row[1]
-    owner = q_company or iv_company  # backfill: questions inherit interview's company
-    if owner and owner != current_user.company_id:
+    # The owning interview is authoritative; the question's own column is a copy of it.
+    # No owner at all means no tenant, which is not the caller's.
+    owner = iv_company or q_company
+    if not owner or owner != current_user.company_id:
         raise HTTPException(status_code=404, detail="Question not found")
 
 

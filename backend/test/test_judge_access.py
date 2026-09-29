@@ -99,7 +99,8 @@ def test_finished_test_cannot_be_graded(client, db, exam, candidate_headers, fak
 def test_run_cap_counts_attempts_still_being_judged(client, db, exam, candidate_headers, fake_grader):
     # Two finished runs and one still running (a parallel click in flight).
     for status, verdict in [("graded", "WA"), ("graded", "AC"), ("running", None)]:
-        db.add(InterviewCodeSubmission(interview_id=exam.mine.id, question_id=exam.q.id,
+        db.add(InterviewCodeSubmission(company_id=exam.mine.company_id,
+                                       interview_id=exam.mine.id, question_id=exam.q.id,
                                        user_id=exam.user.id, language="python",
                                        source_code="x", status=status, verdict=verdict))
     db.flush()

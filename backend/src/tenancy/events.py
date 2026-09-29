@@ -1,9 +1,14 @@
 """
 SQLAlchemy tenant-isolation hooks. Two complementary safety nets:
 
-READ (`before_compile` on Query) — auto-injects
-`Model.company_id == <current_company>` on every Query that selects a
-TenantScoped model, provided a tenant is bound in the contextvar.
+READ (`do_orm_execute` on Session) — adds `with_loader_criteria(TenantScoped,
+company_id == <current_company>)` to every ORM SELECT, UPDATE and DELETE while
+a tenant is bound in the contextvar. Loader criteria reach every way the ORM
+touches a row: legacy `db.query(...)`, 2.0-style `db.execute(select(...))`,
+`db.get()` / `query.get()`, relationship lazy loads, joined and aliased
+entities, and bulk `query.update()` / `query.delete()`. The previous
+`before_compile` hook on Query covered only the first of those — `db.get()`
+and a bulk `.delete()` both reached other companies' rows.
 
 WRITE (`before_flush` on Session) — auto-stamps `company_id =
 <current_company>` onto every NEW TenantScoped row that doesn't already have
@@ -14,23 +19,26 @@ true in SQL). Forgetting to set company_id on insert was the #1 cause of
 "data is in the DB but the dashboard is blank" — see
 docs/DASHBOARD_DATA_PITFALLS.md.
 
-Bypasses (both hooks):
+Bypasses:
 1. No tenant bound (contextvar is None) — superadmin, public, startup work,
    registration before a company exists, and `tenant_bypass()` blocks.
-2. (Read only) Query carries execution_option `_tenant_bypass=True`.
-3. (Read only) Query already filters company_id — caller knows what they're doing.
+2. (Read only) Statement carries execution_option `_tenant_bypass=True`.
+3. (Read only) Refreshing columns of an object already in the session
+   (`is_column_load`). The object was authorised when it was loaded; filtering
+   the refresh would turn a row loaded under `tenant_bypass()` into an
+   ObjectDeletedError the moment it expires.
 4. (Write only) The row already has an explicit company_id — explicit wins.
 
-Bulk update/delete (`Query.update()` / `Query.delete()`) is also covered by the
-read hook because SQLAlchemy invokes before_compile for them too.
+An explicit `.filter(Model.company_id == other)` does NOT escape the filter:
+reaching another company's rows inside a tenant request must go through
+`tenant_bypass()`, where it is visible in review.
 """
 from __future__ import annotations
 
 import logging
-from typing import Iterable
 
 from sqlalchemy import event
-from sqlalchemy.orm import Query, Session
+from sqlalchemy.orm import ORMExecuteState, Session, with_loader_criteria
 
 from .context import get_current_company
 from .mixin import TenantScoped
@@ -38,71 +46,28 @@ from .mixin import TenantScoped
 logger = logging.getLogger(__name__)
 
 
-def _entity_classes(query: Query) -> Iterable[type]:
-    """Yield mapped classes referenced by this query (top-level entities only)."""
-    for desc in query.column_descriptions:
-        entity = desc.get("entity")
-        if entity is None:
-            continue
-        # entity is the mapped class
-        yield entity
-
-
-def _query_already_filters_company(query: Query, model: type) -> bool:
-    """
-    Best-effort check: does this query already constrain `model.company_id`?
-    We render the WHERE clause as a string and search for the column name.
-    Cheap and conservative — if our heuristic returns False, we add the filter,
-    which is the safe default.
-    """
-    crit = query.whereclause
-    if crit is None:
-        return False
-    try:
-        text = str(crit.compile(compile_kwargs={"literal_binds": False}))
-    except Exception:
-        return False
-    tablename = getattr(model, "__tablename__", None)
-    if not tablename:
-        return False
-    return f"{tablename}.company_id" in text
-
-
-@event.listens_for(Query, "before_compile", retval=True)
-def _inject_tenant_filter(query: Query) -> Query:
+@event.listens_for(Session, "do_orm_execute")
+def _inject_tenant_filter(state: ORMExecuteState) -> None:
     company_id = get_current_company()
     if not company_id:
-        return query
+        return
+    if state.execution_options.get("_tenant_bypass"):
+        return
+    if not (state.is_select or state.is_update or state.is_delete):
+        return
+    if state.is_column_load:
+        return
 
-    # Explicit opt-out via execution option.
-    opts = getattr(query, "_execution_options", None)
-    if opts is not None:
-        try:
-            if opts.get("_tenant_bypass"):
-                return query
-        except Exception:
-            pass
-
-    for entity in _entity_classes(query):
-        try:
-            if not isinstance(entity, type):
-                continue
-            if not issubclass(entity, TenantScoped):
-                continue
-            if not hasattr(entity, "company_id"):
-                continue
-            if _query_already_filters_company(query, entity):
-                continue
-            query = query.enable_assertions(False).filter(
-                entity.company_id == company_id
-            )
-        except Exception as exc:
-            # Never break a query because of the auto-filter — log and move on.
-            logger.warning(
-                "tenant auto-filter: failed for %s: %s: %s",
-                entity, type(exc).__name__, exc,
-            )
-    return query
+    # The lambda is cached by SQLAlchemy as a lambda statement; company_id is a
+    # closure variable, which SQLAlchemy extracts as a bound parameter rather
+    # than baking into the cached SQL (test_tenant_filter_switches_company).
+    state.statement = state.statement.options(
+        with_loader_criteria(
+            TenantScoped,
+            lambda cls: cls.company_id == company_id,
+            include_aliases=True,
+        )
+    )
 
 
 @event.listens_for(Session, "before_flush")

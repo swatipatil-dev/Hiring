@@ -198,7 +198,7 @@ async def lifespan(app: FastAPI):
 #
 # Resolved from __file__, never the CWD: systemd, cron and an interactive shell all
 # start somewhere different, and a bare relative path would read nothing under two of
-# the three. Same reason _APP_DIR exists further down this file.
+# the three.
 #
 # Never raises. A missing or unreadable VERSION means we do not know the version, not
 # that the service should refuse to boot.
@@ -445,18 +445,22 @@ app.include_router(public_router, tags=["Public"])
 app.include_router(support_router, tags=["Support"])
 app.include_router(judge_router, tags=["Coding Judge"])
 
-# Serve uploaded files: company logos, profile photos, resumes, cover letters.
-#   local storage  → mount the directories directly (dev default)
-#   gcs storage    → stream objects from the bucket (container FS is ephemeral)
+# Uploaded files.
+#
+# Company logos are public (they appear on public career pages) and are served at
+# /logos. Everything else a person uploads — resumes, cover letters, photos,
+# certificates, voice answers — is private and reachable ONLY through the
+# authenticated, row-keyed routes in routes/file_routes.py. Never mount /uploads,
+# /resumes or /cover_letters here: they used to be static mounts, and anyone holding
+# a path could download a candidate's resume.
+#   local storage  → mount the logos directory directly (dev default)
+#   gcs storage    → stream logo objects from the bucket (container FS is ephemeral)
 from src.services.storage import storage as _file_storage, DATA_DIR as _DATA_DIR
+from routes.file_routes import router as file_router
 
-# Assets that ship with the CODE resolve against this file's directory; uploaded
-# DATA resolves against storage.DATA_DIR. Neither may depend on the process
-# working directory — systemd, cron and a shell all start with a different CWD,
-# and a bare relative path would create a second, unserved uploads tree.
-_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+app.include_router(file_router, tags=["Files"])
 
-_FILE_PREFIXES = ["logos", "uploads", "resumes", "cover_letters"]
+_PUBLIC_FILE_PREFIXES = ["logos"]
 
 if getattr(_file_storage, "backend", "local") == "gcs":
     import mimetypes
@@ -471,26 +475,20 @@ if getattr(_file_storage, "backend", "local") == "gcs":
             except Exception:
                 raise HTTPException(status_code=404, detail="File not found")
             ctype = mimetypes.guess_type(key)[0] or "application/octet-stream"
-            return _BytesResponse(content=data, media_type=ctype)
+            return _BytesResponse(content=data, media_type=ctype,
+                                  headers={"X-Content-Type-Options": "nosniff"})
 
-    for _p in _FILE_PREFIXES:
+    for _p in _PUBLIC_FILE_PREFIXES:
         _register_file_route(_p)
 else:
-    for _p in _FILE_PREFIXES:
+    for _p in _PUBLIC_FILE_PREFIXES:
         _dir = os.path.join(_DATA_DIR, _p)
         os.makedirs(_dir, exist_ok=True)
         app.mount(f"/{_p}", StaticFiles(directory=_dir), name=_p)
 
-# Serve proctoring static files (shipped alongside the code)
-_PROCTOR_STATIC = os.path.join(_APP_DIR, "proctoring", "static")
-app.mount("/proctor/static", StaticFiles(directory=_PROCTOR_STATIC), name="proctor-static")
-
-@app.get("/proctor", response_class=HTMLResponse)
-async def proctor_page():
-    """Serve the AI Proctor monitoring dashboard."""
-    html_path = os.path.join(_PROCTOR_STATIC, "proctor.html")
-    with open(html_path, "r", encoding="utf-8") as f:
-        return HTMLResponse(content=f.read())
+# The standalone proctoring demo page (proctoring/static/proctor.html) is no longer
+# served: it started anonymous sessions, which proctoring now refuses, and the real
+# UI is the candidate test page in the frontend.
 
 # ==================== APPLICATION READY ====================
 

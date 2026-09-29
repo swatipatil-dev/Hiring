@@ -163,25 +163,28 @@ def test_draft_offer_not_respondable(client, db, candidate_headers):
     # Insert a Candidate, JobPosting, and DRAFT Offer so the endpoint's JOIN succeeds.
     # The candidate row must use candidate_test@test.com so the auth-ownership
     # check in respond_to_offer passes and we actually reach the status check.
-    from src.models.models import Candidate, JobPosting
+    # All three rows sit in the candidate's company: the endpoint only answers for
+    # an offer and application in the caller's own company.
+    from src.models.models import Candidate, JobPosting, User
+    me = db.query(User).filter(User.email == "candidate_test@test.com").first()
     job_id = str(uuid.uuid4())
     cand_id = str(uuid.uuid4())
     offer_id = str(uuid.uuid4())
 
     db.add(JobPosting(
-        id=job_id, title="Draft Test Job", description="x", requirements="x",
-        location="Remote", employment_type="full_time", status="active",
+        id=job_id, company_id=me.company_id, title="Draft Test Job", description="x",
+        requirements="x", location="Remote", employment_type="full_time", status="active",
     ))
     db.add(Candidate(
-        id=cand_id, job_id=job_id,
+        id=cand_id, company_id=me.company_id, user_id=me.id, job_id=job_id,
         email="candidate_test@test.com", first_name="Cand", last_name="User",
     ))
     db.flush()
 
     db.execute(text(
-        "INSERT IGNORE INTO offers (id, status, salary, job_id, candidate_id) "
-        "VALUES (:oid, 'draft', 60000, :jid, :cid)"
-    ), {"oid": offer_id, "jid": job_id, "cid": cand_id})
+        "INSERT IGNORE INTO offers (id, company_id, status, salary, job_id, candidate_id) "
+        "VALUES (:oid, :co, 'draft', 60000, :jid, :cid)"
+    ), {"oid": offer_id, "co": me.company_id, "jid": job_id, "cid": cand_id})
     db.commit()
 
     resp = client.post(

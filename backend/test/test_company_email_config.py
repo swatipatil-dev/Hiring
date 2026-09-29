@@ -380,8 +380,12 @@ def test_send_test_email_uses_company_smtp_when_configured(client, admin_with_co
 
 
 @pytest.mark.admin
-def test_send_test_email_falls_back_to_global_when_not_configured(client, admin_with_company):
-    """When the company has no SMTP override, the response indicates the fallback."""
+def test_send_test_email_refuses_when_not_configured(client, admin_with_company):
+    """With no company SMTP, /email/test refuses rather than sending as the platform.
+
+    It used to fall back to the platform's env SMTP and echo that host and account back
+    to the tenant.
+    """
     headers, _ = admin_with_company
 
     with patch("src.services.email_service.smtplib.SMTP") as MockSMTP:
@@ -391,10 +395,10 @@ def test_send_test_email_falls_back_to_global_when_not_configured(client, admin_
             "subject": "T",
             "body": "<p>x</p>",
         })
+        assert not MockSMTP.called
 
-    assert resp.status_code == 200, resp.text
-    data = resp.json()
-    assert data["using_company_smtp"] is False  # global env-var path taken
+    assert resp.status_code == 400, resp.text
+    assert "smtp" not in {k.lower() for k in resp.json()}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

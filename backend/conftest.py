@@ -14,6 +14,10 @@ from fastapi.testclient import TestClient
 # would let anyone forge an admin token). Set a fixed test value before anything
 # imports the app. CI overrides this with its own secret.
 os.environ.setdefault("SECRET_KEY", "pytest-only-secret-key-not-for-any-real-deployment")
+# Admin/superadmin MFA is enforced in production (src/auth.py mfa_required_roles).
+# Off for the suite, like the rate limiter below, so role fixtures can log in with a
+# password alone; test/test_auth_hardening.py switches it back on for its own tests.
+os.environ.setdefault("MFA_REQUIRED_ROLES", "")
 
 # Point at the test DB — CI sets TEST_DB env var; local default works too
 _db_host = os.getenv("DB_HOST", "127.0.0.1")

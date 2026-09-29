@@ -36,13 +36,16 @@ export default function ChangePasswordCard() {
     try {
       // confirm_password is deliberately NOT sent — it is a client-side check,
       // and the endpoint rejects unknown fields.
-      await api.post('/auth/change-password', {
+      const res = await api.post('/auth/change-password', {
         current_password: form.current_password,
         new_password: form.new_password,
       })
+      // The change revoked every existing token, this one included; the response
+      // carries a fresh one so this tab stays signed in.
+      if (res.data?.access_token) localStorage.setItem('hireflow_token', res.data.access_token)
       setForm(EMPTY)
       setOpen(false)
-      setDone('Password changed. Other devices stay signed in until their session expires.')
+      setDone('Password changed. You have been signed out on every other device.')
     } catch (err) {
       const status = err.response?.status
       if (status === 429) {
@@ -105,8 +108,9 @@ export default function ChangePasswordCard() {
           </div>
 
           <p style={{ fontSize: '0.75rem', color: 'var(--text-tertiary)', lineHeight: 1.5, margin: 0 }}>
-            At least {MIN_LENGTH} characters. Changing your password does not sign
-            out your other devices — those sessions last until they expire.
+            At least {MIN_LENGTH} characters, mixing at least two of lowercase,
+            uppercase, digits and symbols. Changing your password signs you out on
+            every other device.
           </p>
         </form>
       )}

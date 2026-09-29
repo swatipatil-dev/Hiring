@@ -197,8 +197,8 @@ async def reap_idle_sessions(interval_sec: int = 60, idle_sec: int = 900) -> Non
                     entry["pipeline"].shutdown()
                 except Exception:
                     pass
-                logger.info("Reaped idle proctoring session %s (idle > %ds, frames=%s)",
-                            sid, idle_sec, entry.get("frame_count"))
+                logger.info("Reaped idle proctoring session %s… (idle > %ds, frames=%s)",
+                            sid[:8], idle_sec, entry.get("frame_count"))
         except asyncio.CancelledError:
             raise
         except Exception as e:

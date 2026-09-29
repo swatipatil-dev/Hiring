@@ -19,12 +19,21 @@ def _register_unverified(client, email: str):
     return resp.json()
 
 
-def _inject_otp(db, email: str, otp: str = "123456", expired: bool = False):
-    """Directly set an OTP on a user row for test-controlled verification."""
+def _inject_otp(db, email: str, otp: str = "123456", expired: bool = False,
+                purpose: str = "verify"):
+    """Directly set an OTP on a user row for test-controlled verification.
+
+    Only the HMAC is stored (src/auth.py set_user_otp), bound to a purpose — a
+    signup code is not a reset code.
+    """
     from src.models.models import User
+    from src.auth import _otp_digest
     user = db.query(User).filter(User.email == email).first()
     assert user, f"User {email} not found in DB"
-    user.otp_code = otp
+    user.otp_code = None
+    user.otp_hash = _otp_digest(user, purpose, otp)
+    user.otp_purpose = purpose
+    user.otp_attempts = 0
     user.otp_expires_at = (
         datetime.utcnow() - timedelta(minutes=1)  # already expired
         if expired
@@ -50,7 +59,7 @@ def test_verify_otp_success(client, db):
 
     user = db.query(User).filter(User.email == email).first()
     assert user.email_verified is True
-    assert user.otp_code is None
+    assert user.otp_hash is None
 
 
 @pytest.mark.auth
@@ -210,7 +219,7 @@ def test_reset_password_success(client, db):
     user = db.query(User).filter(User.email == email).first()
     user.email_verified = True
     db.flush()
-    _inject_otp(db, email, otp="RESET1")
+    _inject_otp(db, email, otp="RESET1", purpose="reset")
 
     resp = client.post("/api/v1/auth/reset-password", json={
         "email": email,
@@ -233,7 +242,7 @@ def test_reset_password_wrong_otp(client, db):
     """Wrong OTP on reset-password returns 400."""
     email = "resetpw_wrong@test.com"
     _register_unverified(client, email)
-    _inject_otp(db, email, otp="123456")  # otp_code column is String(6)
+    _inject_otp(db, email, otp="123456", purpose="reset")
 
     resp = client.post("/api/v1/auth/reset-password", json={
         "email": email, "otp": "999999", "new_password": "NewPass@9999"
@@ -265,7 +274,7 @@ def test_reset_password_too_short(client, db):
     """Password shorter than 8 chars returns 400."""
     email = "resetpw_short@test.com"
     _register_unverified(client, email)
-    _inject_otp(db, email, otp="SHORT1")
+    _inject_otp(db, email, otp="SHORT1", purpose="reset")
 
     resp = client.post("/api/v1/auth/reset-password", json={
         "email": email, "otp": "SHORT1", "new_password": "abc"

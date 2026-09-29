@@ -1,0 +1,58 @@
+# HireFlow nightly backup — database + uploaded files, encrypted, copied off-site.
+#
+# WHY THIS EXISTS: until it did, the only dumps were the ones the deploy pipeline takes
+# when a release carries a migration, written to /root on the same disk, and no uploaded
+# file (resumes, cover letters, logos, proctoring evidence) was backed up at all.
+#
+# What it runs and why each setting is there: backend/scripts/backup.py and
+# docs/BACKUP_AND_RESTORE.md. Restoring is only proven by the monthly drill
+# (backend/scripts/restore_drill.py) — do not skip it.
+#
+# Prerequisites in /opt/hireflow/backend/.env:
+#   BACKUP_DIR=/opt/hireflow/backups
+#   BACKUP_GPG_RECIPIENT=<key id>      (public key imported into GNUPGHOME below)
+#     or BACKUP_PASSPHRASE_FILE=/opt/hireflow/.backup-passphrase   (0600, hireflow)
+#   BACKUP_OFFSITE=rclone:<remote>:<path> | gs://<bucket>/<path> | s3://<bucket>/<path>
+#
+# Install:
+#   cp hireflow-backup.service hireflow-backup.timer /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now hireflow-backup.timer
+#   systemctl start hireflow-backup.service       # take the first backup now
+#   journalctl -u hireflow-backup.service         # what each run did
+#   systemctl list-timers hireflow-backup.timer   # when the next one runs
+
+[Unit]
+Description=HireFlow nightly backup (database + uploads, encrypted)
+After=network-online.target mysqld.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=hireflow
+Group=hireflow
+WorkingDirectory=/opt/hireflow/backend
+EnvironmentFile=/opt/hireflow/backend/.env
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/opt/hireflow/venv/bin:/usr/local/bin:/usr/bin:/bin
+# ProtectHome=true hides /home, so gpg's keyring cannot live in ~hireflow.
+Environment=GNUPGHOME=/opt/hireflow/.gnupg
+
+ExecStart=/opt/hireflow/venv/bin/python /opt/hireflow/backend/scripts/backup.py
+
+# A dump competes with live traffic; this box also hosts other cPanel accounts.
+Nice=10
+IOSchedulingClass=idle
+CPUWeight=20
+IOWeight=20
+MemoryMax=1G
+# A large database plus an off-site upload can take a while; never let a hung upload
+# run into the next night.
+TimeoutStartSec=4h
+
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/hireflow

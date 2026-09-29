@@ -4,20 +4,43 @@ Mirrors ``src/judge/queue.py``. ``enqueue_email(payload)`` pushes a send job ont
 the RQ ``email`` queue; when Redis is unavailable (or ``EMAIL_SYNC=1``) it runs the
 send **inline** so the platform still works with no queue infra (dev). Note: the
 per-sender rate limiting only applies on the async (Redis) path.
+
+Jobs travel as JSON and the worker runs only the send job (src/mailq/safety.py).
 """
 from __future__ import annotations
 
 import os
+from urllib.parse import urlsplit, urlunsplit
 
-_REDIS_URL = os.getenv(
-    "EMAIL_REDIS_URL",
-    os.getenv("JUDGE_REDIS_URL", os.getenv("REDIS_URL", "redis://localhost:6379/0")),
-)
+from .safety import SEND_JOB, SERIALIZER
+
+
+def resolve_redis_url() -> str:
+    """The email queue's Redis URL.
+
+    ``EMAIL_REDIS_URL`` wins. Otherwise it is the shared ``REDIS_URL`` (or
+    ``JUDGE_REDIS_URL``) with the database index swapped for ``EMAIL_REDIS_DB``
+    (default 1), so email jobs and counters never sit in the judge's database.
+    Host, port and password are kept, so one Redis ACL still covers both.
+    Set ``EMAIL_REDIS_DB=0`` to share the judge's database deliberately.
+    """
+    explicit = os.getenv("EMAIL_REDIS_URL")
+    if explicit:
+        return explicit
+    base = os.getenv("REDIS_URL", os.getenv("JUDGE_REDIS_URL", "redis://localhost:6379/0"))
+    db = os.getenv("EMAIL_REDIS_DB", "1").strip()
+    parts = urlsplit(base)
+    if not db.isdigit() or parts.scheme not in ("redis", "rediss"):
+        return base   # unix sockets etc.: leave as configured
+    return urlunsplit((parts.scheme, parts.netloc, f"/{db}", parts.query, parts.fragment))
+
+
+_REDIS_URL = resolve_redis_url()
 _QUEUE_NAME = os.getenv("EMAIL_QUEUE", "email")
 _JOB_TIMEOUT = int(os.getenv("EMAIL_JOB_TIMEOUT_S", "60"))
 
 _redis = None          # decode_responses=True  — plain string keys (rate limits, llen)
-_redis_raw = None      # decode_responses=False — RQ (pickled payloads)
+_redis_raw = None      # decode_responses=False — RQ (job hashes hold compressed bytes)
 _redis_checked = False
 _redis_ok = False
 
@@ -43,9 +66,9 @@ def get_redis():
 def get_redis_raw():
     """Shared Redis client for RQ — returns bytes, never decodes.
 
-    RQ stores job arguments and results as pickle, so a client with
-    ``decode_responses=True`` breaks on the first binary read. Same reasoning as
-    ``src/judge/queue.py:get_redis_raw`` — see the fuller note there.
+    RQ zlib-compresses the serialized job data into the job hash, so a client
+    with ``decode_responses=True`` breaks on the first binary read even with the
+    JSON serializer. Same reasoning as ``src/judge/queue.py:get_redis_raw``.
     """
     global _redis_raw
     if _redis_raw is None:
@@ -77,6 +100,12 @@ def _sync_forced() -> bool:
     return os.getenv("EMAIL_SYNC", "").lower() in ("1", "true", "yes")
 
 
+def email_queue():
+    """The email queue, JSON-serialised (see src/mailq/safety.py)."""
+    from rq import Queue
+    return Queue(_QUEUE_NAME, connection=get_redis_raw(), serializer=SERIALIZER)
+
+
 def enqueue_email(payload: dict) -> dict:
     """Queue one email for delivery; returns the dispatch mode.
 
@@ -87,10 +116,8 @@ def enqueue_email(payload: dict) -> dict:
         res = send_email_job(payload) or {}
         return {"mode": "sync", **res}
 
-    from rq import Queue
-    q = Queue(_QUEUE_NAME, connection=get_redis_raw())
-    job = q.enqueue(
-        "src.mailq.worker.send_email_job",
+    job = email_queue().enqueue(
+        SEND_JOB,
         payload,
         job_timeout=_JOB_TIMEOUT,
         result_ttl=3600,
