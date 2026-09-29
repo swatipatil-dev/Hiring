@@ -30,6 +30,7 @@ from src.rate_limit import limiter
 from src.tenancy.platform_company import platform_slug
 
 logger = logging.getLogger(__name__)
+from src.services.skills_parsing import parse_skills
 
 router = APIRouter(prefix="/api/v1/public", tags=["Public"])
 
@@ -121,7 +122,7 @@ def _job_card(job: JobPosting, desc_len: int) -> dict:
         "salary_max": float(job.salary_max) if job.salary_max else None,
         "experience_years": job.experience_years,
         "description": (job.description or "")[:desc_len],
-        "required_skills": job.required_skills or [],
+        "required_skills": parse_skills(job.required_skills),
         "created_at": job.created_at,
     }
 
@@ -254,7 +255,7 @@ async def get_careers_job_detail(
             "salary_min": float(job.salary_min) if job.salary_min else None,
             "salary_max": float(job.salary_max) if job.salary_max else None,
             "experience_years": job.experience_years,
-            "required_skills": job.required_skills or [],
+            "required_skills": parse_skills(job.required_skills),
             "created_at": job.created_at,
         },
     }

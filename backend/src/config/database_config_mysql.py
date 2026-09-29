@@ -588,6 +588,7 @@ class DatabaseManager:
                         salary_max DECIMAL(10,2),
                         experience_years INT,
                         required_skills TEXT,
+                        preferred_skills TEXT,
                         status VARCHAR(20) DEFAULT 'active',
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,

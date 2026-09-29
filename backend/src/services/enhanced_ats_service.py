@@ -321,7 +321,44 @@ EVIDENCE_CAPABLE_SECTIONS = frozenset({"experience", "projects", "skills"})
 #       keyword .05), skills matched flat over the whole document.
 #   2 — experience and projects promoted over keyword placement; skills credit
 #       scaled by the section evidencing each skill.
-ATS_RUBRIC_VERSION = 2
+#   3 — mandatory and preferred separated: preferred became a bonus instead of
+#       a rescale, and missing mandatory skills mark the composite down on jobs
+#       whose HR has actually split the two.
+ATS_RUBRIC_VERSION = 3
+
+# Preferred skills add at most this much to the skills sub-score, on top of a
+# base of 100 x required-coverage. A bonus, never a tax: a job that lists
+# nice-to-haves must not score a fully-qualified candidate lower than the
+# identical job that lists none. The old 70/30 split did exactly that — naming
+# one preferred skill cost a candidate who held every requirement 30 skills
+# points, which is 7.5 of the final score.
+#
+# It saturates for a candidate already at 100, deliberately. Preferred is a
+# tiebreaker among PARTIALLY qualified candidates, which is where ties actually
+# need breaking.
+PREFERRED_BONUS_MAX = 15.0
+
+# Floor of the mandatory-coverage multiplier applied to the composite score.
+#
+# The skills sub-score is only 25% of the total, so nothing inside it can
+# express "this candidate does not have the required skills". Non-skills weight
+# is 0.75, which means a candidate matching ZERO requirements still reached 75 —
+# reported as "Very Good - Recommended, shortlist for interview".
+#
+# A multiplier, not a gate. At 0.55 a candidate whose skills we READ and who does
+# not have them lands near 41 (44 with the rural bonus): below the >=50
+# auto-promote threshold and out of the "Good" band, but still scored, still
+# ranked, still carrying a full breakdown. (0.50 -> ~40; 0.60 -> ~48, which is
+# uncomfortably close to the promote threshold.)
+#
+# That calibration assumes the other 0.75 of weight survives to catch the fall,
+# which is true only when the resume parsed. It does not apply when we read no
+# skills at all: a parse failure suppresses education, experience, certification
+# and project simultaneously, so there is nothing left to catch it. Hence the
+# 'no_skills_read' exemption at the gate — without it the worst case was not 41
+# but near zero, and an unreadable resume scored below a candidate who
+# demonstrably lacked nine of ten requirements.
+MANDATORY_COVERAGE_FLOOR = 0.55
 
 # Factor weights, summing to 1.0. Single source of truth — tests and docs read
 # this rather than restating the numbers.
@@ -814,6 +851,37 @@ def _match_credit(required_norm: str, resume_normalized: set) -> Tuple[float, st
     if cluster_hit:
         return CLUSTER_PARTIAL_CREDIT, "cluster", cluster_hit
     return 0.0, "missing", ""
+
+
+def _classify_skills(resume_normalized: set, skills: List[str]) -> Tuple[List[str], List[Dict[str, str]], List[str]]:
+    """Split ``skills`` into (matched, cluster_matched, missing) using the SCORER's rule.
+
+    This used to be a plain set difference while the score came from
+    ``_match_credit``, so the two disagreed: a candidate could earn full credit
+    for "AWS Lambda" satisfying a required "lambda" and still be told they were
+    missing it — and that phantom leaked into `weaknesses` and the
+    recommendations shown to HR.
+
+    Cosmetic while nothing depended on it. Once a missing mandatory skill marks
+    the composite down, a recruiter seeing a candidate penalised for a skill the
+    panel says they have is an explainability defect, so the two must agree.
+    """
+    matched: List[str] = []
+    cluster_matched: List[Dict[str, str]] = []
+    missing: List[str] = []
+    for raw in OrderedDict.fromkeys(normalize_skill(x).lower() for x in (skills or []) if str(x).strip()):
+        credit, status, hit = _match_credit(raw, resume_normalized)
+        if status in ("exact", "phrase"):
+            matched.append(raw)
+        elif status == "cluster":
+            cluster_matched.append({
+                "required": raw,
+                "found": hit,
+                "cluster": SKILL_TO_CLUSTER.get(raw.lower(), ""),
+            })
+        else:
+            missing.append(raw)
+    return matched, cluster_matched, missing
 
 
 def _best_evidence_section(sections: Dict[str, str], terms: List[str]) -> Tuple[str, float]:
@@ -1770,7 +1838,7 @@ class EnhancedATSScoringService:
     # Recruiter rubric — nested sub-scores
     #   Education   = Degree match (40) + College tier (30) + CGPA (30)
     #   Experience  = Relevant exp (50) + Internships (25) + GitHub/OSS/Hack (25)
-    #   Skills      = Required (70) + Preferred (30)
+    #   Skills      = 100 x mandatory coverage, + up to PREFERRED_BONUS_MAX
     # ──────────────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -1917,8 +1985,12 @@ class EnhancedATSScoringService:
         return score, detail
 
     def score_skills_v2(self, resume_skills, required_skills, preferred_skills, sections=None):
-        """Skills sub-score (0-100) = required(70) + preferred(30).
-        When the JD lists no preferred skills, required carries the full 100.
+        """Skills sub-score (0-100) = 100 x required-coverage, + up to
+        PREFERRED_BONUS_MAX for preferred skills, capped at 100.
+
+        Preferred is a bonus, not a rescale. A job that lists nice-to-haves
+        scores a fully-qualified candidate exactly as the identical job that
+        lists none.
 
         When ``sections`` is supplied and usable, each skill's credit is scaled
         by where the resume evidences it (SKILL_EVIDENCE_WEIGHTS) — a skill used
@@ -1943,26 +2015,25 @@ class EnhancedATSScoringService:
         else:
             req_pct = flat_req_pct
 
+        req_sub = round(100.0 * req_pct, 1)
         if preferred_skills:
             if evidence_capable:
                 pref_pct = score_required_skills_with_evidence(
                     sections, resume_skills, preferred_skills)[0] / 100.0
             else:
                 pref_pct = self.calculate_skills_match(resume_skills, preferred_skills) / 100.0
-            req_sub = round(70.0 * req_pct, 1)
-            pref_sub = round(30.0 * pref_pct, 1)
-            score = round(req_sub + pref_sub, 2)
+            pref_sub = round(PREFERRED_BONUS_MAX * pref_pct, 1)
+            score = round(min(100.0, req_sub + pref_sub), 2)
         else:
-            req_sub = round(70.0 * req_pct, 1)
             pref_sub = None
-            score = round(100.0 * req_pct, 2)
+            score = round(req_sub, 2)
 
         demonstrated = sum(1 for e in skill_evidence
                            if e.get('section') in ('experience', 'projects'))
         credited = sum(1 for e in skill_evidence if e.get('credit', 0) > 0)
         detail = {
-            'required_skills': req_sub, 'required_max': 70,
-            'preferred_skills': pref_sub, 'preferred_max': 30,
+            'required_skills': req_sub, 'required_max': 100,
+            'preferred_skills': pref_sub, 'preferred_max': PREFERRED_BONUS_MAX,
             'has_preferred': bool(preferred_skills),
             # False means the resume had no recognisable sections and was scored
             # flat — so a recruiter can tell a weak resume from an unparsed one.
@@ -2174,6 +2245,10 @@ class EnhancedATSScoringService:
         # list (even an empty one) is used as given. Either way a mandatory skill is never
         # also counted as preferred.
         required_keys = {normalize_skill(x).lower() for x in required_skills}
+        # Captured before inference replaces None below: whether HR has separated
+        # mandatory from preferred is what exempts a legacy job from the mandatory
+        # coverage rule further down.
+        preferred_specified = preferred_skills is not None
         if preferred_skills is None:
             preferred_skills = self.extract_preferred_skills(job_description, exclude=required_skills)
             preferred_source = "inferred" if preferred_skills else "none"
@@ -2220,6 +2295,44 @@ class EnhancedATSScoringService:
         rural = bool(permanent_pincode) and is_rural(permanent_pincode)
         rural_bonus = 3.0 if rural else 0.0
         total_bonus = rural_bonus
+
+        # ── Mandatory coverage ──
+        #
+        # Applied to the composite, because the skills sub-score is only 25% of
+        # it: nothing inside that sub-score can say "this candidate does not
+        # have the required skills". Before this, a candidate matching ZERO
+        # requirements still reached 75 and was reported as "Very Good —
+        # Recommended, shortlist for interview".
+        #
+        # Gated on the opt-in sentinel. A job whose preferred_skills is NULL has
+        # never had its two lists separated, so everything in its list may well
+        # be a nice-to-have that HR was forced to file as mandatory — marking
+        # candidates down against it would punish them for a data model they
+        # never saw. Those jobs score exactly as before.
+        #
+        # coverage is the UNDISCOUNTED match: a skill shown or listed counts in full,
+        # a related one (same cluster) earns CLUSTER_PARTIAL_CREDIT. Using the
+        # evidence-weighted figure would penalise a candidate twice over for the
+        # same thin evidence.
+        mandatory_factor = 1.0
+        coverage = 1.0
+        mandatory_exempt_reason = None
+        if not preferred_specified:
+            mandatory_exempt_reason = 'legacy_job'
+        elif not required_skills:
+            mandatory_exempt_reason = 'no_required_skills'
+        elif not resume_result.skills:
+            # We read NO skills from this resume at all. A coverage of zero
+            # computed from an empty list is not a measurement of the candidate —
+            # it is a measurement of the parser, and marking them down for it
+            # inverts the ordering: a resume whose skills sat in an image scored
+            # BELOW one that demonstrably matched a single requirement.
+            mandatory_exempt_reason = 'no_skills_read'
+        else:
+            credit = {'demonstrated': 1.0, 'listed': 1.0, 'related': CLUSTER_PARTIAL_CREDIT}
+            coverage = sum(credit.get(c['level'], 0.0) for c in required_checks) / len(required_checks)
+            mandatory_factor = MANDATORY_COVERAGE_FLOOR + (1.0 - MANDATORY_COVERAGE_FLOOR) * coverage
+            ats_score *= mandatory_factor
 
         ats_score = min(100.0, ats_score + total_bonus)
 
@@ -2324,6 +2437,13 @@ class EnhancedATSScoringService:
                 'rural': rural,
                 'rural_bonus': rural_bonus,
                 'total_bonus': total_bonus,
+                # Recorded so a composite markdown is explainable rather than a
+                # mystery. mandatory_factor of 1.0 means it did not apply.
+                'mandatory_coverage': round(coverage, 4),
+                'mandatory_factor': round(mandatory_factor, 4),
+                # Why the markdown did not apply, so an exemption is as auditable
+                # as the markdown itself. None means it did apply.
+                'mandatory_exempt_reason': mandatory_exempt_reason,
             },
             'plagiarism': plagiarism,
         }

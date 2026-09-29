@@ -165,7 +165,7 @@ class TestBreakdownShape:
     def test_flat_score_is_reported_alongside_the_discounted_one(self):
         _, detail = svc.score_skills_v2(RESUME_SKILLS, REQ, [], sections={"skills": "Python Docker AWS"})
         assert detail["required_flat_pct"] == 100.0
-        assert detail["required_skills"] < 70.0  # discounted below the /70 max
+        assert detail["required_skills"] < 100.0  # discounted below the /100 max
 
     def test_missing_skill_is_recorded_with_zero_credit(self):
         _, detail = svc.score_skills_v2(["Python"], ["python", "rust"], [], sections={"skills": "Python"})
@@ -242,3 +242,181 @@ class TestEndToEnd:
         result = svc.enhanced_score_candidate(DEMONSTRATOR, JD, PAIR_REQ, 3, "bachelor")
         assert result.scoring_breakdown["rubric_version"] >= 2
         assert result.scoring_breakdown["weights_used"] == DEFAULT_ATS_WEIGHTS
+
+
+class TestMandatoryCoverage:
+    """The composite markdown for missing must-have skills.
+
+    It lives on the composite, not inside the skills sub-score, because that
+    sub-score is only 25% of the total — nothing inside it can express "this
+    candidate does not have the required skills". Before this, a candidate
+    matching zero requirements still reached 75, reported as "Very Good —
+    Recommended, shortlist for interview".
+    """
+
+    JD = "Backend engineer. Python, FastAPI, PostgreSQL, Docker, AWS."
+    REQ = ["python", "fastapi", "postgresql", "docker", "aws"]
+    _EDU = "EDUCATION\nB.Tech Computer Science, IIT Kanpur, CGPA 8.5\n"
+    QUALIFIED = (
+        "SKILLS\nBackend\n\nEXPERIENCE\nEngineer at Acme, 2020 - 2024\n"
+        "Built the billing API in Python with FastAPI on PostgreSQL.\n"
+        "Containerised with Docker and deployed to AWS.\n" + _EDU
+    )
+    NO_SKILLS = (
+        "SKILLS\nExcel, PowerPoint\n\nEXPERIENCE\nAnalyst at Beta, 2019 - 2024\n"
+        "Prepared reports and managed stakeholder communication.\n" + _EDU
+    )
+
+    def score(self, resume, preferred):
+        return svc.enhanced_score_candidate(
+            resume, self.JD, self.REQ, 3, "bachelor", preferred_skills=preferred)
+
+    def test_missing_all_mandatory_is_penalised_but_not_rejected(self):
+        """Heavy, and deliberately not a knockout.
+
+        A parser miss must cost a candidate their place in the ordering, never
+        their existence in it — so they keep a score, a rating and a full
+        breakdown.
+        """
+        r = self.score(self.NO_SKILLS, ["kubernetes"])
+        assert r.ats_score > 0
+        assert r.ats_score < 50          # below the auto-promote threshold
+        assert r.rating                  # still rated
+        assert r.scoring_breakdown["individual_scores"]
+        assert r.scoring_breakdown["bonus"]["mandatory_factor"] < 1.0
+
+    def test_full_coverage_is_untouched(self):
+        """The invariant the whole design rests on: a candidate who meets every
+        requirement is not moved at all."""
+        r = self.score(self.QUALIFIED, ["kubernetes"])
+        assert r.scoring_breakdown["bonus"]["mandatory_factor"] == 1.0
+
+    def test_legacy_job_is_exempt(self):
+        """preferred_skills=None means nobody has split this job's lists, so
+        everything in `required` may be a nice-to-have HR had nowhere else to
+        file. Marking candidates down against it would punish them for a data
+        model they never saw."""
+        for resume in (self.QUALIFIED, self.NO_SKILLS):
+            r = self.score(resume, None)
+            assert r.scoring_breakdown["bonus"]["mandatory_factor"] == 1.0
+
+    def test_opting_in_only_moves_the_unqualified(self):
+        qualified = (self.score(self.QUALIFIED, None).ats_score,
+                     self.score(self.QUALIFIED, []).ats_score)
+        unqualified = (self.score(self.NO_SKILLS, None).ats_score,
+                       self.score(self.NO_SKILLS, []).ats_score)
+        assert qualified[0] == qualified[1]      # unchanged
+        assert unqualified[1] < unqualified[0]   # marked down
+
+    def test_job_with_no_required_skills_is_exempt(self):
+        r = svc.enhanced_score_candidate(
+            self.QUALIFIED, self.JD, [], 3, "bachelor", preferred_skills=["aws"])
+        assert r.scoring_breakdown["bonus"]["mandatory_factor"] == 1.0
+
+    def test_breakdown_exposes_the_markdown(self):
+        """A 20-point markdown must be auditable, not mysterious."""
+        b = self.score(self.NO_SKILLS, ["kubernetes"]).scoring_breakdown["bonus"]
+        assert "mandatory_coverage" in b and "mandatory_factor" in b
+
+
+class TestMissingSkillsAgreesWithScoring:
+    """`missing_skills` is shown next to the markdown it justifies, so the two
+    must be decided by the same rule. A plain set difference disagreed with
+    `_match_credit`: a candidate could earn full credit for "AWS Lambda"
+    satisfying a required "lambda" and still be told they were missing it."""
+
+    def test_phrase_match_is_not_reported_missing(self):
+        r = svc.enhanced_score_candidate(
+            "SKILLS\nAWS Lambda\n\nEXPERIENCE\nBuilt serverless handlers on AWS Lambda.\n",
+            "Serverless engineer. Lambda required.", ["lambda"], 0, "bachelor",
+            preferred_skills=[])
+        assert "lambda" not in r.missing_skills
+        assert r.skills_match_score > 0
+
+    def test_genuinely_absent_skill_is_reported_missing(self):
+        r = svc.enhanced_score_candidate(
+            "SKILLS\nExcel\n\nEXPERIENCE\nReporting.\n",
+            "Rust engineer.", ["rust"], 0, "bachelor", preferred_skills=[])
+        assert "rust" in r.missing_skills
+
+
+class TestUnreadableResumeIsNotUnqualified:
+    """A resume we could not read is not a candidate who lacks the skills.
+
+    The coverage multiplier computes coverage from `required_flat_pct`. When
+    `extract_skills` returns [] — skills in an image, a scanned PDF, an OCR
+    failure — that percentage is 0, and the candidate took the maximum penalty:
+    harsher than someone who demonstrably matched one requirement in ten.
+
+    The damage is not at the empty extreme (a blank resume scores ~0 anyway, so
+    the multiplier is moot there). It lands on a resume that parses well EXCEPT
+    for skills, which is exactly the common failure.
+    """
+
+    JD = "Backend engineer. Python, FastAPI, PostgreSQL, Docker, AWS."
+    REQ = ["python", "fastapi", "postgresql", "docker", "aws"]
+
+    # Strong on every channel the parser CAN read, but no skill token survives
+    # extraction — the shape of a resume whose skills sat in an image. Kept free
+    # of incidental technology words on purpose: an earlier draft of this fixture
+    # ended "AWS Certified Solutions Architect", and extract_skills duly found
+    # "aws", so the case under test never arose and the test failed against
+    # correct code.
+    SKILLS_UNREADABLE = """PROFESSIONAL SUMMARY
+Experienced professional with eight years in the sector.
+
+EXPERIENCE
+Senior Associate at Acme Corp, 2016 - 2024
+Led the regional team and owned the annual planning programme.
+Mentored four colleagues and ran the weekly review meeting.
+
+EDUCATION
+B.Tech Computer Science, IIT Kanpur, CGPA 8.5
+"""
+
+    # Same body, but one requirement genuinely present.
+    ONE_SKILL_MATCHED = SKILLS_UNREADABLE.replace(
+        "PROFESSIONAL SUMMARY", "SKILLS\nPython\n\nPROFESSIONAL SUMMARY")
+
+    def score(self, resume):
+        return svc.enhanced_score_candidate(
+            resume, self.JD, self.REQ, 3, "bachelor", preferred_skills=[])
+
+    def test_no_skills_read_is_exempt_from_the_markdown(self):
+        r = self.score(self.SKILLS_UNREADABLE)
+        b = r.scoring_breakdown["bonus"]
+        assert b["mandatory_factor"] == 1.0
+        assert b["mandatory_exempt_reason"] == "no_skills_read"
+
+    def test_unreadable_does_not_score_below_one_genuine_match(self):
+        """The ordering inversion — the test that would have caught this.
+
+        Before the fix the unreadable resume took factor 0.55 while the resume
+        matching a single requirement took 0.595, so being unreadable was worse
+        than being unqualified.
+        """
+        unreadable = self.score(self.SKILLS_UNREADABLE).ats_score
+        one_match = self.score(self.ONE_SKILL_MATCHED).ats_score
+        assert unreadable >= one_match
+
+    def test_wrong_skills_are_still_penalised(self):
+        """The guard against over-correcting.
+
+        This resume's skills WERE read — they are simply the wrong ones. That is
+        a finding about the candidate, so the markdown must still apply. Without
+        this, the fix would become an exemption for anyone missing every
+        requirement.
+        """
+        wrong = self.SKILLS_UNREADABLE.replace(
+            "PROFESSIONAL SUMMARY", "SKILLS\nExcel, PowerPoint\n\nPROFESSIONAL SUMMARY")
+        b = self.score(wrong).scoring_breakdown["bonus"]
+        assert b["mandatory_factor"] < 1.0
+        assert b["mandatory_exempt_reason"] is None
+
+    def test_legacy_and_no_requirement_exemptions_are_named(self):
+        legacy = svc.enhanced_score_candidate(
+            self.SKILLS_UNREADABLE, self.JD, self.REQ, 3, "bachelor", preferred_skills=None)
+        assert legacy.scoring_breakdown["bonus"]["mandatory_exempt_reason"] == "legacy_job"
+        no_req = svc.enhanced_score_candidate(
+            self.SKILLS_UNREADABLE, self.JD, [], 3, "bachelor", preferred_skills=[])
+        assert no_req.scoring_breakdown["bonus"]["mandatory_exempt_reason"] == "no_required_skills"

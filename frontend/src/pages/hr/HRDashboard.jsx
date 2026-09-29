@@ -758,10 +758,11 @@ HR Team`,
       salary_min: '',
       salary_max: '',
       experience_years: req.min_experience_years || 0,
-      // Kept separate: mandatory requirements and nice-to-haves are scored and shown
-      // differently (they used to be merged into one mandatory list here).
+      // Kept apart. Concatenating these was the point where the interviewer's
+      // nice-to-haves became hard requirements: the request carries two lists,
+      // and everything downstream then scored them identically.
       required_skills: (req.required_skills || []).join(', ') || (job.required_skills || []).join(', '),
-      preferred_skills: (req.preferred_skills || []).join(', '),
+      preferred_skills: (req.preferred_skills || []).join(', ') || (job.preferred_skills || []).join(', '),
     }
     setJobForm(formData)
 
@@ -4790,6 +4791,18 @@ HR Team`,
                 ))}
                 {(!viewJob.required_skills || viewJob.required_skills.length === 0) && <span className="text-muted text-sm">No skills listed</span>}
               </div>
+              {/* Indigo, matching how the candidate request already renders its
+                  preferred skills, so the two surfaces read as one concept. */}
+              {Array.isArray(viewJob.preferred_skills) && viewJob.preferred_skills.length > 0 && (
+                <>
+                  <div style={{ fontSize: '0.72rem', fontWeight: 700, textTransform: 'uppercase', color: 'var(--text-tertiary)', margin: '14px 0 8px', fontFamily: 'var(--font-display)' }}>Preferred Skills</div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                    {viewJob.preferred_skills.map((s, i) => (
+                      <span key={i} style={{ padding: '4px 12px', background: '#e0e7ff', color: '#3730a3', borderRadius: 6, fontSize: '0.82rem', fontWeight: 600 }}>{s}</span>
+                    ))}
+                  </div>
+                </>
+              )}
             </div>
 
             <div style={{ padding: '12px 16px', background: 'var(--surface-input)', borderRadius: 10, marginBottom: 20 }}>

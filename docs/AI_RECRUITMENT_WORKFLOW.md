@@ -159,7 +159,7 @@ Submit Application
 | Factor | Weight | Description |
 |---------|--------|-------------|
 | Education | 35% | Degree match (40) + college tier (30) + CGPA (30) |
-| Skills Match | 25% | Required (70) + preferred (30), **each scaled by where the resume evidences it** |
+| Skills Match | 25% | Mandatory coverage (0-100) + up to 15 bonus for preferred, each scaled by where the resume evidences it. Missing mandatory skills also mark the **composite** down (see below) |
 | Experience | 20% | Relevant years (50) + internships (25) + GitHub/OSS/hackathons (25) |
 | Certifications | 10% | Count and relevance of professional certifications |
 | Projects | 8% | Relevance of projects to the JD |
@@ -167,6 +167,21 @@ Submit Application
 | Keyword | 1% | JD keyword coverage, wherever in the resume it appears |
 
 Source of truth: `DEFAULT_ATS_WEIGHTS` in `backend/src/services/enhanced_ats_service.py`.
+
+**Missing mandatory skills reduce the whole score, not just the skills factor.**
+The skills factor is 25% of the total, so on its own it cannot express "this
+candidate does not have the required skills" — a candidate matching none of them
+still reached 75, which the system reported as *"Very Good — shortlist for
+interview"*. A coverage multiplier now scales the composite, bottoming out at
+0.55 rather than zero: heavily marked down, still scored, still ranked, still
+carrying a full breakdown. A parsing miss should cost a candidate their place in
+the ordering, never their place in the list.
+
+It applies **only to jobs where HR has actually separated mandatory from
+preferred skills**. A job whose preferred list has never been set is scored
+exactly as before, because everything in its single list may well be a
+nice-to-have that HR had nowhere else to file.
+
 
 **Skills are evidence-weighted.** A required skill used inside a job or a project
 counts in full; the same skill sitting in a comma-separated list is discounted

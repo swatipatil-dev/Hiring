@@ -92,12 +92,32 @@ Before relying on it, in this order:
 feature/*  →  develop  →  testing  →  main  →  production
 ```
 
-| Branch | Purpose | CI | Deploys |
+| Branch | Purpose | CI on push | Deploys |
 |---|---|---|---|
-| feature branches | day-to-day work | ✅ full suite | ✗ |
+| feature branches | day-to-day work | lint + frontend | ✗ |
 | `develop` | integration | ✅ full suite | ✗ |
 | `testing` | pre-release / QA | ✅ full suite | ✗ |
 | `main` | production | ✅ full suite | ✅ **automatically, if CI passes** |
+
+**A pull request always runs the full suite**, whatever the branch. Feature
+branches get the fast signal on every push and the expensive one when the work
+is merge-bound.
+
+Why: the backend job is 9.7 of every 13.5 billable minutes, and 82 of 100 runs
+in September were direct pushes — one feature branch alone spent ~390 minutes on
+intermediate commits nobody was merging yet. That exhausted the month's Actions
+allowance by the 19th and stopped CI *and* production deploys dead for the rest
+of the cycle. Running the full suite on a branch's every keystroke bought very
+little and cost the thing outright.
+
+The branch list is deliberately still `['**']` — see below. What changed is how
+much of the matrix a run pays for, not whether a run happens.
+
+`backend` and `migrations` also skip when a commit touches no backend code, and
+`frontend` skips when it touches no frontend code. The detection fails **open**:
+a first push, a force-push, or a failed diff all run everything, because a false
+negative silently skips tests on code that changed while a false positive only
+costs minutes.
 
 **`testing` does not deploy anywhere.** There is exactly one environment —
 `career.innomaxskills.com` on `66.116.207.71`. Deploying `testing` would replace the live

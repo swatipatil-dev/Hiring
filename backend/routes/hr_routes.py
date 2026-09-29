@@ -53,19 +53,9 @@ import os
 
 logger = logging.getLogger(__name__)
 
-def _parse_skills(raw_skills):
-    """Parse required_skills from various formats (JSON array, comma-separated, list, None)"""
-    if isinstance(raw_skills, list):
-        return raw_skills
-    if isinstance(raw_skills, str) and raw_skills.strip():
-        try:
-            parsed = json.loads(raw_skills)
-            if isinstance(parsed, list):
-                return parsed
-        except (json.JSONDecodeError, TypeError):
-            pass
-        return [s.strip() for s in raw_skills.split(",") if s.strip()]
-    return []
+# Shared with every other reader of these columns, so a Python-repr row parses
+# the same way everywhere. See src/services/skills_parsing.py.
+from src.services.skills_parsing import parse_skills as _parse_skills, dump_skills, parse_skills_or_none
 
 # The three proctoring flags HR can see and override at send time. They live as keys
 # inside Interview.security_settings_data (a JSON TEXT blob), not as real columns.
@@ -299,6 +289,10 @@ class JobApprovalRequest(BaseModel):
     employment_type: Optional[str] = None
     description: Optional[str] = None
     requirements: Optional[str] = None
+    # The approval form shows skills carried over from the candidate request,
+    # and until now had nowhere to send them — so editing them there silently
+    # did nothing. Written only when present, so an approval that omits them
+    # leaves the draft's own skills alone.
     required_skills: Optional[List[str]] = None
     preferred_skills: Optional[List[str]] = None
 
@@ -1364,6 +1358,9 @@ def _prepare_active_jobs(db: Session, company_id: Optional[str]) -> List[Dict[st
         "job": job,
         "jd_text": f"{job.description or ''} {job.requirements or ''}".strip(),
         "skills": _parse_skills(job.required_skills),
+        # None preserved deliberately: it is the sentinel marking a job whose
+        # mandatory/preferred split has never been set.
+        "preferred": parse_skills_or_none(job.preferred_skills),
         "experience": job.experience_years or 0,
         "department": job.department.name if job.department else None,
     } for job in jobs]
@@ -1399,6 +1396,9 @@ def _score_against_jobs(resume_text: str, prepared_jobs: List[Dict[str, Any]], l
                 job_description=pj["jd_text"],
                 required_skills=pj["skills"],
                 required_experience=pj["experience"],
+                # .get, not [...]: a caller that builds these dicts without the
+                # key means "no split recorded", which is exactly None.
+                preferred_skills=pj.get("preferred"),
                 prepared=prepared_resume,
             )
         except Exception as e:
