@@ -1,0 +1,44 @@
+# HireFlow pending-action reminders — tells stage owners which candidates are overdue.
+#
+# WHY THIS EXISTS: a stage deadline (HR → Workflow → Stages & owners) only puts a
+# candidate on a pending list. Nobody looks at a list they are not reminded of, so this
+# sweep emails each owner a daily digest and drops an in-app notification.
+# It is idempotent: a candidate's stage visit is reminded once when due soon, then at
+# most once per 24h while overdue (stage_reminder_log), so running it hourly is safe.
+#
+# Same shape as hireflow-regrade.service: a oneshot curl from a timer, straight to the
+# API port.
+#
+# Prerequisites:
+#   WORKFLOW_REMINDER_TOKEN must be set in /opt/hireflow/backend/.env (openssl rand -hex 32).
+#   Without it the endpoint rejects the call with 401 and no reminders go out.
+#   WORKFLOW_REMINDER_EMAIL=0 keeps the in-app notifications but skips the emails.
+#
+# Install:
+#   cp hireflow-reminders.service hireflow-reminders.timer /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now hireflow-reminders.timer
+#   journalctl -u hireflow-reminders.service           # what each sweep sent
+
+[Unit]
+Description=HireFlow pending-action reminders (stage deadlines)
+After=network.target hireflow-api.service
+Wants=hireflow-api.service
+
+[Service]
+Type=oneshot
+User=hireflow
+Group=hireflow
+WorkingDirectory=/opt/hireflow/backend
+EnvironmentFile=/opt/hireflow/backend/.env
+ExecStart=/usr/bin/curl -fsS -m 120 -X POST \
+    -H "X-Workflow-Reminder-Token: ${WORKFLOW_REMINDER_TOKEN}" \
+    http://127.0.0.1:8000/api/v1/hr/workflow/reminders/run
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/hireflow
+
+[Install]
+WantedBy=multi-user.target

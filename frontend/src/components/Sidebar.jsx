@@ -6,7 +6,7 @@ import {
   LayoutDashboard, Users, Building2, BarChart3, Briefcase, KanbanSquare,
   Calendar, Gift, ScanSearch, ClipboardList, MessageSquare,
   Search, FileText, Clock, LogOut, Shield, UserCircle, UserPlus, Crown, Mail,
-  LifeBuoy, BookOpen, SlidersHorizontal, History, Menu, X,
+  LifeBuoy, BookOpen, SlidersHorizontal, History, Menu, X, ListChecks,
 } from 'lucide-react'
 
 const NAV = {
@@ -26,6 +26,7 @@ const NAV = {
   hr: [
     { to: '/hr', icon: LayoutDashboard, label: 'Dashboard' },
     { to: '/hr/pipeline', icon: KanbanSquare, label: 'Pipeline' },
+    { to: '/hr/workflow', icon: ListChecks, label: 'Workflow' },
     { to: '/hr/requirements', icon: UserPlus, label: 'Requirements' },
     { to: '/hr/jobs', icon: Briefcase, label: 'Job Postings' },
     { to: '/hr/exam-drafts', icon: SlidersHorizontal, label: 'Exam Drafts' },

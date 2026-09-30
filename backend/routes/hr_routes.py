@@ -24,6 +24,7 @@ from src.services.resume_pool_import import (
     score_backlog, count_unscored,
 )
 from src.services.job_dedup import find_open_duplicate_job, duplicate_job_detail
+from src.services.candidate_source import SOURCES, from_pool_channel, source_view
 from src.services.staff_directory import (
     active_interviewer_query, active_hr_query, active_user_by_email,
 )
@@ -219,6 +220,10 @@ class ATSCandidateResponse(BaseModel):
     is_stale: bool = False
     stale_reason: Optional[str] = None          # jd_changed | rules_updated | legacy
     scored_at: Optional[datetime] = None
+    # ── Source (src/services/candidate_source.py); NULL = not recorded.
+    source: Optional[str] = None
+    source_label: Optional[str] = None
+    source_detail: Optional[str] = None
 
 class JobCandidatesEnhancedResponse(BaseModel):
     job_id: str
@@ -583,53 +588,10 @@ def update_candidate_stage(db: Session, candidate_id: str, new_stage: str, chang
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
     
-    old_stage = candidate.current_stage
-    candidate.current_stage = new_stage
-    candidate.updated_at = datetime.utcnow()
-    
-    # Create stage history
-    stage_history = CandidateStageHistory(
-        company_id=candidate.company_id,
-        candidate_id=candidate_id,
-        from_stage=old_stage,
-        to_stage=new_stage,
-        changed_by_id=changed_by_id,
-        notes=notes
-    )
-    
-    db.add(stage_history)
-
-    # Notify the candidate of meaningful status changes. Stages that get a
-    # richer dedicated notification elsewhere (interview scheduled, offer sent)
-    # are skipped here to avoid double-notifying. commit=False — flushes with the
-    # caller's commit.
-    _CANDIDATE_STAGE_MESSAGES = {
-        "hr_review": "Your application is now under HR review.",
-        "shortlisted": "Good news — you've been shortlisted!",
-        "test_scheduled": "A test has been assigned to you. Check your Interviews tab.",
-        "test_completed": "Your test has been recorded.",
-        "interview_scheduled": "An interview is being arranged for you.",
-        "hired": "Congratulations — you've been hired! 🎉",
-        "onboarding": "Welcome aboard — onboarding has begun.",
-        "rejected": "There's an update on your application.",
-    }
-    _STAGE_SKIP = {"technical_interview", "interview_scheduled", "offer_sent", "applied", "ats_screening"}
-    if old_stage != new_stage and new_stage not in _STAGE_SKIP and getattr(candidate, "user_id", None):
-        from src.services.notification_service import create_notification
-        msg = _CANDIDATE_STAGE_MESSAGES.get(
-            new_stage, f"Your application status changed to {new_stage.replace('_', ' ').title()}."
-        )
-        create_notification(
-            db,
-            user_id=candidate.user_id,
-            company_id=candidate.company_id,
-            title="Application update",
-            message=msg,
-            type="stage_change",
-            reference_type="application",
-            reference_id=candidate.id,
-            commit=False,
-        )
+    from src.services.stage_change import apply_stage_change
+    # record_unchanged: callers use a same-stage move to log an event (e.g. a
+    # reschedule) in the history, as this always did.
+    apply_stage_change(db, candidate, new_stage, changed_by_id, notes, record_unchanged=True)
 
     return candidate
 
@@ -2795,6 +2757,7 @@ async def move_pool_resume_to_ats(
         # Candidate.experience_years is an Integer while the pool keeps one decimal.
         experience_years=int(round(float(entry.experience_years))) if entry.experience_years is not None else None,
         ats_score=ats_score,
+        **from_pool_channel(entry.source_channel),
     )
     db.add(candidate)
     db.flush()                              # need candidate.id for the child rows
@@ -5652,7 +5615,9 @@ async def get_job_candidates_enhanced(
             latest_ats_subq, Candidate.id == latest_ats_subq.c.cid
         ).join(
             ATSResult, ATSResult.id == latest_ats_subq.c.latest_id
-        ).filter(Candidate.job_id == job_id)
+        ).filter(Candidate.job_id == job_id,
+                 # A merged duplicate is kept for undo, not shown as a second person.
+                 Candidate.merged_into_id.is_(None))
         
         # Apply filters efficiently
         if min_score is not None:
@@ -5789,6 +5754,9 @@ async def get_job_candidates_enhanced(
                     is_stale=stale in ("jd_changed", "rules_updated"),
                     stale_reason=stale,
                     scored_at=ats_result.scored_at,
+                    source=candidate.source,
+                    source_label=SOURCES.get(candidate.source, "Not recorded"),
+                    source_detail=candidate.source_detail,
                 ))
             except Exception as candidate_error:
                 print(f"Error processing candidate {candidate.id}: {candidate_error}")
@@ -6676,6 +6644,10 @@ async def get_candidate_stage_history(
         "email": candidate.email,
         "current_stage": candidate.current_stage,
         "job_title": candidate.job.title if candidate.job else None,
+        "source": source_view(candidate),
+        "merged_into_id": candidate.merged_into_id,
+        "withdrawn_at": candidate.withdrawn_at.isoformat() if candidate.withdrawn_at else None,
+        "withdrawal_reason": candidate.withdrawal_reason,
         "stage_history": [
             {
                 "from_stage": h.from_stage,

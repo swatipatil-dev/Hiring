@@ -117,6 +117,19 @@ def _visible_candidates(db: Session, user: User):
     return q
 
 
+def _visible_feedback_interview_ids(db: Session, user: User, candidate_id: str) -> set:
+    """Ids of this candidate's interviews whose scores the caller may see. A panellist
+    sees no one's scores for an interview until they have submitted their own
+    (src/services/scorecards.py) — these views used to show an interviewer every
+    colleague's scores before they had scored the candidate themselves."""
+    from src.services.scorecards import feedback_visibility
+    interviews = db.query(Interview).filter(
+        Interview.candidate_id == candidate_id,
+        Interview.company_id == user.company_id,
+    ).all()
+    return feedback_visibility(db, user, interviews)
+
+
 def _candidate_or_404(db: Session, candidate_id: str, user: User) -> Candidate:
     c = _visible_candidates(db, user).filter(Candidate.id == candidate_id).first()
     if not c:
@@ -320,8 +333,10 @@ def candidate_360_profile(
     ).all()
     interviews_out = []
     total_mcq_attempted = total_mcq_correct = 0
+    from src.services.scorecards import feedback_visibility
+    visible_fb = feedback_visibility(db, current_user, interviews_db)
     for iv in interviews_db:
-        fb = iv.interview_feedback
+        fb = iv.interview_feedback if iv.id in visible_fb else None
         # Count questions
         q_count = db.query(Question).filter(Question.interview_id == iv.id).count()
 
@@ -347,6 +362,7 @@ def candidate_360_profile(
                 "weaknesses": _safe_json(fb.weaknesses) if fb else [],
                 "recommendations": fb.recommendations if fb else None,
             } if fb else None,
+            "feedback_hidden": iv.id not in visible_fb and iv.interview_feedback is not None,
         })
 
     # ── Assessments ────────────────────────────────────────────────────────
@@ -583,7 +599,8 @@ def compare_candidates(
             db.query(InterviewFeedback)
             .join(Interview, InterviewFeedback.interview_id == Interview.id)
             .filter(Interview.candidate_id == cid,
-                    Interview.company_id == current_user.company_id)
+                    Interview.company_id == current_user.company_id,
+                    Interview.id.in_(_visible_feedback_interview_ids(db, current_user, cid) or [-1]))
             .all()
         )
         iv_count = len(feedbacks)
@@ -716,6 +733,9 @@ def bulk_candidate_action(
         if not c:
             failed.append({"candidate_id": cid, "reason": "not found"})
             continue
+        if new_stage and (c.merged_into_id or c.current_stage in ("withdrawn", "merged")):
+            failed.append({"candidate_id": cid, "reason": f"{c.current_stage}: no longer an active application"})
+            continue
 
         if new_stage:
             old_stage = c.current_stage
@@ -840,6 +860,10 @@ def advanced_search(
     if skills:
         for skill in (s.strip() for s in skills.split(",") if s.strip()):
             query = query.filter(Candidate.extracted_skills.ilike(f"%{skill}%"))
+    if hire_recommendation and current_user.role == "interviewer":
+        # Filtering on a verdict is reading it; interviewers see colleagues' verdicts
+        # only through the per-candidate views, after scoring themselves.
+        raise HTTPException(403, "Filtering by hire recommendation is not available to interviewers")
     if hire_recommendation:
         cids_with_rec = [
             row[0] for row in db.query(Interview.candidate_id)
@@ -1235,7 +1259,9 @@ def auto_reject(
     eligible = db.query(Candidate).filter(
         Candidate.job_id == job_id,
         Candidate.company_id == current_user.company_id,
-        Candidate.current_stage.notin_(["hired", "rejected", "offer"]),
+        # withdrawn / merged are final too: never auto-reject someone who pulled out,
+        # or a duplicate row kept only so its merge can be undone.
+        Candidate.current_stage.notin_(["hired", "rejected", "offer", "withdrawn", "merged"]),
     ).all()
 
     from src.services.ats_scoring_pipeline import needs_review_candidate_ids
@@ -1609,7 +1635,8 @@ def candidate_scorecard(
     feedbacks = (
         db.query(InterviewFeedback)
         .join(Interview, InterviewFeedback.interview_id == Interview.id)
-        .filter(Interview.candidate_id == candidate_id, Interview.company_id == cid)
+        .filter(Interview.candidate_id == candidate_id, Interview.company_id == cid,
+                Interview.id.in_(_visible_feedback_interview_ids(db, current_user, candidate_id) or [-1]))
         .all()
     )
     hire_votes: Dict[str, int] = defaultdict(int)

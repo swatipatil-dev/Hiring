@@ -11,6 +11,7 @@ export const STATUS_BADGES = {
   'offer_sent': 'badge-green',
   'rejected': 'badge-red',         'offer_rejected': 'badge-red',
   'registered': 'badge-neutral',
+  'withdrawn': 'badge-neutral',    'merged': 'badge-neutral',
 }
 
 export const STAGE_LABELS = {
@@ -53,6 +54,10 @@ export function parseApps(data) {
     stage: a.stage || a.status,
     applied: new Date(a.applied_at).toLocaleDateString(),
     atsScore: a.ats_score ? Math.round(a.ats_score) : null,
+    // Plain-language status from the backend (src/services/candidate_status.py).
+    statusLabel: a.status_label || null,
+    statusMessage: a.status_message || null,
+    canWithdraw: !!a.can_withdraw,
   }))
 }
 

@@ -68,6 +68,8 @@ from routes.superadmin_routes import router as superadmin_router
 from routes.public_routes import router as public_router
 from routes.support_routes import router as support_router
 from routes.judge_routes import router as judge_router
+from routes.recruiter_workflow_routes import router as recruiter_workflow_router
+from routes.scorecard_routes import router as scorecard_router
 try:
     from proctoring.routes import router as proctor_router
 except ImportError:
@@ -444,6 +446,8 @@ app.include_router(superadmin_router, tags=["Super Admin"])
 app.include_router(public_router, tags=["Public"])
 app.include_router(support_router, tags=["Support"])
 app.include_router(judge_router, tags=["Coding Judge"])
+app.include_router(recruiter_workflow_router, tags=["Recruiter Workflow"])
+app.include_router(scorecard_router, tags=["Scorecards"])
 
 # Uploaded files.
 #

@@ -1,0 +1,15 @@
+# Schedule for hireflow-reminders.service. See that unit for why the sweep exists.
+
+[Unit]
+Description=Run the HireFlow pending-action reminder sweep hourly
+Requires=hireflow-reminders.service
+
+[Timer]
+# Hourly, so a deadline passing mid-morning is reminded that morning rather than the
+# next day. Each candidate is reminded at most once per 24h regardless.
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

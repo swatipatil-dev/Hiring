@@ -72,6 +72,8 @@ Routes are in the `routes/` package, registered in `main.py` via `include_router
 | `routes/database_management_routes.py` | `/api/v1/db` | Database admin operations |
 | `routes/evaluation_routes.py` | (evaluation) | Evaluation & workflow |
 | `routes/advanced_features_routes.py` | (advanced) | Advanced features |
+| `routes/recruiter_workflow_routes.py` | `/api/v1/hr/workflow` | Stages/owners/deadlines, reminders, duplicates & merge, bulk actions, sources |
+| `routes/scorecard_routes.py` | `/api/v1/scorecards` | Independent panellist scorecards |
 
 Three top-level routers are also registered directly in `main.py`:
 - `generator_router.py` (`/interviews`) — AI question generation using Gemini
@@ -92,6 +94,7 @@ Three top-level routers are also registered directly in `main.py`:
 - Pydantic models for request/response validation (defined alongside route files and in `src/models/`)
 - Database sessions managed via FastAPI `Depends(get_db)` pattern
 - Candidate stage progression is tracked in `candidate_stage_history` table (immutable audit trail)
+- **Recruiter workflows** (full rules in `docs/RECRUITER_WORKFLOWS.md`): move a candidate with `src/services/stage_change.apply_stage_change` so history and the candidate's notice stay in one place. Stage deadlines are computed from history, never stored. Bulk actions are preview-then-confirm (`src/services/bulk_actions.py`). A merged candidate is kept with `merged_into_id` set and hidden from pipeline lists — filter it out of any new list. Panellists see no one's interview scores for an interview until they submit their own (`src/services/scorecards.feedback_visibility`); apply it to any new view that shows feedback to interviewers.
 - Resume files stored in `resumes/` directory
 
 ## Environment

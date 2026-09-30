@@ -13,6 +13,7 @@ import './InterviewerDashboard.css'
 // shared with the HR one so both produce the same duration.
 import { TYPE_LABELS, TYPE_TIME_DEFAULTS, computeDuration, normalizeQuestionType } from '../shared/CreateTestWizard'
 import ProctoringReport from '../../components/ProctoringReport'
+import ScorecardPanel from '../../components/workflow/ScorecardPanel'
 import ExamDrafts from '../../components/ExamDrafts'
 import Header from '../../components/Header'
 
@@ -226,6 +227,7 @@ export default function InterviewerDashboard() {
   const [allJobs, setAllJobs] = useState([])
   const [myMeetings, setMyMeetings] = useState([])
   const [meetingFeedback, setMeetingFeedback] = useState(null) // meeting id
+  const [scorecardFor, setScorecardFor] = useState(null)        // interview id whose scorecards are open
   const [mfForm, setMfForm] = useState({
     technical_score: 0, communication_score: 0, problem_solving_score: 0,
     cultural_fit_score: 0, strengths: '', weaknesses: '', recommendations: '',
@@ -1838,6 +1840,11 @@ export default function InterviewerDashboard() {
                             <button onClick={() => { setMeetingFeedback(m.id); setMfForm({ technical_score: 0, communication_score: 0, problem_solving_score: 0, cultural_fit_score: 0, strengths: '', weaknesses: '', recommendations: '', hire_recommendation: 'proceed' }) }}
                               style={{ padding: '7px 16px', borderRadius: 8, background: 'var(--status-warning)', color: '#fff', fontSize: '0.82rem', fontWeight: 600, border: 'none', cursor: 'pointer' }}>
                               ✍ Complete & Give Feedback
+                            </button>
+                            <button onClick={() => setScorecardFor(m.id)}
+                              title="Your own independent scorecard — colleagues' scores stay hidden until you submit"
+                              style={{ padding: '7px 16px', borderRadius: 8, background: 'var(--bg-tertiary)', color: 'var(--text-primary)', fontSize: '0.82rem', fontWeight: 600, border: '1px solid var(--border-subtle)', cursor: 'pointer' }}>
+                              📝 My Scorecard
                             </button>
                           </div>
 
@@ -4770,6 +4777,8 @@ export default function InterviewerDashboard() {
           </div>
         </div>
       )}
+
+      {scorecardFor && <ScorecardPanel interviewId={scorecardFor} onClose={() => setScorecardFor(null)} />}
 
       <style>{`
         .q-num {

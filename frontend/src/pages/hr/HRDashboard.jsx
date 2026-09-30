@@ -16,6 +16,10 @@ import { RetestModal, AdjustmentModal, AdjustmentRequestsModal } from './TestFai
 import ATSOverridePanel from '../../components/ats/ATSOverridePanel'
 import ATSExplanation from '../../components/ats/ATSExplanation'
 import ScreeningReview from './ScreeningReview'
+import RecruiterWorkflow from './RecruiterWorkflow'
+import BulkActionBar from '../../components/workflow/BulkActionBar'
+import CandidateWorkflowPanel from '../../components/workflow/CandidateWorkflowPanel'
+import ScorecardPanel from '../../components/workflow/ScorecardPanel'
 
 const CHART_COLORS = ['#2b7cba', '#3b82f6', '#22c55e', '#8b5cf6', '#ef4444', '#06b6d4', '#f59e0b', '#ec4899']
 
@@ -94,7 +98,7 @@ const STAGE_ALIASES = {
 // 'registered' are excluded on purpose — a rejection is terminal, and a registered
 // talent-pool entry has not applied to this job — but they are listed explicitly so
 // the exclusion is a decision rather than an accident of the lookup missing.
-const STAGE_EXCLUDED = new Set(['rejected', 'registered'])
+const STAGE_EXCLUDED = new Set(['rejected', 'registered', 'withdrawn', 'merged'])
 
 const normalizeStage = (stage) => {
   const s = stage || 'ats_screening'
@@ -113,7 +117,7 @@ const UNSENT_STAGES = new Set(['applied', 'ats_screening', 'hr_review'])
 const isMailSent = (c) => !UNSENT_STAGES.has(c.current_stage)
 
 // 'resume-match' is kept as an alias for 'talent-pool' so existing bookmarks still work.
-const TAB_MAP = { jobs: 'jobs', pipeline: 'pipeline', interviews: 'interviews', offers: 'offers', ats: 'ats', 'talent-pool': 'resume-match', 'resume-match': 'resume-match', 'test-results': 'test-results', feedback: 'feedback', requirements: 'requirements', notifications: 'notifications', 'exam-drafts': 'exam-drafts' }
+const TAB_MAP = { jobs: 'jobs', pipeline: 'pipeline', interviews: 'interviews', offers: 'offers', ats: 'ats', 'talent-pool': 'resume-match', 'resume-match': 'resume-match', 'test-results': 'test-results', feedback: 'feedback', requirements: 'requirements', notifications: 'notifications', 'exam-drafts': 'exam-drafts', workflow: 'workflow' }
 
 export default function HRDashboard() {
   const location = useLocation()
@@ -166,6 +170,8 @@ export default function HRDashboard() {
   const [jobScope, setJobScope] = useState('mine')
   const [pipelineCandidates, setPipelineCandidates] = useState({})
   const [pipelineStageFilter, setPipelineStageFilter] = useState(null)
+  const [pipeSel, setPipeSel] = useState(() => new Set())   // candidate_ids ticked for a bulk action
+  const [scorecardFor, setScorecardFor] = useState(null)      // interview id whose panel scorecards are open
   const [pipelineSearch, setPipelineSearch] = useState('')
   const [pipelineJobFilter, setPipelineJobFilter] = useState('')
   const [pipelineExpFilter, setPipelineExpFilter] = useState('')
@@ -2226,6 +2232,15 @@ HR Team`,
               )}
             </div>
 
+            {/* Bulk actions: preview, then confirm the exact count (components/workflow). */}
+            {pipeSel.size > 0 && (
+              <BulkActionBar
+                selectedIds={[...pipeSel]}
+                onClear={() => setPipeSel(new Set())}
+                onDone={() => { setPipeSel(new Set()); fetchJobs() }}
+              />
+            )}
+
             {/* Candidate Table */}
             {jobsLoading ? (
               <div className="card" style={{ padding: 60, textAlign: 'center', color: 'var(--text-tertiary)' }}>Loading pipeline data…</div>
@@ -2236,10 +2251,20 @@ HR Team`,
                 <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                   <thead>
                     <tr style={{ background: 'var(--bg-hover)', borderBottom: '1px solid var(--border-subtle)' }}>
+                      <th style={{ ...thSt, width: 36, paddingRight: 0 }}>
+                        <input type="checkbox" aria-label="Select all shown candidates"
+                          checked={filtered.length > 0 && filtered.every(c => pipeSel.has(c.candidate_id))}
+                          onChange={e => setPipeSel(prev => {
+                            const next = new Set(prev)
+                            filtered.forEach(c => c.candidate_id && (e.target.checked ? next.add(c.candidate_id) : next.delete(c.candidate_id)))
+                            return next
+                          })} />
+                      </th>
                       <th style={thSt}>Candidate</th>
                       <th style={thSt}>Role</th>
                       <th style={{ ...thSt, textAlign: 'center' }}>ATS Score</th>
                       <th style={thSt}>Experience</th>
+                      <th style={thSt}>Source</th>
                       <th style={thSt}>Stage</th>
                     </tr>
                   </thead>
@@ -2254,6 +2279,15 @@ HR Team`,
                           onClick={() => c.candidate_id && openStageTracker(c.candidate_id)}
                           onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-hover)'}
                           onMouseLeave={e => e.currentTarget.style.background = ''}>
+                          <td style={{ padding: '13px 0 13px 20px' }} onClick={e => e.stopPropagation()}>
+                            <input type="checkbox" aria-label={`Select ${c.name}`}
+                              checked={pipeSel.has(c.candidate_id)}
+                              onChange={() => setPipeSel(prev => {
+                                const next = new Set(prev)
+                                next.has(c.candidate_id) ? next.delete(c.candidate_id) : next.add(c.candidate_id)
+                                return next
+                              })} />
+                          </td>
                           <td style={{ padding: '13px 20px' }}>
                             <div style={{ display: 'flex', alignItems: 'center', gap: 11 }}>
                               <div style={{
@@ -2285,14 +2319,21 @@ HR Team`,
                           <td style={{ padding: '13px 20px', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
                             {expBucket(c.experience_years) || '—'}
                           </td>
+                          <td style={{ padding: '13px 20px', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
+                            {c.source ? c.source_label : <span style={{ color: 'var(--text-tertiary)' }}>—</span>}
+                            {c.source_detail && <div style={{ fontSize: '0.72rem', color: 'var(--text-tertiary)' }}>{c.source_detail}</div>}
+                          </td>
                           <td style={{ padding: '13px 20px' }}>
-                            {stage && (
+                            {stage ? (
                               <span style={{
                                 padding: '3px 11px', borderRadius: 20, fontSize: '0.73rem', fontWeight: 600,
                                 background: `${stage.color}18`, color: stage.color, whiteSpace: 'nowrap',
                               }}>
                                 {stage.label}
                               </span>
+                            ) : (
+                              // A custom stage from Workflow → Stages & owners has no funnel bucket.
+                              <span className="badge badge-neutral">{(c.current_stage || '').replace(/_/g, ' ')}</span>
                             )}
                           </td>
                         </tr>
@@ -2387,6 +2428,11 @@ HR Team`,
                         👥 Edit Panel
                       </button>
                     )}
+                    <button type="button" onClick={() => setScorecardFor(iv.id)}
+                      title="Each panellist's independent scorecard"
+                      style={{ padding: '6px 14px', borderRadius: 8, background: '#f8fafc', color: '#334155', fontSize: '0.8rem', fontWeight: 600, border: '1px solid #e2e8f0', cursor: 'pointer' }}>
+                      🗂 Panel Scorecards
+                    </button>
                     {/* Give / edit interview feedback — works for online AND offline */}
                     {(() => {
                       const fb = feedbackData.find(f => f.interview_id === iv.id)
@@ -3591,6 +3637,16 @@ HR Team`,
                     <button onClick={() => setTrackerModal(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-tertiary)', fontSize: '1.3rem', lineHeight: 1, padding: '2px 6px' }}>×</button>
                   </div>
                   <StageTimeline currentStage={stageIdx} timestamps={ts} isRejected={isRejected} />
+                  {trackerModal.withdrawn_at && (
+                    <div style={{ marginTop: 14, padding: '8px 12px', borderRadius: 8, background: '#f59e0b18', color: '#b45309', fontSize: '0.82rem' }}>
+                      Withdrawn by the candidate on {new Date(trackerModal.withdrawn_at + 'Z').toLocaleDateString()}
+                      {trackerModal.withdrawal_reason ? ` — “${trackerModal.withdrawal_reason}”` : ''}
+                    </div>
+                  )}
+                  {trackerModal.candidate_id && (
+                    <CandidateWorkflowPanel candidateId={trackerModal.candidate_id} source={trackerModal.source}
+                      onChanged={() => fetchJobs()} />
+                  )}
                   {(trackerModal.stage_history || []).length > 0 && (
                     <div style={{ marginTop: 20 }}>
                       <div style={{ fontSize: '0.75rem', fontWeight: 700, textTransform: 'uppercase', color: 'var(--text-tertiary)', letterSpacing: '0.06em', marginBottom: 10 }}>History</div>
@@ -5913,6 +5969,10 @@ HR Team`,
       })()}
 
       {tab === 'notifications' && <PipelineNotifications />}
+
+      {tab === 'workflow' && <RecruiterWorkflow onOpenCandidate={openStageTracker} />}
+
+      {scorecardFor && <ScorecardPanel interviewId={scorecardFor} onClose={() => setScorecardFor(null)} />}
     </>
   )
 }

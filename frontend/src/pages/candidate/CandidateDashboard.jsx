@@ -12,6 +12,7 @@ import useApiError from './hooks/useApiError'
 import OverviewTab from './tabs/OverviewTab'
 import JobsTab from './tabs/JobsTab'
 import ApplicationsTab from './tabs/ApplicationsTab'
+import SourceFields, { initialSource, sourcePayload } from './SourceFields'
 import InterviewsTab from './tabs/InterviewsTab'
 import TrackerTab from './tabs/TrackerTab'
 import CoursesTab from './tabs/CoursesTab'
@@ -107,6 +108,7 @@ export default function CandidateDashboard() {
   const [applyError, setApplyError] = useState('')
   const [applyLoading, setApplyLoading] = useState(false)
   const [coverNote, setCoverNote] = useState('')
+  const [applySource, setApplySource] = useState(() => initialSource())
   const [coverGenLoading, setCoverGenLoading] = useState(false)
 
   // Notifications
@@ -155,6 +157,7 @@ export default function CandidateDashboard() {
     }
     const fd = new FormData()
     fd.append('photo', photo)
+    Object.entries(sourcePayload(applySource)).forEach(([k, v]) => fd.append(k, v))
     setQuickApplyLoading(true)
     try {
       await api.post(`/candidate/jobs/${quickApplyModal.id}/quick-apply`, fd, {
@@ -208,6 +211,7 @@ export default function CandidateDashboard() {
       github_url: form.github_url?.value?.trim() || null,
       portfolio_url: null,
       additional_info: coverNote.trim() || null,
+      ...sourcePayload(applySource),
     }
 
     const formData = new FormData()
@@ -356,6 +360,7 @@ export default function CandidateDashboard() {
         <ApplicationsTab
           apps={apps}
           reportApiError={reportApiError}
+          onChanged={() => { refreshApps(); api.get('/candidate/interviews').then(r => setMyInterviews(r.data || [])).catch(() => {}) }}
           onOpenDetails={({ modal, details, loading }) => {
             setViewAppModal(modal)
             setViewAppDetails(details)
@@ -830,6 +835,7 @@ export default function CandidateDashboard() {
                   onChange={e => setCoverNote(e.target.value)}
                 />
               </div>
+              <SourceFields value={applySource} onChange={setApplySource} />
               {applyError && (
                 <div style={{ color: '#ef4444', fontSize: '0.85rem', fontWeight: 500, padding: '8px 12px', background: '#fef2f2', borderRadius: 6 }}>
                   {applyError}
@@ -989,6 +995,10 @@ export default function CandidateDashboard() {
                       </button>
                     </div>
                   )}
+                </div>
+
+                <div style={{ marginTop: 14 }}>
+                  <SourceFields value={applySource} onChange={setApplySource} />
                 </div>
 
                 {quickApplyError && (

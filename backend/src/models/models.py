@@ -421,6 +421,18 @@ class Candidate(Base, TenantScoped):
     portfolio_url    = Column(String(500))
     additional_info  = Column(Text)
     photo_path       = Column(String(500), nullable=True)
+    # ── Where the application came from (src/services/candidate_source.py).
+    # source is one of SOURCES; NULL = recorded before sources were tracked.
+    source           = Column(String(30), nullable=True, index=True)
+    source_detail    = Column(String(255), nullable=True)   # portal / agency / campaign name
+    referrer_name    = Column(String(255), nullable=True)
+    referrer_email   = Column(String(255), nullable=True)
+    # ── Controlled merge (src/services/candidate_duplicates.py). A merged row is kept,
+    # never deleted, so the merge can be undone; it is hidden from pipeline lists.
+    merged_into_id   = Column(String(36), ForeignKey("candidates.id"), nullable=True, index=True)
+    # ── Candidate-initiated withdrawal.
+    withdrawn_at     = Column(DateTime, nullable=True)
+    withdrawal_reason = Column(Text, nullable=True)
     created_at       = Column(DateTime, default=datetime.utcnow)
     updated_at       = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -822,6 +834,44 @@ class InterviewFeedback(Base, TenantScoped):
 
     interview   = relationship("Interview", back_populates="interview_feedback")
     interviewer = relationship("InterviewerProfile")
+
+
+class InterviewScorecard(Base, TenantScoped):
+    """One panellist's own scorecard for one interview (src/services/scorecards.py).
+
+    Kept apart from InterviewFeedback, which is the single consolidated result per
+    interview that the rest of the app reads. A scorecard is private to its author
+    while it is a draft, locked once submitted, and other panellists' submitted
+    scorecards stay hidden from a panellist until they have submitted their own.
+    """
+    __tablename__ = "interview_scorecards"
+    __table_args__ = (
+        UniqueConstraint("interview_id", "panelist_user_id", name="uq_scorecard_interview_panelist"),
+    )
+
+    id                    = Column(String(36), primary_key=True, default=_uuid)
+    company_id            = Column(String(36), ForeignKey("companies.id"), nullable=True, index=True)
+    interview_id          = Column(Integer, ForeignKey("interviews.id"), nullable=False, index=True)
+    panelist_user_id      = Column(String(36), ForeignKey("users.id"), nullable=False, index=True)
+    panelist_email        = Column(String(255), nullable=True)
+    panelist_name         = Column(String(255), nullable=True)
+    technical_score       = Column(DECIMAL(5, 2))
+    communication_score   = Column(DECIMAL(5, 2))
+    problem_solving_score = Column(DECIMAL(5, 2))
+    cultural_fit_score    = Column(DECIMAL(5, 2))
+    overall_score         = Column(DECIMAL(5, 2))
+    strengths             = Column(Text)     # JSON list
+    weaknesses            = Column(Text)     # JSON list
+    recommendations       = Column(Text)
+    hire_recommendation   = Column(String(50))
+    notes                 = Column(Text)
+    status                = Column(String(20), nullable=False, default="draft")  # draft | submitted
+    submitted_at          = Column(DateTime, nullable=True)
+    created_at            = Column(DateTime, default=datetime.utcnow)
+    updated_at            = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    interview = relationship("Interview")
+    panelist  = relationship("User")
 
 
 class Offer(Base, TenantScoped):
@@ -1452,6 +1502,94 @@ class ProctoringTranscript(Base, TenantScoped):
     flagged_keywords = Column(JSON, nullable=True)
 
     session = relationship("ProctoringSession", back_populates="transcripts")
+
+
+# ═══════════════════════════════════════════════════════
+# RECRUITER WORKFLOW — stages, reminders, bulk actions, merges
+# ═══════════════════════════════════════════════════════
+
+class PipelineStageConfig(Base, TenantScoped):
+    """A company's hiring stages: label, order, owner and deadline
+    (src/services/pipeline_stages.py). No rows = the built-in defaults.
+
+    ``sla_days`` NULL means the stage has no deadline, so it never raises a pending
+    action. ``owner_user_id`` NULL means "the job's owning HR".
+    """
+    __tablename__ = "pipeline_stage_configs"
+    __table_args__ = (UniqueConstraint("company_id", "stage_key", name="uq_stage_config_company_key"),)
+
+    id            = Column(String(36), primary_key=True, default=_uuid)
+    company_id    = Column(String(36), ForeignKey("companies.id"), nullable=True, index=True)
+    stage_key     = Column(String(50), nullable=False)
+    label         = Column(String(100), nullable=False)
+    position      = Column(Integer, nullable=False, default=0)
+    owner_user_id = Column(String(36), ForeignKey("users.id"), nullable=True)
+    sla_days      = Column(Integer, nullable=True)
+    is_active     = Column(Boolean, nullable=False, default=True)
+    created_at    = Column(DateTime, default=datetime.utcnow)
+    updated_at    = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    owner = relationship("User")
+
+
+class StageReminderLog(Base, TenantScoped):
+    """One row per pending-action reminder sent, so the sweep never nags twice for the
+    same candidate stage within a day. ``stage_entered_at`` ties the row to one visit
+    to the stage: a candidate who leaves and comes back is a fresh deadline."""
+    __tablename__ = "stage_reminder_log"
+
+    id                = Column(String(36), primary_key=True, default=_uuid)
+    company_id        = Column(String(36), ForeignKey("companies.id"), nullable=True, index=True)
+    candidate_id      = Column(String(36), ForeignKey("candidates.id"), nullable=False, index=True)
+    stage_key         = Column(String(50), nullable=False)
+    stage_entered_at  = Column(DateTime, nullable=True)
+    recipient_user_id = Column(String(36), ForeignKey("users.id"), nullable=False, index=True)
+    due_at            = Column(DateTime, nullable=True)
+    status            = Column(String(20), nullable=False)   # overdue | due_soon
+    sent_at           = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class BulkOperation(Base, TenantScoped):
+    """A bulk candidate action: previewed first, executed only on confirmation
+    (src/services/bulk_actions.py). The row is the audit record of the batch —
+    who asked, what was shown to them, and what happened to each candidate."""
+    __tablename__ = "bulk_operations"
+
+    id             = Column(String(36), primary_key=True, default=_uuid)
+    company_id     = Column(String(36), ForeignKey("companies.id"), nullable=True, index=True)
+    action         = Column(String(30), nullable=False)
+    params         = Column(Text, nullable=True)          # JSON
+    candidate_ids  = Column(Text, nullable=False)          # JSON list as requested
+    preview        = Column(Text, nullable=True)           # JSON {eligible, skipped, warnings}
+    result         = Column(Text, nullable=True)           # JSON per-candidate outcome
+    status         = Column(String(20), nullable=False, default="previewed")  # previewed | executed | cancelled
+    eligible_count = Column(Integer, nullable=False, default=0)
+    affected_count = Column(Integer, nullable=True)
+    created_by_id  = Column(String(36), ForeignKey("users.id"), nullable=True)
+    executed_by_id = Column(String(36), ForeignKey("users.id"), nullable=True)
+    created_at     = Column(DateTime, default=datetime.utcnow, index=True)
+    expires_at     = Column(DateTime, nullable=True)
+    executed_at    = Column(DateTime, nullable=True)
+
+
+class CandidateMerge(Base, TenantScoped):
+    """Audit record of merging one application into another (and of undoing it).
+    The before-snapshots are what make the merge reversible."""
+    __tablename__ = "candidate_merges"
+
+    id                   = Column(String(36), primary_key=True, default=_uuid)
+    company_id           = Column(String(36), ForeignKey("companies.id"), nullable=True, index=True)
+    primary_candidate_id = Column(String(36), ForeignKey("candidates.id"), nullable=False, index=True)
+    merged_candidate_id  = Column(String(36), ForeignKey("candidates.id"), nullable=False, index=True)
+    merged_by_id         = Column(String(36), ForeignKey("users.id"), nullable=True)
+    reason               = Column(Text, nullable=True)
+    field_choices        = Column(Text, nullable=True)   # JSON {field: "primary"|"merged"}
+    primary_before       = Column(Text, nullable=True)   # JSON snapshot
+    merged_before        = Column(Text, nullable=True)   # JSON snapshot
+    moved                = Column(Text, nullable=True)   # JSON {interviews: [...], notes: [...]}
+    created_at           = Column(DateTime, default=datetime.utcnow)
+    undone_at            = Column(DateTime, nullable=True)
+    undone_by_id         = Column(String(36), ForeignKey("users.id"), nullable=True)
 
 
 # ═══════════════════════════════════════════════════════

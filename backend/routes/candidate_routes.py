@@ -41,6 +41,8 @@ from src.utils import (
     create_error_response, create_success_response
 )
 from src.services.job_dedup import duplicate_as_conflict
+from src.services.candidate_status import candidate_status, withdraw_application
+from src.services.candidate_source import CANDIDATE_SELECTABLE, normalize_source
 from src.services.ats_scoring_pipeline import (
     build_inputs_for_candidate, score_for_job, persist_ats_result, ATS_REVIEW_THRESHOLD,
 )
@@ -83,6 +85,12 @@ class CandidateApplication(BaseModel):
     portfolio_url: Optional[str] = None
     additional_info: Optional[str] = None
     cover_letter: Optional[str] = None
+    # How they heard about the job (src/services/candidate_source.py). Optional;
+    # a career-page link can carry it, e.g. ?source=job_portal&source_detail=LinkedIn.
+    source: Optional[str] = None
+    source_detail: Optional[str] = None
+    referrer_name: Optional[str] = None
+    referrer_email: Optional[str] = None
 
 class CareerPageResponse(BaseModel):
     jobs: List[JobPostingResponse]
@@ -112,6 +120,10 @@ class ApplicationResponse(BaseModel):
     ats_score: Optional[float]
     applied_at: datetime
     status: str
+    status_label: Optional[str] = None
+    status_message: Optional[str] = None
+    can_withdraw: bool = False
+    withdrawn_at: Optional[str] = None
 
 # ==================== HELPER FUNCTIONS ====================
 
@@ -334,6 +346,10 @@ async def apply_for_job_enhanced(
     email: Optional[str] = Form(None),
     phone: Optional[str] = Form(None),
     years_experience: Optional[str] = Form(None),
+    source: Optional[str] = Form(None),
+    source_detail: Optional[str] = Form(None),
+    referrer_name: Optional[str] = Form(None),
+    referrer_email: Optional[str] = Form(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -381,6 +397,14 @@ async def apply_for_job_enhanced(
             )
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid application data: {str(e)}")
+
+    source_fields = normalize_source(
+        application_data.source or source,
+        application_data.source_detail or source_detail,
+        application_data.referrer_name or referrer_name,
+        application_data.referrer_email or referrer_email,
+        allowed=CANDIDATE_SELECTABLE,
+    )
     
     # Check if already applied
     existing_application = db.query(Candidate).filter(
@@ -488,7 +512,8 @@ async def apply_for_job_enhanced(
         github_url=application_data.github_url,
         portfolio_url=application_data.portfolio_url,
         additional_info=application_data.additional_info,
-        photo_path=photo_path
+        photo_path=photo_path,
+        **source_fields,
     )
     
     db.add(candidate)
@@ -595,10 +620,16 @@ async def apply_for_job_enhanced(
 async def quick_apply_for_job(
     job_id: str,
     photo: UploadFile = File(..., description="Candidate photo for identity verification"),
+    source: Optional[str] = Form(None),
+    source_detail: Optional[str] = Form(None),
+    referrer_name: Optional[str] = Form(None),
+    referrer_email: Optional[str] = Form(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(AuthMiddleware.get_current_candidate)
 ):
     """Submit a job application using the candidate's saved profile data. Only a photo is required."""
+    source_fields = normalize_source(source, source_detail, referrer_name, referrer_email,
+                                     allowed=CANDIDATE_SELECTABLE)
 
     # Company clause required for the same reason as /apply above.
     job = db.query(JobPosting).filter(
@@ -693,7 +724,8 @@ async def quick_apply_for_job(
         linkedin_url=linkedin_url,
         github_url=github_url,
         portfolio_url=portfolio_url,
-        photo_path=photo_path
+        photo_path=photo_path,
+        **source_fields,
     )
 
     db.add(candidate)
@@ -823,7 +855,8 @@ async def get_my_applications(
             stage=stage,
             ats_score=float(candidate.ats_score) if candidate.ats_score else None,
             applied_at=candidate.created_at,
-            status=stage
+            status=stage,
+            **candidate_status(candidate),
         ))
 
     return applications
@@ -897,6 +930,7 @@ async def get_application_details(
             "missing_skills": ats_result.missing_skills if ats_result else []
         },
         "current_stage": candidate.current_stage or 'ats_screening',
+        **candidate_status(candidate),
         "stage_history": [
             {
                 "from_stage": stage.from_stage,
@@ -908,6 +942,40 @@ async def get_application_details(
         "applied_at": candidate.created_at,
         "updated_at": candidate.updated_at
     }
+
+class WithdrawRequest(BaseModel):
+    reason: Optional[str] = Field(None, max_length=2000)
+    confirm: bool = False
+
+
+@router.post("/applications/{application_id}/withdraw")
+async def withdraw_my_application(
+    application_id: str,
+    body: WithdrawRequest,
+    current_user: User = Depends(AuthMiddleware.get_current_candidate),
+    db: Session = Depends(get_db),
+):
+    """Withdraw an application. Irreversible from the candidate's side, hence ``confirm``.
+
+    Ownership is checked exactly as for GET /applications/{id}. Upcoming interviews
+    are cancelled, an outstanding offer is withdrawn, and the job's HRs are notified.
+    """
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="Set confirm=true to withdraw this application.")
+    candidate = db.query(Candidate).filter(
+        Candidate.id == application_id,
+        Candidate.email == current_user.email,
+        Candidate.company_id == current_user.company_id,
+        Candidate.job_id.isnot(None),
+        or_(Candidate.user_id.is_(None), Candidate.user_id == current_user.id),
+    ).first()
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Application not found")
+    result = withdraw_application(db, candidate, current_user, body.reason)
+    db.commit()
+    return {"application_id": candidate.id, "current_stage": candidate.current_stage,
+            **candidate_status(candidate), **result}
+
 
 @router.get("/offers")
 async def get_my_offers(
