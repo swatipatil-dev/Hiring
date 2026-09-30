@@ -1686,8 +1686,8 @@ async def generate_interview_questions(
     
     # Get interview details
     interview = _company_scope(
-            db.query(Interview).filter(Interview.id == interview_id), Interview, current_user
-        ).first()
+        db.query(Interview).filter(Interview.id == interview_id), Interview, current_user
+    ).first()
     if not interview:
         raise HTTPException(status_code=404, detail="Interview not found")
     

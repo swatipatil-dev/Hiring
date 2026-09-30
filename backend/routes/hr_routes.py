@@ -1201,7 +1201,7 @@ def _entry_to_result(entry: ResumePoolEntry,
 
     return ResumeMatchResult(
         parse_status=getattr(entry, "parse_status", None),
-id=entry.id,
+        id=entry.id,
         filename=entry.filename or "resume",
         full_name=entry.full_name,
         email=entry.email,
@@ -3083,7 +3083,8 @@ async def transfer_jobs_bulk(
     """
     to_hr = _assignable_hr_or_error(db, body.to_hr_id, current_user)
 
-    if body.from_hr_id and current_user.role != "admin"             and str(body.from_hr_id) != str(get_hr_profile(db, current_user).id):
+    if (body.from_hr_id and current_user.role != "admin"
+            and str(body.from_hr_id) != str(get_hr_profile(db, current_user).id)):
         raise HTTPException(status_code=403, detail="Only an admin can transfer another HR's jobs.")
     if body.from_hr_id:
         from_hr = db.query(HRProfile).join(User, HRProfile.user_id == User.id).filter(

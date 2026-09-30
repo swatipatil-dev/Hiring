@@ -303,8 +303,8 @@ def _visible_users_query(db: Session, company_id: Optional[str]):
     """
     query = (
         db.query(User)
-          .execution_options(_tenant_bypass=True)
-          .filter(User.role != "superadmin")
+        .execution_options(_tenant_bypass=True)
+        .filter(User.role != "superadmin")
     )
     if not company_id:
         # Never unscoped for a tenant user; only a company-less caller lands here.
