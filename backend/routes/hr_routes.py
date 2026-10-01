@@ -5657,7 +5657,10 @@ async def get_job_candidates_enhanced(
                 query = query.order_by(desc(Candidate.last_name), desc(Candidate.first_name))
             else:
                 query = query.order_by(Candidate.last_name, Candidate.first_name)
-        
+        # Tiebreak on id: rows with equal scores (or names) otherwise come back in no
+        # fixed order, so paging through them could skip one candidate and repeat another.
+        query = query.order_by(Candidate.id)
+
         # Apply pagination
         offset = (page - 1) * per_page
         candidates = query.offset(offset).limit(per_page).all()

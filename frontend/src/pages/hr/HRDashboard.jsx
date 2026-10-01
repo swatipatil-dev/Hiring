@@ -413,8 +413,8 @@ HR Team`,
     if (!jobId) return
     setPickerLoading(true)
     try {
-      const r = await api.get(`/hr/jobs/${jobId}/candidates?per_page=100`)
-      setPickerCandidates(r.data?.candidates || [])
+      const { candidates } = await fetchAllJobCandidates(jobId)
+      setPickerCandidates(candidates)
     } catch { setPickerCandidates([]) }
     setPickerLoading(false)
   }
@@ -1194,6 +1194,31 @@ HR Team`,
     setSubmitting(false)
   }
 
+  // Every applicant for a job, not just the first page. The endpoint caps a page at 100,
+  // and the ATS sheet used to stop there: applicants ranked below 100 never showed, while
+  // a Top-N / Top-% send still auto-rejected them server-side (reject_others covers the
+  // whole job), and "top 10%" was a tenth of 100 rather than of everyone.
+  const fetchAllJobCandidates = async (jobId, params = {}) => {
+    const perPage = 100
+    let candidates = []
+    let meta = null
+    for (let page = 1; page <= 200; page++) {
+      const res = await api.get(`/hr/jobs/${jobId}/candidates`, { params: { ...params, page, per_page: perPage } })
+      const data = res.data || {}
+      const rows = data.candidates || []
+      candidates = candidates.concat(rows)
+      meta = meta
+        ? {
+            ...meta,
+            rules_versions_present: [...new Set([...(meta.rules_versions_present || []), ...(data.rules_versions_present || [])])],
+            needs_review_count: (meta.needs_review_count || 0) + (data.needs_review_count || 0),
+          }
+        : data
+      if (rows.length < perPage || candidates.length >= (data.total_candidates || 0)) break
+    }
+    return { candidates, meta: meta ? { ...meta, candidates } : null }
+  }
+
   const openAtsSheet = async (job) => {
     setAtsJob(job)
     setAtsLoading(true)
@@ -1204,9 +1229,9 @@ HR Team`,
     setSelectMode(false)
     setSelInterviewer('')
     try {
-      const res = await api.get(`/hr/jobs/${job.id}/candidates?sort_by=ats_score&order=desc&per_page=100`)
-      setAtsCandidates(res.data?.candidates || [])
-      setAtsMeta(res.data || null)
+      const { candidates, meta } = await fetchAllJobCandidates(job.id, { sort_by: 'ats_score', order: 'desc' })
+      setAtsCandidates(candidates)
+      setAtsMeta(meta)
     } catch (err) {
       setAtsCandidates([])
       setAtsMeta(null)
@@ -1220,9 +1245,9 @@ HR Team`,
   const reloadAtsCandidates = async () => {
     if (!atsJob) return
     try {
-      const res = await api.get(`/hr/jobs/${atsJob.id}/candidates?sort_by=ats_score&order=desc&per_page=100`)
-      setAtsCandidates(res.data?.candidates || [])
-      setAtsMeta(res.data || null)
+      const { candidates, meta } = await fetchAllJobCandidates(atsJob.id, { sort_by: 'ats_score', order: 'desc' })
+      setAtsCandidates(candidates)
+      setAtsMeta(meta)
     } catch { /* keep what is shown */ }
   }
 

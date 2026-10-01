@@ -245,3 +245,21 @@ def test_editing_the_jd_makes_scores_stale_but_a_title_edit_does_not(client, hr_
     assert r.status_code == 200 and r.json()["rescored"] == 1
     row = _list(client, hr_headers, job)["candidates"][0]
     assert not row["is_stale"] and row["jd_version_no"] == 2
+
+
+# ── paging ───────────────────────────────────────────────────────────────────
+
+def test_paging_through_equal_scores_returns_everyone_exactly_once(client, hr_headers, db, job):
+    """The ATS sheet pages through a job's applicants 100 at a time. Ordered by score
+    alone, equal scores came back in no fixed order, so a page boundary could skip one
+    applicant and repeat another."""
+    ids = {_scored(db, job, f"same{i}", GOOD_RESUME).id for i in range(5)}
+    seen = []
+    for page in (1, 2, 3):
+        r = client.get(f"/api/v1/hr/jobs/{job.id}/candidates", headers=hr_headers,
+                       params={"sort_by": "ats_score", "order": "desc", "page": page, "per_page": 2})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["total_candidates"] == 5
+        seen += [c["candidate_id"] for c in body["candidates"]]
+    assert sorted(seen) == sorted(ids)
