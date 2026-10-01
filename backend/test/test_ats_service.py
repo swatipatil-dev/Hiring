@@ -42,8 +42,12 @@ def _make_fake_sentence_transformers():
     return st
 
 
-# Ensure fake sentence_transformers is available before importing the service
-if "sentence_transformers" not in sys.modules:
+# Fake sentence_transformers only where it is not installed. Installing it whenever it
+# was merely not imported YET replaced the real package for the whole session, so every
+# later test that scored a resume got a constant 0.85 similarity.
+try:
+    import sentence_transformers  # noqa: F401
+except ImportError:
     sys.modules["sentence_transformers"] = _make_fake_sentence_transformers()
 
 # Also ensure rapidfuzz is faked if missing

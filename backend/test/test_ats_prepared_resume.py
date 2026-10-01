@@ -217,43 +217,56 @@ def test_prepare_resume_handles_empty_text(svc):
 
 
 # ── Embedding cache is LRU, not FIFO ──────────────────────────────────────────
+# These test the eviction policy, not the model, so they use a fake encoder: no
+# download, no torch, and they cannot skip. (They used to guard on
+# SENTENCE_TRANSFORMERS_AVAILABLE, which is False until the model is lazily loaded,
+# so they skipped whenever no earlier test had happened to load it.)
 
-def test_embedding_cache_evicts_least_recently_used(monkeypatch):
+class _FakeEncoder:
+    def __init__(self):
+        self.encoded = []
+
+    def encode(self, text, convert_to_tensor=False, **kwargs):
+        self.encoded.append(text)
+        return f"emb:{text}"
+
+
+@pytest.fixture
+def fake_encoder(monkeypatch):
+    import src.services.enhanced_ats_service as svc_mod
+
+    encoder = _FakeEncoder()
+    monkeypatch.setattr(svc_mod, "_get_semantic_model", lambda: encoder)
+    svc_mod._EMBEDDING_CACHE.clear()
+    yield encoder
+    svc_mod._EMBEDDING_CACHE.clear()
+
+
+def test_embedding_cache_evicts_least_recently_used(monkeypatch, fake_encoder):
     """The bug this replaces: FIFO eviction dropped the job-description embeddings a
     batch re-reads, because a burst of resume-section inserts aged them out."""
     import src.services.enhanced_ats_service as svc_mod
 
-    if not svc_mod.SENTENCE_TRANSFORMERS_AVAILABLE:
-        pytest.skip("sentence-transformers unavailable; embedding cache is inert")
-
     monkeypatch.setattr(svc_mod, "_EMBEDDING_CACHE_MAXSIZE", 4)
-    svc_mod._EMBEDDING_CACHE.clear()
-    try:
-        _get_text_embedding("hot")                       # the entry we keep re-reading
-        for i in range(3):
-            _get_text_embedding(f"filler-{i}")
-            _get_text_embedding("hot")                   # touch it, keeping it fresh
-        _get_text_embedding("overflow")                  # forces an eviction
+    _get_text_embedding("hot")                       # the entry we keep re-reading
+    for i in range(3):
+        _get_text_embedding(f"filler-{i}")
+        _get_text_embedding("hot")                   # touch it, keeping it fresh
+    _get_text_embedding("overflow")                  # forces an eviction
 
-        import hashlib
-        hot = hashlib.sha256("hot".encode()).hexdigest()
-        assert hot in svc_mod._EMBEDDING_CACHE, "recently-used entry was evicted (FIFO?)"
-        assert len(svc_mod._EMBEDDING_CACHE) <= 4
-    finally:
-        svc_mod._EMBEDDING_CACHE.clear()
+    import hashlib
+    hot = hashlib.sha256("hot".encode()).hexdigest()
+    assert hot in svc_mod._EMBEDDING_CACHE, "recently-used entry was evicted (FIFO?)"
+    assert len(svc_mod._EMBEDDING_CACHE) <= 4
+    assert fake_encoder.encoded.count("hot") == 1, "hot entry was re-encoded"
+    # filler-0 was the least recently used when "overflow" arrived.
+    assert hashlib.sha256(b"filler-0").hexdigest() not in svc_mod._EMBEDDING_CACHE
 
 
-def test_embedding_cache_respects_maxsize(monkeypatch):
+def test_embedding_cache_respects_maxsize(monkeypatch, fake_encoder):
     import src.services.enhanced_ats_service as svc_mod
 
-    if not svc_mod.SENTENCE_TRANSFORMERS_AVAILABLE:
-        pytest.skip("sentence-transformers unavailable; embedding cache is inert")
-
     monkeypatch.setattr(svc_mod, "_EMBEDDING_CACHE_MAXSIZE", 3)
-    svc_mod._EMBEDDING_CACHE.clear()
-    try:
-        for i in range(10):
-            _get_text_embedding(f"text-{i}")
-        assert len(svc_mod._EMBEDDING_CACHE) <= 3
-    finally:
-        svc_mod._EMBEDDING_CACHE.clear()
+    for i in range(10):
+        _get_text_embedding(f"text-{i}")
+    assert len(svc_mod._EMBEDDING_CACHE) == 3

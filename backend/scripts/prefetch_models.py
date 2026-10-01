@@ -5,11 +5,11 @@ BEFORE starting the services.
 
 Why this exists
 ---------------
-`src/services/enhanced_ats_service.py` builds a SentenceTransformer at *import*
-time. On a fresh server that triggers a HuggingFace download on the very first
-request, as whichever user owns the service process, into whatever $HOME
-resolves to. That is slow, happens on the request path, and silently leaves the
-cache somewhere different from where the service will look for it next time.
+`src/services/enhanced_ats_service.py` builds a SentenceTransformer when each API
+worker starts. On a fresh server that triggers a HuggingFace download at startup,
+as whichever user owns the service process, into whatever $HOME resolves to.
+That is slow, repeats in every worker, and silently leaves the cache somewhere
+different from where the service will look for it next time.
 
 Running this as part of deployment makes the download explicit, puts it in a
 known place (HF_HOME), and surfaces a failure at deploy time rather than when the

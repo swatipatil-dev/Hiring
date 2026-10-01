@@ -175,6 +175,7 @@ jobs:
       DB_PASSWORD: "1234"
       SECRET_KEY: ${{ secrets.SECRET_KEY || 'ci-test-secret-key-32chars-minimum!!' }}
       DATABASE_URL: mysql+pymysql://root:1234@localhost:3306/recruitment_test_db
+      HF_HOME: /tmp/hf-cache
 
     steps:
       - uses: actions/checkout@v4
@@ -188,6 +189,17 @@ jobs:
           cache-dependency-path: backend/requirements-ci.txt
 
       - run: pip install -r requirements-ci.txt
+
+      # Every resume score uses all-MiniLM-L6-v2, so the ATS tests here load it too.
+      # Fetched up front (same cache key as stage 2) rather than downloaded mid-test.
+      - name: Cache HuggingFace models
+        uses: actions/cache@v4
+        with:
+          path: /tmp/hf-cache
+          key: hf-models-${{ hashFiles('backend/scripts/prefetch_models.py') }}
+
+      - name: Fetch models
+        run: python scripts/prefetch_models.py
 
       # The judge integration tests run real code inside hardened Docker
       # containers. ubuntu-latest HAS a Docker daemon, so docker_available() is

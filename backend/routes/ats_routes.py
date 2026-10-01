@@ -181,11 +181,12 @@ async def get_ats_diagnostics():
     """Live diagnostic: which NLP models are loaded and which code paths are active."""
     try:
         from src.services.enhanced_ats_service import (
-            SENTENCE_TRANSFORMERS_AVAILABLE,
+            semantic_model_available,
             RAPIDFUZZ_AVAILABLE,
             _get_nlp,
         )
         nlp = _get_nlp()
+        SENTENCE_TRANSFORMERS_AVAILABLE = semantic_model_available()
 
         st_version = None
         if SENTENCE_TRANSFORMERS_AVAILABLE:

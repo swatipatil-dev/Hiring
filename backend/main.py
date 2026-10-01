@@ -109,10 +109,11 @@ async def lifespan(app: FastAPI):
     # NLP model availability check
     try:
         from src.services.enhanced_ats_service import (
-            SENTENCE_TRANSFORMERS_AVAILABLE,
+            semantic_model_available,
             RAPIDFUZZ_AVAILABLE,
         )
-        if SENTENCE_TRANSFORMERS_AVAILABLE:
+        # Loads the model here, per worker, rather than on the first resume scored.
+        if semantic_model_available():
             logger.info("NLP: sentence-transformers loaded (semantic scoring: all-MiniLM-L6-v2)")
         else:
             logger.warning("NLP: sentence-transformers NOT available — semantic scoring uses TF-IDF fallback")

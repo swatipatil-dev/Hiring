@@ -60,6 +60,35 @@ class TestComputeSemanticScore:
             f"Related score ({related}) should exceed unrelated ({unrelated})"
         )
 
+    def test_uses_the_model_without_anything_loading_it_first(self, monkeypatch):
+        """Regression: scoring checked SENTENCE_TRANSFORMERS_AVAILABLE, which only
+        loading the model sets, and nothing else loaded it — so every score in
+        production silently used the TF-IDF fallback."""
+        import src.services.enhanced_ats_service as svc_mod
+
+        class Encoder:
+            def encode(self, text, convert_to_tensor=False, **kwargs):
+                return text
+
+        class Util:
+            @staticmethod
+            def cos_sim(a, b):
+                return 0.42
+
+        monkeypatch.setattr(svc_mod, "SENTENCE_TRANSFORMERS_AVAILABLE", False)
+        monkeypatch.setattr(svc_mod, "_get_semantic_model", lambda: Encoder())
+        monkeypatch.setattr(svc_mod, "st_util", Util())
+        monkeypatch.setattr(svc_mod, "_EMBEDDING_CACHE", svc_mod.OrderedDict())
+
+        assert compute_semantic_score("Python developer", "Python engineer") == 42.0
+        assert svc_mod.current_model_versions()["semantic"] == "all-MiniLM-L6-v2"
+
+    def test_records_tfidf_when_the_model_cannot_load(self, monkeypatch):
+        import src.services.enhanced_ats_service as svc_mod
+
+        monkeypatch.setattr(svc_mod, "_get_semantic_model", lambda: None)
+        assert svc_mod.current_model_versions()["semantic"] == "tfidf"
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # compute_weighted_semantic_score

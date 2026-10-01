@@ -268,7 +268,7 @@ class TestScoringFactorRanges:
 class TestFallbackBehavior:
 
     def test_semantic_score_tfidf_fallback(self):
-        with patch("src.services.enhanced_ats_service.SENTENCE_TRANSFORMERS_AVAILABLE", False):
+        with patch("src.services.enhanced_ats_service._get_semantic_model", return_value=None):
             from src.services.enhanced_ats_service import compute_semantic_score
             score = compute_semantic_score(
                 "Python developer with 5 years experience",
@@ -283,7 +283,7 @@ class TestFallbackBehavior:
             assert result == []
 
     def test_enhanced_score_candidate_runs_without_models(self):
-        with patch("src.services.enhanced_ats_service.SENTENCE_TRANSFORMERS_AVAILABLE", False), \
+        with patch("src.services.enhanced_ats_service._get_semantic_model", return_value=None), \
              patch("src.services.enhanced_ats_service.RAPIDFUZZ_AVAILABLE", False), \
              patch("src.services.enhanced_ats_service._get_nlp", return_value=None):
             from src.services.enhanced_ats_service import EnhancedATSScoringService

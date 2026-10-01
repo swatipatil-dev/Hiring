@@ -72,8 +72,15 @@ CLUSTER_PARTIAL_CREDIT = 0.6  # 60% of full credit for a same-category skill
 #               experience parts excluded rather than scored 0; no credit for bare words
 #   2026.10-v4  weights from DEFAULT_ATS_WEIGHTS (experience 20, project 8, semantic 1,
 #               keyword 1 — was 15/5/5/5), merged in with the per-factor excerpts
-SCORING_RULES_VERSION = "2026.10-v4"
+#   2026.10-v5  semantic similarity (semantic factor + project relevance) actually uses
+#               all-MiniLM-L6-v2. Before, the model was never loaded and every score used
+#               the TF-IDF fallback: compute_semantic_score checked
+#               SENTENCE_TRANSFORMERS_AVAILABLE, which only loading the model sets
+SCORING_RULES_VERSION = "2026.10-v5"
 
+# Status only, set by _get_semantic_model(). Never branch on it: it is False until the
+# model has been loaded, and `from ... import` takes a copy that never updates. Use
+# semantic_model_available() instead.
 SENTENCE_TRANSFORMERS_AVAILABLE = False
 _SEMANTIC_MODEL = None
 st_util = None
@@ -94,6 +101,12 @@ def _get_semantic_model():
             st_util = None
             SENTENCE_TRANSFORMERS_AVAILABLE = False
     return _SEMANTIC_MODEL
+
+
+def semantic_model_available() -> bool:
+    """Whether semantic scoring uses the sentence-transformers model (loading it on the
+    first call) rather than the TF-IDF fallback."""
+    return _get_semantic_model() is not None
 
 # Embedding cache, keyed on SHA-256 of the text. Genuinely LRU: an earlier version
 # evicted by insertion order (FIFO), which is the wrong policy here. Scoring one resume
@@ -127,7 +140,8 @@ def _get_text_embedding(text: str) -> Any:
         logger.debug("JD embedding cache hit: %s", text_hash[:8])
         _EMBEDDING_CACHE.move_to_end(text_hash)
         return _EMBEDDING_CACHE[text_hash]
-    embedding = model.encode(text, convert_to_tensor=True)
+    # No progress bar: at INFO logging it prints one per call into the service journal.
+    embedding = model.encode(text, convert_to_tensor=True, show_progress_bar=False)
     # Evict least-recently-used if at capacity.
     if len(_EMBEDDING_CACHE) >= _EMBEDDING_CACHE_MAXSIZE:
         _EMBEDDING_CACHE.popitem(last=False)
@@ -493,9 +507,8 @@ def compute_semantic_score(text_a: str, text_b: str) -> float:
     """
     if not text_a or not text_b:
         return 0.0
-    if SENTENCE_TRANSFORMERS_AVAILABLE:
+    if semantic_model_available():
         try:
-            # FIXED: No embedding cache — use cached embeddings
             emb_a = _get_text_embedding(text_a)
             emb_b = _get_text_embedding(text_b)
             if emb_a is not None and emb_b is not None:
@@ -2672,7 +2685,7 @@ def current_model_versions(llm_model: Optional[str] = None) -> Dict[str, str]:
     and scores differ between the two."""
     nlp = _NLP if _NLP else None
     versions = {
-        "semantic": "all-MiniLM-L6-v2" if SENTENCE_TRANSFORMERS_AVAILABLE else "tfidf",
+        "semantic": "all-MiniLM-L6-v2" if semantic_model_available() else "tfidf",
         "nlp": (f"{nlp.meta.get('name', '?')}-{nlp.meta.get('version', '?')}" if nlp is not None
                 and hasattr(nlp, "meta") else "none"),
     }
