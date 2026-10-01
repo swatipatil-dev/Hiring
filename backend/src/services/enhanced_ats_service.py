@@ -76,7 +76,11 @@ CLUSTER_PARTIAL_CREDIT = 0.6  # 60% of full credit for a same-category skill
 #               all-MiniLM-L6-v2. Before, the model was never loaded and every score used
 #               the TF-IDF fallback: compute_semantic_score checked
 #               SENTENCE_TRANSFORMERS_AVAILABLE, which only loading the model sets
-SCORING_RULES_VERSION = "2026.10-v5"
+#   2026.10-v6  BBA, BCom and MCom recognised as degrees. Before, a BBA/BCom resume
+#               found no degree, and the CERTIFICATIONS heading matched "certification"
+#               (20), scoring education 33 instead of 100. ("m.com" is deliberately not a
+#               key: degrees match as substrings, and it would match "zoom.com" emails.)
+SCORING_RULES_VERSION = "2026.10-v6"
 
 # Status only, set by _get_semantic_model(). Never branch on it: it is False until the
 # model has been loaded, and `from ... import` takes a copy that never updates. Use
@@ -187,13 +191,13 @@ DEGREE_SCORES = {
     # Masters
     "master": 80, "masters": 80, "m.s": 80, "m.s.": 80, "m.sc": 80, "m.sc.": 80,
     "mba": 80, "m.b.a": 80, "m.tech": 80, "m.tech.": 80, "m.e": 80, "m.e.": 80,
-    "mca": 80, "m.c.a": 80, "msc": 80, "m.eng": 80, "master of science": 80,
+    "mca": 80, "m.c.a": 80, "msc": 80, "m.eng": 80, "master of science": 80, "mcom": 80,
     "master of technology": 80, "master of engineering": 80,
     # Bachelors
     "bachelor": 60, "bachelors": 60, "b.s": 60, "b.s.": 60, "b.sc": 60, "b.sc.": 60,
     "b.tech": 60, "b.tech.": 60, "btech": 60, "b tech": 60,
     "b.e": 60, "b.e.": 60, "be": 60, "b.eng": 60, "b.eng.": 60,
-    "bca": 60, "b.c.a": 60, "bsc": 60, "b.com": 60,
+    "bca": 60, "b.c.a": 60, "bsc": 60, "b.com": 60, "bcom": 60, "bba": 60, "b.b.a": 60,
     "bachelor of science": 60, "bachelor of technology": 60,
     "bachelor of engineering": 60, "bachelor of arts": 55,
     "honours": 60, "hons": 60,
@@ -221,7 +225,8 @@ SOFT_SKILLS_SET: set = {
 DEGREE_TITLES_SET: set = {
     'b.tech', 'btech', 'b.e', 'be', 'b.sc', 'bsc', 'bachelor', 'bachelors',
     'm.tech', 'mtech', 'm.e', 'me', 'm.sc', 'msc', 'master', 'masters',
-    'phd', 'ph.d', 'doctorate', 'diploma', 'bca', 'mca', 'b.com', 'm.com'
+    'phd', 'ph.d', 'doctorate', 'diploma', 'bca', 'mca', 'b.com', 'm.com',
+    'bcom', 'mcom', 'bba', 'b.b.a'
 }
 
 # --- C4.6: Section detection ---

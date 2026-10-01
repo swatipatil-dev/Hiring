@@ -172,3 +172,26 @@ def test_end_to_end_breakdown_shape():
     # it matched "plus"/"bonus" as bare substrings anywhere in the prose.
     assert "kubernetes" in [s.lower() for s in sb["missing_preferred_skills"]]
     assert 0.0 <= res.ats_score <= 100.0
+
+
+def _education_for(degree_line):
+    resume = (
+        "SKILLS Excel, Budgeting, GAAP\n"
+        "EXPERIENCE 2018-2024 Accountant at AuditFirm LLP\n"
+        f"EDUCATION {degree_line} 2018\n"
+        "CERTIFICATIONS CPA Certified 2020\n"
+    )
+    return svc.enhanced_score_candidate(
+        resume_text=resume, job_description="Accountant: Budgeting, GAAP. 3+ yrs.",
+        required_skills=["budgeting", "gaap"], required_experience=3,
+    ).education_score
+
+
+@pytest.mark.parametrize("degree_line", [
+    "BBA Marketing", "B.B.A. Marketing", "BCom Accounting", "B.Com Accounting", "MCom Finance",
+])
+def test_commerce_and_business_degrees_count_as_degrees(degree_line):
+    """Regression: BBA and BCom were not degree keys, so the best "degree" found was
+    the word "certification" in the CERTIFICATIONS heading — education 33 instead of
+    100, on the factor weighted 35%."""
+    assert _education_for(degree_line) == _education_for("B.Tech IT")
