@@ -20,6 +20,9 @@ Usage
     export HF_HOME=/opt/hireflow/hf-cache
     /opt/hireflow/venv/bin/python scripts/prefetch_models.py
 
+    # ATS model only (CI stage 1, which installs no proctoring extras):
+    python scripts/prefetch_models.py --ats-only
+
 Exits non-zero if a REQUIRED model could not be fetched, so a deploy script can
 fail fast. Optional components (proctoring extras) only warn — the app degrades
 cleanly without them.
@@ -152,14 +155,19 @@ def check_spacy():
 
 
 def main():
+    # Without the proctoring extras, model_registry still imports and builds a set
+    # with no engines, which fails warm_model_pool()'s required face-engine check.
+    ats_only = "--ats-only" in sys.argv[1:]
+
     print("=" * 68)
-    print("HireFlow model prefetch")
+    print("HireFlow model prefetch" + (" (ATS model only)" if ats_only else ""))
     print("=" * 68)
 
     prefetch_sentence_transformer()
-    check_proctoring_models()
-    warm_model_pool()
-    check_spacy()
+    if not ats_only:
+        check_proctoring_models()
+        warm_model_pool()
+        check_spacy()
 
     print("\n" + "=" * 68)
     if warnings:

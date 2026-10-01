@@ -192,14 +192,15 @@ jobs:
 
       # Every resume score uses all-MiniLM-L6-v2, so the ATS tests here load it too.
       # Fetched up front (same cache key as stage 2) rather than downloaded mid-test.
+      # --ats-only: the proctoring checks need stage 2's extras and would fail here.
       - name: Cache HuggingFace models
         uses: actions/cache@v4
         with:
           path: /tmp/hf-cache
           key: hf-models-${{ hashFiles('backend/scripts/prefetch_models.py') }}
 
-      - name: Fetch models
-        run: python scripts/prefetch_models.py
+      - name: Fetch ATS model
+        run: python scripts/prefetch_models.py --ats-only
 
       # The judge integration tests run real code inside hardened Docker
       # containers. ubuntu-latest HAS a Docker daemon, so docker_available() is
