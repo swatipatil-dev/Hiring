@@ -325,6 +325,20 @@ jobs:
           CFG
           chmod 600 ~/.ssh/config
 
+      # Before anything on the server changes, so a missing one stops the deploy
+      # with nothing to roll back. Checked on every deploy, not only ones that
+      # change hireflow.conf: by the time that is known, the code is pulled and the
+      # schema migrated.
+      - name: Root-installed prerequisites are present
+        run: |
+          LOAD=$(ssh target "systemctl show -p LoadState --value hireflow-apache-reload")
+          if [ "$LOAD" != "loaded" ]; then
+            echo "::error::hireflow-apache-reload.service is not installed (LoadState=$LOAD)."
+            echo "::error::An admin must install deploy/cpanel/root/hireflow-apache-reload.service"
+            echo "::error::and the current deploy/cpanel/deploy-sudoers, as root — see their headers."
+            exit 1
+          fi
+
       # Step 1 — pull, and let the diff decide what else has to happen.
       - name: Pull and compute the change set
         id: pull
@@ -426,13 +440,21 @@ jobs:
           ssh target "sudo systemctl daemon-reload"
 
       # Both std and ssl — cPanel rebuilds its own configuration and needs both.
+      #
+      # The rebuild and restart go through hireflow-apache-reload.service, a root
+      # unit an admin installs by hand (deploy/cpanel/root/). Running cPanel's
+      # scripts directly under the deploy user's `noexec` sudo stopped Apache and
+      # could not start it again, taking the whole site down (2026-10-01). The
+      # unit's presence is checked before the deploy touches anything (above).
+      #
+      # Note the rollback does not restore hireflow.conf: once copied, cPanel loads
+      # it at its next Apache restart whether or not this step finished.
       - name: Update the Apache vhost include
         if: steps.pull.outputs.apache == 'true' && !inputs.dry_run
         run: |
           ssh target "for m in std ssl; do sudo cp -f $APP_DIR/deploy/cpanel/hireflow.conf \
             /etc/apache2/conf.d/userdata/\$m/2_4/innomaxskills/career.innomaxskills.com/; done"
-          ssh target "sudo /scripts/ensure_vhost_includes --user=innomaxskills"
-          ssh target "sudo /scripts/restartsrv_httpd"
+          ssh target "sudo systemctl start hireflow-apache-reload"
 
       # .htaccess is copied AFTER the rsync: --delete would otherwise remove it
       # and every deep link would 404. Order matters here.

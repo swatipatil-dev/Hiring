@@ -49,10 +49,13 @@ Cmnd_Alias HF_CONFIG = \
     /usr/bin/cp -f /opt/hireflow/deploy/cpanel/*.timer /etc/systemd/system/, \
     /usr/bin/cp -f /opt/hireflow/deploy/cpanel/hireflow.conf /etc/apache2/conf.d/userdata/*/2_4/innomaxskills/career.innomaxskills.com/
 
-# cPanel's own vhost rebuild and httpd restart.
+# cPanel's own vhost rebuild and httpd restart, through a root-owned oneshot unit
+# (deploy/cpanel/root/hireflow-apache-reload.service, installed by hand). Not the
+# cPanel scripts themselves: they run other programs, which the `noexec` default
+# below refuses, so restartsrv_httpd stopped Apache and could not start it again —
+# the 2026-10-01 deploy took the site down that way.
 Cmnd_Alias HF_APACHE = \
-    /scripts/ensure_vhost_includes --user=innomaxskills, \
-    /scripts/restartsrv_httpd
+    /usr/bin/systemctl start hireflow-apache-reload
 
 # Publishing the built frontend. Confined to the career/ docroot.
 Cmnd_Alias HF_WEB = \

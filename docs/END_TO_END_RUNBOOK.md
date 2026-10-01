@@ -468,6 +468,13 @@ visudo -c -f /opt/hireflow/deploy/cpanel/deploy-sudoers
 install -m 0440 -o root -g root \
   /opt/hireflow/deploy/cpanel/deploy-sudoers \
   /etc/sudoers.d/hireflow-deploy
+
+# The root unit the pipeline starts to rebuild vhosts and restart Apache. Installed
+# here, never by the pipeline (its header says why).
+install -m 0644 -o root -g root \
+  /opt/hireflow/deploy/cpanel/root/hireflow-apache-reload.service \
+  /etc/systemd/system/
+systemctl daemon-reload
 ```
 
 What the six groups allow:
@@ -477,7 +484,7 @@ What the six groups allow:
 | `HF_SERVICES` | `systemctl restart / is-active / status` on the four HireFlow units, and `daemon-reload` |
 | `HF_APP` | Three venv binaries as the `hireflow` user: `pip`, `alembic`, `python` |
 | `HF_CONFIG` | Copy `*.service` / `*.timer` / `hireflow.conf` **from the repo tree only** into `/etc` |
-| `HF_APACHE` | `ensure_vhost_includes` and `restartsrv_httpd` |
+| `HF_APACHE` | `systemctl start hireflow-apache-reload` only: a root unit that runs `ensure_vhost_includes` and `restartsrv_httpd`. Run directly under `noexec`, `restartsrv_httpd` stopped Apache and could not start it |
 | `HF_WEB` | rsync into the career docroot, copy the SPA `.htaccess`, chown that directory |
 | `HF_BACKUP` | `mysqldump` only |
 
@@ -985,6 +992,8 @@ chmod -R g+rwX /opt/hireflow && chmod 600 /opt/hireflow/backend/.env
 sudo -u deploy git config --global --add safe.directory /opt/hireflow
 visudo -c -f /opt/hireflow/deploy/cpanel/deploy-sudoers
 install -m 0440 -o root -g root /opt/hireflow/deploy/cpanel/deploy-sudoers /etc/sudoers.d/hireflow-deploy
+install -m 0644 -o root -g root /opt/hireflow/deploy/cpanel/root/hireflow-apache-reload.service /etc/systemd/system/
+systemctl daemon-reload
 sudo -u deploy sudo -l
 
 # Manual restart

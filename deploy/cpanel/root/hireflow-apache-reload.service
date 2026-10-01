@@ -1,0 +1,29 @@
+# Rebuild cPanel's vhost includes and restart Apache, as root.
+#
+# Install ONCE, as root — the deploy pipeline never copies this file:
+#   install -m 0644 -o root -g root \
+#     /opt/hireflow/deploy/cpanel/root/hireflow-apache-reload.service /etc/systemd/system/
+#   systemctl daemon-reload
+#
+# Why a unit: the deploy user's sudo rules set `noexec`, and cPanel's scripts
+# run other programs (systemctl, ensure_conf_dir_crt_key, httpd). Run directly
+# under sudo, restartsrv_httpd stopped Apache and then could not start it again;
+# the 2026-10-01 deploy took the whole site down that way. systemd runs these
+# with no sudo restrictions, and the deploy user is granted only
+# `systemctl start hireflow-apache-reload` — noexec stays on for everything else.
+#
+# It lives in deploy/cpanel/root/, not deploy/cpanel/, on purpose: the pipeline's
+# "Update systemd units" step copies deploy/cpanel/*.service, and a root unit it
+# could overwrite would let anyone who can change the repo run commands as root.
+#
+# No [Install] section: it runs only when started, never at boot.
+
+[Unit]
+Description=HireFlow: rebuild cPanel vhost includes and restart Apache
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/scripts/ensure_vhost_includes --user=innomaxskills
+ExecStart=/scripts/restartsrv_httpd
+TimeoutStartSec=300

@@ -262,6 +262,13 @@ visudo -c -f /opt/hireflow/deploy/cpanel/deploy-sudoers
 install -m 0440 -o root -g root \
   /opt/hireflow/deploy/cpanel/deploy-sudoers \
   /etc/sudoers.d/hireflow-deploy
+
+# The root unit the pipeline starts to rebuild vhosts and restart Apache. Installed
+# here, never by the pipeline (its header says why).
+install -m 0644 -o root -g root \
+  /opt/hireflow/deploy/cpanel/root/hireflow-apache-reload.service \
+  /etc/systemd/system/
+systemctl daemon-reload
 ```
 
 Read [`deploy/cpanel/deploy-sudoers`](../deploy/cpanel/deploy-sudoers) — the comments say
