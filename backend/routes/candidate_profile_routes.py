@@ -43,6 +43,7 @@ CONF_INFERRED = 0.5
 from src.services.file_access import certificate_file_url, profile_file_url
 from src.config.database_config_mysql import get_db
 from src.auth import AuthMiddleware
+from src.tenancy import get_current_company, tenant_bypass
 from src.models.models import (
     User,
     CandidateProfileExt,
@@ -57,15 +58,50 @@ router = APIRouter(prefix="/api/v1/candidate/profile", tags=["Candidate Profile"
 
 
 #  helpers
+_PROFILE_SECTIONS = (
+    CandidateWorkExperience,
+    CandidateEducation,
+    CandidateSkill,
+    CandidateCertification,
+    CandidateProject,
+)
+
+
 def _get_or_create_profile(user_id: str, db: Session) -> CandidateProfileExt:
     profile = db.query(CandidateProfileExt).filter(
         CandidateProfileExt.user_id == user_id
     ).first()
-    if not profile:
-        profile = CandidateProfileExt(user_id=user_id)
-        db.add(profile)
-        db.commit()
-        db.refresh(profile)
+    if profile:
+        return profile
+
+    # The tenant filter hides a row whose company_id is NULL (written before
+    # tenancy) or stale. Creating another one then hits the unique user_id and
+    # the profile endpoints 500. user_id is per-company, so the row is this
+    # user's own: re-stamp it and its sections into the bound company.
+    company_id = get_current_company()
+    if company_id:
+        with tenant_bypass():
+            profile = db.query(CandidateProfileExt).filter(
+                CandidateProfileExt.user_id == user_id
+            ).first()
+            if profile:
+                logger.warning(
+                    "Adopting candidate profile %s into company %s (was %s)",
+                    profile.id, company_id, profile.company_id,
+                )
+                profile.company_id = company_id
+                for model in _PROFILE_SECTIONS:
+                    db.query(model).filter(model.profile_id == profile.id).update(
+                        {model.company_id: company_id}, synchronize_session=False,
+                    )
+                db.commit()
+                db.refresh(profile)
+                return profile
+
+    profile = CandidateProfileExt(user_id=user_id)
+    db.add(profile)
+    db.commit()
+    db.refresh(profile)
     return profile
 
 
