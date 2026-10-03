@@ -261,8 +261,17 @@ def persist_ats_result(db, *, candidate, job, outcome: ScoringOutcome, event_typ
 
 
 def needs_review_candidate_ids(db, job_id: str) -> set:
-    """Candidates whose resume could not be read reliably for this job. Every automatic
-    reject or shortlist must leave them alone: they go to a person."""
-    from src.models.models import ATSResult
-    return {cid for (cid,) in db.query(ATSResult.candidate_id).filter(
+    """Candidates this job's ranking says nothing about. Every automatic reject or
+    shortlist must leave them alone: they go to a person.
+
+    Two kinds: a resume that could not be read reliably (parse_status needs_review),
+    and an applicant with no ATS result for this job at all — scoring failed or never
+    ran at apply time. "Not in the top N" is not a verdict on someone never ranked.
+    """
+    from src.models.models import ATSResult, Candidate
+    unreadable = {cid for (cid,) in db.query(ATSResult.candidate_id).filter(
         ATSResult.job_id == job_id, ATSResult.parse_status == "needs_review").all()}
+    scored = db.query(ATSResult.candidate_id).filter(ATSResult.job_id == job_id)
+    unscored = {cid for (cid,) in db.query(Candidate.id).filter(
+        Candidate.job_id == job_id, Candidate.id.notin_(scored)).all()}
+    return unreadable | unscored

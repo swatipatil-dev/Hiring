@@ -12,6 +12,7 @@ import MailFromPicker from './MailFromPicker'
 import CreateTestWizard from '../shared/CreateTestWizard'
 import ExamDrafts from '../../components/ExamDrafts'
 import ResumeMatcher from './ResumeMatcher'
+import MoveToATSModal from './MoveToATSModal'
 import { RetestModal, AdjustmentModal, AdjustmentRequestsModal } from './TestFairnessModals'
 import ATSOverridePanel from '../../components/ats/ATSOverridePanel'
 import ATSExplanation from '../../components/ats/ATSExplanation'
@@ -256,6 +257,11 @@ export default function HRDashboard() {
   // how many resumes could not be read and are held for a person.
   const [atsMeta, setAtsMeta] = useState(null)
   const [rescoring, setRescoring] = useState(false)
+  // Talent Pool resumes matched to the open job that are not candidates on it yet —
+  // the sheet lists Candidates only, so without this they were invisible from the job.
+  const [poolMatches, setPoolMatches] = useState([])
+  const [movingEntry, setMovingEntry] = useState(null)     // pool match in the Move to ATS dialog
+  const [scoringId, setScoringId] = useState(null)         // unscored applicant being scored now
   const [screeningJob, setScreeningJob] = useState(null)   // 'Check this ranking' dialog
   const [atsLoading, setAtsLoading] = useState(false)
   const [atsSearch, setAtsSearch] = useState('')
@@ -1219,10 +1225,16 @@ HR Team`,
     return { candidates, meta: meta ? { ...meta, candidates } : null }
   }
 
+  const loadPoolMatches = (jobId) =>
+    api.get(`/hr/jobs/${jobId}/pool-matches`)
+      .then(r => setPoolMatches(r.data || []))
+      .catch(() => setPoolMatches([]))
+
   const openAtsSheet = async (job) => {
     setAtsJob(job)
     setAtsLoading(true)
     setAtsCandidates([])
+    setPoolMatches([])
     setAtsSearch('')
     setExpandedCandidate(null)
     setSelectedCandidates(new Set())
@@ -1236,6 +1248,7 @@ HR Team`,
       setAtsCandidates([])
       setAtsMeta(null)
     }
+    loadPoolMatches(job.id)
     api.get('/hr/interviewers').then(r => setInterviewers(r.data || [])).catch(() => {})
     api.get(`/hr/jobs/${job.id}/tests`).then(r => setJobTests(r.data || [])).catch(() => setJobTests([]))
     setAtsLoading(false)
@@ -1276,15 +1289,31 @@ HR Team`,
   // A resume that could not be read reliably is never ranked, so it never enters an
   // automatic top-N / top-% pick (or the rejection that follows one).
   const needsReview = (c) => c.parse_status === 'needs_review'
+  // No ATS result for this job at all (scoring failed or never ran). Listed so HR can
+  // see and score them, but not ranked, and never auto-rejected server-side.
+  const isUnscored = (c) => c.scored === false || c.ats_score == null
+  const rankable = atsCandidates.filter(c => !needsReview(c) && !isUnscored(c))
+
+  const scoreNow = async (c) => {
+    setScoringId(c.candidate_id)
+    try {
+      await api.post(`/hr/jobs/${atsJob.id}/candidates/${c.candidate_id}/rescore`)
+      await reloadAtsCandidates()
+    } catch (e) {
+      alert(e?.response?.data?.detail || 'Scoring failed')
+    } finally {
+      setScoringId(null)
+    }
+  }
 
   const handleSelectTopN = () => {
-    const pool = atsCandidates.filter(c => !isMailSent(c) && !needsReview(c))
+    const pool = rankable.filter(c => !isMailSent(c))
     const top = pool.slice(0, topN).map(c => c.candidate_id)
     setSelectedCandidates(new Set(top))
   }
 
   const handleSelectTopPercentile = () => {
-    const pool = atsCandidates.filter(c => !isMailSent(c) && !needsReview(c))
+    const pool = rankable.filter(c => !isMailSent(c))
     if (!pool.length) return
     const count = Math.max(1, Math.ceil(pool.length * topPercentile / 100))
     const top = pool.slice(0, count).map(c => c.candidate_id)
@@ -2295,8 +2324,9 @@ HR Team`,
                   </thead>
                   <tbody>
                     {filtered.map((c, i) => {
-                      const score = Math.round(c.ats_score || 0)
-                      const scoreColor = score >= 70 ? '#22c55e' : score >= 50 ? '#f59e0b' : '#ef4444'
+                      const unscored = c.ats_score == null
+                      const score = unscored ? '–' : Math.round(c.ats_score)
+                      const scoreColor = unscored ? '#94a3b8' : score >= 70 ? '#22c55e' : score >= 50 ? '#f59e0b' : '#ef4444'
                       const stage = PIPELINE_STAGES.find(s => s.key === normalizeStage(c.current_stage))
                       return (
                         <tr key={c.candidate_id || i}
@@ -5132,7 +5162,12 @@ HR Team`,
                 <div>
                   <h2 style={{ margin: 0, fontSize: '1.3rem' }}>{atsJob.title}</h2>
                   <div className="text-sm text-muted" style={{ marginTop: 4 }}>
-                    {atsJob.department} &middot; {atsJob.location} &middot; {atsCandidates.length} candidates
+                    {atsJob.department} &middot; {atsJob.location} &middot; {atsCandidates.length} candidate{atsCandidates.length === 1 ? '' : 's'}
+                    {(() => {
+                      const unscoredCount = atsCandidates.filter(isUnscored).length
+                      return unscoredCount > 0 && <span> ({unscoredCount} not scored)</span>
+                    })()}
+                    {poolMatches.length > 0 && <span> &middot; {poolMatches.length} more in Talent Pool, not yet in ATS</span>}
                     {selectedCandidates.size > 0 && <span style={{ color: 'var(--accent-primary)', fontWeight: 600 }}> &middot; {selectedCandidates.size} selected</span>}
                   </div>
                   {(() => {
@@ -5208,7 +5243,7 @@ HR Team`,
                   {selectionMode === 'top_n' && (
                     <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '0 10px' }}>
                       <input
-                        type="number" min={1} max={atsCandidates.length || 50}
+                        type="number" min={1} max={rankable.length || 50}
                         value={topN}
                         onChange={e => setTopN(parseInt(e.target.value) || 1)}
                         style={{
@@ -5217,8 +5252,9 @@ HR Team`,
                           outline: 'none', fontWeight: 600, color: '#1e1b4b'
                         }}
                       />
-                      <span style={{ fontSize: '0.78rem', color: '#6366f1', fontWeight: 500 }}>
-                        of {atsCandidates.length}
+                      <span style={{ fontSize: '0.78rem', color: '#6366f1', fontWeight: 500 }}
+                        title="Only ranked candidates count: unscored and unreadable resumes are never picked automatically">
+                        of {rankable.length} ranked
                       </span>
                     </div>
                   )}
@@ -5235,7 +5271,7 @@ HR Team`,
                         }}
                       />
                       <span style={{ fontSize: '0.78rem', color: '#6366f1', fontWeight: 500 }}>
-                        % = {atsCandidates.length ? Math.max(1, Math.ceil(atsCandidates.length * topPercentile / 100)) : 0} candidates
+                        % = {rankable.length ? Math.max(1, Math.ceil(rankable.length * topPercentile / 100)) : 0} candidates
                       </span>
                     </div>
                   )}
@@ -5348,7 +5384,9 @@ HR Team`,
               {atsLoading ? (
                 <div style={{ padding: 60, textAlign: 'center', color: 'var(--text-tertiary)' }}>Loading candidates...</div>
               ) : atsCandidates.length === 0 ? (
-                <div style={{ padding: 60, textAlign: 'center', color: 'var(--text-tertiary)' }}>No candidates have applied for this job yet</div>
+                <div style={{ padding: 60, textAlign: 'center', color: 'var(--text-tertiary)' }}>
+                  {poolMatches.length > 0 ? 'No candidates in the ATS for this job yet — see the Talent Pool matches below' : 'No candidates have applied for this job yet'}
+                </div>
               ) : (
                 <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                   <thead>
@@ -5376,27 +5414,35 @@ HR Team`,
                     {(() => {
                       const visible = atsCandidates.filter(c => !atsSearch || c.name?.toLowerCase().includes(atsSearch.toLowerCase()) || c.email?.toLowerCase().includes(atsSearch.toLowerCase()))
                       const held = visible.filter(needsReview)
-                      const ranked = visible.filter(c => !needsReview(c))
-                      return [...held.map(c => ({ c, i: null })), ...ranked.map((c, i) => ({ c, i }))]
+                      const unscored = visible.filter(c => !needsReview(c) && isUnscored(c))
+                      const ranked = visible.filter(c => !needsReview(c) && !isUnscored(c))
+                      return [
+                        ...held.map(c => ({ c, i: null, group: 'held' })),
+                        ...ranked.map((c, i) => ({ c, i, group: 'ranked' })),
+                        ...unscored.map(c => ({ c, i: null, group: 'unscored' })),
+                      ]
                     })()
-                      .map(({ c, i }, idx, rows) => {
-                        const held = needsReview(c)
+                      .map(({ c, i, group }, idx, rows) => {
+                        const held = group === 'held'
+                        const unscored = group === 'unscored'
                         const scoreColor = c.ats_score >= 80 ? '#22c55e' : c.ats_score >= 60 ? '#2b7cba' : c.ats_score >= 40 ? '#f59e0b' : '#ef4444'
                         // Selection band by ATS score: green (selected) >=70, yellow (pending) 50-69, red (rejected) <50.
-                        // Unreadable resumes get no band: they are not ranked.
-                        const band = held ? 'none' : c.ats_score >= 70 ? 'green' : c.ats_score >= 50 ? 'yellow' : 'red'
+                        // Unreadable resumes and unscored applicants get no band: they are not ranked.
+                        const band = (held || unscored) ? 'none' : c.ats_score >= 70 ? 'green' : c.ats_score >= 50 ? 'yellow' : 'red'
                         const bandColor = band === 'none' ? '#9ca3af' : band === 'green' ? '#22c55e' : band === 'yellow' ? '#f59e0b' : '#ef4444'
                         const bandTint  = band === 'none' ? '#f9fafb' : band === 'green' ? '#f0fdf4' : band === 'yellow' ? '#fffbeb' : '#fef2f2'
                         const isExpanded = expandedCandidate === c.candidate_id
                         const sent = isMailSent(c)
                         const cols = selectMode ? 8 : 7
-                        const groupHeader = held && idx === 0
-                          ? `Needs manual review (${rows.filter(r => r.i === null).length}): the resume could not be read reliably, so it is not ranked and will never be rejected automatically.`
-                          : (!held && i === 0 && idx > 0) ? 'Ranked by resume match' : null
+                        const firstOfGroup = idx === 0 || rows[idx - 1].group !== group
+                        const groupHeader = !firstOfGroup ? null
+                          : held ? `Needs manual review (${rows.filter(r => r.group === 'held').length}): the resume could not be read reliably, so it is not ranked and will never be rejected automatically.`
+                          : unscored ? `Not scored yet (${rows.filter(r => r.group === 'unscored').length}): applied, but there is no ATS result for this job. Score them to rank them — they are never rejected automatically.`
+                          : idx > 0 ? 'Ranked by resume match' : null
                         return (
                           <React.Fragment key={c.candidate_id}>
                             {groupHeader && (
-                              <tr><td colSpan={cols} style={{ padding: '10px 16px', fontSize: '0.8rem', fontWeight: 700, color: held ? '#92400e' : '#374151', background: held ? '#fffbeb' : '#f3f4f6' }}>{groupHeader}</td></tr>
+                              <tr><td colSpan={cols} style={{ padding: '10px 16px', fontSize: '0.8rem', fontWeight: 700, color: held ? '#92400e' : unscored ? '#475569' : '#374151', background: held ? '#fffbeb' : unscored ? '#f1f5f9' : '#f3f4f6' }}>{groupHeader}</td></tr>
                             )}
                             <tr style={{
                                 borderBottom: '1px solid #f3f4f6', transition: 'background 0.1s', cursor: 'pointer',
@@ -5453,6 +5499,15 @@ HR Team`,
                                 {held ? (
                                   <div title={(c.parse_issues || []).join(' ')} style={{ fontSize: '0.75rem', fontWeight: 700, color: '#92400e', background: '#fef3c7', borderRadius: 8, padding: '6px 8px', lineHeight: 1.3 }}>
                                     Not ranked<br/><span style={{ fontWeight: 500 }}>Read the resume</span>
+                                  </div>
+                                ) : unscored ? (
+                                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6 }}>
+                                    <span style={{ fontSize: '0.75rem', fontWeight: 700, color: '#475569' }}>Not scored</span>
+                                    <button className="btn btn-sm" disabled={scoringId === c.candidate_id}
+                                      onClick={e => { e.stopPropagation(); scoreNow(c) }}
+                                      style={{ background: '#fff', border: '1px solid #94a3b8', color: '#334155', fontSize: '0.74rem', padding: '3px 10px' }}>
+                                      {scoringId === c.candidate_id ? 'Scoring…' : 'Score now'}
+                                    </button>
                                   </div>
                                 ) : (<>
                                 <div style={{
@@ -5518,10 +5573,16 @@ HR Team`,
                                     {/* What the score rests on: evidence with resume excerpts, unknowns kept
                                         separate from gaps, and provenance (components/ats/ATSExplanation). */}
                                     <div style={{ marginBottom: 20, padding: 16, background: '#f9fafb', borderRadius: 10 }}>
-                                      <ATSExplanation
-                                        loadUrl={`/hr/jobs/${atsJob.id}/candidates/${c.candidate_id}/ats-explanation`}
-                                        onRescore={async () => { await api.post(`/hr/jobs/${atsJob.id}/candidates/${c.candidate_id}/rescore`); reloadAtsCandidates() }}
-                                      />
+                                      {unscored ? (
+                                        <div style={{ fontSize: '0.86rem', color: '#475569' }}>
+                                          No ATS result for this job yet, so there is nothing to explain. Use <strong>Score now</strong> to score this resume against the job.
+                                        </div>
+                                      ) : (
+                                        <ATSExplanation
+                                          loadUrl={`/hr/jobs/${atsJob.id}/candidates/${c.candidate_id}/ats-explanation`}
+                                          onRescore={async () => { await api.post(`/hr/jobs/${atsJob.id}/candidates/${c.candidate_id}/rescore`); reloadAtsCandidates() }}
+                                        />
+                                      )}
                                     </div>
 
                                     {/* Contact + Photo + Skills */}
@@ -5584,7 +5645,7 @@ HR Team`,
                                         </div>
                                       </div>
                                     )}
-                                    <ATSOverridePanel jobId={atsJob.id} candidate={c} onChanged={reloadAtsCandidates} />
+                                    {!unscored && <ATSOverridePanel jobId={atsJob.id} candidate={c} onChanged={reloadAtsCandidates} />}
                                     <div style={{ marginTop: 12, fontSize: '0.78rem', color: '#9ca3af', fontFamily: 'var(--font-mono)' }}>
                                       Applied: {c.applied_at ? new Date(c.applied_at).toLocaleString() : '—'}
                                       {c.scored_at ? ` · Scored ${new Date(c.scored_at + (String(c.scored_at).endsWith('Z') ? '' : 'Z')).toLocaleString()}` : ''}
@@ -5602,8 +5663,75 @@ HR Team`,
                   </tbody>
                 </table>
               )}
+
+              {/* Talent Pool resumes ranked against this job that are not candidates on
+                  it yet. The table above lists Candidates only; these join it via Move to ATS. */}
+              {!atsLoading && poolMatches.length > 0 && (
+                <div style={{ margin: '18px 16px 24px', border: '1px solid #e2e8f0', borderRadius: 12, overflow: 'hidden' }}>
+                  <div style={{ padding: '10px 16px', background: '#f8fafc', borderBottom: '1px solid #e2e8f0', fontSize: '0.82rem', color: '#334155' }}>
+                    <strong>In Talent Pool — not yet in ATS ({poolMatches.length})</strong>
+                    <span style={{ color: '#64748b' }}> · Resumes matched to this job that nobody has moved into the ATS. They are not applicants until moved.</span>
+                  </div>
+                  <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                    <tbody>
+                      {poolMatches
+                        .filter(p => !atsSearch || p.full_name?.toLowerCase().includes(atsSearch.toLowerCase()) || p.email?.toLowerCase().includes(atsSearch.toLowerCase()))
+                        .map(p => (
+                        <tr key={p.entry_id} style={{ borderBottom: '1px solid #f1f5f9' }}>
+                          <td style={{ padding: '10px 16px' }}>
+                            <div style={{ fontWeight: 600, fontSize: '0.9rem' }}>{p.full_name || 'Name not found on resume'}</div>
+                            {p.is_best_match && <div style={{ fontSize: '0.72rem', color: '#15803d', marginTop: 2 }}>Best match is this job</div>}
+                          </td>
+                          <td style={{ padding: '10px 16px' }}>
+                            <div style={{ fontSize: '0.82rem', color: 'var(--text-secondary)' }}>{p.email || '—'}</div>
+                            <div style={{ fontSize: '0.78rem', color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono)' }}>{p.phone || '—'}</div>
+                          </td>
+                          <td style={{ padding: '10px 16px', textAlign: 'center', fontFamily: 'var(--font-mono)', fontSize: '0.85rem' }}
+                            title="Resume match score against this job, from the Talent Pool">
+                            {p.parse_status === 'needs_review' ? <span style={{ color: '#92400e' }}>Needs review</span>
+                              : p.match_score != null ? `${Math.round(p.match_score)} match` : '—'}
+                          </td>
+                          <td style={{ padding: '10px 16px', fontFamily: 'var(--font-mono)', fontSize: '0.85rem' }}>
+                            {p.experience_years ? `${p.experience_years}y` : <span style={{ color: '#9ca3af' }}>—</span>}
+                          </td>
+                          <td style={{ padding: '10px 16px', textAlign: 'right' }}>
+                            <button className="btn btn-sm" onClick={() => setMovingEntry(p)}
+                              style={{ background: '#fff', border: '1px solid var(--accent-primary, #2b7cba)', color: 'var(--accent-primary, #2b7cba)' }}>
+                              Move to ATS
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </div>
           </div>
+          {movingEntry && (
+            // Its backdrop click closes the dialog; stop it there, or it would bubble
+            // to the sheet's backdrop and close the whole sheet too.
+            <div onClick={e => e.stopPropagation()}>
+            <MoveToATSModal
+              entry={{
+                id: movingEntry.entry_id,
+                full_name: movingEntry.full_name,
+                email: movingEntry.email,
+                phone: movingEntry.phone,
+                // Preselects this job, the one the sheet is open on.
+                best_match: { job_id: atsJob.id, job_title: atsJob.title, ats_score: movingEntry.match_score },
+                alternates: [],
+                applications: [],
+              }}
+              onClose={() => setMovingEntry(null)}
+              onMoved={async () => {
+                setMovingEntry(null)
+                await reloadAtsCandidates()
+                loadPoolMatches(atsJob.id)
+              }}
+            />
+            </div>
+          )}
         </div>
       )}
 

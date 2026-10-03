@@ -172,7 +172,9 @@ def test_auto_reject_refuses_missing_skills_and_holds_unknowns(client, hr_header
     assert r.status_code == 400
 
     _scored(db, job, "blank", "")
-    _candidate(db, job, "noexp", experience_years=None)
+    # Scored, so it reaches the experience check: an applicant with no ATS result at
+    # all is held earlier, as never ranked.
+    _scored(db, job, "noexp", GOOD_RESUME, experience_years=None)
     r = client.post(f"/api/v1/advanced/jobs/{job.id}/auto-reject", headers=hr_headers,
                     json={"min_experience_years": 3, "dry_run": True})
     assert r.status_code == 200, r.text
@@ -263,3 +265,124 @@ def test_paging_through_equal_scores_returns_everyone_exactly_once(client, hr_he
         assert body["total_candidates"] == 5
         seen += [c["candidate_id"] for c in body["candidates"]]
     assert sorted(seen) == sorted(ids)
+
+
+# ── applicants with no ATS result ────────────────────────────────────────────
+
+def test_sheet_lists_an_applicant_with_no_ats_result_last(client, hr_headers, db, job):
+    """Scoring failed or never ran at apply time. The inner join hid them from the sheet
+    meant to list everyone who applied; they now show, marked unscored, after the rest."""
+    scored = _scored(db, job, "scored", GOOD_RESUME)
+    unscored = _candidate(db, job, "unscored", stage="applied")
+    for order in ("desc", "asc"):
+        r = client.get(f"/api/v1/hr/jobs/{job.id}/candidates", headers=hr_headers,
+                       params={"sort_by": "ats_score", "order": order})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["total_candidates"] == 2
+        assert [c["candidate_id"] for c in body["candidates"]] == [scored.id, unscored.id]
+    row = body["candidates"][1]
+    assert row["scored"] is False and row["ats_score"] is None
+    assert row["ats_level"] == "Not scored"
+    assert body["candidates"][0]["scored"] is True
+
+
+def test_score_filters_and_merge_still_exclude(client, hr_headers, db, job):
+    keep = _scored(db, job, "keep", GOOD_RESUME)
+    _candidate(db, job, "unscored")
+    _candidate(db, job, "dupe", merged_into_id=keep.id)
+    r = client.get(f"/api/v1/hr/jobs/{job.id}/candidates", headers=hr_headers)
+    assert {c["name"] for c in r.json()["candidates"]} == {"keep X", "unscored X"}
+    r = client.get(f"/api/v1/hr/jobs/{job.id}/candidates", headers=hr_headers,
+                   params={"min_score": 0})
+    assert [c["candidate_id"] for c in r.json()["candidates"]] == [keep.id]
+
+
+def test_reject_others_never_reaches_an_unscored_applicant(client, hr_headers, db, job):
+    """Never ranked, so "not in the top N" says nothing about them — and they used to be
+    rejected and emailed without ever appearing on the sheet."""
+    _scored(db, job, "good", GOOD_RESUME)
+    weak = _scored(db, job, "weak", GOOD_RESUME.replace("Python", "Cobol"))
+    unscored = _candidate(db, job, "unscored", stage="applied")
+    assert unscored.id in needs_review_candidate_ids(db, job.id)
+    r = client.post(f"/api/v1/hr/jobs/{job.id}/select-candidates", headers=hr_headers, json={
+        "candidate_ids": [], "selection_type": "top_n", "top_n": 1,
+        "reject_others": True, "next_stage": "screening"})
+    assert r.status_code == 200, r.text
+    assert r.json()["held_for_review"] == 1
+    db.refresh(weak)
+    db.refresh(unscored)
+    assert weak.current_stage == "rejected"
+    assert unscored.current_stage == "applied"
+
+
+def test_reject_others_leaves_a_merged_duplicate_alone(client, hr_headers, db, job):
+    good = _scored(db, job, "good", GOOD_RESUME)
+    dupe = _scored(db, job, "dupe", GOOD_RESUME.replace("Python", "Cobol"))
+    dupe.merged_into_id = good.id
+    db.flush()
+    r = client.post(f"/api/v1/hr/jobs/{job.id}/select-candidates", headers=hr_headers, json={
+        "candidate_ids": [good.id], "selection_type": "manual",
+        "reject_others": True, "next_stage": "screening"})
+    assert r.status_code == 200, r.text
+    db.refresh(dupe)
+    assert dupe.current_stage != "rejected"
+
+
+# ── Talent Pool matches not yet in ATS ───────────────────────────────────────
+
+def _pool(db, company_id, name, **kw):
+    from src.models.models import ResumePoolEntry
+    e = ResumePoolEntry(id=str(uuid.uuid4()), company_id=company_id, full_name=name,
+                        email=kw.pop("email", f"{name}@pool.com"), status=kw.pop("status", "new"), **kw)
+    db.add(e)
+    db.flush()
+    return e
+
+
+def _ranked(*pairs):
+    return json.dumps([{"job_id": jid, "job_title": "t", "ats_score": score, "rating": "Good"}
+                       for jid, score in pairs])
+
+
+def test_pool_matches_lists_entries_ranked_against_the_job(client, hr_headers, db, job):
+    other_job = str(uuid.uuid4())
+    best = _pool(db, job.company_id, "best", best_job_id=job.id, best_score=81,
+                 match_results=_ranked((job.id, 81.0)))
+    second = _pool(db, job.company_id, "second", match_results=_ranked((other_job, 90.0), (job.id, 64.5)))
+    _pool(db, job.company_id, "unrelated", match_results=_ranked((other_job, 70.0)))
+    _pool(db, job.company_id, "archived", status="archived", best_job_id=job.id,
+          match_results=_ranked((job.id, 99.0)))
+    # Already a candidate on this job (case differs): Move to ATS would refuse it.
+    _pool(db, job.company_id, "applied", email="Applied@Pool.com", best_job_id=job.id,
+          match_results=_ranked((job.id, 75.0)))
+    c = Candidate(id=str(uuid.uuid4()), company_id=job.company_id, job_id=job.id,
+                  email="applied@pool.com", first_name="applied", last_name="X",
+                  current_stage="ats_screening")
+    db.add(c)
+    db.flush()
+
+    r = client.get(f"/api/v1/hr/jobs/{job.id}/pool-matches", headers=hr_headers)
+    assert r.status_code == 200, r.text
+    rows = r.json()
+    assert [p["entry_id"] for p in rows] == [best.id, second.id]
+    assert rows[0]["match_score"] == 81.0 and rows[0]["is_best_match"] is True
+    assert rows[1]["match_score"] == 64.5 and rows[1]["is_best_match"] is False
+
+
+def test_pool_matches_are_company_scoped(client, hr_headers, db, job):
+    from src.models.models import Company
+    other = Company(id=str(uuid.uuid4()), name="Other Co", slug=f"other-{uuid.uuid4().hex[:8]}")
+    db.add(other)
+    db.flush()
+    _pool(db, other.id, "foreign", best_job_id=job.id, match_results=_ranked((job.id, 88.0)))
+    r = client.get(f"/api/v1/hr/jobs/{job.id}/pool-matches", headers=hr_headers)
+    assert r.status_code == 200, r.text
+    assert r.json() == []
+
+    foreign_job = JobPosting(id=str(uuid.uuid4()), company_id=other.id, title="Theirs",
+                             description="d", requirements="r", status="active")
+    db.add(foreign_job)
+    db.flush()
+    r = client.get(f"/api/v1/hr/jobs/{foreign_job.id}/pool-matches", headers=hr_headers)
+    assert r.status_code == 404
