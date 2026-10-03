@@ -66,7 +66,11 @@ def stub_scorer(monkeypatch):
             extracted_skills=["python", "fastapi"], extracted_experience=3.0,
         )
 
-    monkeypatch.setattr(enhanced_ats_service, "enhanced_score_candidate", _fake)
+    # setitem on the instance __dict__, not setattr: undoing setattr on an instance
+    # stores the real bound method there, which then hides any later class-level patch
+    # (test_ats_prepared_resume) whenever both files share an xdist worker. setitem
+    # deletes the key on undo, leaving the instance as it was.
+    monkeypatch.setitem(vars(enhanced_ats_service), "enhanced_score_candidate", _fake)
     return calls
 
 
