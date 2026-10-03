@@ -5611,21 +5611,25 @@ async def get_job_candidates_enhanced(
             func.max(ATSResult.id).label('latest_id')
         ).group_by(ATSResult.candidate_id).subquery()
 
-        # Build optimized query with proper joins
-        query = db.query(Candidate, ATSResult).join(
+        # Outer joins: every applicant stays on the sheet while the job is open,
+        # including one whose result is missing (scoring failed) or hidden by the
+        # tenant filter. An inner join dropped them without a trace.
+        query = db.query(Candidate, ATSResult).outerjoin(
             latest_ats_subq, Candidate.id == latest_ats_subq.c.cid
-        ).join(
+        ).outerjoin(
             ATSResult, ATSResult.id == latest_ats_subq.c.latest_id
         ).filter(Candidate.job_id == job_id,
                  # A merged duplicate is kept for undo, not shown as a second person.
                  Candidate.merged_into_id.is_(None))
-        
+        # Without a result, fall back to the score mirrored onto the candidate.
+        score_col = func.coalesce(effective_score_col(), Candidate.ats_score)
+
         # Apply filters efficiently
         if min_score is not None:
-            query = query.filter(effective_score_col() >= min_score)
+            query = query.filter(score_col >= min_score)
 
         if max_score is not None:
-            query = query.filter(effective_score_col() <= max_score)
+            query = query.filter(score_col <= max_score)
         
         if stage:
             query = query.filter(Candidate.current_stage == stage)
@@ -5644,9 +5648,9 @@ async def get_job_candidates_enhanced(
         # Apply sorting
         if sort_by == "ats_score":
             if sort_order == "desc":
-                query = query.order_by(desc(effective_score_col()))
+                query = query.order_by(desc(score_col))
             else:
-                query = query.order_by(effective_score_col())
+                query = query.order_by(score_col)
         elif sort_by == "applied_at":
             if sort_order == "desc":
                 query = query.order_by(desc(Candidate.created_at))
@@ -5674,8 +5678,37 @@ async def get_job_candidates_enhanced(
             JobDescriptionVersion.job_id == job_id).all()}
 
         # Create enhanced candidate responses with error handling
+        def _basic_row(candidate, ats_result):
+            """The applicant without the scoring detail: never leave them off the sheet."""
+            score = effective_score(ats_result)
+            if score is None and candidate.ats_score is not None:
+                score = float(candidate.ats_score)
+            interp = get_ats_interpretation(score) if score is not None else {"level": "Not scored", "color": "gray"}
+            return ATSCandidateResponse(
+                candidate_id=str(candidate.id),
+                name=f"{candidate.first_name or ''} {candidate.last_name or ''}".strip() or (candidate.email or ""),
+                email=candidate.email or "",
+                phone=candidate.phone,
+                current_stage=candidate.current_stage or "applied",
+                ats_score=score or 0.0,
+                ats_level=interp["level"],
+                ats_color=interp["color"],
+                experience_years=candidate.experience_years,
+                applied_at=candidate.created_at,
+                resume_url=application_file_url(candidate, "resume", current_user),
+                parse_status=getattr(ats_result, "parse_status", None),
+                is_stale=ats_result is None,
+                stale_reason="legacy" if ats_result is None else None,
+                source=candidate.source,
+                source_label=SOURCES.get(candidate.source, "Not recorded"),
+                source_detail=candidate.source_detail,
+            )
+
         result = []
         for candidate, ats_result in candidates:
+            if ats_result is None:
+                result.append(_basic_row(candidate, None))
+                continue
             try:
                 eff = effective_score(ats_result) or 0.0
                 ats_interpretation = get_ats_interpretation(eff)
@@ -5762,10 +5795,10 @@ async def get_job_candidates_enhanced(
                     source_label=SOURCES.get(candidate.source, "Not recorded"),
                     source_detail=candidate.source_detail,
                 ))
-            except Exception as candidate_error:
-                print(f"Error processing candidate {candidate.id}: {candidate_error}")
-                continue
-        
+            except Exception:
+                logger.exception("ATS sheet: showing basic row for candidate %s", candidate.id)
+                result.append(_basic_row(candidate, ats_result))
+
         # Calculate ATS distribution using shared utility
         ats_distribution = calculate_ats_distribution([c.ats_score for c in result if c.ats_score])
         
