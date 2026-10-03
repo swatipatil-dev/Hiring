@@ -106,14 +106,16 @@ def email_queue():
     return Queue(_QUEUE_NAME, connection=get_redis_raw(), serializer=SERIALIZER)
 
 
-def enqueue_email(payload: dict) -> dict:
+def enqueue_email(payload: dict, db=None) -> dict:
     """Queue one email for delivery; returns the dispatch mode.
 
-    Falls back to sending inline when Redis is down or EMAIL_SYNC is set.
+    Falls back to sending inline when Redis is down or EMAIL_SYNC is set. ``db``
+    is the caller's session, used only by that inline send to update the queued
+    row it flushed (see ``worker._log``); it never goes into the RQ payload.
     """
     if _sync_forced() or not redis_available():
         from .worker import send_email_job
-        res = send_email_job(payload) or {}
+        res = send_email_job(payload, db=db) or {}
         return {"mode": "sync", **res}
 
     job = email_queue().enqueue(

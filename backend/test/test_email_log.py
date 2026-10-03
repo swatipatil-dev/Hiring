@@ -138,6 +138,31 @@ def test_queued_row_is_written_before_the_worker_runs(db):
 
 
 @pytest.mark.security
+def test_inline_fallback_updates_the_queued_row_on_the_callers_session(db):
+    """With Redis down the job runs inside the request that flushed the queued
+    row. A second session would block on that uncommitted insert until
+    innodb_lock_wait_timeout — 50s per email — and then drop the outcome."""
+    from src.services import email_service as es
+    from src.mailq import queue as mq, ratelimit
+
+    to = f"inline_{uuid.uuid4().hex[:6]}@example.com"
+    cid = _make_company(db, "Inline Co")
+    with patch.object(mq, "redis_available", return_value=False), \
+         patch.object(ratelimit, "get_redis", return_value=None), \
+         patch.object(es, "_deliver", return_value={
+             "sent": True, "error": None, "error_type": None}), \
+         patch.object(email_log, "_open_session",
+                      side_effect=AssertionError("inline send opened its own session")):
+        result = es.dispatch(to, "Subject", "<p>b</p>",
+                             smtp_config=_cfg(company_id=cid), db=db)
+
+    assert result["mode"] == "sync"
+    rows = _rows(db, to)
+    assert len(rows) == 1, "inline send added a second row"
+    assert rows[0].status == email_log.SENT
+
+
+@pytest.mark.security
 def test_worker_updates_the_queued_row_instead_of_adding_a_second(db):
     """finalize() on an existing id must UPDATE, not INSERT."""
     to = f"upd_{uuid.uuid4().hex[:6]}@example.com"
@@ -424,7 +449,7 @@ def test_worker_marks_a_rate_limit_hold_as_deferred(monkeypatch):
 
     statuses = []
     monkeypatch.setattr(worker, "_log",
-                        lambda payload, status, attempt, result=None:
+                        lambda payload, status, attempt, result=None, db=None:
                         statuses.append(status))
 
     out = worker.send_email_job(_payload())
