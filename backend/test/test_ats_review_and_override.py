@@ -287,6 +287,22 @@ def test_sheet_lists_an_applicant_with_no_ats_result_last(client, hr_headers, db
     assert body["candidates"][0]["scored"] is True
 
 
+def test_sheet_lists_an_applicant_whose_result_will_not_render(client, hr_headers, db, job):
+    """A stored result the row builder cannot read used to drop the applicant from the
+    list while total_candidates still counted them."""
+    ok = _scored(db, job, "ok", GOOD_RESUME)
+    broken = _scored(db, job, "broken", GOOD_RESUME)
+    res = db.query(ATSResult).filter(ATSResult.candidate_id == broken.id).one()
+    res.matched_skills = json.dumps({"not": "a list"})
+    db.flush()
+    body = _list(client, hr_headers, job)
+    assert body["total_candidates"] == 2
+    rows = {c["candidate_id"]: c for c in body["candidates"]}
+    assert set(rows) == {ok.id, broken.id}
+    assert rows[broken.id]["scored"] is False
+    assert rows[ok.id]["scored"] is True
+
+
 def test_score_filters_and_merge_still_exclude(client, hr_headers, db, job):
     keep = _scored(db, job, "keep", GOOD_RESUME)
     _candidate(db, job, "unscored")

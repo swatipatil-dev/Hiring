@@ -5809,10 +5809,11 @@ async def get_job_candidates_enhanced(
                     source_detail=candidate.source_detail,
                 ))
             except Exception:
-                # Still skipped, but no longer silently: total_candidates counts this
-                # row, so a gap between the header and the list is otherwise a mystery.
+                # A stored result that will not render (bad JSON, an odd column value)
+                # must not take the applicant off the sheet. Show them as unscored, so
+                # "Score now" can rebuild the result, and log why.
                 logger.exception("ATS sheet: could not build row for candidate %s", candidate.id)
-                continue
+                result.append(_unscored_candidate_response(candidate, current_user))
 
         # Calculate ATS distribution using shared utility
         ats_distribution = calculate_ats_distribution([c.ats_score for c in result if c.ats_score])
