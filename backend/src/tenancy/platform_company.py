@@ -28,7 +28,9 @@ def platform_slug() -> str:
 
 def platform_name() -> str:
     """Display name used when the platform company has to be created."""
-    return os.getenv("PLATFORM_COMPANY_NAME", "Innomax IT Solutions")
+    # Not "Innomax IT Solutions": that is a client company's name, and the platform's
+    # careers page under it read as the client's job board.
+    return os.getenv("PLATFORM_COMPANY_NAME", "Innomax Skills")
 
 
 def get_platform_company(db):

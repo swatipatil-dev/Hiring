@@ -239,3 +239,51 @@ def test_a_named_company_that_does_not_resolve_fails_closed(client, db):
         "api_key": "sk_live_rotated_away",
     })
     assert resp.status_code == 404, resp.text
+
+
+# ── which org is the platform: decided by the backend, carried in the JWT ──────
+
+def _claims(token):
+    from jose import jwt
+    return jwt.get_unverified_claims(token)
+
+
+def _login_token(client, db, email, company_id):
+    from src.auth import get_password_hash
+    from src.models.models import User
+    db.add(User(
+        id=str(uuid.uuid4()), email=email, password_hash=get_password_hash("Pass@1234"),
+        role="candidate", first_name="P", last_name="U",
+        is_active=True, email_verified=True, company_id=company_id,
+    ))
+    db.flush()
+    resp = client.post("/api/v1/auth/login", json={"email": email, "password": "Pass@1234"})
+    assert resp.status_code == 200, resp.text
+    return resp.json()["access_token"]
+
+
+@pytest.mark.auth
+def test_token_marks_platform_staff_as_platform(client, db):
+    """The frontend used to recognise the platform org by a company id hardcoded from
+    one database. Ids are random per database, so in production platform users failed
+    the check and were logged out to the platform's careers page as client staff."""
+    from src.tenancy.platform_company import ensure_platform_company
+    platform = ensure_platform_company(db)
+    db.flush()
+    claims = _claims(_login_token(client, db, "platform_user@test.com", platform.id))
+    assert claims["is_platform"] is True
+    assert claims["company_slug"] == platform.slug
+
+
+@pytest.mark.auth
+def test_token_marks_client_staff_as_not_platform(client, db):
+    company = _make_company(db, "Client Co", "client-co")
+    claims = _claims(_login_token(client, db, "client_user@test.com", company.id))
+    assert claims["is_platform"] is False
+    assert claims["company_slug"] == "client-co"
+
+
+def test_platform_company_default_name_is_not_a_clients_name(monkeypatch):
+    monkeypatch.delenv("PLATFORM_COMPANY_NAME", raising=False)
+    from src.tenancy.platform_company import platform_name
+    assert platform_name() == "Innomax Skills"

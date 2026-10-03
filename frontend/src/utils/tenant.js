@@ -55,6 +55,24 @@ export function getStoredSlug() {
   }
 }
 
+/**
+ * Does this signed-in user belong to the platform org (Innomax Skills), not a client?
+ *
+ * The backend decides, from its env-driven platform slug, and puts `is_platform` in the
+ * JWT (mirrored onto the cached user by AuthContext). Never compare the company id: the
+ * platform company's id is a random uuid per database, so an id copied from one
+ * environment matches nothing in another — which logged production platform users out
+ * to the platform's careers page as though they worked for a client.
+ *
+ * The slug check covers sessions issued before the claim existed; no company at all
+ * means a platform-level account.
+ */
+export function isPlatformUser(user) {
+  if (!user) return false
+  if (typeof user.is_platform === 'boolean') return user.is_platform
+  return !user.company_id || user.company_slug === 'innomax'
+}
+
 export function storeSlug(slug) {
   if (!slug) return
   safeSet(SLUG_KEY, slug)
