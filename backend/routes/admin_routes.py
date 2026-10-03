@@ -1076,7 +1076,7 @@ async def delete_user(
     # on an active->inactive change) brought every old token back to life.
     from src.auth import revoke_user_sessions
     revoke_user_sessions(user)
-GIV summary = deactivate_interviewer_assignments(db, user, current_user.id) if was_active else None
+    summary = deactivate_interviewer_assignments(db, user, current_user.id) if was_active else None
     db.commit()
     response = {
         "message": "User deactivated successfully — the account is kept and can be reactivated",
