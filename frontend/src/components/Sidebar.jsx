@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { NavLink, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
-import { clearSlug, getStoredSlug } from '../utils/tenant'
+import { clearSlug, getStoredSlug, isPlatformUser } from '../utils/tenant'
 import {
   LayoutDashboard, Users, Building2, BarChart3, Briefcase, KanbanSquare,
   Calendar, Gift, ScanSearch, ClipboardList, MessageSquare,
@@ -60,8 +60,6 @@ const NAV = {
 const ROLE_ICONS = { superadmin: Crown, admin: Shield, hr: Briefcase, interviewer: ClipboardList, candidate: UserCircle }
 const ROLE_COLORS = { superadmin: '#f59e0b', admin: '#e87c6c', hr: '#4ecdb5', interviewer: '#6ba3d6', candidate: '#c17f3e' }
 
-const INNOMAX_COMPANY_ID = 'b88497df-ffa7-4a7f-b441-9f9ef365d6df'
-
 // Below this width the rail becomes an off-canvas drawer. Matches the index.css
 // breakpoint where .main-content drops its sidebar margin.
 const DRAWER_QUERY = '(max-width: 1024px)'
@@ -110,10 +108,12 @@ export default function Sidebar() {
     // authoritative here and needs no storage lookup. getStoredSlug is the fallback for
     // a session that pre-dates that claim.
     const companySlug = user?.company_slug || getStoredSlug()
-    const isHireFlowUser = !user?.company_id || user.company_id === INNOMAX_COMPANY_ID
+    // Platform staff sign out to the platform login; a client company's people go
+    // back to their company's job board.
+    const platformUser = isPlatformUser(user)
     logout()
     clearSlug()
-    if (!isHireFlowUser && companySlug) {
+    if (!platformUser && companySlug) {
       navigate(`/${encodeURIComponent(companySlug)}/jobs`)
     } else {
       navigate('/login')
@@ -129,12 +129,10 @@ export default function Sidebar() {
   const avatarInitial = (user?.first_name?.[0] || user?.email?.[0] || '?').toUpperCase()
 
   const isCandidate = role === 'candidate'
-  // Platform org (Innomax) → navy + innomax.ai logo. Detect by slug so it works for
-  // superadmin/admin/candidates who belong to the innomax company (which has a color),
-  // not just company-less users. Real client companies keep their own brand color.
-  const isInnomax = !user?.company_id
-    || user?.company_slug === 'innomax'
-    || user?.company_id === INNOMAX_COMPANY_ID
+  // Platform org (Innomax) → navy + innomax.ai logo, for everyone who belongs to it
+  // (superadmin/admin/candidates), not just company-less users. Real client companies
+  // keep their own brand color.
+  const isInnomax = isPlatformUser(user)
   // Optional-chained: `user` is read from localStorage and can be null while a token
   // still exists (cleared site data, half-finished logout) — a bare user.company_color
   // threw and blanked the whole shell.

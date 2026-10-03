@@ -42,7 +42,9 @@ function applyCompanyBranding(token) {
   const payload = parseJWT(token)
   // The platform org (Innomax) keeps the default teal theme — only real client
   // companies override the accent with their brand color.
-  const isInnomax = payload.company_slug === 'innomax'
+  const isInnomax = typeof payload.is_platform === 'boolean'
+    ? payload.is_platform
+    : payload.company_slug === 'innomax'   // tokens issued before the claim existed
   if (payload.company_color && !isInnomax) {
     document.documentElement.style.setProperty('--accent-primary', payload.company_color)
     document.documentElement.style.setProperty('--accent-secondary', payload.company_secondary_color || payload.company_color)
@@ -60,6 +62,9 @@ function applyCompanyBranding(token) {
     company_font: payload.company_font || null,
     company_name: payload.company_name || null,
     company_slug: payload.company_slug || null,
+    // Absent (undefined) on tokens issued before the claim, so isPlatformUser can
+    // tell "not the platform" from "not told".
+    is_platform: typeof payload.is_platform === 'boolean' ? payload.is_platform : undefined,
   }
 }
 

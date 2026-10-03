@@ -178,7 +178,10 @@ class ATSCandidateResponse(BaseModel):
     email: str
     phone: Optional[str] = None
     current_stage: str
-    ats_score: float
+    # None when the applicant has no ATS result yet (scoring failed or never ran at
+    # apply time). They are still listed, with `scored` False, so HR can score them.
+    ats_score: Optional[float] = None
+    scored: bool = True
     ats_level: str
     ats_color: str
     skills_match_score: Optional[float] = 0.0
@@ -5558,6 +5561,52 @@ async def update_interview_panel(
 
 # ==================== ATS SCREENING ENDPOINTS ====================
 
+def _job_for_ats_sheet(db: Session, job_id: str, current_user: User) -> JobPosting:
+    """The job, if it is in the caller's company and (for non-admins) assigned to them."""
+    job = db.query(JobPosting).filter(
+        JobPosting.id == job_id,
+        JobPosting.company_id == current_user.company_id,
+    ).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if current_user.role != "admin":
+        hr_profile = get_hr_profile(db, current_user)
+        if not can_access_job(db, job, hr_profile):
+            raise HTTPException(status_code=403, detail="Access denied")
+    return job
+
+
+def _unscored_candidate_response(candidate, current_user: User) -> "ATSCandidateResponse":
+    """A sheet row for an applicant with no ATS result: listed, but marked unscored."""
+    return ATSCandidateResponse(
+        candidate_id=str(candidate.id),
+        name=f"{candidate.first_name} {candidate.last_name}",
+        email=candidate.email,
+        phone=candidate.phone,
+        current_stage=candidate.current_stage,
+        ats_score=None,
+        scored=False,
+        ats_level="Not scored",
+        ats_color="gray",
+        skills_match_score=None,
+        semantic_score=None,
+        experience_score=None,
+        keyword_score=None,
+        education_score=None,
+        certification_score=None,
+        project_score=None,
+        extracted_skills=json.loads(candidate.extracted_skills) if isinstance(candidate.extracted_skills, str) else (candidate.extracted_skills or []),
+        experience_years=candidate.experience_years,
+        applied_at=candidate.created_at,
+        resume_url=application_file_url(candidate, "resume", current_user),
+        photo_url=application_file_url(candidate, "photo", current_user),
+        stale_reason=None,
+        source=candidate.source,
+        source_label=SOURCES.get(candidate.source, "Not recorded"),
+        source_detail=candidate.source_detail,
+    )
+
+
 @router.get("/jobs/{job_id}/candidates", response_model=JobCandidatesEnhancedResponse)
 async def get_job_candidates_enhanced(
     job_id: str,
@@ -5591,29 +5640,18 @@ async def get_job_candidates_enhanced(
         sort_by = validate_sort_params(sort_by, valid_sort_fields, "ats_score")
         sort_order = validate_order_params(order)
         
-        # Check if job exists and permissions
-        job = db.query(JobPosting).filter(
-            JobPosting.id == job_id,
-            JobPosting.company_id == current_user.company_id,
-        ).first()
-        if not job:
-            raise HTTPException(status_code=404, detail="Job not found")
-        
-        if current_user.role != "admin":
-            hr_profile = get_hr_profile(db, current_user)
-            if not can_access_job(db, job, hr_profile):
-                raise HTTPException(status_code=403, detail="Access denied")
-        
-        # Subquery: get only the latest ATSResult per candidate
+        job = _job_for_ats_sheet(db, job_id, current_user)
+
+        # Subquery: one ATSResult per candidate for THIS job
         # (guards against duplicates when ATS scoring ran more than once)
         latest_ats_subq = db.query(
             ATSResult.candidate_id.label('cid'),
             func.max(ATSResult.id).label('latest_id')
-        ).group_by(ATSResult.candidate_id).subquery()
+        ).filter(ATSResult.job_id == job_id).group_by(ATSResult.candidate_id).subquery()
 
-        # Outer joins: every applicant stays on the sheet while the job is open,
-        # including one whose result is missing (scoring failed) or hidden by the
-        # tenant filter. An inner join dropped them without a trace.
+        # Outer joins: an applicant whose scoring failed or never ran has no ATSResult.
+        # An inner join hid them from HR entirely — on the sheet that is meant to list
+        # everyone who applied. They come back with ats_result None and sort last.
         query = db.query(Candidate, ATSResult).outerjoin(
             latest_ats_subq, Candidate.id == latest_ats_subq.c.cid
         ).outerjoin(
@@ -5621,15 +5659,13 @@ async def get_job_candidates_enhanced(
         ).filter(Candidate.job_id == job_id,
                  # A merged duplicate is kept for undo, not shown as a second person.
                  Candidate.merged_into_id.is_(None))
-        # Without a result, fall back to the score mirrored onto the candidate.
-        score_col = func.coalesce(effective_score_col(), Candidate.ats_score)
-
+        
         # Apply filters efficiently
         if min_score is not None:
-            query = query.filter(score_col >= min_score)
+            query = query.filter(effective_score_col() >= min_score)
 
         if max_score is not None:
-            query = query.filter(score_col <= max_score)
+            query = query.filter(effective_score_col() <= max_score)
         
         if stage:
             query = query.filter(Candidate.current_stage == stage)
@@ -5647,10 +5683,13 @@ async def get_job_candidates_enhanced(
         
         # Apply sorting
         if sort_by == "ats_score":
+            # Unscored applicants last in both directions — MySQL would put NULLs
+            # first on ASC, ahead of everyone who has a score.
+            query = query.order_by(effective_score_col().is_(None))
             if sort_order == "desc":
-                query = query.order_by(desc(score_col))
+                query = query.order_by(desc(effective_score_col()))
             else:
-                query = query.order_by(score_col)
+                query = query.order_by(effective_score_col())
         elif sort_by == "applied_at":
             if sort_order == "desc":
                 query = query.order_by(desc(Candidate.created_at))
@@ -5678,36 +5717,10 @@ async def get_job_candidates_enhanced(
             JobDescriptionVersion.job_id == job_id).all()}
 
         # Create enhanced candidate responses with error handling
-        def _basic_row(candidate, ats_result):
-            """The applicant without the scoring detail: never leave them off the sheet."""
-            score = effective_score(ats_result)
-            if score is None and candidate.ats_score is not None:
-                score = float(candidate.ats_score)
-            interp = get_ats_interpretation(score) if score is not None else {"level": "Not scored", "color": "gray"}
-            return ATSCandidateResponse(
-                candidate_id=str(candidate.id),
-                name=f"{candidate.first_name or ''} {candidate.last_name or ''}".strip() or (candidate.email or ""),
-                email=candidate.email or "",
-                phone=candidate.phone,
-                current_stage=candidate.current_stage or "applied",
-                ats_score=score or 0.0,
-                ats_level=interp["level"],
-                ats_color=interp["color"],
-                experience_years=candidate.experience_years,
-                applied_at=candidate.created_at,
-                resume_url=application_file_url(candidate, "resume", current_user),
-                parse_status=getattr(ats_result, "parse_status", None),
-                is_stale=ats_result is None,
-                stale_reason="legacy" if ats_result is None else None,
-                source=candidate.source,
-                source_label=SOURCES.get(candidate.source, "Not recorded"),
-                source_detail=candidate.source_detail,
-            )
-
         result = []
         for candidate, ats_result in candidates:
             if ats_result is None:
-                result.append(_basic_row(candidate, None))
+                result.append(_unscored_candidate_response(candidate, current_user))
                 continue
             try:
                 eff = effective_score(ats_result) or 0.0
@@ -5796,8 +5809,11 @@ async def get_job_candidates_enhanced(
                     source_detail=candidate.source_detail,
                 ))
             except Exception:
-                logger.exception("ATS sheet: showing basic row for candidate %s", candidate.id)
-                result.append(_basic_row(candidate, ats_result))
+                # A stored result that will not render (bad JSON, an odd column value)
+                # must not take the applicant off the sheet. Show them as unscored, so
+                # "Score now" can rebuild the result, and log why.
+                logger.exception("ATS sheet: could not build row for candidate %s", candidate.id)
+                result.append(_unscored_candidate_response(candidate, current_user))
 
         # Calculate ATS distribution using shared utility
         ats_distribution = calculate_ats_distribution([c.ats_score for c in result if c.ats_score])
@@ -5821,6 +5837,90 @@ async def get_job_candidates_enhanced(
         print(f"Error in get_job_candidates_enhanced: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Internal server error processing candidates")
+
+
+class PoolMatchResponse(BaseModel):
+    entry_id: str
+    full_name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    experience_years: Optional[float] = None
+    match_score: Optional[float] = None       # this entry's score against THIS job
+    rating: Optional[str] = None
+    parse_status: Optional[str] = None
+    is_best_match: bool = False               # this job is the entry's top match
+
+
+POOL_MATCHES_LIMIT = 500
+
+
+@router.get("/jobs/{job_id}/pool-matches", response_model=List[PoolMatchResponse])
+async def get_job_pool_matches(
+    job_id: str,
+    current_user: User = Depends(AuthMiddleware.get_current_hr),
+    db: Session = Depends(get_db),
+):
+    """Talent Pool resumes matched to this job that are not candidates on it yet.
+
+    The ATS sheet lists Candidates only, and a pool entry becomes one only through
+    Move to ATS — so a strong pool match was invisible from the job's own sheet.
+
+    Excludes entries whose email already has a candidate on this job (the same
+    (job_id, email) rule Move to ATS enforces), not entries with status 'moved':
+    one entry can be moved onto several jobs.
+    """
+    _job_for_ats_sheet(db, job_id, current_user)
+
+    entries = db.query(ResumePoolEntry).filter(
+        ResumePoolEntry.company_id == current_user.company_id,
+        or_(ResumePoolEntry.status.is_(None), ResumePoolEntry.status != "archived"),
+        or_(ResumePoolEntry.best_job_id == job_id,
+            # match_results is JSON text; a job id is a UUID, so a substring match
+            # finds exactly the entries ranked against it. Parsed precisely below.
+            ResumePoolEntry.match_results.like(f"%{job_id}%")),
+    ).all()
+
+    on_job = {
+        (e or "").strip().lower()
+        for (e,) in db.query(Candidate.email).filter(
+            Candidate.job_id == job_id, Candidate.merged_into_id.is_(None)).all()
+    }
+
+    out = []
+    for entry in entries:
+        email = (entry.email or "").strip().lower()
+        if email and email in on_job:
+            continue
+        match = None
+        try:
+            ranked = json.loads(entry.match_results) if entry.match_results else []
+        except (TypeError, ValueError):
+            ranked = []
+        for m in ranked if isinstance(ranked, list) else []:
+            if isinstance(m, dict) and str(m.get("job_id")) == job_id:
+                match = m
+                break
+        is_best = entry.best_job_id == job_id
+        if match is None and not is_best:
+            continue      # the id appeared in the JSON, but not as a ranked job
+        score = (match or {}).get("ats_score")
+        if score is None and is_best and entry.best_score is not None:
+            score = entry.best_score
+        out.append(PoolMatchResponse(
+            entry_id=str(entry.id),
+            full_name=entry.full_name,
+            email=entry.email,
+            phone=entry.phone,
+            experience_years=float(entry.experience_years) if entry.experience_years is not None else None,
+            match_score=float(score) if score is not None else None,
+            rating=(match or {}).get("rating"),
+            parse_status=entry.parse_status,
+            is_best_match=is_best,
+        ))
+
+    out.sort(key=lambda p: (p.match_score is None, -(p.match_score or 0), p.full_name or ""))
+    return out[:POOL_MATCHES_LIMIT]
+
 
 @router.post("/jobs/{job_id}/select-candidates", response_model=BulkActionResponse)
 async def select_candidates_bulk(
@@ -5945,6 +6045,10 @@ async def select_candidates_bulk(
             if candidate.id not in selected_id_set and candidate.current_stage not in ("rejected", "hired"):
                 if candidate.id in held_ids:
                     continue
+                # A merged duplicate is a hidden copy of someone shown elsewhere —
+                # possibly the person just selected. Rejecting it emails them a rejection.
+                if candidate.merged_into_id:
+                    continue
                 prev_stage = candidate.current_stage
                 candidate.current_stage = "rejected"
                 candidate.updated_at = datetime.utcnow()
@@ -5973,7 +6077,7 @@ async def select_candidates_bulk(
                 and c.id not in {x.id for x in selected_candidates}])
     return BulkActionResponse(
         message=f"Successfully processed {len(selected_candidates)} candidates using {selection.selection_type} strategy"
-                + (f". {held} held for manual review (resume could not be read reliably)." if held else ""),
+                + (f". {held} held for manual review (resume could not be read reliably, or not scored yet)." if held else ""),
         selected_count=moved_count,
         rejected_count=rejected_count,
         moved_to_stage=selection.next_stage,

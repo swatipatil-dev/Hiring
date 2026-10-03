@@ -717,6 +717,14 @@ def create_token_response(user: User, db: Session = None, *,
                 token_data["company_font"] = company.font_family or ""
                 token_data["company_name"] = company.name or ""
                 token_data["company_slug"] = company.slug or ""
+                # Decided here, from the env-driven platform slug, so the frontend never
+                # has to recognise the platform org by a hardcoded id or slug. Its id is
+                # a random uuid per database: a copied dev id matched nothing in
+                # production, so platform users were logged out to the platform's
+                # careers page as if they were a client company's staff.
+                from .tenancy.platform_company import platform_slug
+                token_data["is_platform"] = (
+                    (company.slug or "").strip().lower() == platform_slug().strip().lower())
 
     # Never outlive the session ceiling, even by a single token lifetime.
     lifetime = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)

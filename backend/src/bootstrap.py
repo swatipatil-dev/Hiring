@@ -19,7 +19,7 @@ Platform admin (admin of the innomax company — runs Innomax's own hiring):
     PLATFORM_ADMIN_LAST_NAME=User             (optional)
 
 Platform company (shared by both of the above):
-    PLATFORM_COMPANY_NAME="Innomax IT Solutions"  (optional)
+    PLATFORM_COMPANY_NAME="Innomax Skills"  (optional)
     PLATFORM_COMPANY_SLUG=innomax                 (optional, default "innomax")
 
 Both creators are idempotent — safe to leave the vars set, or remove the *_PASSWORD

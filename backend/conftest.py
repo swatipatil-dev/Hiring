@@ -153,8 +153,22 @@ def db(db_engine) -> Session:
         if not nested.is_active:
             nested = connection.begin_nested()
 
+    # email_log opens its own session whenever a send has no request session
+    # (dispatch(db=None) — most notification helpers). On a second connection
+    # its INSERT's foreign-key check waits on the company this test created but
+    # never committed, until innodb_lock_wait_timeout: 50s per email, ~70% of
+    # CI time, and the row is then silently dropped. In production that parent
+    # row is already committed. Here the "own" session is a SAVEPOINT on this
+    # test's connection instead, so it sees the test's rows, its commit() only
+    # releases the savepoint, and everything still rolls back below.
+    import src.services.email_log as email_log_mod
+    orig_open_session = email_log_mod._open_session
+    email_log_mod._open_session = lambda: Session(
+        bind=connection, join_transaction_mode="create_savepoint")
+
     yield session
 
+    email_log_mod._open_session = orig_open_session
     session.close()
     transaction.rollback()
     connection.close()

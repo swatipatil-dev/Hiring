@@ -39,8 +39,16 @@ def _smtp_config_from(sender: dict):
     }
 
 
-def _log(payload: dict, status: str, attempt: int, result: dict | None = None) -> None:
-    """Update this message's delivery row. Opens its own session; never raises.
+def _log(payload: dict, status: str, attempt: int, result: dict | None = None,
+         db=None) -> None:
+    """Update this message's delivery row. Never raises.
+
+    In the RQ worker ``db`` is None and a session is opened for the write. On the
+    inline fallback (Redis down, EMAIL_SYNC) the job runs inside the request that
+    flushed the queued row, and ``db`` is that request's session: a second
+    session would block on the row's uncommitted insert until
+    innodb_lock_wait_timeout (50s by default) — per email — and then lose the
+    update.
 
     company_id comes from the payload, not from the tenant contextvar: nothing is
     bound in the worker, so before_flush would leave it NULL and the row would be
@@ -53,11 +61,14 @@ def _log(payload: dict, status: str, attempt: int, result: dict | None = None) -
         from src.services import email_log
         sender = payload.get("sender") or {}
         email_log.finalize(
-            None, payload.get("log_id"), status=status,
+            db, payload.get("log_id"), status=status,
             to_email=payload.get("to"), subject=payload.get("subject"),
             error=result.get("error"), error_type=result.get("error_type"),
             attempt=attempt, sender_user=sender.get("user"),
             company_id=payload.get("company_id"), step_key=payload.get("step_key"),
+            # The caller's transaction commits (or rolls back) the row with
+            # the request, like every other in-request email_log write.
+            commit=db is None,
         )
     except Exception as e:
         logger.warning(f"[EMAIL QUEUE] delivery log write failed for {payload.get('to')}: {e}")
@@ -83,8 +94,12 @@ def _reschedule(payload: dict, attempt: int, delay: int, reason: str) -> None:
         logger.warning(f"[EMAIL QUEUE] reschedule failed for {payload.get('to')}: {e}")
 
 
-def send_email_job(payload: dict, attempt: int = 0) -> dict:
-    """Send one email, applying the hourly cap (defer) and retry-on-transient."""
+def send_email_job(payload: dict, attempt: int = 0, db=None) -> dict:
+    """Send one email, applying the hourly cap (defer) and retry-on-transient.
+
+    ``db`` is only passed by the inline fallback in ``enqueue_email`` — see
+    ``_log``. RQ calls this with ``(payload, attempt)`` and never a session.
+    """
     from . import ratelimit
     from src.services.email_service import _send
 
@@ -102,7 +117,7 @@ def send_email_job(payload: dict, attempt: int = 0) -> dict:
     )
     if claimed is None:
         _reschedule(payload, attempt, ratelimit.seconds_to_next_window(), "rate-limited")
-        _log(payload, "deferred", attempt)
+        _log(payload, "deferred", attempt, db=db)
         return {"deferred": True, "account": account}
 
     # 2. Send.
@@ -115,7 +130,7 @@ def send_email_job(payload: dict, attempt: int = 0) -> dict:
         cc=payload.get("cc"),
     )
     if result.get("sent"):
-        _log(payload, "sent", attempt, result)
+        _log(payload, "sent", attempt, result, db=db)
         return {"sent": True, "account": account}
 
     # 3. Retry transient failures; give the reserved slot back first.
@@ -125,12 +140,12 @@ def send_email_job(payload: dict, attempt: int = 0) -> dict:
         backoff = min((2 ** attempt) * 60, 3600)
         _reschedule(payload, attempt + 1, backoff, f"retry:{etype}")
         # Still 'queued' as far as delivery goes — a retry is pending, not a loss.
-        _log(payload, "queued", attempt + 1, result)
+        _log(payload, "queued", attempt + 1, result, db=db)
         return {"retry": True, "attempt": attempt + 1, "error": result.get("error")}
 
     logger.error(
         f"[EMAIL QUEUE] giving up: to={payload.get('to')} "
         f"type={etype} err={result.get('error')}"
     )
-    _log(payload, "failed", attempt, result)
+    _log(payload, "failed", attempt, result, db=db)
     return {"sent": False, "error": result.get("error"), "error_type": etype}

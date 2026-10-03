@@ -715,7 +715,7 @@ def dispatch(to: str, subject: str, body: str, reply_to: Optional[str] = None,
         "step_key": cfg.get("step_key"),
     }
     try:
-        return enqueue_email(payload)
+        return enqueue_email(payload, db=db)
     except Exception as e:
         logger.warning(f"email enqueue failed ({e}); sending inline")
         return _send(to, subject, body, reply_to=reply_to, smtp_config=smtp_config,
