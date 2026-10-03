@@ -244,9 +244,16 @@ jobs:
       # files are also ignored, not just deselected: they skip at IMPORT time
       # without opencv, before the marker filter applies, and would show up here
       # as skips. Every test in them is marked `proctor`, so stage 2 runs them.
+      #
+      # -n auto: one pytest-xdist worker per vCPU, each on its own database
+      # (<TEST_DB>_gw0, _gw1, … — created by conftest.py). loadscope keeps a
+      # module's or class's tests on one worker so their shared fixtures are
+      # built once. --durations lists the slowest tests, so the next slowdown
+      # shows up in the log rather than only in the total.
       - name: pytest (stage 1 selection)
         run: >-
           pytest test/ -v --tb=short
+          -n auto --dist loadscope --durations=25
           -m "not slow and not proctor"
           --ignore-glob="test/test_proctor_*.py"
           --junit-xml=test-results.xml
@@ -501,6 +508,7 @@ jobs:
       - name: pytest (stage 2 selection)
         run: >-
           pytest test/ -v --tb=short
+          -n auto --dist loadscope --durations=25
           -m "slow or proctor"
           --junit-xml=test-results.xml
 
