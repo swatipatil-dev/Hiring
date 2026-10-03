@@ -9,7 +9,7 @@ import re
 import time
 from datetime import datetime
 from typing import Optional
-from fastapi import APIRouter, HTTPException, Request, status, Depends
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from src.rate_limit import limiter
 
@@ -218,10 +218,13 @@ async def register(request: Request, user_data: RegisterRequest, db: Session = D
         }
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
+        # Logged in full, returned generically: exception text can carry SQL, table
+        # names or connection details, none of which an unauthenticated caller needs.
+        logger.exception("registration failed")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Registration failed: {str(e)}"
+            detail="Registration failed. Please try again."
         )
 
 
@@ -252,9 +255,37 @@ async def verify_otp(request: Request, data: OTPVerifyRequest, db: Session = Dep
     return _issue_login(user, db)
 
 
+def _send_auth_mail_later(background_tasks, db, user, send, otp, what):
+    """Send an OTP email after the response has gone.
+
+    Sent inline, the SMTP round trip happened only when the account existed, so the
+    response time told a caller whether an email was registered even though the body
+    was identical — and it blocked the event loop while it waited. The sender is
+    resolved now, while the request's session is open; only the network send is deferred.
+    Failures are logged, never returned: whether the mail left is not the caller's
+    business, and reporting it would re-open the oracle.
+    """
+    from src.services.email_service import resolve_auth_sender
+    try:
+        smtp_config = resolve_auth_sender(db, user.company_id)
+    except Exception as e:
+        logger.warning(f"{what} email to {user.email}: sender lookup failed: {e}")
+        return
+    email, name = user.email, user.first_name
+
+    def _run():
+        try:
+            send(email, name, otp, smtp_config=smtp_config)
+        except Exception as e:
+            logger.warning(f"{what} email to {email} failed: {e}")
+
+    background_tasks.add_task(_run)
+
+
 @router.post("/resend-otp")
 @limiter.limit("3/minute")
-async def resend_otp(request: Request, data: ResendOTPRequest, db: Session = Depends(get_db)):
+async def resend_otp(request: Request, data: ResendOTPRequest, background_tasks: BackgroundTasks,
+                     db: Session = Depends(get_db)):
     """Resend a fresh OTP, if the address belongs to an unverified account.
 
     Always returns the same 200. The old 404 / 400 / 200 split told an unauthenticated
@@ -267,14 +298,8 @@ async def resend_otp(request: Request, data: ResendOTPRequest, db: Session = Dep
     if not user or user.email_verified:
         return SENT
     otp = set_user_otp(user, db, purpose="verify")
-    try:
-        from src.services.email_service import send_otp_email, resolve_auth_sender
-        smtp_config = resolve_auth_sender(db, user.company_id)
-        send_otp_email(user.email, user.first_name, otp, smtp_config=smtp_config)
-    except Exception as e:
-        # Logged, not returned: whether the mail left the building is not the caller's
-        # business, and reporting it re-opens the oracle this function just closed.
-        logger.warning(f"resend OTP email to {user.email} failed: {e}")
+    from src.services.email_service import send_otp_email
+    _send_auth_mail_later(background_tasks, db, user, send_otp_email, otp, "resend OTP")
     return SENT
 
 @router.post("/login")
@@ -362,10 +387,13 @@ async def login(
         return _issue_login(user, db)
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
+        # Logged in full, returned generically: exception text can carry SQL, table
+        # names or connection details, none of which an unauthenticated caller needs.
+        logger.exception("login failed")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Login failed: {str(e)}"
+            detail="Login failed. Please try again."
         )
 
 @router.post("/refresh", response_model=Token)
@@ -441,12 +469,36 @@ class MfaDisableRequest(BaseModel):
 
 
 class MfaCodeRequest(BaseModel):
+    password: str
     code: str = Field(..., min_length=6, max_length=32)
+
+
+def _require_password_and_code(db: Session, user: User, password: str, code: str) -> None:
+    """Re-authenticate for a change to the account's second factor.
+
+    Failures count toward the same per-account lockout as a wrong password at sign-in:
+    otherwise a stolen session could guess the password here, limited only per IP.
+    """
+    if is_locked(user):
+        raise locked_exception()
+    if not verify_password(password, user.password_hash):
+        register_login_failure(db, user)
+        raise HTTPException(status_code=400, detail="Password is incorrect.")
+    if not _check_second_factor(db, user, code):
+        register_login_failure(db, user)
+        raise _BAD_CODE
+    clear_login_failures(db, user)
 
 
 def _check_second_factor(db: Session, user: User, code: str) -> bool:
     """A TOTP code (replay-guarded) or an unused recovery code. Commits on success."""
     secret = decrypt(user.mfa_secret or "")
+    if user.mfa_secret and not secret:
+        # decrypt() returns "" rather than raising. Here that means the Fernet key
+        # (EMAIL_ENCRYPTION_KEY, else derived from SECRET_KEY) changed after enrolment:
+        # every authenticator code now fails, and only recovery codes still work.
+        logger.error("MFA secret for user %s cannot be decrypted — was EMAIL_ENCRYPTION_KEY "
+                     "or SECRET_KEY changed? TOTP codes will fail until it is restored.", user.id)
     if secret:
         step = totp.verify_totp(secret, code, last_step=user.mfa_last_step)
         if step is not None:
@@ -539,8 +591,11 @@ async def mfa_enroll_confirm(
     secret = decrypt(user.mfa_secret or "")
     if not secret:
         raise HTTPException(status_code=400, detail="Start enrolment first.")
+    if is_locked(user):
+        raise locked_exception()
     step = totp.verify_totp(secret, data.code)
     if step is None:
+        register_login_failure(db, user)
         raise _BAD_CODE
     codes, stored = totp.generate_recovery_codes()
     user.mfa_enabled = True
@@ -561,11 +616,11 @@ async def mfa_regenerate_recovery_codes(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Replace the recovery codes (the old ones stop working). Needs a current code."""
+    """Replace the recovery codes (the old ones stop working). Needs the password and a
+    current code: new codes are a way past the second factor, so a session alone isn't enough."""
     if not current_user.mfa_enabled:
         raise HTTPException(status_code=400, detail="Two-factor authentication is off.")
-    if not _check_second_factor(db, current_user, data.code):
-        raise _BAD_CODE
+    _require_password_and_code(db, current_user, data.password, data.code)
     codes, stored = totp.generate_recovery_codes()
     current_user.mfa_recovery_codes = stored
     db.commit()
@@ -586,10 +641,7 @@ async def mfa_disable(
                             detail="Two-factor authentication is required for your role.")
     if not current_user.mfa_enabled:
         raise HTTPException(status_code=400, detail="Two-factor authentication is off.")
-    if not verify_password(data.password, current_user.password_hash):
-        raise HTTPException(status_code=400, detail="Password is incorrect.")
-    if not _check_second_factor(db, current_user, data.code):
-        raise _BAD_CODE
+    _require_password_and_code(db, current_user, data.password, data.code)
     current_user.mfa_enabled = False
     current_user.mfa_secret = None
     current_user.mfa_recovery_codes = None
@@ -775,9 +827,8 @@ class ChangePasswordRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     current_password: str
-    # max_length because bcrypt only hashes the first 72 bytes (src/auth.py
-    # _bcrypt_bytes) — better to reject a novel than silently truncate it. The full
-    # rules are validate_password_strength; min_length here rejects the obvious as 422.
+    # The full rules — including the 72-byte bcrypt limit — are validate_password_strength;
+    # these bounds only reject the obvious early as a 422.
     new_password: str = Field(..., min_length=8, max_length=128)
 
 
@@ -859,7 +910,8 @@ async def verify_token(current_user: User = Depends(get_current_user)):
 
 @router.post("/forgot-password")
 @limiter.limit("3/minute")
-async def forgot_password(request: Request, data: ForgotPasswordRequest, db: Session = Depends(get_db)):
+async def forgot_password(request: Request, data: ForgotPasswordRequest,
+                          background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     """Send a password-reset OTP to the user's registered email.
 
     Both branches return an identical body. The intent was always non-enumeration, but
@@ -873,12 +925,8 @@ async def forgot_password(request: Request, data: ForgotPasswordRequest, db: Ses
     if not user:
         return OTP_SENT
     otp = set_user_otp(user, db, purpose="reset")
-    try:
-        from src.services.email_service import send_password_reset_otp, resolve_auth_sender
-        smtp_config = resolve_auth_sender(db, user.company_id)
-        send_password_reset_otp(user.email, user.first_name, otp, smtp_config=smtp_config)
-    except Exception as _e:
-        logger.warning(f"password-reset OTP email to {user.email} failed: {_e}")
+    from src.services.email_service import send_password_reset_otp
+    _send_auth_mail_later(background_tasks, db, user, send_password_reset_otp, otp, "password-reset OTP")
     return OTP_SENT
 
 

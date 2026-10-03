@@ -12,7 +12,7 @@ Answer keys: a candidate only ever gets their own interview's paper, with
 returns or changes answer keys is staff-only.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from pydantic import BaseModel
@@ -70,10 +70,11 @@ class MCQQuestionCreate(BaseModel):
     points: int = 10
 
 
-def _assert_interview_in_tenant(db: Session, interview_id, current_user: User) -> Interview:
+def _assert_interview_in_tenant(db: Session, interview_id, current_user: User,
+                                request: Optional[Request] = None) -> Interview:
     """Resolve an interview by id and raise 404 if it doesn't belong to the
-    caller's company.  Superadmin (company_id is None) is exempt — they keep
-    their cross-tenant access for platform-level inspection.  An interview with
+    caller's company.  A superadmin reaches it only under the owning company's
+    support-access grant, audited (require_support_access).  An interview with
     no company belongs to no tenant and is refused to everyone else.
     """
     try:
@@ -90,11 +91,12 @@ def _assert_interview_in_tenant(db: Session, interview_id, current_user: User) -
         raise HTTPException(status_code=404, detail="Interview not found")
     # Superadmin: only under the company's support-access grant, and audited.
     from src.services.audit_log import require_support_access
-    require_support_access(db, None, current_user, interview.company_id, f"interview {iv_id} (mcq)")
+    require_support_access(db, request, current_user, interview.company_id, f"interview {iv_id} (mcq)")
     return interview
 
 
-def _assert_question_in_tenant(db: Session, question_id: str, current_user: User) -> None:
+def _assert_question_in_tenant(db: Session, question_id: str, current_user: User,
+                               request: Optional[Request] = None) -> None:
     """Block cross-tenant question lookup/mutation by id."""
     row = db.execute(
         text("""
@@ -107,13 +109,18 @@ def _assert_question_in_tenant(db: Session, question_id: str, current_user: User
     ).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Question not found")
-    if current_user.role == "superadmin":
-        return
     q_company = row[0]
     iv_company = row[1]
     # The owning interview is authoritative; the question's own column is a copy of it.
     # No owner at all means no tenant, which is not the caller's.
     owner = iv_company or q_company
+    if current_user.role == "superadmin":
+        # Answer keys are client data: only under that company's grant, and audited.
+        if not owner:
+            raise HTTPException(status_code=404, detail="Question not found")
+        from src.services.audit_log import require_support_access
+        require_support_access(db, request, current_user, owner, f"question {question_id} (mcq)")
+        return
     if not owner or owner != current_user.company_id:
         raise HTTPException(status_code=404, detail="Question not found")
 
@@ -121,6 +128,7 @@ def _assert_question_in_tenant(db: Session, question_id: str, current_user: User
 @router.get("/interviews/{interview_id}/questions", response_model=MCQQuestionList)
 def get_interview_mcq_questions(
     interview_id: str,
+    request: Request,
     difficulty: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -130,7 +138,7 @@ def get_interview_mcq_questions(
     Candidates: only their own interview, only approved questions, and never the
     answer key — ``correct_answer`` is always empty for them.
     """
-    _assert_interview_in_tenant(db, interview_id, current_user)
+    _assert_interview_in_tenant(db, interview_id, current_user, request)
     candidate_view = is_candidate(current_user)
     if candidate_view and not candidate_owns_interview(db, current_user, interview_id):
         raise HTTPException(status_code=404, detail="Interview not found")
@@ -268,11 +276,12 @@ def get_interview_mcq_questions(
 @router.get("/questions/{question_id}", response_model=MCQQuestion)
 def get_mcq_question(
     question_id: str,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(_staff_user),
 ):
     """Get a specific MCQ question by ID (tenant-scoped)."""
-    _assert_question_in_tenant(db, question_id, current_user)
+    _assert_question_in_tenant(db, question_id, current_user, request)
 
     try:
         result = db.execute(
@@ -320,11 +329,12 @@ def get_mcq_question(
 @router.post("/questions", response_model=MCQQuestion, status_code=status.HTTP_201_CREATED)
 def create_mcq_question(
     question: MCQQuestionCreate,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(_staff_user),
 ):
     """Create a new MCQ question (tenant-scoped — only on caller's interviews)."""
-    interview = _assert_interview_in_tenant(db, question.interview_id, current_user)
+    interview = _assert_interview_in_tenant(db, question.interview_id, current_user, request)
 
     try:
         import uuid
@@ -440,17 +450,15 @@ def get_sample_mcq_questions(
     current_user: User = Depends(_staff_user),
 ):
     """Sample MCQ questions — limited to the caller's company."""
+    # A superadmin has no company of their own; a random sample across every tenant
+    # (answer keys included) is not support access to any one of them.
+    from src.services.audit_log import refuse_superadmin_listing
+    refuse_superadmin_listing(current_user, "Sample questions")
     try:
-        if current_user.role == "superadmin":
-            result = db.execute(text(
-                "SELECT id, question_text, difficulty_level, options, correct_answer "
-                "FROM interview_questions ORDER BY RAND() LIMIT 5"
-            ))
-        else:
-            result = db.execute(text(
-                "SELECT id, question_text, difficulty_level, options, correct_answer "
-                "FROM interview_questions WHERE company_id = :cid ORDER BY RAND() LIMIT 5"
-            ), {"cid": current_user.company_id})
+        result = db.execute(text(
+            "SELECT id, question_text, difficulty_level, options, correct_answer "
+            "FROM interview_questions WHERE company_id = :cid ORDER BY RAND() LIMIT 5"
+        ), {"cid": current_user.company_id})
         sample_questions = result.fetchall()
 
         questions = []
@@ -478,11 +486,12 @@ def get_sample_mcq_questions(
 @router.delete("/questions/{question_id}")
 def delete_mcq_question(
     question_id: str,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(_staff_user),
 ):
     """Delete a MCQ question (tenant-scoped)."""
-    _assert_question_in_tenant(db, question_id, current_user)
+    _assert_question_in_tenant(db, question_id, current_user, request)
 
     try:
         result = db.execute(

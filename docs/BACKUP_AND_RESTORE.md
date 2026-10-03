@@ -106,6 +106,16 @@ restored.
 - `.env` is **not** in the bundle (it holds the keys that decrypt the mailbox passwords
   and sign sessions). Keep it in the password manager, as CPANEL_DEPLOYMENT.md says.
 
+## Recovery objectives
+
+| | Target | What it rests on |
+|---|---|---|
+| **RPO** (data you can lose) | **24 hours** | One bundle a night at 02:30. Anything written since the last bundle is lost. `LAST_SUCCESS` older than 26 h means the RPO is already broken. |
+| **RTO** (time to be back up) | **2 hours** | Fetch the off-site bundle, then the steps below. A restore of the drill-sized database (65 tables, 846 files) takes under a minute; the rest is people and downloads, so rehearse it in the monthly drill. |
+
+A tighter RPO needs MySQL binary logging (point-in-time recovery), which cPanel shared
+hosting does not offer; the nightly bundle is the floor, not a target to relax.
+
 ## Restoring for real
 
 Don't restore over the live database first. Restore into a scratch database with the drill
@@ -146,6 +156,9 @@ empties it before each run, and again afterwards unless you pass `--keep`.
 - [ ] Put the decryption key where the drill can use it: import the private key for the
       run (`gpg --import`, then `gpg --delete-secret-keys` afterwards), or set
       `BACKUP_PASSPHRASE_FILE`.
+- [ ] Leave `--files-dir` unset (a temp dir) or point it at a new, empty folder. The
+      drill refuses the live `HIREFLOW_DATA_DIR`, anything inside it or containing it,
+      and any folder that already holds files.
 - [ ] Run:
       ```bash
       cd /opt/hireflow/backend
@@ -165,9 +178,32 @@ empties it before each run, and again afterwards unless you pass `--keep`.
 - [ ] Record the date, the bundle name and the result (keep the `--report` JSON).
 - [ ] Anything not `PASS`: treat it as an incident. The backups aren't working.
 
-### A drill that was run
+### Drills that were run
 
-2026-09-29, on a development machine (MySQL 8.0.45, GnuPG 2.4.9), against a seeded
+**2026-09-30**, development machine (Windows, MySQL 8.0.45, Git's GnuPG 2.4.9), against
+the real development database (`recruitment_db`, 65 tables, 2,428 rows, 846 files):
+
+- `backup.py`: encrypted bundle (gpg symmetric AES256), 0.5 MB.
+- `restore_drill.py` into `recruitment_restore_drill`:
+  - `outer_checksum`, `inner_checksums`, `row_counts` (65 tables, 2,428 rows exact) and
+    `files` (846 of 846, none broken; 91 references sampled) all `PASS`.
+  - `alembic`: `FAIL`, as the table above predicts. The dev database was still at
+    `j6z7a8b9c0d1`. `alembic upgrade head` on the restored copy then ran all four newer
+    migrations cleanly to `r1w2f3l4o5w6`, the same path "Restoring for real" takes.
+  - `tenant_isolation`: `FAIL`, but not a backup fault. The live dev database gives the
+    identical result (12 mismatched rows, 1 NULL), so the restore reproduced the data
+    faithfully, drift included. That drift is fixed with the backfill scripts the check
+    names.
+- The encrypted bundle and passphrase were deleted afterwards.
+
+Since then `test/test_backup_restore_roundtrip.py` runs a real mysqldump → restore on
+every CI run: scratch databases, non-ASCII text and binary blobs compared byte for byte,
+files compared byte for byte. It is unencrypted, so the gpg step stays in the monthly
+drill.
+
+**2026-09-29**
+
+On a development machine (MySQL 8.0.45, GnuPG 2.4.9), against a seeded
 database of 58 tables in two companies, with 7 files and one deliberately dangling
 resume reference:
 

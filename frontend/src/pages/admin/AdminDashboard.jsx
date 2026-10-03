@@ -569,6 +569,23 @@ export default function AdminDashboard() {
     }
   }
 
+  // A user who lost their authenticator and recovery codes had no way back in.
+  const handleResetMfa = async (u) => {
+    const name = u.name || `${u.first_name || ''} ${u.last_name || ''}`.trim() || u.email
+    if (!confirm(`Reset two-factor authentication for ${name}?
+
+` +
+      'Confirm who is asking first (in person or on a call) — anyone who can reset it can take over the account. ' +
+      'They will be signed out everywhere and set it up again at their next sign-in.')) return
+    try {
+      await api.post(`/admin/users/${u.id}/mfa/reset`)
+      alert(`Two-factor authentication reset for ${name}.`)
+      fetchUsers()
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Failed to reset two-factor authentication')
+    }
+  }
+
   const handleDeleteDept = async (deptId) => {
     if (!confirm('Delete this department?')) return
     try {
@@ -1360,6 +1377,12 @@ export default function AdminDashboard() {
                             onClick={() => openEditUser(u)}
                             title="Edit details / reset password">
                             <Edit3 size={14} /> Edit
+                          </button>
+                        )}
+                        {u.mfa_enabled && (
+                          <button className="btn btn-ghost btn-sm" onClick={() => handleResetMfa(u)}
+                            title="Turn off two-factor authentication (lost phone)">
+                            Reset 2FA
                           </button>
                         )}
                         <button className="btn btn-ghost btn-sm"

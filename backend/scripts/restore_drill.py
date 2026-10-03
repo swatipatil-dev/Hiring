@@ -82,6 +82,21 @@ def check_target_is_safe(target: str, live: Dict[str, object],
                          f"contain 'drill' or 'restore', so a typo can't name a real one")
 
 
+def check_files_dir_is_safe(files_dir: Path, live_data_dir: Path) -> None:
+    """Refuse a --files-dir that could overwrite real uploads.
+
+    Extraction writes over whatever is there, so the drill must not be pointed at the
+    live data directory (or anything inside it, or any folder that contains it), and
+    must not mix a restore into a folder that already holds files.
+    """
+    d, live_dir = files_dir.resolve(), live_data_dir.resolve()
+    if d == live_dir or live_dir in d.parents or d in live_dir.parents:
+        raise DrillError(f"refusing to restore files into {d}: it overlaps the live data "
+                         f"directory {live_dir} (HIREFLOW_DATA_DIR)")
+    if d.exists() and any(d.iterdir()):
+        raise DrillError(f"refusing to restore files into {d}: the folder is not empty")
+
+
 def default_target(live: Dict[str, object]) -> str:
     # Keeps the cPanel account prefix (acct_hireflow -> acct_hireflow_drill), which cPanel
     # requires for any database the account user may touch.
@@ -282,6 +297,8 @@ def run_drill(bundle: Path, target: str, files_dir: Optional[Path], per_column: 
               tolerance_pct: float, keep: bool) -> Dict[str, object]:
     live = backup.db_params()
     check_target_is_safe(target, live, os.getenv("RESTORE_PROTECTED_DBS", "").split(","))
+    if files_dir is not None:
+        check_files_dir_is_safe(files_dir, backup.data_dir())
     report: Dict[str, object] = {"bundle": str(bundle), "target_db": target, "checks": {}}
     checks = report["checks"]
 

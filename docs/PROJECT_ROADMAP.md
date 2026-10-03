@@ -87,7 +87,7 @@
 - Restrict CORS to specific production domains
 - Add file type and size validation on all upload endpoints
 - Serve uploaded files through authenticated endpoints with signed URLs
-- Add MFA / Two-Factor Authentication support
+- ~~Add MFA / Two-Factor Authentication support~~ — done: TOTP, required for admin/superadmin (docs/AUTH_SECURITY.md)
 
 ### 2.2 Backend Improvements
 

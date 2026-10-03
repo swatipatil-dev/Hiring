@@ -7,7 +7,7 @@
 """
 
 import logging
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
@@ -63,7 +63,7 @@ def _interviewer_is_assigned(db: Session, interview, user: User) -> bool:
 
 
 def _staff_interview_or_404(db: Session, interview_id: int, user: User,
-                            assigned_only: bool = True):
+                            assigned_only: bool = True, request: Request = None):
     """The interview if this staff user may act on it, else 404.
 
     Company always (a NULL-company interview belongs to no tenant and is refused).
@@ -71,7 +71,7 @@ def _staff_interview_or_404(db: Session, interview_id: int, user: User,
     back answer keys and move the candidate's stage.
     """
     interview = db.query(_InterviewModel).filter(_InterviewModel.id == interview_id).first()
-    if not staff_can_access_interview(user, interview, db):
+    if not staff_can_access_interview(user, interview, db, request):
         raise HTTPException(404, "Interview not found")
     if assigned_only and user.role == "interviewer" and \
             not _interviewer_is_assigned(db, interview, user):
@@ -110,6 +110,7 @@ class OfferResponse(BaseModel):
 @router.post("/mcq/submit")
 def submit_mcq_test(
     submission: MCQSubmission,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(_staff_user),
 ):
@@ -118,7 +119,7 @@ def submit_mcq_test(
     # Tenant guard: the raw SQL below bypasses the tenant auto-filter, so verify the
     # target Interview belongs to the caller's company (and, for an interviewer, is
     # assigned to them) before touching anything.
-    interview = _staff_interview_or_404(db, submission.interview_id, current_user)
+    interview = _staff_interview_or_404(db, submission.interview_id, current_user, request=request)
 
     # Who this submission is *about* is decided by the database, never by the
     # request. submission.candidate_name/candidate_email are still accepted for
@@ -291,13 +292,14 @@ def submit_mcq_test(
 @router.post("/coding/submit")
 def submit_coding_answer(
     submission: CodingSubmission,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(_staff_user),
 ):
     """Submit coding or pseudocode answer for a question. Returns structured evaluation."""
 
     # Tenant + assignment guard before raw SQL.
-    interview = _staff_interview_or_404(db, submission.interview_id, current_user)
+    interview = _staff_interview_or_404(db, submission.interview_id, current_user, request=request)
 
     row = db.execute(text(
         "SELECT question_text, sample_answer, correct_answer, points, difficulty_level "
@@ -522,13 +524,14 @@ def respond_to_offer(
 @router.get("/marksheet/{interview_id}")
 def get_marksheet(
     interview_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(_staff_user),
 ):
     """Get question statistics / mark sheet for an interview."""
 
     # Tenant guard before raw SQL.
-    _staff_interview_or_404(db, interview_id, current_user, assigned_only=False)
+    _staff_interview_or_404(db, interview_id, current_user, assigned_only=False, request=request)
 
     rows = db.execute(text(
         """SELECT question_type, difficulty_level, points,

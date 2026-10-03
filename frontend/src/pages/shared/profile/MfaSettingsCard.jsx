@@ -70,7 +70,7 @@ export default function MfaSettingsCard() {
         setCodes(r.data.recovery_codes)
         setDone('Two-factor authentication is on.')
       } else if (mode === 'regenerate') {
-        const r = await api.post('/auth/mfa/recovery-codes', { code: code.trim() })
+        const r = await api.post('/auth/mfa/recovery-codes', { password, code: code.trim() })
         setCodes(r.data.recovery_codes)
         setDone('New recovery codes issued; the old ones no longer work.')
       } else if (mode === 'disable') {
@@ -131,7 +131,7 @@ export default function MfaSettingsCard() {
                              background: 'var(--surface-subtle)', borderRadius: 6 }}>{setup.secret}</code>
             </div>
           )}
-          {mode === 'disable' && (
+          {(mode === 'disable' || mode === 'regenerate') && (
             <label className="mp-edit-field">
               <span>Password</span>
               <input className="input" type="password" autoComplete="current-password"

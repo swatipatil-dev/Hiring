@@ -1,7 +1,8 @@
 """The backup and restore-drill scripts' own logic, without MySQL or gpg.
 
-The end-to-end drill (mysqldump -> gpg -> restore -> checks) is run by hand against a
-scratch database — see docs/BACKUP_AND_RESTORE.md. These pin the decisions that must not
+The end-to-end round trip (mysqldump -> restore -> checks) runs against real MySQL in
+test_backup_restore_roundtrip.py; the encrypted drill is run by hand against a scratch
+database — see docs/BACKUP_AND_RESTORE.md. These pin the decisions that must not
 regress quietly: never restoring over the live database, which bundles retention keeps,
 and what counts as a broken backup versus a reference that was already dangling.
 """
@@ -52,6 +53,21 @@ def test_default_target_keeps_the_cpanel_prefix_and_is_safe():
     target = drill.default_target(LIVE)
     assert target == "acct_hireflow_drill"
     drill.check_target_is_safe(target, LIVE)
+
+
+def test_drill_refuses_to_restore_files_over_live_data(tmp_path):
+    """Extracting over the live uploads would silently replace real resumes."""
+    live = tmp_path / "backend"
+    (live / "resumes").mkdir(parents=True)
+    for bad in (live, live / "resumes", tmp_path):
+        with pytest.raises(drill.DrillError, match="live data"):
+            drill.check_files_dir_is_safe(bad, live)
+    busy = tmp_path.parent / f"{tmp_path.name}-busy"
+    busy.mkdir()
+    (busy / "x").write_text("already here")
+    with pytest.raises(drill.DrillError, match="not empty"):
+        drill.check_files_dir_is_safe(busy, live)
+    drill.check_files_dir_is_safe(tmp_path.parent / f"{tmp_path.name}-fresh", live)   # new dir: fine
 
 
 # ── retention ────────────────────────────────────────────────────────────────

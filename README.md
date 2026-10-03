@@ -331,7 +331,7 @@ DATABASE_URL=postgresql://user:password@localhost:5432/recruitment_db
 # Security
 SECRET_KEY=your-super-secret-key-change-in-production
 ALGORITHM=HS256
-ACCESS_TOKEN_EXPIRE_MINUTES=1440
+ACCESS_TOKEN_EXPIRE_MINUTES=60
 
 # AI/ML (Optional)
 OPENAI_API_KEY=sk-your-openai-key

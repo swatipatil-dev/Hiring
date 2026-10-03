@@ -288,7 +288,7 @@ DATABASE_URL=mysql+pymysql://root:1234@localhost:3306/recruitment_db
 # Security
 SECRET_KEY=your-super-secret-key
 ALGORITHM=HS256
-ACCESS_TOKEN_EXPIRE_MINUTES=1440
+ACCESS_TOKEN_EXPIRE_MINUTES=60
 
 # AI Services
 OLLAMA_BASE_URL=http://localhost:11434

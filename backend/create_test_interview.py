@@ -55,7 +55,7 @@ def create_test_interview():
                 interviewer_user = User(
                     id=str(uuid.uuid4()),
                     email="test_interviewer@example.com",
-                    password_hash="test_password",
+                    password_hash="!",   # unusable: no bcrypt hash matches it, so nobody can sign in as this
                     role="interviewer",
                     first_name="Test",
                     last_name="Interviewer",

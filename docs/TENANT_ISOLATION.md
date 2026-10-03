@@ -86,6 +86,46 @@ and the Users tab above. List them with
 Refreshing an object already in the session is never filtered (`is_column_load`).
 Otherwise a row loaded under a bypass would raise `ObjectDeletedError` when it expires.
 
+## Support access (superadmin)
+
+A superadmin binds no tenant, so the automatic filter does nothing for them. What stops
+platform staff reading client data is the **support-access grant**
+(`src/services/audit_log.py`):
+
+- **Grants.** A client's admin grants access from Settings → Support access, with a
+  reason and a lifetime (24 h by default, 7 days at most), and can revoke it at any time.
+  A grant covers that one company only.
+- **Needs a grant.** Anything holding candidate, interview or assessment data: an
+  interview's questions and answer keys (`/mcq/...`, by interview or by question), a
+  company's non-admin users, coding problems and submissions by id (HTTP and the live
+  WebSocket), proctoring reports, evidence, reviews and live sessions, grading routes, and
+  **adding an admin to a company that already has one**. Every such route calls
+  `require_support_access` (or `staff_can_access_interview` with `db` and the request).
+- **Needs no grant.** Company records and branding, aggregate counts, support tickets
+  the client opened, the platform re-grade sweep, and adding the **first** admin to a
+  company that has none (onboarding, or recovering an admin-less company).
+- **Refused outright.** Anything that lists records across every tenant: question-bank
+  search, `/mcq/sample`, `/judge/problems`, `/judge/submissions`. A superadmin opens one
+  company's record, by id, under that company's grant (`refuse_superadmin_listing`).
+  The interview-authoring routes (`/api/v1/interviewer/interviews/{id}`, templates) don't
+  admit superadmin at all.
+- **Audit.** Every request on the superadmin, support and database routers, every
+  grant-gated access, every refusal, and every grant or revocation is an `audit_log` row.
+  Rows carry the method, path and IP. Reads are `superadmin.read` and anything else is
+  `superadmin.write`. Admin creation is `superadmin.create_admin`, and the company's
+  existing admins get an in-app notice. SQL-console queries are
+  `superadmin.sql_query` with the query text, and the platform re-grade sweep is
+  `superadmin.regrade`. Ticket requests are filed under the ticket's company.
+- **Fails closed.** If the audit row for a superadmin access can't be written, the
+  access is refused with a 503. Other callers of `record_audit` keep its never-raise
+  behaviour; pass `required=True` for anything that must not happen unrecorded.
+- **Where the client sees it.** `GET /api/v1/support/access-log` (Settings → Support
+  access) lists every row for the admin's own company.
+
+New code that serves client data to staff: call `require_support_access(db, request,
+user, company_id, resource)` before returning it, and don't give superadmin a path that
+skips the company filter.
+
 ## Rows with no company
 
 A row with `company_id IS NULL` belongs to no tenant, so the filter hides it from every

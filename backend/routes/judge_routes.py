@@ -155,14 +155,15 @@ def _own_company(q, model, user: User):
     return q.filter(model.company_id == user.company_id)
 
 
-def _problem_or_404(db: Session, problem_id: str, user: User) -> CodingProblem:
+def _problem_or_404(db: Session, problem_id: str, user: User,
+                    request: Optional[Request] = None) -> CodingProblem:
     p = _own_company(db.query(CodingProblem), CodingProblem, user).filter(
         CodingProblem.id == problem_id
     ).first()
     if not p:
         raise HTTPException(404, "Problem not found")
     from src.services.audit_log import require_support_access
-    require_support_access(db, None, user, p.company_id, f"coding problem {problem_id}")
+    require_support_access(db, request, user, p.company_id, f"coding problem {problem_id}")
     return p
 
 
@@ -262,7 +263,7 @@ async def run_code(
     stdin = body.stdin or ""
     seeded_from_sample = False
     if lang == "sql" and not stdin.strip() and body.question_id:
-        q, _ = _question_for_caller(db, current_user, body.question_id, body.interview_id)
+        q, _ = _question_for_caller(db, current_user, body.question_id, body.interview_id, request)
         if q and getattr(q, "test_cases", None):
             try:
                 cases = json.loads(q.test_cases) or []
@@ -312,7 +313,7 @@ def _candidate_owns_interview(db: Session, user: User, interview_id: int):
 
 
 def _question_for_caller(db: Session, user: User, question_id: str,
-                         interview_id: Optional[int]):
+                         interview_id: Optional[int], request: Optional[Request] = None):
     """Resolve a coding question the caller may run code against, or raise 404.
 
     Candidates: only a question of their own, unfinished interview. Hidden test cases
@@ -326,7 +327,7 @@ def _question_for_caller(db: Session, user: User, question_id: str,
         raise HTTPException(404, "Question not found")
     if is_staff(user):
         owner = db.query(Interview).filter(Interview.id == q.interview_id).first()
-        if not staff_can_access_interview(user, owner, db):
+        if not staff_can_access_interview(user, owner, db, request):
             raise HTTPException(404, "Question not found")
         return q, None
     if interview_id is None:
@@ -391,7 +392,7 @@ async def grade_question(
     """
     from src.judge.interview_grading import grade_interview_question
 
-    q, interview = _question_for_caller(db, current_user, body.question_id, body.interview_id)
+    q, interview = _question_for_caller(db, current_user, body.question_id, body.interview_id, request)
     reveal = current_user.role in _ADMIN_ROLES
 
     # Candidate in-test run: claim a run BEFORE judging, so an over-limit click
@@ -611,6 +612,7 @@ async def regrade_pending(
     # Both branches bind the tenant contextvar explicitly. There is no
     # get_current_user dependency on this route to do it, and the contextvar is
     # per-thread state that would otherwise carry over from an earlier request.
+    superadmin = None
     authorized = _shared_secret_matches(request.headers.get("X-Judge-Regrade-Token"),
                                         "JUDGE_REGRADE_TOKEN")
     if authorized:
@@ -623,10 +625,19 @@ async def regrade_pending(
                 authorized = u.role in _ADMIN_ROLES
                 if authorized:
                     set_current_company(u.company_id if u.role != "superadmin" else None)
+                    if u.role == "superadmin":
+                        superadmin = u
             except HTTPException:
                 authorized = False
     if not authorized:
         raise HTTPException(401, "Unauthorized")
+    if superadmin is not None:
+        # A superadmin JWT sweeps every tenant and rewrites their scores. It only
+        # re-grades, so it needs no grant — but it is on the record, or it doesn't run.
+        from src.services.audit_log import _audit_or_deny
+        _audit_or_deny(db, action="superadmin.regrade", actor=superadmin,
+                       resource=f"{request.method} {request.url.path}", request=request,
+                       detail={"interview_id": interview_id, "limit": limit})
 
     # An on-demand judge VM is stopped precisely because nobody is testing, so an
     # unattended sweeper would otherwise always hit the 503 below and never recover
@@ -773,6 +784,8 @@ async def list_problems(
     db: Session = Depends(get_db),
     difficulty: Optional[str] = None,
 ):
+    from src.services.audit_log import refuse_superadmin_listing
+    refuse_superadmin_listing(current_user, "Coding problems")
     q = _own_company(db.query(CodingProblem), CodingProblem, current_user)
     if difficulty:
         q = q.filter(CodingProblem.difficulty == difficulty)
@@ -785,10 +798,11 @@ async def list_problems(
 @router.get("/problems/{problem_id}")
 async def get_problem(
     problem_id: str,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    p = _problem_or_404(db, problem_id, current_user)
+    p = _problem_or_404(db, problem_id, current_user, request)
     if not _is_admin(current_user) and p.status != "published":
         raise HTTPException(404, "Problem not found")
 
@@ -809,11 +823,12 @@ async def get_problem(
 @router.put("/problems/{problem_id}")
 async def update_problem(
     problem_id: str,
+    request: Request,
     body: ProblemUpdate,
     current_user: User = Depends(require_role(["admin", "hr", "superadmin"])),
     db: Session = Depends(get_db),
 ):
-    p = _problem_or_404(db, problem_id, current_user)
+    p = _problem_or_404(db, problem_id, current_user, request)
     for field, value in body.dict(exclude_unset=True).items():
         setattr(p, field, value)
     p.updated_at = datetime.utcnow()
@@ -825,11 +840,12 @@ async def update_problem(
 @router.post("/problems/{problem_id}/testcases", status_code=status.HTTP_201_CREATED)
 async def add_testcases(
     problem_id: str,
+    request: Request,
     body: List[TestCaseIn],
     current_user: User = Depends(require_role(["admin", "hr", "superadmin"])),
     db: Session = Depends(get_db),
 ):
-    p = _problem_or_404(db, problem_id, current_user)
+    p = _problem_or_404(db, problem_id, current_user, request)
     created = []
     for i, tc in enumerate(body):
         row = ProblemTestCase(
@@ -847,11 +863,12 @@ async def add_testcases(
 @router.get("/problems/{problem_id}/testcases")
 async def list_testcases(
     problem_id: str,
+    request: Request,
     current_user: User = Depends(require_role(["admin", "hr", "superadmin"])),
     db: Session = Depends(get_db),
 ):
     """Admin/HR only — includes hidden cases."""
-    p = _problem_or_404(db, problem_id, current_user)
+    p = _problem_or_404(db, problem_id, current_user, request)
     tcs = db.query(ProblemTestCase).filter(
         ProblemTestCase.problem_id == p.id,
         ProblemTestCase.company_id == p.company_id,
@@ -871,7 +888,7 @@ async def submit_code(
     if body.language not in judge_languages.supported_languages():
         raise HTTPException(400, f"Unsupported language '{body.language}'")
 
-    problem = _problem_or_404(db, body.problem_id, current_user)
+    problem = _problem_or_404(db, body.problem_id, current_user, request)
     if not _is_admin(current_user) and problem.status != "published":
         raise HTTPException(404, "Problem not found")
     if problem.allowed_languages and body.language not in problem.allowed_languages:
@@ -914,6 +931,7 @@ async def submit_code(
 @router.get("/submissions/{submission_id}")
 async def get_submission(
     submission_id: str,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -923,7 +941,7 @@ async def get_submission(
     if not sub:
         raise HTTPException(404, "Submission not found")
     from src.services.audit_log import require_support_access
-    require_support_access(db, None, current_user, sub.company_id, f"code submission {submission_id}")
+    require_support_access(db, request, current_user, sub.company_id, f"code submission {submission_id}")
     admin = _is_admin(current_user)
     if not admin and sub.user_id != current_user.id:
         raise HTTPException(403, "Not your submission")
@@ -940,6 +958,8 @@ async def list_submissions(
     problem_id: Optional[str] = None,
     limit: int = Query(50, le=200),
 ):
+    from src.services.audit_log import refuse_superadmin_listing
+    refuse_superadmin_listing(current_user, "Code submissions")
     q = _own_company(db.query(CodeSubmission), CodeSubmission, current_user)
     if not _is_admin(current_user):
         q = q.filter(CodeSubmission.user_id == current_user.id)
@@ -984,6 +1004,14 @@ def _ws_authorize(token: Optional[str], submission_id: str):
         if not sub:
             raise ValueError("submission not found")
         if user.role not in _ADMIN_ROLES and sub.user_id != user.id:
+            raise ValueError("forbidden")
+        # A superadmin watches a submission (hidden-test detail included) only under
+        # the owning company's support-access grant, audited like the HTTP read.
+        from src.services.audit_log import require_support_access
+        try:
+            require_support_access(db, None, user, sub.company_id,
+                                   f"code submission {submission_id} (live)")
+        except HTTPException:
             raise ValueError("forbidden")
         return user.id, user.role
     finally:

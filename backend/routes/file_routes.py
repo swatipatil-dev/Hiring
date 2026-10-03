@@ -47,10 +47,15 @@ def _resolve_viewer(
 
     params = request.query_params
     user_id = params.get("u")
-    if not verify_signature(request.url.path, user_id, params.get("e"), params.get("s")):
+    if not user_id:
         raise _NOT_FOUND
     user = db.query(User).filter(User.id == user_id).first()
     if user is None or not user.is_active:
+        raise _NOT_FOUND
+    # Checked against the user's current token_version, so a link stops working the
+    # moment their sessions are revoked, not when it expires.
+    if not verify_signature(request.url.path, user_id, params.get("e"), params.get("s"),
+                            token_version=user.token_version or 0):
         raise _NOT_FOUND
     if user.company_id:
         company = db.query(Company).filter(Company.id == user.company_id).first()

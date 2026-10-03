@@ -17,7 +17,6 @@ from fastapi import HTTPException, Request, status, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import bcrypt
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr
 from .config.database_config_mysql import get_db
 from .models.models import User, Candidate, HRProfile, InterviewerProfile, Company
@@ -67,9 +66,6 @@ SESSION_MAX_HOURS = float(os.getenv("SESSION_MAX_HOURS", "12"))
 # Lifetime of the intermediate token between password and MFA code.
 MFA_TOKEN_EXPIRE_MINUTES = 5
 
-# Password Hashing
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
 # JWT Bearer
 security = HTTPBearer()
 
@@ -98,6 +94,7 @@ class UserResponse(BaseModel):
     phone: Optional[str]
     is_active: bool
     created_at: datetime
+    mfa_enabled: bool = False
 
 class Token(BaseModel):
     access_token: str
@@ -213,6 +210,9 @@ def get_password_hash(password: str) -> str:
 # NIST SP 800-63B's floor. Length alone is weak, hence the class mix and the denylist.
 MIN_PASSWORD_LENGTH = 8
 MAX_PASSWORD_LENGTH = 128
+# bcrypt reads only the first 72 bytes. A longer password would be silently truncated,
+# so two passwords sharing those bytes would both work — refuse it instead.
+MAX_PASSWORD_BYTES = 72
 
 # The most-guessed passwords that would otherwise pass the length and character-class
 # rules. Compared case-insensitively. A floor, not a breach corpus.
@@ -243,10 +243,12 @@ def validate_password_strength(password: str) -> None:
             status_code=400,
             detail=f"Password must be at least {MIN_PASSWORD_LENGTH} characters",
         )
-    if len(password) > MAX_PASSWORD_LENGTH:
+    if len(password) > MAX_PASSWORD_LENGTH or len(password.encode("utf-8")) > MAX_PASSWORD_BYTES:
         raise HTTPException(
             status_code=400,
-            detail=f"Password must be at most {MAX_PASSWORD_LENGTH} characters",
+            detail=f"Password must be at most {MAX_PASSWORD_BYTES} bytes "
+                   f"({MAX_PASSWORD_BYTES} plain characters; fewer if it uses accented or other "
+                   f"non-English characters)",
         )
     classes = sum((
         any(c.islower() for c in password),
@@ -372,17 +374,6 @@ def decode_mfa_token(db: Session, token: str, kind: str) -> User:
     if not user or not user.is_active or payload.get("tv", 0) != (user.token_version or 0):
         raise expired
     return user
-
-def verify_token(token: str) -> Optional[str]:
-    """Verify JWT token and return user ID"""
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id: str = payload.get("sub")
-        if user_id is None:
-            return None
-        return user_id
-    except JWTError:
-        return None
 
 # ==================== USER AUTHENTICATION ====================
 
@@ -675,7 +666,8 @@ def create_user_response(user: User) -> UserResponse:
         last_name=user.last_name,
         phone=user.phone,
         is_active=user.is_active,
-        created_at=user.created_at
+        created_at=user.created_at,
+        mfa_enabled=bool(getattr(user, "mfa_enabled", False)),
     )
 
 def create_token_response(user: User, db: Session = None, *,
@@ -817,28 +809,3 @@ def get_user_permissions(user: User) -> List[str]:
     }
     
     return permissions.get(user.role, [])
-
-# ==================== TOKEN VALIDATION ====================
-
-def validate_token_and_get_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-    db: Session = Depends(get_db)
-) -> User:
-    """Validate token and return user"""
-    token = credentials.credentials
-    user_id = verify_token(token)
-    
-    if not user_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token"
-        )
-    
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user or not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found or inactive"
-        )
-    
-    return user

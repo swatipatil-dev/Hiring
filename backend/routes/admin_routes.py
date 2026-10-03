@@ -3,7 +3,7 @@
 Handles user management, department creation, system configuration, and analytics
 """
 
-from fastapi import APIRouter, HTTPException, status, Depends, UploadFile, File
+from fastapi import APIRouter, HTTPException, Request, status, Depends, UploadFile, File
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func, desc, case, extract, or_
 from datetime import date
@@ -118,6 +118,7 @@ class UserResponse(BaseModel):
     phone: Optional[str]
     is_active: bool
     created_at: datetime
+    mfa_enabled: bool = False
 
 class UserListResponse(BaseModel):
     """Paged envelope for the admin user list.
@@ -1003,6 +1004,49 @@ async def delete_department(
     return {"message": "Department deleted successfully"}
 
 
+@router.post("/users/{user_id}/mfa/reset")
+async def reset_user_mfa(
+    user_id: str,
+    request: Request,
+    current_user: User = Depends(AuthMiddleware.get_current_admin),
+    db: Session = Depends(get_db)
+):
+    """Turn off another user's two-factor authentication (a lost or replaced phone).
+
+    Until this existed, a user who lost their authenticator and their recovery codes
+    could only be recovered by editing the database. It signs the user out everywhere.
+    A user whose role requires MFA is sent straight back through enrolment at their next
+    sign-in — so confirm who they are (in person or on a call) before resetting.
+
+    Not for your own account: use a recovery code, or ask another admin. Audited.
+    """
+    from src.auth import revoke_user_sessions
+    from src.services.audit_log import record_audit
+    user = db.query(User).filter(
+        User.id == user_id,
+        User.company_id == current_user.company_id,
+    ).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.id == current_user.id:
+        raise HTTPException(status_code=400, detail="You cannot reset your own two-factor "
+                                                    "authentication. Use a recovery code, or ask another admin.")
+    if not user.mfa_enabled and not user.mfa_secret:
+        raise HTTPException(status_code=400, detail="Two-factor authentication is not on for this user.")
+    user.mfa_enabled = False
+    user.mfa_secret = None
+    user.mfa_recovery_codes = None
+    user.mfa_last_step = None
+    revoke_user_sessions(user)
+    record_audit(db, action="admin.mfa_reset", actor=current_user, company_id=current_user.company_id,
+                 resource=f"users/{user.id}", request=request,
+                 detail={"target_email": user.email, "target_role": user.role}, commit=False)
+    db.commit()
+    return {"message": "Two-factor authentication reset. The user has been signed out and "
+                       "will set it up again at their next sign-in if their role requires it.",
+            "mfa_enabled": False}
+
+
 @router.delete("/users/{user_id}")
 async def delete_user(
     user_id: str,
@@ -1027,7 +1071,12 @@ async def delete_user(
         raise HTTPException(status_code=400, detail="Cannot delete yourself")
     was_active = bool(user.is_active)
     user.is_active = False
-    summary = deactivate_interviewer_assignments(db, user, current_user.id) if was_active else None
+    # Sign them out everywhere. Without this their tokens were only refused while the
+    # account stayed inactive — reactivating it through PUT /status (which revokes only
+    # on an active->inactive change) brought every old token back to life.
+    from src.auth import revoke_user_sessions
+    revoke_user_sessions(user)
+GIV summary = deactivate_interviewer_assignments(db, user, current_user.id) if was_active else None
     db.commit()
     response = {
         "message": "User deactivated successfully — the account is kept and can be reactivated",

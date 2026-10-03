@@ -64,20 +64,29 @@ def _signing_key() -> bytes:
     return hmac.new(SECRET_KEY.encode(), b"hireflow-file-url-v1", hashlib.sha256).digest()
 
 
-def _signature(path: str, user_id: str, expires: int) -> str:
-    msg = f"{path}\n{user_id}\n{expires}".encode()
+def _signature(path: str, user_id: str, expires: int, token_version: int = 0) -> str:
+    # token_version is in the MAC, not the URL: the verifier recomputes it from the
+    # user's CURRENT version, so logout, a password change or a deactivation (all of
+    # which bump it — src/auth.revoke_user_sessions) voids every link already handed out.
+    msg = f"{path}\n{user_id}\n{expires}\n{int(token_version or 0)}".encode()
     return hmac.new(_signing_key(), msg, hashlib.sha256).hexdigest()
 
 
-def sign_path(path: str, user_id: str, ttl: Optional[int] = None) -> str:
-    """`path` plus a signature letting `user_id` fetch it until the expiry."""
+def sign_path(path: str, user_id: str, ttl: Optional[int] = None, token_version: int = 0) -> str:
+    """`path` plus a signature letting `user_id` fetch it until the expiry, for as long
+    as their sessions are not revoked."""
     expires = int(time.time()) + (ttl if ttl is not None else FILE_URL_TTL_SECONDS)
-    query = urlencode({"u": user_id, "e": expires, "s": _signature(path, str(user_id), expires)})
+    sig = _signature(path, str(user_id), expires, token_version)
+    query = urlencode({"u": user_id, "e": expires, "s": sig})
     return f"{path}?{query}"
 
 
+def _sign_for(path: str, viewer) -> str:
+    return sign_path(path, viewer.id, token_version=getattr(viewer, "token_version", 0) or 0)
+
+
 def verify_signature(path: str, user_id: Optional[str], expires: Optional[str],
-                     signature: Optional[str]) -> bool:
+                     signature: Optional[str], token_version: int = 0) -> bool:
     if not (user_id and expires and signature):
         return False
     try:
@@ -86,7 +95,7 @@ def verify_signature(path: str, user_id: Optional[str], expires: Optional[str],
         return False
     if exp < int(time.time()):
         return False
-    return hmac.compare_digest(_signature(path, str(user_id), exp), str(signature))
+    return hmac.compare_digest(_signature(path, str(user_id), exp, token_version), str(signature))
 
 
 # ── URL builders (for API responses) ─────────────────────────────────────────
@@ -96,26 +105,26 @@ def application_file_url(candidate, kind: str, viewer) -> Optional[str]:
     column = APPLICATION_KINDS[kind]
     if candidate is None or not getattr(candidate, column, None) or viewer is None:
         return None
-    return sign_path(f"{FILE_URL_PREFIX}/applications/{candidate.id}/{kind}", viewer.id)
+    return _sign_for(f"{FILE_URL_PREFIX}/applications/{candidate.id}/{kind}", viewer)
 
 
 def profile_file_url(profile, kind: str, viewer) -> Optional[str]:
     column = PROFILE_KINDS[kind]
     if profile is None or not getattr(profile, column, None) or viewer is None:
         return None
-    return sign_path(f"{FILE_URL_PREFIX}/profiles/{profile.user_id}/{kind}", viewer.id)
+    return _sign_for(f"{FILE_URL_PREFIX}/profiles/{profile.user_id}/{kind}", viewer)
 
 
 def certificate_file_url(cert, viewer) -> Optional[str]:
     if cert is None or not cert.certificate_file_path or viewer is None:
         return None
-    return sign_path(f"{FILE_URL_PREFIX}/certificates/{cert.id}", viewer.id)
+    return _sign_for(f"{FILE_URL_PREFIX}/certificates/{cert.id}", viewer)
 
 
 def voice_answer_url(answer_id: Optional[str], viewer) -> Optional[str]:
     if not answer_id or viewer is None:
         return None
-    return sign_path(f"{FILE_URL_PREFIX}/voice-answers/{answer_id}", viewer.id)
+    return _sign_for(f"{FILE_URL_PREFIX}/voice-answers/{answer_id}", viewer)
 
 
 # ── Access rules ──────────────────────────────────────────────────────────────

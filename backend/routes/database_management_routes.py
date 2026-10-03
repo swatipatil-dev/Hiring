@@ -3,12 +3,12 @@
 Enhanced database management endpoints with advanced features
 """
 
-from fastapi import APIRouter, HTTPException, status, Depends, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Request, status, Depends, BackgroundTasks
 from sqlalchemy.orm import Session
 from typing import List, Optional, Dict, Any
 from src.config.database_config_mysql import get_db, db_manager
-from src.auth import require_role
-from src.services.audit_log import audit_superadmin_request
+from src.auth import get_current_user, require_role
+from src.services.audit_log import _audit_or_deny, audit_superadmin_request
 from pydantic import BaseModel, ConfigDict, Field
 from datetime import datetime
 import logging
@@ -160,7 +160,9 @@ def check_console_query(query: str) -> None:
 async def execute_query(
     request: QueryRequest,
     background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db)
+    http_request: Request,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
 ):
     """Execute a read-only query — only when ENABLE_RAW_SQL_CONSOLE is set."""
     if not raw_sql_console_enabled():
@@ -170,6 +172,12 @@ async def execute_query(
         )
     start_time = datetime.utcnow()
     check_console_query(request.query)
+    # The query spans every tenant, so the audit row must say what was asked — the
+    # router-level row records only that the console was used. Unrecorded, it doesn't run.
+    _audit_or_deny(db, action="superadmin.sql_query", actor=current_user,
+                   resource=f"POST {http_request.url.path}", request=http_request,
+                   detail={"query": request.query[:4000],
+                           "params": {k: str(v)[:200] for k, v in (request.params or {}).items()}})
 
     try:
         # Log query execution

@@ -15,15 +15,19 @@ time-limited, revocable consent (default 24 hours). Call
 of any handler that returns such data; for a non-superadmin caller it does
 nothing. It records the read (or the refusal) either way.
 
-Where it is enforced today:
-  * superadmin_routes  GET /companies/{id} — HR/interviewer/candidate list only under a grant
-  * mcq_api            any per-interview read (_assert_interview_in_tenant)
-  * proctoring/routes  GET /results/{interview_id} and evidence frames
-  * judge_routes       problem reads (_problem_or_404) and GET /submissions/{id}
+Where it is enforced today (full list in docs/TENANT_ISOLATION.md → Support access):
+  * superadmin_routes  GET /companies/{id} user list; POST /companies/{id}/admin once
+                       the company has an admin
+  * mcq_api            per-interview and per-question reads and writes
+  * proctoring/routes  results, evidence, reviews and live sessions
+  * judge_routes       problems and submissions by id, and the live-status WebSocket
   * interview_access   staff_can_access_interview (evaluation and judge grading routes)
-Aggregate counts (company list)
-and company profile/branding are not candidate data and need no grant, but every
+Cross-tenant lists are refused to superadmin (refuse_superadmin_listing). Aggregate
+counts and company profile/branding are not candidate data and need no grant, but every
 superadmin request on the superadmin, support and database routers is audited.
+
+Superadmin access fails closed: an access whose audit row cannot be written is refused
+(_audit_or_deny → 503).
 """
 
 import json
@@ -65,12 +69,15 @@ def _client_ip(request: Optional[Request]) -> Optional[str]:
 def record_audit(db: Optional[Session], *, action: str, actor: Optional[User] = None,
                  company_id: Optional[str] = None, resource: Optional[str] = None,
                  request: Optional[Request] = None, detail=None,
-                 commit: bool = True) -> None:
+                 commit: bool = True, required: bool = False) -> None:
     """Append one audit row. Never raises into the caller: a failure is logged.
 
     Commits by default so the row survives the request failing afterwards (a
     refused access raises straight after recording it). Call it before the
     handler has pending writes of its own, or pass commit=False and commit with them.
+
+    ``required=True`` makes it fail closed instead: a failed write is re-raised as
+    AuditUnavailable, for accesses that must not happen unrecorded.
     """
     own_session = db is None
     if own_session:
@@ -101,9 +108,32 @@ def record_audit(db: Optional[Session], *, action: str, actor: Optional[User] = 
             db.rollback()
         except Exception:
             pass
+        if required:
+            raise AuditUnavailable(str(exc)) from exc
     finally:
         if own_session:
             db.close()
+
+
+class AuditUnavailable(RuntimeError):
+    """A required audit row could not be written."""
+
+
+def _audit_or_deny(db, **kw) -> None:
+    """Record a superadmin's access to client data, or refuse the access (503).
+
+    Support access is only acceptable because it is on the record; an access we
+    cannot record is an access we do not allow.
+    """
+    try:
+        record_audit(db, required=True, **kw)
+    except AuditUnavailable:
+        raise HTTPException(status_code=503,
+                            detail="Support access is unavailable: it could not be audited.")
+
+
+def _is_write(request: Optional[Request]) -> bool:
+    return request is not None and request.method.upper() not in ("GET", "HEAD", "OPTIONS")
 
 
 def audit_superadmin_access(request: Optional[Request], user: Optional[User], resource: str,
@@ -112,8 +142,8 @@ def audit_superadmin_access(request: Optional[Request], user: Optional[User], re
     """Record a superadmin's read of `resource`. A no-op for every other role."""
     if user is None or (user.role or "").lower() != "superadmin":
         return
-    record_audit(db, action="superadmin.read", actor=user, company_id=company_id,
-                 resource=resource, request=request)
+    _audit_or_deny(db, action="superadmin.write" if _is_write(request) else "superadmin.read",
+                   actor=user, company_id=company_id, resource=resource, request=request)
 
 
 def audit_superadmin_request(
@@ -129,9 +159,24 @@ def audit_superadmin_request(
     """
     if (user.role or "").lower() != "superadmin":
         return
-    record_audit(db, action="superadmin.request", actor=user,
-                 company_id=request.path_params.get("company_id"),
-                 resource=f"{request.method} {request.url.path}", request=request)
+    _audit_or_deny(db, action="superadmin.request", actor=user,
+                   company_id=_request_company(db, request),
+                   resource=f"{request.method} {request.url.path}", request=request)
+
+
+def _request_company(db: Session, request: Request) -> Optional[str]:
+    """The client company a superadmin request is about, so the row reaches that
+    company's access log: the {company_id} in the path, or a support ticket's company."""
+    params = request.path_params
+    if params.get("company_id"):
+        return params["company_id"]
+    if params.get("ticket_id"):
+        from src.models.models import SupportRequest
+        row = (db.query(SupportRequest.company_id)
+               .execution_options(_tenant_bypass=True)
+               .filter(SupportRequest.id == params["ticket_id"]).first())
+        return row[0] if row else None
+    return None
 
 
 def active_grant(db: Session, company_id: Optional[str]) -> Optional[SupportAccessGrant]:
@@ -152,7 +197,7 @@ def active_grant(db: Session, company_id: Optional[str]) -> Optional[SupportAcce
 
 
 def require_support_access(db: Session, request: Optional[Request], user: Optional[User],
-                           company_id: Optional[str], resource: str) -> None:
+                           company_id: Optional[str], resource: str) -> Optional[SupportAccessGrant]:
     """Gate a superadmin's read of a company's candidate/interview data.
 
     Non-superadmin callers pass straight through (their own tenant checks apply).
@@ -170,8 +215,19 @@ def require_support_access(db: Session, request: Optional[Request], user: Option
             detail="This company has not granted support access. Ask its admin to grant "
                    "access from Settings → Support access.",
         )
-    record_audit(db, action="superadmin.read", actor=user, company_id=company_id,
-                 resource=resource, request=request, detail={"grant_id": grant.id})
+    _audit_or_deny(db, action="superadmin.write" if _is_write(request) else "superadmin.read",
+                   actor=user, company_id=company_id, resource=resource, request=request,
+                   detail={"grant_id": grant.id})
+    return grant
+
+
+def refuse_superadmin_listing(user: Optional[User], what: str) -> None:
+    """Cross-tenant lists are not support access: a superadmin reaches one company's
+    records, by id, under that company's grant. Listing every tenant's is refused."""
+    if user is not None and (user.role or "").lower() == "superadmin":
+        raise HTTPException(status_code=403,
+                            detail=f"{what} are listed per company; superadmins open a "
+                                   f"specific record under that company's support-access grant.")
 
 
 def grant_hours(hours: Optional[float]) -> float:

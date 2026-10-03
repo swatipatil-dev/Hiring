@@ -7,7 +7,7 @@ Implemented here rather than pulled in as a dependency — it is thirty lines of
 HMAC, and test_mfa.py checks it against the RFC's own test vectors.
 
 The shared secret is stored Fernet-encrypted (src/security.py). Recovery codes
-are stored only as SHA-256 hashes and each works once.
+are stored only as HMAC-SHA256 digests keyed by SECRET_KEY, and each works once.
 """
 
 import base64
@@ -82,9 +82,24 @@ def provisioning_uri(secret: str, account: str, issuer: Optional[str] = None) ->
 
 # ── Recovery codes ──────────────────────────────────────────────────────────
 
+# A recovery code has 40 bits. As a plain SHA-256 that is a few hours of GPU time for
+# anyone holding a database dump; keyed by SECRET_KEY, the dump alone is not enough.
+# New digests carry this prefix. Unprefixed ones are the old plain SHA-256, still
+# accepted so codes issued before the change keep working until used or regenerated.
+_HMAC_PREFIX = "h1:"
+
+
+def _normalise_recovery(code: str) -> bytes:
+    return (code or "").strip().lower().replace("-", "").replace(" ", "").encode("utf-8")
+
+
 def _hash_recovery(code: str) -> str:
-    normalised = (code or "").strip().lower().replace("-", "").replace(" ", "")
-    return hashlib.sha256(normalised.encode("utf-8")).hexdigest()
+    key = os.getenv("SECRET_KEY", "").encode("utf-8")
+    return _HMAC_PREFIX + hmac.new(key, _normalise_recovery(code), hashlib.sha256).hexdigest()
+
+
+def _legacy_hash_recovery(code: str) -> str:
+    return hashlib.sha256(_normalise_recovery(code)).hexdigest()
 
 
 def generate_recovery_codes() -> Tuple[List[str], str]:
@@ -102,9 +117,10 @@ def consume_recovery_code(stored_json: Optional[str], code: str) -> Tuple[bool, 
         hashes = json.loads(stored_json or "[]")
     except (TypeError, ValueError):
         return False, stored_json
-    wanted = _hash_recovery(code)
+    wanted, legacy = _hash_recovery(code), _legacy_hash_recovery(code)
     for i, h in enumerate(hashes):
-        if hmac.compare_digest(h, wanted):
+        expected = wanted if str(h).startswith(_HMAC_PREFIX) else legacy
+        if hmac.compare_digest(str(h), expected):
             remaining = hashes[:i] + hashes[i + 1:]
             return True, json.dumps(remaining)
     return False, stored_json

@@ -54,7 +54,7 @@ npm run dev
 
 **Tenancy** (full model in `docs/TENANT_ISOLATION.md`): every company's data carries `company_id`, and a person has a separate `User` per company (no shared cross-company profile). Routes filter by `current_user.company_id` explicitly; as a safety net, `get_current_user` binds the company and `src/tenancy/events.py` adds it to every ORM query on `TenantScoped` models. `get_current_user` must stay `async def` — a sync dependency's contextvar never reaches the endpoint. Raw SQL, background workers and superadmin requests are not auto-filtered. Never add an `OR company_id IS NULL` branch; backfill instead (`scripts/backfill_orphan_company_ids.py`).
 
-**Authentication**: `src/auth.py` — JWT tokens via python-jose, bcrypt password hashing, `HTTPBearer` security scheme. Role-based access via dependency functions.
+**Authentication**: `src/auth.py` — JWT tokens via python-jose, bcrypt password hashing, `HTTPBearer` security scheme. Role-based access via dependency functions. Controls and known limitations are in `docs/AUTH_SECURITY.md`: any path that ends or changes a session calls `revoke_user_sessions`, and passwords go through `validate_password_strength` (72-byte bcrypt limit included).
 
 ### Route Organization
 

@@ -18,12 +18,31 @@ os.environ.setdefault("SECRET_KEY", "pytest-only-secret-key-not-for-any-real-dep
 # Off for the suite, like the rate limiter below, so role fixtures can log in with a
 # password alone; test/test_auth_hardening.py switches it back on for its own tests.
 os.environ.setdefault("MFA_REQUIRED_ROLES", "")
+# The app lifespan is replaced with a no-op for the suite (see
+# _skip_app_startup_for_suite), but anything that reads these directly should
+# also not start the proctoring warm-up or attempt CREATE DATABASE / CREATE USER.
+os.environ.setdefault("PROCTOR_PREWARM", "0")
+os.environ.setdefault("DB_BOOTSTRAP", "0")
 
 # Point at the test DB — CI sets TEST_DB env var; local default works too
 _db_host = os.getenv("DB_HOST", "127.0.0.1")
 _db_pass = os.getenv("DB_PASSWORD", "1234")
 _test_db = os.getenv("TEST_DB", "recruitment_test_db")
-TEST_DATABASE_URL = f"mysql+pymysql://root:{_db_pass}@{_db_host}:3306/{_test_db}"
+
+# Under pytest-xdist every worker is its own process with its own session, and
+# db_engine drops every table at session end — so workers sharing one database
+# would wipe each other's schema mid-run. Each worker gets <TEST_DB>_gw0, _gw1, …
+# DATABASE_URL is pointed there too, before anything imports the app, because
+# database_config_mysql reads it at import time and code that uses db_manager
+# directly would otherwise reach the shared database.
+_xdist_worker = os.getenv("PYTEST_XDIST_WORKER")
+if _xdist_worker:
+    _test_db = f"{_test_db}_{_xdist_worker}"
+
+_SERVER_URL = f"mysql+pymysql://root:{_db_pass}@{_db_host}:3306/"
+TEST_DATABASE_URL = f"{_SERVER_URL}{_test_db}"
+if _xdist_worker:
+    os.environ["DATABASE_URL"] = TEST_DATABASE_URL
 
 # Lazy imports so heavy ML models are not loaded at collection time
 def _get_app_and_deps():
@@ -50,9 +69,49 @@ def _disable_rate_limiter_for_suite():
     auth_mod.limiter.enabled = orig_auth
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _skip_app_startup_for_suite():
+    """Two per-test costs that no test depends on, removed for the session.
+
+    Lifespan: `with TestClient(app)` runs main.lifespan for every test — init_db()
+    re-checks every table with create_all, admins are bootstrapped, and the
+    proctoring warm-up starts and is torn down again. db_engine already built the
+    schema once, and the lifespan sets nothing on app.state, so a no-op is
+    equivalent here. The TestClient context itself is kept, so each test still
+    gets one event loop for all of its requests.
+
+    bcrypt: 12 rounds costs ~0.25s per hash and per login check, paid by every
+    role fixture. 4 rounds is the bcrypt minimum; the hashes still go through
+    the real hashpw/checkpw, only the work factor changes.
+    """
+    import functools
+    from contextlib import asynccontextmanager
+    import src.auth as auth_mod
+
+    app, _, _ = _get_app_and_deps()
+
+    @asynccontextmanager
+    async def _no_lifespan(_app):
+        yield
+
+    orig_lifespan = app.router.lifespan_context
+    orig_gensalt = auth_mod.bcrypt.gensalt
+    app.router.lifespan_context = _no_lifespan
+    auth_mod.bcrypt.gensalt = functools.partial(orig_gensalt, rounds=4)
+    yield
+    app.router.lifespan_context = orig_lifespan
+    auth_mod.bcrypt.gensalt = orig_gensalt
+
+
 @pytest.fixture(scope="session")
 def db_engine():
     """Create test engine and build all tables once per session."""
+    # Each xdist worker has its own database name, which nothing has created yet.
+    server = create_engine(_SERVER_URL, connect_args={"charset": "utf8mb4"})
+    with server.begin() as conn:
+        conn.execute(text(f"CREATE DATABASE IF NOT EXISTS `{_test_db}`"))
+    server.dispose()
+
     engine = create_engine(
         TEST_DATABASE_URL,
         pool_pre_ping=True,

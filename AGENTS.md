@@ -56,7 +56,7 @@ npm run dev
 
 **ORM models**: All in `src/models/models.py` using `declarative_base()`. UUIDs stored as `String(36)`. Key models: User, Department, JobPosting, Candidate, ATSResult, Interview, InterviewFeedback, Offer, CandidateStageHistory.
 
-**Authentication**: `src/auth.py` — JWT tokens via python-jose, bcrypt password hashing, `HTTPBearer` security scheme. Role-based access via dependency functions.
+**Authentication**: `src/auth.py` — JWT tokens via python-jose, bcrypt password hashing, `HTTPBearer` security scheme. Role-based access via dependency functions. Controls and known limitations are in `docs/AUTH_SECURITY.md`: any path that ends or changes a session calls `revoke_user_sessions`, and passwords go through `validate_password_strength` (72-byte bcrypt limit included).
 
 ### Route Organization
 

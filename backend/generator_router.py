@@ -42,9 +42,14 @@ router = APIRouter(prefix="/interviews", tags=["Question Generator"],
 
 
 def _in_caller_company(query, user: User):
-    """Limit a Question query to questions whose interview belongs to the caller's company."""
+    """Limit a Question query to questions whose interview belongs to the caller's company.
+
+    A superadmin has no tenant of their own here, so they get nothing: the question
+    bank (answer keys, hidden tests) is client data, reached per interview under that
+    company's support-access grant, never searched across every tenant at once."""
     if user.role == "superadmin":
-        return query
+        from sqlalchemy import false
+        return query.filter(false())
     return query.join(Interview, QuestionModel.interview_id == Interview.id).filter(
         Interview.company_id == user.company_id
     )
@@ -520,6 +525,8 @@ def search_questions_by_skill(
     Results are de-duped by normalized question text (newest kept) as a defensive measure in
     case the bank already contains duplicate rows.
     """
+    from src.services.audit_log import refuse_superadmin_listing
+    refuse_superadmin_listing(current_user, "Question-bank search results")
     query = _in_caller_company(db.query(QuestionModel).filter(
         QuestionModel.skill_name.ilike(f"%{skill_name}%"),
         QuestionModel.is_pool_question == True,

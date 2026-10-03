@@ -2,6 +2,7 @@
 
 Run from project root: `python scripts/seed_users.py`
 """
+import secrets
 import sys
 import os
 
@@ -9,9 +10,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.config.database_config_mysql import db_manager
 from src.models.models import User, Company, HRProfile, InterviewerProfile, Department
-from src.auth import get_password_hash
+from src.auth import get_password_hash, validate_password_strength
 
-DEFAULT_PASSWORD = "Password@123"
+# One password for every seeded account: SEED_USER_PASSWORD if set, else a fresh random
+# one printed at the end. It used to be "Password@123" — on the common-password denylist,
+# and the same on every machine the script ever ran on, superadmin included.
+DEFAULT_PASSWORD = os.getenv("SEED_USER_PASSWORD") or f"Seed-{secrets.token_urlsafe(12)}9"
+validate_password_strength(DEFAULT_PASSWORD)
 
 SEED = [
     {

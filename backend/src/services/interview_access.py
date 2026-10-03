@@ -58,23 +58,28 @@ def candidate_owns_interview(db: Session, user: User, interview_id) -> Optional[
 
 
 def staff_can_access_interview(user: User, interview: Optional[Interview],
-                               db: Optional[Session] = None) -> bool:
+                               db: Optional[Session] = None, request=None) -> bool:
     """Staff reach interviews in their own company.
 
     A superadmin needs an active support-access grant from the interview's company,
     checked (and audited) through `db`; without a session there is nothing to check
-    the grant against, so the answer is no.
+    the grant against, so the answer is no. Pass the request so the audit row carries
+    the method, path and IP. An access that cannot be audited is refused (503).
     """
     if interview is None or not is_staff(user):
         return False
     if user.role == "superadmin":
         if db is None or not interview.company_id:
             return False
-        from src.services.audit_log import active_grant, record_audit
+        from src.services.audit_log import _audit_or_deny, _is_write, active_grant, record_audit
         grant = active_grant(db, interview.company_id)
-        record_audit(db, action="superadmin.read" if grant else "support_access.denied",
-                     actor=user, company_id=interview.company_id,
-                     resource=f"interview:{interview.id}",
-                     detail={"grant_id": grant.id} if grant else None)
-        return grant is not None
+        resource = f"interview:{interview.id}"
+        if grant is None:
+            record_audit(db, action="support_access.denied", actor=user,
+                         company_id=interview.company_id, resource=resource, request=request)
+            return False
+        _audit_or_deny(db, action="superadmin.write" if _is_write(request) else "superadmin.read",
+                       actor=user, company_id=interview.company_id, resource=resource,
+                       request=request, detail={"grant_id": grant.id})
+        return True
     return bool(interview.company_id) and interview.company_id == user.company_id

@@ -18,7 +18,7 @@ from sqlalchemy.exc import DataError, IntegrityError
 from src.config.database_config_mysql import get_db
 from src.auth import get_current_user, get_password_hash, validate_password_strength
 from src.models.models import (
-    Company, User, JobPosting, Candidate, Department, SubscriptionPlan, AuditLog,
+    Company, User, JobPosting, Candidate, Department, SubscriptionPlan, AuditLog, Notification,
 )
 from src.schemas.company_profile import COMPANY_PROFILE_FIELDS, serialize_company
 from src.services.audit_log import audit_superadmin_request, active_grant, record_audit
@@ -427,9 +427,10 @@ async def get_company(
     if grant is None:
         users_q = users_q.filter(User.role == "admin")
     else:
-        record_audit(db, action="superadmin.read", actor=_, company_id=company_id,
-                     resource=f"company {company_id} user list", request=request,
-                     detail={"grant_id": grant.id})
+        from src.services.audit_log import _audit_or_deny
+        _audit_or_deny(db, action="superadmin.read", actor=_, company_id=company_id,
+                       resource=f"company {company_id} user list", request=request,
+                       detail={"grant_id": grant.id})
     users = users_q.all()
     sub = db.query(SubscriptionPlan).filter(SubscriptionPlan.company_id == company_id).first()
     payload = serialize_company(company)
@@ -504,14 +505,31 @@ class CreateAdminUserRequest(BaseModel):
 async def create_company_admin(
     company_id: str,
     data: CreateAdminUserRequest,
+    request: Request,
     db: Session = Depends(get_db),
-    _: User = Depends(require_superadmin),
+    current_user: User = Depends(require_superadmin),
 ):
-    """Add an admin user to an existing client company."""
+    """Add an admin user to an existing client company.
+
+    An admin account opens everything a company holds, so this is support access in
+    its strongest form. Without a grant it is allowed only for a company that has no
+    active admin (onboarding, or recovering a company whose admins are all gone).
+    Once a company has an admin, that admin must grant support access first — and is
+    told, in-app, that an admin was added. Either way the creation is audited, in the
+    same transaction: no audit row, no account.
+    """
+    from src.services.audit_log import require_support_access
     validate_password_strength(data.password)
     company = db.query(Company).filter(Company.id == company_id).first()
     if not company:
         raise HTTPException(status_code=404, detail="Company not found")
+    existing_admins = db.query(User).filter(
+        User.company_id == company_id, User.role == "admin", User.is_active.is_(True),
+    ).all()
+    grant = None
+    if existing_admins:
+        grant = require_support_access(db, request, current_user, company_id,
+                                       f"create admin account in company {company_id}")
     if db.query(User).filter(User.email == data.email).first():
         raise HTTPException(status_code=400, detail="Email already registered")
     admin = User(
@@ -526,6 +544,21 @@ async def create_company_admin(
         email_verified=True,
     )
     db.add(admin)
+    db.flush()
+    for existing in existing_admins:
+        db.add(Notification(
+            user_id=existing.id, company_id=company_id,
+            title="A new admin was added by platform support",
+            message=f"Platform support ({current_user.email}) added {admin.email} as an admin "
+                    f"of your company. If you did not expect this, revoke support access and "
+                    f"deactivate the account.",
+            type="security", reference_type="user", reference_id=admin.id,
+        ))
+    record_audit(db, action="superadmin.create_admin", actor=current_user, company_id=company_id,
+                 resource=f"users/{admin.id}", request=request,
+                 detail={"new_admin_email": admin.email, "grant_id": grant.id if grant else None,
+                         "company_had_admin": bool(existing_admins)},
+                 commit=False, required=True)
     db.commit()
     db.refresh(admin)
     return {"id": admin.id, "email": admin.email, "role": "admin", "message": "Admin created successfully"}

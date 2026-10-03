@@ -1449,7 +1449,7 @@ _SCHEDULED_EDITABLE_FIELDS = ("status", "notes", "rating")
 
 def _may_edit_scheduled(interview, current_user) -> bool:
     """HR/admin, the creator, or someone on the panel."""
-    if current_user.role in ("hr", "admin", "superadmin"):
+    if current_user.role in ("hr", "admin"):
         return True
     email = (current_user.email or "").strip().lower()
     if (interview.created_by or "").strip().lower() == email:
@@ -1468,7 +1468,7 @@ async def update_interview(
     interview_id: int,
     interview_update: InterviewUpdate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role(["interviewer", "hr", "admin", "superadmin"]))
+    current_user: User = Depends(require_role(_STAFF_ROLES))
 ):
     """Update an existing interview.
 
@@ -1604,7 +1604,7 @@ async def update_interview(
 async def delete_interview(
     interview_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role(["interviewer", "hr", "admin", "superadmin"]))
+    current_user: User = Depends(require_role(_STAFF_ROLES))
 ):
     """Delete an unfinished DRAFT test.
 
@@ -2248,7 +2248,8 @@ async def list_candidate_requests(
 
 # ==================== JD TEMPLATE ENDPOINTS ====================
 
-_ALLOWED_TEMPLATE_ROLES = {"interviewer", "hr", "admin", "superadmin"}
+# No superadmin: templates live inside one company (see _STAFF_ROLES).
+_ALLOWED_TEMPLATE_ROLES = {"interviewer", "hr", "admin"}
 
 
 def _require_template_role(user: User):
@@ -2563,11 +2564,13 @@ def _company_scope(q, model, current_user):
     A row with a NULL company_id belongs to no tenant and matches nobody: it used to be
     visible to every company, which exposed drafts, questions and answer keys across
     tenants. Legacy NULL rows are repaired by scripts/backfill_orphan_company_ids.py,
-    not tolerated here. Only the superadmin, who has no company, reads unscoped; any
-    other company-less caller gets nothing.
+    not tolerated here. A company-less caller gets nothing, and so does a superadmin:
+    these routes act inside one company, and support access to a client's interviews
+    goes through the grant-gated routes (src/services/audit_log.py), never an
+    unscoped read here.
     """
-    if not current_user.company_id:
-        return q if current_user.role == "superadmin" else q.filter(False)
+    if not current_user.company_id or current_user.role == "superadmin":
+        return q.filter(False)
     return q.filter(model.company_id == current_user.company_id)
 
 

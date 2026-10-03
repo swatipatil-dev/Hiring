@@ -23,7 +23,7 @@ def _log(msg):
 
 import numpy as np
 import cv2
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, HTTPException, Response
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -604,14 +604,20 @@ def _owned_entry(session_id: str, user) -> dict:
     return entry
 
 
-def _readable_entry(session_id: str, user) -> dict:
-    """The live session for its owner, or for staff of the interview's company."""
+def _readable_entry(session_id: str, user, request: Optional[Request] = None) -> dict:
+    """The live session for its owner, or for staff of the interview's company.
+
+    A superadmin reads it only under that company's support-access grant, audited."""
     entry = _sessions.get(session_id)
     if entry:
         if entry.get("owner_user_id") and str(entry["owner_user_id"]) == str(user.id):
             return entry
         role = (getattr(user, "role", "") or "").lower()
         if role == "superadmin":
+            from src.services.audit_log import require_support_access
+            with _db_session() as db:
+                require_support_access(db, request, user, entry.get("company_id"),
+                                       f"live proctoring session {session_id}")
             return entry
         if (role in _STAFF_READ_ROLES and entry.get("company_id")
                 and str(entry["company_id"]) == str(user.company_id)):
@@ -899,9 +905,9 @@ async def stop_session(session_id: str, current_user=Depends(_CANDIDATE)):
 
 
 @router.get("/sessions/{session_id}/status", response_model=SessionStatusResponse)
-async def session_status(session_id: str, current_user=Depends(get_current_user)):
+async def session_status(session_id: str, request: Request, current_user=Depends(get_current_user)):
     """Get live status of a proctoring session."""
-    entry = _readable_entry(session_id, current_user)
+    entry = _readable_entry(session_id, current_user, request)
 
     pipeline = entry["pipeline"]
     summary = pipeline.get_summary()
@@ -1041,6 +1047,7 @@ _REVIEW_ROLES = require_role(["hr", "admin", "interviewer", "superadmin"])
 @router.get("/results/{interview_id}")
 async def get_proctoring_results(
     interview_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     current_user=Depends(_REVIEW_ROLES),
 ):
@@ -1065,7 +1072,7 @@ async def get_proctoring_results(
     if iv is None:
         raise HTTPException(404, "Interview not found")
     from src.services.audit_log import require_support_access
-    require_support_access(db, None, current_user, iv.company_id,
+    require_support_access(db, request, current_user, iv.company_id,
                            f"proctoring results for interview {interview_id}")
 
     sessions = db.query(ProctoringSession).filter(
@@ -1204,6 +1211,7 @@ class ReviewRequest(BaseModel):
 @router.post("/reviews")
 async def record_review(
     req: ReviewRequest,
+    request: Request,
     db: Session = Depends(get_db),
     current_user=Depends(_REVIEW_ROLES),
 ):
@@ -1235,7 +1243,7 @@ async def record_review(
     # A superadmin's outcome can count against a candidate, so it needs the same
     # support-access grant as reading the report, and it is audited.
     from src.services.audit_log import require_support_access
-    require_support_access(db, None, current_user, session.company_id,
+    require_support_access(db, request, current_user, session.company_id,
                            f"proctoring_review:{session.id}")
 
     ids = list(dict.fromkeys(req.violation_ids or []))   # de-duplicated, order kept
@@ -1272,6 +1280,7 @@ async def record_review(
 async def get_evidence_image(
     session_id: str,
     filename: str,
+    request: Request,
     db: Session = Depends(get_db),
     current_user=Depends(_REVIEW_ROLES),
 ):
@@ -1286,7 +1295,7 @@ async def get_evidence_image(
     if not _sess:
         raise HTTPException(404, "Session not found")
     from src.services.audit_log import require_support_access
-    require_support_access(db, None, current_user, _sess.company_id,
+    require_support_access(db, request, current_user, _sess.company_id,
                            f"proctoring evidence {session_id}/{filename}")
 
     # Reject path traversal — only a bare filename under this session's evidence dir.
@@ -1396,9 +1405,9 @@ async def behavior_check(session_id: str, req: BehaviorCheckRequest,
 
 
 @router.get("/sessions/{session_id}/logs")
-async def get_session_logs(session_id: str, current_user=Depends(get_current_user)):
+async def get_session_logs(session_id: str, request: Request, current_user=Depends(get_current_user)):
     """Fetch cheating violation logs for a proctoring session."""
-    entry = _readable_entry(session_id, current_user)
+    entry = _readable_entry(session_id, current_user, request)
     db_session_id = entry.get("db_session_id")
 
     if not db_session_id:
