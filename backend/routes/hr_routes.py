@@ -4021,7 +4021,7 @@ async def send_test_invite_and_reject(
     db: Session = Depends(get_db)
 ):
     """Send test invitation to selected candidates and auto-reject others using custom templates"""
-    from src.services.email_service import _send, dispatch
+    from src.services.email_service import dispatch
 
     job = db.query(JobPosting).filter(
         JobPosting.id == job_id,
@@ -4253,7 +4253,7 @@ async def send_round2_invite(
     """Round 2 (Coding): after reviewing Round 1 (MCQ) scores, HR advances selected
     candidates. Clones the coding-only questions from the same test template into a
     new per-candidate test. Only candidates whose Round 1 test is COMPLETED qualify."""
-    from src.services.email_service import _send, dispatch
+    from src.services.email_service import dispatch
 
     job = db.query(JobPosting).filter(
         JobPosting.id == job_id,
@@ -4342,7 +4342,7 @@ async def send_round2_invite(
         notice = MONITORING_EMAIL_NOTICE if _test_is_proctored(r2) else ""
         try:
             dispatch(c.email, subject, f"<div style='font-family:sans-serif;line-height:1.7'>{text.replace(chr(10), '<br>')}{notice}</div>",
-                     smtp_config=r2_smtp, cc=(r2_disp["cc"] if not r2_cc_sent else None))
+                     smtp_config=r2_smtp, cc=(r2_disp["cc"] if not r2_cc_sent else None), db=db)
             r2_cc_sent = True
         except Exception as e:
             logger.warning(f"round-2 invite email to {c.email} failed: {e}")
@@ -4998,8 +4998,14 @@ async def grant_retest(
             body_html += "<br><br>Adjustments for this attempt: " + ", ".join(summary) + "."
         if _test_is_proctored(retest):
             body_html += MONITORING_EMAIL_NOTICE
+        # It had no sender at all, which the legacy path turned into the
+        # platform's environment account. It is an assessment invitation; it
+        # goes out the way that step is routed.
+        from src.services.pipeline_notifications import resolve_step_sender
+        smtp_config, disp = resolve_step_sender(db, job.company_id, "test_invitation", job=job)
         res = dispatch(candidate.email, f"Another attempt: {job.title} assessment",
-                       f"<div style='font-family:sans-serif;line-height:1.7'>{body_html}</div>", db=db)
+                       f"<div style='font-family:sans-serif;line-height:1.7'>{body_html}</div>",
+                       smtp_config=smtp_config, cc=disp["cc"] or None, db=db)
         email_sent = delivery_outcome(res)["ok"]
     except Exception as e:
         logger.warning(f"retest email to {candidate.email} failed: {e}")
@@ -5327,7 +5333,7 @@ async def hr_schedule_interview(
                 db, job.company_id, "interview_scheduled", body.mailbox_id, job=job)
             if body.email_subject or body.email_body:
                 # Use custom subject/body supplied by HR, substituting placeholders
-                from src.services.email_service import _send, dispatch
+                from src.services.email_service import dispatch
                 placeholders = {
                     "{{candidate_name}}": candidate_name_str,
                     "{{job_title}}": job.title,
@@ -5342,8 +5348,10 @@ async def hr_schedule_interview(
                 for k, v in placeholders.items():
                     subj = subj.replace(k, v)
                     html = html.replace(k, v)
-                send_result = _send(candidate.email, subj, html.replace("\n", "<br>"),
-                                    smtp_config=smtp_config, cc=disp["cc"])
+                # Through the outbox like every other send: this used to call the
+                # synchronous _send, bypassing the queue and the hourly limit.
+                send_result = dispatch(candidate.email, subj, html.replace("\n", "<br>"),
+                                       smtp_config=smtp_config, cc=disp["cc"], db=db)
             else:
                 from src.services.email_service import send_interview_scheduled
                 send_result = send_interview_scheduled(
@@ -5412,6 +5420,9 @@ async def hr_schedule_interview(
         "sent": " — email sent to candidate",
         "queued": " — email queued for delivery",
         "failed": " — WARNING: candidate email could not be sent",
+        "blocked": " — WARNING: candidate email blocked: no working sender is configured "
+                   "for this step (see Admin → Mail Routing)",
+        "disabled": " — the interview email is switched off in Pipeline Notifications",
     }.get(email_status, "")
 
     return {
@@ -6591,6 +6602,9 @@ async def create_offer(
         "sent": " — offer letter emailed to the candidate",
         "queued": " — offer letter queued for delivery",
         "failed": " — WARNING: the offer letter email could not be sent",
+        "blocked": " — WARNING: the offer letter email is blocked: no working sender is "
+                   "configured for it (see Admin → Mail Routing)",
+        "disabled": " — the offer letter email is switched off in Pipeline Notifications",
         "skipped": " — no email address on file, so nothing was sent",
     }.get(email_status, "")
 
@@ -6690,20 +6704,23 @@ async def get_email_log(
     since: Optional[str] = None,
     skip: int = 0,
     limit: int = 50,
+    source: Optional[str] = None,
     current_user: User = Depends(AuthMiddleware.get_current_hr),
     db: Session = Depends(get_db)
 ):
     """Delivery history for outbound mail — "did candidate X get their offer?".
 
-    Before this existed the only trace of a message was a log line, and the send
-    helpers report failure by return value rather than by raising, so a failed
-    offer letter left nothing behind at all.
+    Reads the email API's messages. ``status`` is the message state: ``queued``,
+    ``deferred`` (rate limit or retry pending), ``sending``, ``accepted`` (the
+    mail server took it — SMTP cannot see further than that), ``failed``,
+    ``blocked`` (configuration stopped it; ``error`` says why), ``unknown`` (the
+    connection dropped after sending; it may have arrived) or ``cancelled``.
+    ``sender_user`` is the address it went out from.
 
-    ``status`` is the three-state delivery contract: ``queued`` (accepted, worker
-    has not finished), ``sent``, ``failed``, plus ``deferred`` for a rate-limit
-    hold. A queued row that never becomes ``sent`` means the worker is not
-    draining — that is the signal to look for.
+    ``source=legacy`` reads the old ``email_log`` table, kept for one release.
     """
+    if source != "legacy":
+        return _email_message_log(db, current_user, to_email, step_key, status, since, skip, limit)
     from src.models.models import EmailLog
 
     q = db.query(EmailLog)
@@ -6752,6 +6769,63 @@ async def get_email_log(
                 "updated_at": r.updated_at.isoformat() if r.updated_at else None,
             }
             for r in rows
+        ],
+    }
+
+
+def _email_message_log(db, current_user, to_email, step_key, status, since, skip, limit):
+    """``GET /email-log`` over ``email_messages``, in the shape the dashboard reads."""
+    from src.models.models import EmailMessage, EmailRecipient
+
+    q = db.query(EmailMessage).filter(EmailMessage.company_id == current_user.company_id,
+                                      EmailMessage.is_test.is_(False))
+    if to_email:
+        ids = (db.query(EmailRecipient.message_id)
+               .filter(EmailRecipient.company_id == current_user.company_id,
+                       EmailRecipient.email == to_email.strip()))
+        q = q.filter(EmailMessage.id.in_(ids))
+    if step_key:
+        q = q.filter(EmailMessage.event_type == step_key)
+    if status:
+        q = q.filter(EmailMessage.status == status)
+    if since:
+        try:
+            q = q.filter(EmailMessage.created_at >= datetime.fromisoformat(since))
+        except ValueError:
+            raise HTTPException(status_code=400,
+                                detail="since must be ISO-8601, e.g. 2026-09-01")
+    total = q.count()
+    rows = (q.order_by(EmailMessage.created_at.desc())
+             .offset(max(0, skip)).limit(min(max(1, limit), 200)).all())
+    primary = {}
+    if rows:
+        for r in (db.query(EmailRecipient)
+                  .filter(EmailRecipient.company_id == current_user.company_id,
+                          EmailRecipient.message_id.in_([m.id for m in rows]),
+                          EmailRecipient.kind == "to")
+                  .all()):
+            primary.setdefault(r.message_id, r.email)
+    return {
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+        "entries": [
+            {
+                "id": m.id,
+                "to_email": primary.get(m.id),
+                "subject": m.subject,
+                "step_key": m.event_type,
+                "status": m.status,
+                "error_type": m.status_reason if m.status in ("blocked", "failed", "unknown") else None,
+                "error": m.status_detail,
+                "attempt": m.attempt_count,
+                "sender_user": m.from_email,
+                "reference_type": m.reference_type,
+                "reference_id": m.reference_id,
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+                "updated_at": m.updated_at.isoformat() if m.updated_at else None,
+            }
+            for m in rows
         ],
     }
 
@@ -7028,28 +7102,19 @@ async def hr_list_mailboxes(
 
 
 def _selectable_mailboxes(db: Session, company_id: str) -> List[dict]:
-    """Active mailboxes for this company, shaped for a 'send from' dropdown.
+    """The company's enabled senders, shaped for a 'send from' dropdown.
 
-    Credentials are never included — only ``has_password``, because a mailbox
-    without one is silently unusable at send time.
+    Credentials are never included. ``usable`` / ``unusable_reason`` say whether
+    a sender can send right now: choosing one that cannot blocks the email (it
+    is no longer silently replaced by the company default).
     """
-    from src.models.models import CompanyMailbox
-    rows = (
-        db.query(CompanyMailbox)
-        .filter(CompanyMailbox.company_id == company_id,
-                CompanyMailbox.is_active == True)  # noqa: E712
-        .order_by(CompanyMailbox.name)
-        .all()
-    )
+    from src.email_api import facade
     return [
-        {
-            "id": m.id,
-            "name": m.name,
-            "from_email": m.smtp_from_email or m.smtp_user or "",
-            # Boolean only — never the credential itself.
-            "has_password": bool(m.smtp_pass),
-        }
-        for m in rows
+        {"id": m["id"], "name": m["name"], "from_email": m["smtp_from_email"],
+         # Boolean only — never the credential itself.
+         "has_password": m["has_password"], "usable": m["usable"],
+         "unusable_reason": m["unusable_reason"]}
+        for m in facade.list_mailboxes(db, company_id, usable_only=True)
     ]
 
 
@@ -7059,17 +7124,17 @@ async def hr_mail_preview(
     current_user: User = Depends(require_role(["hr", "admin"])),
     db: Session = Depends(get_db),
 ):
-    """What address will this step's mail actually go out from, and what else could it.
+    """What address will this step's mail go out from — or why it will not go out.
 
-    Powers the "Send from" control on the HR send dialogs: it reports the
-    resolved default (the mailbox an admin/HR configured for this stage, or the
-    company default when there is none) plus the list HR may pick from.
+    Powers the "Send from" control on the HR send dialogs: the sender the policy
+    picks for this step (the step's own, else the company default) plus the
+    list HR may choose from. ``source`` is ``step_mailbox``, ``company_default``,
+    ``blocked`` (``fallback_reason`` says why) or ``disabled``.
 
     Never returns credentials.
     """
     if not current_user.company_id:
         raise HTTPException(status_code=400, detail="User is not associated with a company")
-    from src.services import email_service
     from src.services import pipeline_notifications as pn
 
     if not pn.is_valid_step(step_key):
@@ -7077,24 +7142,25 @@ async def hr_mail_preview(
 
     cid = current_user.company_id
     step = pn.describe_step_dispatch(db, cid, step_key)
-
-    # Where it lands when the step has no usable mailbox of its own.
-    chain = email_service.describe_sender_chain(db, cid, "candidate")
-    active = next((c for c in chain if c.get("active")), None)
-    default_from = (active or {}).get("sender", {}) or {}
-
-    using_step_mailbox = bool(step["mailbox"] and step["mailbox"]["usable"])
+    eff = step["effective"] or {}
+    status = eff.get("status")
+    if status == "blocked":
+        source, source_label = "blocked", "Blocked"
+    elif status == "disabled":
+        source, source_label = "disabled", "Switched off"
+    elif eff.get("route_source") == "route":
+        source, source_label = "step_mailbox", (step["mailbox"] or {}).get("name") or "Step sender"
+    else:
+        source, source_label = "company_default", "Company default"
     return {
         "step_key": step_key,
         "label": step["label"],
-        # The mailbox HR configured for this stage — the dropdown's default
-        # selection. Reported even when unusable so the UI can explain itself.
+        # The sender configured for this stage — the dropdown's default selection.
+        # Reported even when unusable so the UI can explain itself.
         "default_mailbox_id": (step["mailbox"] or {}).get("id"),
-        "from_email": (step["mailbox"]["from_email"] if using_step_mailbox
-                       else default_from.get("from_email") or ""),
-        "source": "step_mailbox" if using_step_mailbox else "company_default",
-        "source_label": (step["mailbox"]["name"] if using_step_mailbox
-                         else (active or {}).get("label") or "Platform default"),
+        "from_email": eff.get("from_email") or "",
+        "source": source,
+        "source_label": source_label,
         "fallback_reason": step["fallback_reason"],
         "cc": step["cc"],
         "enabled": step["enabled"],
@@ -7121,13 +7187,11 @@ async def hr_send_mail(
 ):
     """Send an ad-hoc email from the HR dashboard's Compose Mail dialog.
 
-    Goes through ``dispatch``, not ``_send``: dispatch is the only path that
-    enqueues onto the RQ queue hireflow-email-worker consumes, and therefore the
-    only one that honours the mailbox's hourly_limit. A direct _send would bypass
-    the provider cap and get the company's SMTP account throttled or blocked.
-
-    Returns dispatch's own result, so the caller can tell "queued" from "sent" —
-    the UI must not claim delivery for a job that has not run yet.
+    Goes through the outbox like every other email: rate limited per mailbox,
+    recorded, retried. The response says what happened — ``status`` is
+    ``queued`` (accepted for delivery), ``blocked`` (no working sender; nothing
+    sent), or ``disabled`` (this kind of mail is switched off) — so the UI never
+    claims delivery for something that did not, or will not, go out.
     """
     if not current_user.company_id:
         raise HTTPException(status_code=400, detail="User is not associated with a company")
@@ -7145,9 +7209,9 @@ async def hr_send_mail(
     if not (request.body or "").strip():
         raise HTTPException(status_code=400, detail="Message body is required")
 
-    # One call for the whole precedence chain (HR's pick → step mailbox → company
-    # default → env). It also verifies the chosen mailbox belongs to this company,
-    # so a guessed id cannot borrow another tenant's SMTP credentials.
+    # HR's pick → the step's sender → the company default, decided by the sender
+    # policy. A chosen mailbox that is another company's, or cannot send, blocks
+    # the message rather than being swapped for a different sender.
     smtp, disp = resolve_step_sender(
         db, current_user.company_id, request.step_key,
         request.mailbox_id, category="candidate",
@@ -7160,13 +7224,15 @@ async def hr_send_mail(
     result = dispatch(
         str(request.to), subject,
         f"<div style='font-family:sans-serif;line-height:1.7'>{body_html}</div>",
-        smtp_config=smtp, cc=cc or None,
-        hourly_limit=(smtp or {}).get("hourly_limit"),
+        smtp_config=smtp, cc=cc or None, db=db,
     )
+    db.commit()
 
-    logger.info("HR ad-hoc mail from %s to %s (step=%s, mode=%s)",
-                current_user.id, request.to, request.step_key, result.get("mode"))
-    return {"queued": True, "cc": cc, **result}
+    logger.info("HR ad-hoc mail from %s to %s (step=%s, status=%s)",
+                current_user.id, request.to, request.step_key, result.get("status"))
+    queued = result.get("status") not in ("blocked", "disabled", "failed")
+    return {"queued": queued, "cc": cc, **result,
+            "error": result.get("error") or (smtp.get("reason") if not queued else None)}
 
 
 # ── Mail templates ───────────────────────────────────────────────────────────
@@ -7338,26 +7404,39 @@ async def get_pipeline_notifications(
     current_user: User = Depends(require_role(["hr", "admin"])),
     db: Session = Depends(get_db),
 ):
-    """Return per-step notification config for this company, with defaults filled
-    for steps that have no saved row. Passwords are never returned."""
+    """Per-step notification settings, with defaults for steps never saved.
+
+    ``enabled`` and ``mailbox_id`` (the step's sender) come from the email
+    routes; CC from the step config. ``effective`` says what will actually
+    happen: ``ok`` with the address, ``blocked`` with the reason, or
+    ``disabled``. Passwords are never returned.
+    """
     if not current_user.company_id:
         raise HTTPException(status_code=400, detail="User is not associated with a company")
-    from src.models.models import PipelineStepConfig
+    from src.models.models import PipelineStepConfig, EmailRoute
     from src.services import pipeline_notifications as pn
 
+    cid = current_user.company_id
     rows = {
         r.step_key: r
         for r in db.query(PipelineStepConfig)
-        .filter(PipelineStepConfig.company_id == current_user.company_id)
+        .filter(PipelineStepConfig.company_id == cid)
         .all()
+    }
+    routes = {
+        r.event_type: r
+        for r in db.query(EmailRoute).filter(EmailRoute.company_id == cid).all()
     }
     steps = []
     for key in pn.STEP_KEYS:
-        if key in rows:
-            data = pn.serialize_row(rows[key])
-            data["label"] = pn.STEP_LABELS[key]
-        else:
-            data = pn.default_step_payload(key)
+        data = pn.serialize_row(rows[key]) if key in rows else pn.default_step_payload(key)
+        data["label"] = pn.STEP_LABELS[key]
+        route = routes.get(key)
+        data["enabled"] = bool(route.enabled) if route is not None else True
+        data["mailbox_id"] = route.sender_id if route is not None else None
+        eff = pn.describe_step_dispatch(db, cid, key)["effective"] or {}
+        data["effective"] = {"status": eff.get("status"), "reason": eff.get("reason"),
+                             "from_email": eff.get("from_email")}
         steps.append(data)
     return {"steps": steps}
 
@@ -7368,45 +7447,49 @@ async def update_pipeline_notifications(
     current_user: User = Depends(require_role(["hr", "admin"])),
     db: Session = Depends(get_db),
 ):
-    """Upsert per-step notification config. Unknown step keys are ignored. CC is
-    only the explicitly-typed ``extra_emails`` — there is no role-based mapping."""
+    """Save per-step settings: on/off and sender (email routes), CC (step config).
+
+    Unknown step keys are ignored. A ``mailbox_id`` that is not one of this
+    company's senders is dropped (the step uses the company default). Each
+    change bumps the route's policy version; mail already queued keeps the
+    sender it was accepted with.
+    """
     if not current_user.company_id:
         raise HTTPException(status_code=400, detail="User is not associated with a company")
-    from src.models.models import PipelineStepConfig, CompanyMailbox
+    from src.models.models import PipelineStepConfig, EmailSender
     from src.services import pipeline_notifications as pn
+    from src.email_api.facade import set_route
 
-    # Valid mailbox ids for this company (to reject foreign / stale references).
-    valid_mailbox_ids = {
-        m.id for m in db.query(CompanyMailbox.id)
-        .filter(CompanyMailbox.company_id == current_user.company_id).all()
+    cid = current_user.company_id
+    valid_sender_ids = {
+        s.id for s in db.query(EmailSender.id)
+        .filter(EmailSender.company_id == cid, EmailSender.deleted_at.is_(None)).all()
     }
 
     for item in payload.steps:
         if not pn.is_valid_step(item.step_key):
             continue
         emails = [str(e) for e in item.extra_emails]
-        mailbox_id = item.mailbox_id if item.mailbox_id in valid_mailbox_ids else None
+        sender_id = item.mailbox_id if item.mailbox_id in valid_sender_ids else None
 
         row = (
             db.query(PipelineStepConfig)
             .filter(
-                PipelineStepConfig.company_id == current_user.company_id,
+                PipelineStepConfig.company_id == cid,
                 PipelineStepConfig.step_key == item.step_key,
             )
             .first()
         )
         if not row:
-            row = PipelineStepConfig(
-                company_id=current_user.company_id, step_key=item.step_key
-            )
+            row = PipelineStepConfig(company_id=cid, step_key=item.step_key)
             db.add(row)
-
-        row.enabled      = item.enabled
         row.extra_emails = json.dumps(emails)
         row.notify_roles = json.dumps([])   # role-based CC removed; always empty
         row.as_cc        = item.as_cc
-        row.mailbox_id   = mailbox_id
         row.updated_at   = datetime.utcnow()
+
+        set_route(db, cid, item.step_key, sender_id=sender_id, clear_sender=sender_id is None,
+                  enabled=item.enabled, actor_user_id=current_user.id)
 
     try:
         db.commit()
@@ -7424,35 +7507,37 @@ async def test_pipeline_notification(
     current_user: User = Depends(require_role(["hr", "admin"])),
     db: Session = Depends(get_db),
 ):
-    """Send a sample message for one step to ``to``, applying that step's
-    configured extra recipients and custom sender (so HR can verify routing)."""
+    """Send a sample message for one step to ``to``, from the sender the step
+    really resolves to, now — so HR can verify routing before a candidate is
+    affected. A switched-off or blocked step says so instead of sending."""
     if not current_user.company_id:
         raise HTTPException(status_code=400, detail="User is not associated with a company")
-    from src.services import email_service
+    from src.email_api import facade, senders as S
     from src.services.pipeline_notifications import resolve_step_dispatch, STEP_LABELS, is_valid_step
 
     if not is_valid_step(step_key):
         raise HTTPException(status_code=400, detail="Unknown step_key")
 
-    disp = resolve_step_dispatch(db, current_user.company_id, step_key)
-    smtp_config = disp["smtp_config"] or email_service.resolve_sender(
-        db, current_user.company_id, "candidate")
+    cid = current_user.company_id
+    disp = resolve_step_dispatch(db, cid, step_key)
+    decision = disp["smtp_config"].decision
+    base = {"cc": disp["cc"], "using_step_smtp": decision.route_source == "route"}
+    if decision.status != "ok":
+        return {**base, "sent": False, "error": decision.reason,
+                "error_type": "disabled" if decision.status == "disabled" else "blocked"}
+    sender, conn = S.load(db, decision.sender_company_id, decision.sender_id)
     label = STEP_LABELS.get(step_key, step_key)
-    result = email_service._send(
-        to,
-        f"[Test] {label} notification",
-        f"<p>This is a test of the <b>{label}</b> pipeline notification. "
-        f"Extra recipients configured for this step are CC'd.</p>",
-        smtp_config=smtp_config,
-        cc=disp["cc"],
-    )
-    return {
-        "sent": result.get("sent"),
-        "error": result.get("error"),
-        "error_type": result.get("error_type"),
-        "cc": disp["cc"],
-        "using_step_smtp": disp["smtp_config"] is not None,
-    }
+    try:
+        result = facade.test_send(
+            db, cid, sender, conn, str(to),
+            subject=f"[Test] {label} notification",
+            html=(f"<p>This is a test of the <b>{label}</b> pipeline notification, sent "
+                  f"from the sender this step uses.</p>"))
+    except facade.FacadeError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
+    db.commit()
+    return {**base, "sent": result.get("sent"), "error": result.get("error"),
+            "error_type": result.get("error_type")}
 
 
 # ==================== MY ACTIVITY (personal profile page) ====================

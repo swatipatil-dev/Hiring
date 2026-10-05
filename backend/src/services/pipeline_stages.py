@@ -367,7 +367,8 @@ def _same_visit(log, item):
 
 def _send_digest(db, company_id, owner, items):
     try:
-        from src.services.email_service import _build_email, dispatch, resolve_sender
+        from src.services.email_service import (_build_email, dispatch, resolve_sender,
+                                                delivery_outcome)
         rows = "".join(
             f"<tr><td style='padding:4px 8px'>{html.escape(i['candidate_name'])}</td>"
             f"<td style='padding:4px 8px'>{html.escape(i['job_title'] or '')}</td>"
@@ -382,9 +383,12 @@ def _send_digest(db, company_id, owner, items):
                 f"<th align='left'>Stage</th><th align='left'>Deadline</th></tr>{rows}</table>")
         result = dispatch(owner.email, f"{len(items)} candidate(s) need your action",
                           _build_email("Pending actions", body),
-                          smtp_config=resolve_sender(db, company_id, "system"), db=db,
-                          reference_type="pending_actions")
-        return not (isinstance(result, dict) and result.get("ok") is False)
+                          smtp_config=resolve_sender(db, company_id,
+                                                     event_type="workflow.reminder_digest"),
+                          db=db, reference_type="pending_actions")
+        # dispatch never returns "ok"; reading it directly counted every
+        # failure as delivered.
+        return delivery_outcome(result)["ok"]
     except Exception as exc:
         logger.warning("pending-action digest to %s failed: %s", owner.email, exc)
         return False

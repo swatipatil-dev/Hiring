@@ -4,17 +4,19 @@ This endpoint replaced a button that popped `alert('Mail sent!')` and made no
 request at all, so the tests here are mostly about the send actually happening,
 and happening through the right path:
 
-- it goes through email_service.dispatch (the RQ-queued, hourly-limit-respecting
-  path), never the raw _send that bypasses the provider cap
-- a mailbox_id belonging to another company is ignored rather than borrowed
+- it goes through email_service.dispatch (the outbox: recorded, rate limited,
+  retried), never the raw _send
+- a mailbox_id belonging to another company is never borrowed — the message is
+  blocked instead
 - the step's configured CC is merged with the caller's CC
-- the response reports queued-vs-sent honestly
+- the response reports queued / blocked honestly, and the message is recorded
 """
 import json
 import uuid
 import pytest
 
-from src.security import encrypt
+from src.email_api import constants as C
+from test.email_factories import make_route, make_smtp_sender
 
 
 def _make_company(db, name="Compose Co") -> str:
@@ -46,27 +48,22 @@ def _login(client, email, password="Pass@1234"):
 
 
 def _mailbox(db, company_id, name, *, user="box@acme.com", password="pw"):
-    from src.models.models import CompanyMailbox
-    mb = CompanyMailbox(
-        id=str(uuid.uuid4()), company_id=company_id, name=name,
-        smtp_host="smtp.acme.com", smtp_port=587,
-        smtp_user=user, smtp_pass=encrypt(password) if password else None,
-        smtp_from_email=user, is_active=True,
-    )
-    db.add(mb)
-    db.flush()
-    return mb
+    sender, _ = make_smtp_sender(db, company_id, name, email=user, password=password)
+    return sender
 
 
 def _step(db, company_id, step_key, mailbox_id=None, extra_emails=None):
+    """CC lives in the step config; the stage's mailbox is the step's route."""
     from src.models.models import PipelineStepConfig
     row = PipelineStepConfig(
         id=str(uuid.uuid4()), company_id=company_id, step_key=step_key,
         enabled=True, extra_emails=json.dumps(extra_emails or []),
-        notify_roles=json.dumps([]), as_cc=True, mailbox_id=mailbox_id,
+        notify_roles=json.dumps([]), as_cc=True,
     )
     db.add(row)
     db.flush()
+    if mailbox_id:
+        make_route(db, company_id, step_key, mailbox_id)
     return row
 
 
@@ -78,7 +75,7 @@ def captured(monkeypatch):
 
     def fake_dispatch(to, subject, body, **kw):
         calls.append({"to": to, "subject": subject, "body": body, **kw})
-        return {"mode": "async", "job_id": "job-123"}
+        return {"mode": "outbox", "message_id": "msg-123", "status": "queued"}
 
     def poisoned_send(*a, **kw):
         raise AssertionError("send-mail must use dispatch(), not _send()")
@@ -105,19 +102,44 @@ def test_send_mail_uses_dispatch_not_send(client, db, captured):
     assert "Line one<br>Line two" in captured[0]["body"]
 
 
-def test_response_reports_queued_not_sent(client, db, captured):
-    """The UI must be able to distinguish 'handed to the worker' from 'delivered'."""
+def test_response_reports_queued_and_records_the_message(client, db):
+    """The UI must be able to distinguish 'accepted for delivery' from 'delivered'."""
+    from src.models.models import EmailMessage
     cid = _make_company(db)
+    box = _mailbox(db, cid, "Default", user="hr@compose.com")
+    make_route(db, cid, C.DEFAULT_ROUTE, box.id)
     _create_user(db, "hr_queued@test.com", "hr", cid)
     headers = _login(client, "hr_queued@test.com")
 
     r = client.post("/api/v1/hr/send-mail", json=BODY, headers=headers)
-    assert r.status_code == 200
-    assert r.json()["mode"] == "async"
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["queued"] is True and out["status"] == C.QUEUED and "sent" not in out
+    msg = db.query(EmailMessage).filter_by(id=out["message_id"]).one()
+    assert msg.company_id == cid and msg.from_email == "hr@compose.com"
+    assert msg.event_type == "custom_mail" and msg.status == C.QUEUED
 
 
-def test_foreign_mailbox_id_is_ignored(client, db, captured):
-    """A guessed mailbox id from another tenant must not lend its SMTP credentials."""
+def test_unconfigured_company_is_blocked_not_sent(client, db):
+    """No sender configured: the message is recorded as blocked — never sent
+    from the platform's account — and the response says so."""
+    from src.models.models import EmailMessage
+    cid = _make_company(db, "Bare Co")
+    _create_user(db, "hr_bare@test.com", "hr", cid)
+    headers = _login(client, "hr_bare@test.com")
+
+    r = client.post("/api/v1/hr/send-mail", json=BODY, headers=headers)
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["queued"] is False and out["status"] == C.BLOCKED
+    msg = db.query(EmailMessage).filter_by(id=out["message_id"]).one()
+    assert msg.status == C.BLOCKED and msg.status_reason == C.R_NO_SENDER
+    assert msg.from_email is None
+
+
+@pytest.mark.security
+def test_foreign_mailbox_id_is_never_borrowed(client, db, captured):
+    """A guessed mailbox id from another tenant must not lend its sender."""
     mine = _make_company(db, "Mine Co")
     theirs = _make_company(db, "Theirs Co")
     their_box = _mailbox(db, theirs, "Their Box", user="secret@theirs.com")
@@ -129,9 +151,32 @@ def test_foreign_mailbox_id_is_ignored(client, db, captured):
                     json={**BODY, "mailbox_id": their_box.id}, headers=headers)
     assert r.status_code == 200, r.text
 
-    smtp = captured[0].get("smtp_config") or {}
+    smtp = captured[0].get("smtp_config")
+    assert smtp.decision.status == "blocked"
+    assert smtp.decision.reason_code == C.R_SENDER_NOT_FOUND
     assert smtp.get("user") != "secret@theirs.com"
     assert smtp.get("from_email") != "secret@theirs.com"
+
+
+@pytest.mark.security
+def test_foreign_mailbox_id_records_a_blocked_message(client, db):
+    from src.models.models import EmailMessage
+    mine = _make_company(db, "Mine Co")
+    own_box = _mailbox(db, mine, "Mine", user="me@mine.com")
+    make_route(db, mine, C.DEFAULT_ROUTE, own_box.id)
+    theirs = _make_company(db, "Theirs Co")
+    their_box = _mailbox(db, theirs, "Their Box", user="secret@theirs.com")
+    _create_user(db, "hr_scope2@test.com", "hr", mine)
+    headers = _login(client, "hr_scope2@test.com")
+
+    r = client.post("/api/v1/hr/send-mail",
+                    json={**BODY, "mailbox_id": their_box.id}, headers=headers)
+    out = r.json()
+    assert out["status"] == C.BLOCKED and out["queued"] is False
+    msg = db.query(EmailMessage).filter_by(id=out["message_id"]).one()
+    # Neither the other tenant's sender nor a quiet switch to our own default.
+    assert msg.sender_id is None and msg.from_email is None
+    assert "secret@theirs.com" not in r.text
 
 
 def test_own_mailbox_id_is_honoured(client, db, captured):
@@ -145,6 +190,7 @@ def test_own_mailbox_id_is_honoured(client, db, captured):
     assert r.status_code == 200, r.text
     smtp = captured[0].get("smtp_config") or {}
     assert smtp.get("from_email") == "hello@own.com"
+    assert "password" not in smtp
 
 
 def test_step_cc_merges_with_request_cc(client, db, captured):
@@ -172,7 +218,9 @@ def test_offer_resend_reuses_endpoint_with_offer_step(client, db, captured):
     r = client.post("/api/v1/hr/send-mail",
                     json={**BODY, "step_key": "offer_letter"}, headers=headers)
     assert r.status_code == 200, r.text
-    assert (captured[0].get("smtp_config") or {}).get("from_email") == "offers@co.com"
+    smtp = captured[0].get("smtp_config") or {}
+    assert smtp.get("from_email") == "offers@co.com"
+    assert smtp.decision.event_type == "offer_letter"
 
 
 def test_unknown_step_key_rejected(client, db, captured):

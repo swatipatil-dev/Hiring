@@ -188,7 +188,7 @@ def submit(db, *, tenant_id: str, decision: SenderDecision, event_type: str,
            is_test: bool = False, priority: str = C.PRIORITY_NORMAL,
            is_sensitive: bool = False, requested_sender_id: Optional[str] = None,
            from_name: Optional[str] = None, unsubscribe_to: Optional[str] = None,
-           defer_inline: bool = False) -> SubmitResult:
+           reply_to: Optional[str] = None, defer_inline: bool = False) -> SubmitResult:
     """Persist one email. See the module docstring. The caller commits."""
     from src.models.models import EmailMessage, EmailRecipient, EmailOutbox
 
@@ -201,6 +201,14 @@ def submit(db, *, tenant_id: str, decision: SenderDecision, event_type: str,
         raise SubmitError(C.R_SENDER_NOT_FOUND, "Sender belongs to another company")
 
     rcpts = normalise_recipients(to, cc, bcc)
+    # The sender's own Reply-To is an administrator's choice and wins; the
+    # caller's (a company support address, say) applies when it has none.
+    reply_to = (decision.reply_to or (reply_to or "").strip()) or None
+    if reply_to and (_CRLF.search(reply_to) or not _EMAIL_RE.match(reply_to)):
+        # A malformed support address in a company's branding must not stop the
+        # email itself; it just goes without a Reply-To.
+        logger.warning("[EMAIL] ignoring invalid Reply-To %r for %s", reply_to, event_type)
+        reply_to = None
     if template_id:
         if subject or html or text:
             raise SubmitError("content_conflict", "Send either a template or subject/html/text, not both")
@@ -242,7 +250,7 @@ def submit(db, *, tenant_id: str, decision: SenderDecision, event_type: str,
         connection_id=None if blocked else decision.connection_id,
         route_source=decision.route_source, policy_version=decision.policy_version,
         from_email=decision.from_email, from_name=from_name or decision.from_name,
-        reply_to=decision.reply_to, subject=subject,
+        reply_to=reply_to, subject=subject,
         content_enc=content_enc, content_key_version=content_version,
         content_sha256=hashlib.sha256(content.encode()).hexdigest(),
         is_sensitive=bool(is_sensitive), template_id=template_id,

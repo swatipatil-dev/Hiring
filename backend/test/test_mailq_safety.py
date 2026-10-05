@@ -80,11 +80,12 @@ def test_a_forged_pickle_payload_is_never_unpickled():
     assert _Detonator.fired == []
 
 
-def test_enqueue_and_reschedule_use_the_json_serializer(monkeypatch):
-    """Both ways a job reaches the queue must agree with the worker's serializer."""
+def test_enqueue_paths_use_the_json_serializer(monkeypatch):
+    """Both ways a job reaches the queue must agree with the worker's serializer:
+    the outbox's id-only delivery job, and the legacy enqueue kept for old jobs."""
     import sys
     import types
-    import src.mailq.worker as worker
+    from src.email_api import outbox
 
     seen = []
 
@@ -105,8 +106,15 @@ def test_enqueue_and_reschedule_use_the_json_serializer(monkeypatch):
     monkeypatch.setattr(mq, "_sync_forced", lambda: False)
 
     assert mq.enqueue_email(_payload())["mode"] == "async"
-    worker._reschedule(_payload(), attempt=1, delay=5, reason="test")
-    assert seen == [JSONSerializer, safety.SEND_JOB, JSONSerializer, safety.SEND_JOB]
+    outbox._enqueue("msg-1", "co-1")
+    assert seen == [JSONSerializer, safety.SEND_JOB, JSONSerializer, safety.DELIVER_JOB]
+
+
+def test_the_delivery_job_is_allowed_and_carries_ids_only():
+    job = _job(safety.DELIVER_JOB, {"message_id": "m", "tenant_id": "t"})
+    func, _instance, args, _kwargs = JSONSerializer.loads(job.data)
+    assert func == safety.DELIVER_JOB and args == [{"message_id": "m", "tenant_id": "t"}]
+    safety.check_allowed(safety.DELIVER_JOB)
 
 
 def test_entrypoint_starts_the_email_worker_locked_down():
@@ -211,13 +219,29 @@ def test_release_send_frees_every_claimed_bucket(fake):
     assert all(v == 0 for v in fake.store.values())
 
 
-def test_worker_marks_otps_as_priority(monkeypatch):
+def test_legacy_job_is_converted_without_its_password(db, monkeypatch):
+    """A job queued by the previous release is re-submitted through the sender
+    policy: an OTP keeps its priority, and the queued password is never used."""
     import src.mailq.worker as worker
-    calls = []
-    monkeypatch.setattr(ratelimit, "reserve_send",
-                        lambda account, limit, company_id=None, priority=False:
-                        calls.append((account, company_id, priority)) or None)
-    monkeypatch.setattr(worker, "_reschedule", lambda *a, **k: None)
-    monkeypatch.setattr(worker, "_log", lambda *a, **k: None)
-    worker.send_email_job(_payload(is_otp=True, sender=None, company_id="co-9"))
-    assert calls == [(ratelimit.SHARED_ACCOUNT, "co-9", True)]
+    from src.email_api import constants as C
+    from src.models.models import EmailMessage
+    from test.email_factories import make_company, make_route, make_smtp_sender
+    monkeypatch.setattr("src.mailq.queue.redis_available", lambda: False)
+    co = make_company(db, "Legacy")
+    s, _ = make_smtp_sender(db, co.id, "HR", email="hr@legacy.example")
+    make_route(db, co.id, C.DEFAULT_ROUTE, s.id)
+    out = worker.send_email_job(_payload(is_otp=True, step_key=None, company_id=co.id), db=db)
+    msg = db.query(EmailMessage).filter_by(id=out["message_id"]).one()
+    assert out["converted"] and msg.priority == C.PRIORITY_AUTH
+    assert msg.event_type == C.EVENT_AUTH_VERIFY and msg.from_email == "hr@legacy.example"
+    assert msg.reference_type == "legacy_job" and msg.reference_id == "log-1"
+
+
+def test_legacy_job_for_an_unconfigured_company_is_blocked_not_sent(db, monkeypatch):
+    import src.mailq.worker as worker
+    from src.email_api import constants as C
+    from src.models.models import EmailMessage
+    from test.email_factories import make_company
+    co = make_company(db, "Bare")
+    out = worker.send_email_job(_payload(company_id=co.id), db=db)
+    assert db.query(EmailMessage).filter_by(id=out["message_id"]).one().status == C.BLOCKED

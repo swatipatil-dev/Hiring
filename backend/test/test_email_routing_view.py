@@ -2,19 +2,26 @@
 Admin mail-routing view tests — GET /api/v1/admin/email/routing.
 
 Covers:
-- No SMTP password (plaintext OR stored ciphertext) ever reaches the response
-- Every mailbox_unusable_reason branch surfaces as a step fallback_reason
-- A usable mailbox is reported as the step's sender
-- Cross-tenant isolation
-- delivery.mode reflects queued vs inline
-- Disabled steps are reported but NOT as "off" (the HR toggle is not enforced)
+- No password (plaintext OR stored ciphertext) ever reaches the response
+- Each pipeline step reports its routed sender and its effective decision;
+  a sender that cannot send is reported as a *blocked* step, with the reason
+- Switched-off steps are reported as disabled (and are now enforced)
+- The policy layers ("chain"), including the explicit platform route for
+  verification codes; the environment is reported as never used
+- delivery: queue mode, outbox backlog and recent outcomes
+- Cross-tenant isolation and access control
 """
 import json
+import logging
 import uuid
-import pytest
 from unittest.mock import patch
 
-from src.security import encrypt
+import pytest
+
+from src.email_api import constants as C
+from src.models.models import EmailConnection
+from src.tenancy.platform_company import ensure_platform_company
+from test.email_factories import make_route, make_smtp_sender, queue_message
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -55,44 +62,28 @@ def _make_company(db, name: str = "Routing Co") -> str:
     return company.id
 
 
-def _make_mailbox(db, company_id: str, name: str = "Offers", *,
-                  user="offers@acme.com", password="mailbox-secret",
-                  is_active=True, hourly_limit=None):
-    """Create a CompanyMailbox. `password=None` leaves smtp_pass unset."""
-    from src.models.models import CompanyMailbox
-    mb = CompanyMailbox(
-        id=str(uuid.uuid4()),
-        company_id=company_id,
-        name=name,
-        smtp_host="smtp.acme.com",
-        smtp_port=587,
-        smtp_user=user,
-        smtp_pass=encrypt(password) if password else None,
-        smtp_from_email=user,
-        hourly_limit=hourly_limit,
-        is_active=is_active,
-    )
-    db.add(mb)
-    db.flush()
-    return mb
+def _sender(db, company_id, label="Offers", *, email="offers@acme.com", password="mailbox-secret",
+            enabled=True, hourly_limit=None, conn_status=C.CONN_ACTIVE):
+    sender, _ = make_smtp_sender(db, company_id, label, email=email, password=password,
+                                 enabled=enabled, hourly_limit=hourly_limit,
+                                 conn_status=conn_status)
+    return sender
 
 
-def _map_step(db, company_id: str, step_key: str, mailbox_id=None, *,
-              enabled=True, extra_emails=None):
+def _cc_row(db, company_id: str, step_key: str, extra_emails):
     from src.models.models import PipelineStepConfig
     row = PipelineStepConfig(
-        id=str(uuid.uuid4()),
-        company_id=company_id,
-        step_key=step_key,
-        enabled=enabled,
-        extra_emails=json.dumps(extra_emails or []),
-        notify_roles=json.dumps([]),
-        as_cc=True,
-        mailbox_id=mailbox_id,
+        id=str(uuid.uuid4()), company_id=company_id, step_key=step_key, enabled=True,
+        extra_emails=json.dumps(extra_emails), notify_roles=json.dumps([]), as_cc=True,
     )
     db.add(row)
     db.flush()
     return row
+
+
+@pytest.fixture(autouse=True)
+def _no_redis(monkeypatch):
+    monkeypatch.setattr("src.mailq.queue.redis_available", lambda: False)
 
 
 @pytest.fixture()
@@ -114,6 +105,10 @@ def _step(payload, step_key):
     return next(s for s in payload["steps"] if s["step_key"] == step_key)
 
 
+def _chain(payload):
+    return {c["layer"]: c for c in payload["chain"]}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # The non-negotiable one: no credentials in the response
 # ─────────────────────────────────────────────────────────────────────────────
@@ -121,41 +116,28 @@ def _step(payload, step_key):
 @pytest.mark.security
 @pytest.mark.admin
 def test_routing_never_leaks_passwords(client, db, admin_with_company):
-    """Neither the plaintext password nor the stored ciphertext may appear.
-
-    Both the tenant_configs override and a CompanyMailbox hold encrypted
-    credentials, and this endpoint reads both.
-    """
-    from src.models.models import TenantConfig
+    """Neither the plaintext password nor the stored ciphertext may appear."""
     headers, cid = admin_with_company
 
     tenant_plain  = "tenant-app-password-XYZ"
     mailbox_plain = "mailbox-app-password-ABC"
-
-    tc = TenantConfig(
-        id=str(uuid.uuid4()), company_id=cid,
-        smtp_host="smtp.gmail.com", smtp_port=587,
-        smtp_user="hr@acme.com", smtp_pass=encrypt(tenant_plain),
-        smtp_from_email="hr@acme.com",
-    )
-    db.add(tc)
-    mb = _make_mailbox(db, cid, "Offers", password=mailbox_plain)
-    _map_step(db, cid, "offer_letter", mailbox_id=mb.id)
-    db.flush()
+    default = _sender(db, cid, "Company default", email="hr@acme.com", password=tenant_plain)
+    make_route(db, cid, C.DEFAULT_ROUTE, default.id)
+    offers = _sender(db, cid, "Offers", password=mailbox_plain)
+    make_route(db, cid, "offer_letter", offers.id)
 
     payload = _routing(client, headers)
     raw = json.dumps(payload)
 
     assert tenant_plain not in raw
     assert mailbox_plain not in raw
-    assert tc.smtp_pass not in raw, "stored tenant ciphertext leaked"
-    assert mb.smtp_pass not in raw, "stored mailbox ciphertext leaked"
+    for conn in db.query(EmailConnection).filter_by(company_id=cid):
+        assert conn.credential_enc not in raw, "stored ciphertext leaked"
 
     # No credential-bearing key anywhere in the tree. Checked structurally rather
-    # than by substring: the "OTP & password reset" label legitimately contains
-    # the word, and _public_sender allow-lists keys so a new smtp_config field
-    # must not start leaking silently.
-    banned = {"password", "smtp_pass", "password_enc", "pass"}
+    # than by substring: labels legitimately contain the word "password".
+    banned = {"password", "smtp_pass", "password_enc", "pass", "credential_enc", "secret"}
+
     def _walk(node, path="$"):
         if isinstance(node, dict):
             for k, v in node.items():
@@ -172,10 +154,10 @@ def test_routing_never_leaks_passwords(client, db, admin_with_company):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.admin
-def test_usable_mailbox_is_reported_for_step(client, db, admin_with_company):
+def test_usable_sender_is_reported_for_step(client, db, admin_with_company):
     headers, cid = admin_with_company
-    mb = _make_mailbox(db, cid, "Offers", user="offers@acme.com", hourly_limit=250)
-    _map_step(db, cid, "offer_letter", mailbox_id=mb.id)
+    offers = _sender(db, cid, "Offers", email="offers@acme.com", hourly_limit=250)
+    make_route(db, cid, "offer_letter", offers.id)
 
     step = _step(_routing(client, headers), "offer_letter")
 
@@ -184,43 +166,44 @@ def test_usable_mailbox_is_reported_for_step(client, db, admin_with_company):
     assert step["mailbox"]["usable"] is True
     assert step["mailbox"]["from_email"] == "offers@acme.com"
     assert step["mailbox"]["hourly_limit"] == 250
+    assert step["effective"]["status"] == "ok"
+    assert step["effective"]["route_source"] == C.SRC_ROUTE
+    assert step["effective"]["from_email"] == "offers@acme.com"
 
 
 @pytest.mark.admin
 @pytest.mark.parametrize("kwargs,expected", [
-    ({"password": None},              "no password set"),
-    ({"is_active": False},            "mailbox is inactive"),
-    ({"user": None},                  "no SMTP user"),
+    ({"password": None},                 "password"),
+    ({"enabled": False},                 "disabled"),
+    ({"conn_status": C.CONN_FAILED},     "failed"),
 ])
-def test_fallback_reason_branches(client, db, admin_with_company, kwargs, expected):
-    """Each unusable-mailbox branch must surface to the admin, not just the log."""
+def test_unusable_step_sender_blocks_and_says_why(client, db, admin_with_company,
+                                                  kwargs, expected):
+    """A step whose sender cannot send is blocked — and the admin sees why.
+
+    It used to fall back silently to the company default; even with a working
+    default configured, nothing is now re-routed.
+    """
     headers, cid = admin_with_company
-    mb = _make_mailbox(db, cid, "Interviews", **kwargs)
-    _map_step(db, cid, "interview_scheduled", mailbox_id=mb.id)
+    default = _sender(db, cid, "Default", email="hr@acme.com")
+    make_route(db, cid, C.DEFAULT_ROUTE, default.id)
+    broken = _sender(db, cid, "Interviews", email="interviews@acme.com", **kwargs)
+    make_route(db, cid, "interview_scheduled", broken.id)
 
     step = _step(_routing(client, headers), "interview_scheduled")
 
+    assert step["effective"]["status"] == "blocked"
+    assert step["effective"]["from_email"] is None
     assert step["fallback_reason"] is not None
-    assert expected in step["fallback_reason"]
+    assert expected in step["fallback_reason"].lower()
     # Named even when unusable — "Interviews (no password)" beats a bare reason.
     assert step["mailbox"]["name"] == "Interviews"
     assert step["mailbox"]["usable"] is False
 
 
 @pytest.mark.admin
-def test_missing_mailbox_reason_is_reported():
-    """A dangling mailbox_id can't be inserted (FK), so cover the branch directly.
-
-    It is still reachable at runtime: the row is read in a separate query from the
-    step row, so a concurrent delete lands here.
-    """
-    from src.services.pipeline_notifications import mailbox_unusable_reason
-    assert mailbox_unusable_reason(None) == "no such mailbox"
-
-
-@pytest.mark.admin
-def test_unconfigured_steps_default_cleanly(client, admin_with_company):
-    """A company with no step rows still gets one entry per step, all defaulted."""
+def test_unconfigured_company_reports_every_step_blocked(client, admin_with_company):
+    """No sender at all: each step is listed, and each says mail is blocked."""
     from src.services.pipeline_notifications import STEP_KEYS
     headers, _ = admin_with_company
 
@@ -230,160 +213,156 @@ def test_unconfigured_steps_default_cleanly(client, admin_with_company):
     for s in payload["steps"]:
         assert s["enabled"] is True
         assert s["mailbox"] is None
-        assert s["fallback_reason"] is None
         assert s["cc"] == []
+        assert s["effective"]["status"] == "blocked"
+        assert s["effective"]["reason_code"] == C.R_NO_SENDER
+        assert s["fallback_reason"]
+
+
+@pytest.mark.admin
+def test_steps_use_the_company_default(client, db, admin_with_company):
+    headers, cid = admin_with_company
+    default = _sender(db, cid, "Default", email="hr@acme.com")
+    make_route(db, cid, C.DEFAULT_ROUTE, default.id)
+
+    step = _step(_routing(client, headers), "application_received")
+    assert step["effective"]["status"] == "ok"
+    assert step["effective"]["route_source"] == C.SRC_DEFAULT
+    assert step["effective"]["from_email"] == "hr@acme.com"
+    assert step["mailbox"] is None and step["fallback_reason"] is None
 
 
 @pytest.mark.admin
 def test_disabled_step_reports_enabled_false(client, db, admin_with_company):
-    """The UI needs this flag to say 'not yet enforced' rather than 'off'."""
+    """Switched-off steps are now enforced: nothing is sent for them."""
     headers, cid = admin_with_company
-    _map_step(db, cid, "candidate_rejected", enabled=False)
+    make_route(db, cid, "candidate_rejected", enabled=False)
 
     step = _step(_routing(client, headers), "candidate_rejected")
     assert step["enabled"] is False
+    assert step["effective"]["status"] == "disabled"
 
 
 @pytest.mark.admin
 def test_step_cc_is_cleaned(client, db, admin_with_company):
     """CC must match what the real resolver applies: valid, de-duped, ordered."""
     headers, cid = admin_with_company
-    _map_step(db, cid, "offer_letter",
-              extra_emails=["ops@acme.com", "not-an-email", "OPS@acme.com", "vp@acme.com"])
+    _cc_row(db, cid, "offer_letter",
+            ["ops@acme.com", "not-an-email", "OPS@acme.com", "vp@acme.com"])
 
     step = _step(_routing(client, headers), "offer_letter")
     assert step["cc"] == ["ops@acme.com", "vp@acme.com"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sender chain
+# Policy layers
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.admin
-def test_chain_marks_company_override_active_when_configured(client, db, admin_with_company):
-    from src.models.models import TenantConfig
+def test_chain_marks_company_default_active_when_configured(client, db, admin_with_company):
     headers, cid = admin_with_company
-    db.add(TenantConfig(
-        id=str(uuid.uuid4()), company_id=cid,
-        smtp_host="smtp.gmail.com", smtp_port=587,
-        smtp_user="hr@acme.com", smtp_pass=encrypt("pw"),
-        smtp_from_email="hr@acme.com",
-    ))
-    db.flush()
+    default = _sender(db, cid, "Default", email="hr@acme.com")
+    make_route(db, cid, C.DEFAULT_ROUTE, default.id)
 
-    chain = {c["layer"]: c for c in _routing(client, headers)["chain"]}
+    chain = _chain(_routing(client, headers))
 
-    assert chain["company_override"]["configured"] is True
-    assert chain["company_override"]["active"] is True
-    assert chain["company_override"]["sender"]["from_email"] == "hr@acme.com"
-    assert chain["env_default"]["active"] is False
+    assert chain["tenant_default"]["configured"] is True
+    assert chain["tenant_default"]["active"] is True
+    assert chain["tenant_default"]["sender"]["from_email"] == "hr@acme.com"
+    assert chain["environment"]["active"] is False
 
 
 @pytest.mark.admin
-def test_chain_falls_through_to_env_when_unconfigured(client, admin_with_company):
+def test_chain_says_mail_is_blocked_when_unconfigured(client, admin_with_company):
+    """There is no environment fallback to fall through to any more."""
     headers, _ = admin_with_company
-    chain = {c["layer"]: c for c in _routing(client, headers)["chain"]}
+    chain = _chain(_routing(client, headers))
 
-    assert chain["company_override"]["configured"] is False
-    assert chain["env_default"]["active"] is True
-    # A client company is never routed through the platform's Innomax mailboxes.
-    assert chain["platform_category"]["configured"] is False
+    assert chain["tenant_default"]["configured"] is False
+    assert chain["tenant_default"]["active"] is False
+    assert "blocked" in chain["tenant_default"]["detail"].lower()
+    assert chain["environment"]["configured"] is False
+    assert chain["environment"]["active"] is False
+    assert "never used" in chain["environment"]["detail"].lower()
 
 
 @pytest.mark.admin
-def test_auth_layer_reports_the_usable_mailbox(client, db, admin_with_company):
-    from src.services.email_service import AUTH_MAILBOX_NAME
+def test_chain_names_why_the_default_cannot_send(client, db, admin_with_company):
     headers, cid = admin_with_company
-    _make_mailbox(db, cid, AUTH_MAILBOX_NAME, user="auth@acme.com")
+    default = _sender(db, cid, "Default", email="hr@acme.com", password=None)
+    make_route(db, cid, C.DEFAULT_ROUTE, default.id)
 
-    auth = {c["layer"]: c for c in _routing(client, headers)["chain"]}["auth_mailbox"]
-
-    assert auth["configured"] is True
-    assert auth["sender"]["from_email"] == "auth@acme.com"
+    layer = _chain(_routing(client, headers))["tenant_default"]
+    assert layer["configured"] is True and layer["active"] is False
+    assert "password" in layer["detail"].lower()
 
 
 @pytest.mark.admin
-@pytest.mark.parametrize("kwargs,expected", [
-    ({"password": None},   "no password set"),
-    ({"is_active": False}, "mailbox is inactive"),
-    ({"user": None},       "no SMTP user"),
-])
-def test_auth_layer_names_why_the_mailbox_cannot_send(client, db, admin_with_company,
-                                                      kwargs, expected):
-    """Reporting absence sends an admin off to create a mailbox that already exists.
-
-    The password case is the one that matters: seed_innomax_mailboxes.py creates
-    mailboxes with smtp_pass=None by design, and that is how auth mail ended up
-    going out from the env Gmail account.
-    """
-    from src.services.email_service import AUTH_MAILBOX_NAME
+def test_platform_auth_route_is_shown_for_codes_only(client, db, admin_with_company):
+    """A company with no sender gets verification codes from the platform's
+    explicit auth route — and only those; other mail stays blocked."""
     headers, cid = admin_with_company
-    _make_mailbox(db, cid, AUTH_MAILBOX_NAME, **kwargs)
+    platform = ensure_platform_company(db)
+    p_sender = _sender(db, platform.id, "Platform Auth", email="auth@platform.example")
+    make_route(db, platform.id, C.EVENT_AUTH_VERIFY, p_sender.id)
 
-    auth = {c["layer"]: c for c in _routing(client, headers)["chain"]}["auth_mailbox"]
+    payload = _routing(client, headers)
+    layer = _chain(payload)["platform_auth_route"]
+    assert layer["configured"] is True and layer["active"] is True
+    assert layer["sender"]["from_email"] == "auth@platform.example"
 
-    assert auth["configured"] is False
-    assert expected in auth["detail"]
-    assert "No mailbox named" not in auth["detail"]
-
-
-@pytest.mark.admin
-def test_auth_layer_says_absent_when_there_is_no_mailbox(client, admin_with_company):
-    """Genuinely absent reads differently from present-but-broken."""
-    headers, _ = admin_with_company
-
-    auth = {c["layer"]: c for c in _routing(client, headers)["chain"]}["auth_mailbox"]
-
-    assert auth["configured"] is False
-    assert "No mailbox named" in auth["detail"]
+    events = {e["event_type"]: e for e in payload["events"]}
+    assert events[C.EVENT_AUTH_VERIFY]["route_source"] == C.SRC_PLATFORM_AUTH
+    assert events["offer_letter"]["status"] == "blocked"
+    # A client company never sees (or sends) the platform's own events.
+    assert not any(k.startswith(("platform.", "support.")) for k in events)
 
 
 @pytest.mark.admin
-def test_routing_view_does_not_log_the_send_path_warning(client, db, admin_with_company,
-                                                         caplog):
+def test_company_auth_sender_wins_over_platform_route(client, db, admin_with_company):
+    headers, cid = admin_with_company
+    platform = ensure_platform_company(db)
+    p_sender = _sender(db, platform.id, "Platform Auth", email="auth@platform.example")
+    make_route(db, platform.id, C.EVENT_AUTH_VERIFY, p_sender.id)
+    own = _sender(db, cid, "Default", email="hr@acme.com")
+    make_route(db, cid, C.DEFAULT_ROUTE, own.id)
+
+    layer = _chain(_routing(client, headers))["platform_auth_route"]
+    assert layer["configured"] is False and layer["active"] is False
+
+
+@pytest.mark.admin
+def test_routing_view_logs_no_warnings(client, db, admin_with_company, caplog):
     """This panel gets reloaded while somebody debugs exactly this — it must stay quiet.
 
     The reason belongs in the response, not in the log, for a read-only view.
     """
-    import logging
-    from src.services.email_service import AUTH_MAILBOX_NAME
     headers, cid = admin_with_company
-    _make_mailbox(db, cid, AUTH_MAILBOX_NAME, password=None)
+    broken = _sender(db, cid, "Broken", password=None)
+    make_route(db, cid, "offer_letter", broken.id)
 
-    caplog.set_level(logging.WARNING, logger="src.services.email_service")
+    caplog.set_level(logging.WARNING)
     _routing(client, headers)
 
-    assert "Falling back to the default sender" not in caplog.text
-
-
-@pytest.mark.admin
-def test_chain_counts_usable_step_mailboxes(client, db, admin_with_company):
-    headers, cid = admin_with_company
-    good = _make_mailbox(db, cid, "Good")
-    bad  = _make_mailbox(db, cid, "Bad", password=None)
-    _map_step(db, cid, "offer_letter", mailbox_id=good.id)
-    _map_step(db, cid, "interview_scheduled", mailbox_id=bad.id)
-
-    chain = {c["layer"]: c for c in _routing(client, headers)["chain"]}
-
-    assert chain["step_mailbox"]["configured"] is True
-    assert "1 of 2" in chain["step_mailbox"]["detail"]
+    assert not [r for r in caplog.records
+                if r.name.startswith(("src.services", "src.email_api"))
+                and r.levelno >= logging.WARNING]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Delivery mode
+# Delivery
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.admin
-def test_delivery_mode_inline_when_redis_absent(client, admin_with_company):
+def test_delivery_waits_in_outbox_when_redis_absent(client, admin_with_company):
     headers, _ = admin_with_company
-    with patch("src.mailq.queue.redis_available", return_value=False), \
-         patch("src.mailq.queue._sync_forced", return_value=False):
+    with patch("src.mailq.queue._sync_forced", return_value=False):
         delivery = _routing(client, headers)["delivery"]
 
-    assert delivery["mode"] == "inline"
+    assert delivery["mode"] == "outbox_waiting"
     assert delivery["redis_available"] is False
     assert delivery["queue_depth"] is None
+    assert delivery["dispatcher_heartbeat_age_s"] is None
 
 
 @pytest.mark.admin
@@ -393,6 +372,9 @@ def test_delivery_mode_queued_reports_depth(client, admin_with_company):
     class _FakeRedis:
         def llen(self, key):
             return 7
+
+        def get(self, key):
+            return None
 
     with patch("src.mailq.queue.redis_available", return_value=True), \
          patch("src.mailq.queue._sync_forced", return_value=False), \
@@ -404,8 +386,7 @@ def test_delivery_mode_queued_reports_depth(client, admin_with_company):
 
 
 @pytest.mark.admin
-def test_delivery_mode_inline_when_sync_forced(client, admin_with_company):
-    """EMAIL_SYNC beats a live Redis — mail sends in-request either way."""
+def test_delivery_reports_sync_forced(client, admin_with_company):
     headers, _ = admin_with_company
     with patch("src.mailq.queue.redis_available", return_value=True), \
          patch("src.mailq.queue._sync_forced", return_value=True), \
@@ -423,9 +404,24 @@ def test_queue_probe_failure_degrades_gracefully(client, admin_with_company):
     with patch("src.mailq.queue.redis_available", side_effect=RuntimeError("boom")):
         payload = _routing(client, headers)
 
-    assert payload["delivery"]["mode"] == "inline"
+    assert payload["delivery"]["mode"] == "outbox_waiting"
     assert payload["delivery"]["queue_depth"] is None
     assert len(payload["steps"]) > 0
+
+
+@pytest.mark.admin
+def test_delivery_counts_blocked_and_pending_mail(client, db, admin_with_company):
+    headers, cid = admin_with_company
+    queue_message(db, cid)                                   # blocked: no sender
+    default = _sender(db, cid, "Default", email="hr@acme.com")
+    make_route(db, cid, C.DEFAULT_ROUTE, default.id)
+    queue_message(db, cid, subject="queued")                 # waits in the outbox
+    db.flush()
+
+    outbox = _routing(client, headers)["delivery"]["outbox"]
+    assert outbox["blocked_24h"] == 1
+    assert outbox["pending"] >= 1
+    assert outbox["oldest_age_s"] is not None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -435,19 +431,14 @@ def test_queue_probe_failure_degrades_gracefully(client, admin_with_company):
 @pytest.mark.security
 @pytest.mark.admin
 def test_cross_tenant_isolation(client, db):
-    """Company B's admin must not see company A's mailboxes or sender."""
-    from src.models.models import TenantConfig
+    """Company B's admin must not see company A's senders."""
     cid_a = _make_company(db, "Company A")
     cid_b = _make_company(db, "Company B")
 
-    db.add(TenantConfig(
-        id=str(uuid.uuid4()), company_id=cid_a,
-        smtp_host="smtp.gmail.com", smtp_port=587,
-        smtp_user="secret-a@companyA.com", smtp_pass=encrypt("pw-a"),
-        smtp_from_email="secret-a@companyA.com",
-    ))
-    mb_a = _make_mailbox(db, cid_a, "A Offers", user="offers@companyA.com")
-    _map_step(db, cid_a, "offer_letter", mailbox_id=mb_a.id)
+    default_a = _sender(db, cid_a, "A Default", email="secret-a@companyA.com")
+    make_route(db, cid_a, C.DEFAULT_ROUTE, default_a.id)
+    offers_a = _sender(db, cid_a, "A Offers", email="offers@companyA.com")
+    make_route(db, cid_a, "offer_letter", offers_a.id)
 
     email_b = f"admin_b_{uuid.uuid4().hex[:6]}@test.com"
     _create_admin_directly(db, email_b, company_id=cid_b)

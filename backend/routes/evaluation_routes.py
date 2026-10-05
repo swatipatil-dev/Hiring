@@ -513,6 +513,8 @@ def respond_to_offer(
             "sent": " HR has been notified via email.",
             "queued": " An email to HR is queued for delivery.",
             "failed": " WARNING: HR could not be notified by email.",
+            "blocked": " WARNING: the email to HR is blocked: no working sender is configured.",
+            "disabled": " The HR notification is switched off.",
             "skipped": " No HR notification was sent.",
         }.get(hr_email_status, ""),
         "hr_email_status": hr_email_status,

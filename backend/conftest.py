@@ -106,6 +106,21 @@ def _skip_app_startup_for_suite():
     auth_mod.bcrypt.gensalt = orig_gensalt
 
 
+@pytest.fixture(autouse=True)
+def _no_real_email_network(monkeypatch):
+    """No test may resolve a mail host or talk to a mail server for real.
+
+    Saving a mailbox now verifies it (DNS check, TLS, login), so without this a
+    test that saves "smtp.gmail.com" would go to the internet. Hostnames resolve
+    to a fixed public address, and delivery goes to the NullAdapter. Tests that
+    exercise the SMTP adapter itself patch the socket layer directly; tests that
+    need a different resolution patch ``ssrf._system_resolve`` again.
+    """
+    from src.email_api import ssrf
+    monkeypatch.setattr(ssrf, "_system_resolve", lambda host, port: ["93.184.216.34"])
+    monkeypatch.setenv("EMAIL_DELIVERY_MODE", "null")
+
+
 @pytest.fixture(scope="session")
 def db_engine():
     """Create test engine and build all tables once per session."""

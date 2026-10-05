@@ -337,14 +337,15 @@ async def create_company(
     db.refresh(company)
 
     # Welcome email — fire-and-log; never fail the create on SMTP issues.
-    # This is platform→client "official" comms, so it sends from the Innomax
-    # official@ mailbox (resolve via the PLATFORM company, category "client"),
-    # not the brand-new client company (which has no SMTP yet).
+    # This is platform→client "official" comms: the PLATFORM company's
+    # platform.tenant_welcome route (seeded from INNOMAX_OFFICIAL_*), not the
+    # brand-new client company, which has no sender yet.
     try:
         from src.services.email_service import send_admin_welcome_email, resolve_sender
         from src.tenancy.platform_company import get_platform_company
         _platform = get_platform_company(db)
-        smtp_config = resolve_sender(db, _platform.id if _platform else None, "client")
+        smtp_config = resolve_sender(db, _platform.id if _platform else None,
+                                     event_type="platform.tenant_welcome")
         login_url = f"{str(request.base_url).rstrip('/')}/admin/login"
         send_admin_welcome_email(
             to=data.admin_email,

@@ -1,233 +1,156 @@
 """
-The sender chain for OTP / verification / password-reset mail — resolve_auth_sender.
+The sender for OTP / verification / password-reset mail — resolve_auth_sender.
 
-Auth mail is the only category not routed by a pipeline step: it finds its mailbox
-by NAME. That makes it the one path with no UI of its own showing which sender won,
-so every way it can fall back is covered here.
+Auth mail has its own chain because a company that has connected no mailbox still
+needs its users to be able to register and reset passwords:
 
-Covers:
-- named Auth mailbox wins when usable
-- each unusable branch falls through to the company override, and says why in the log
-- an absent mailbox falls through in silence — not having one is a choice, not a fault
-- the chain is identical for all three call sites (registration, resend, reset)
+    the company's auth route → the company's default sender
+      → the platform's explicit auth route (visible in Admin → Mail Routing)
+
+and never the environment. Every way the chain can end is covered here, plus the
+three call sites (registration, resend, reset) end to end.
 """
-import logging
-import uuid
-
 import pytest
 
-from src.security import encrypt
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _make_company(db, name: str = "Auth Co") -> str:
-    from src.models.models import Company
-    company = Company(id=str(uuid.uuid4()), name=name, slug=f"co-{uuid.uuid4().hex[:8]}")
-    db.add(company)
-    db.flush()
-    return company.id
-
-
-def _make_mailbox(db, company_id: str, name: str, *,
-                  user="auth@acme.com", password="mailbox-secret", is_active=True):
-    """`password=None` leaves smtp_pass unset — what the seed script produces."""
-    from src.models.models import CompanyMailbox
-    mb = CompanyMailbox(
-        id=str(uuid.uuid4()),
-        company_id=company_id,
-        name=name,
-        smtp_host="mail.acme.com",
-        smtp_port=465,
-        smtp_user=user,
-        smtp_pass=encrypt(password) if password else None,
-        smtp_from_email=user,
-        is_active=is_active,
-    )
-    db.add(mb)
-    db.flush()
-    return mb
-
-
-def _make_company_override(db, company_id: str, user="company@acme.com"):
-    from src.models.models import TenantConfig
-    tc = TenantConfig(
-        id=str(uuid.uuid4()), company_id=company_id,
-        smtp_host="smtp.acme.com", smtp_port=587,
-        smtp_user=user, smtp_pass=encrypt("company-pw"), smtp_from_email=user,
-    )
-    db.add(tc)
-    db.flush()
-    return tc
+from src.email_api import constants as C
+from src.models.models import EmailMessage
+from src.tenancy.platform_company import ensure_platform_company
+from test.email_factories import make_company, make_route, make_smtp_sender
 
 
 @pytest.fixture()
-def auth_name():
-    from src.services.email_service import AUTH_MAILBOX_NAME
-    return AUTH_MAILBOX_NAME
+def platform_auth(db):
+    """The platform's auth route, as seeded from SMTP_* (src/email_api/bootstrap.py)."""
+    platform = ensure_platform_company(db)
+    sender, _ = make_smtp_sender(db, platform.id, "Platform System",
+                                 email="system@platform.example", is_shared=True)
+    make_route(db, platform.id, C.EVENT_AUTH_VERIFY, sender.id)
+    make_route(db, platform.id, C.EVENT_AUTH_RESET, sender.id)
+    return sender
 
 
-_EMAIL_LOGGER = "src.services.email_service"
-
-
-def _warnings(caplog) -> str:
-    """Only this module's warnings.
-
-    ``caplog.text`` collects every logger that propagates to root, and importing the
-    app emits unrelated warnings (proctoring's optional deps), so asserting on the
-    whole buffer would be both flaky and falsely reassuring.
-    """
-    return "\n".join(r.getMessage() for r in caplog.records
-                     if r.name == _EMAIL_LOGGER and r.levelno >= logging.WARNING)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# The chain
-# ─────────────────────────────────────────────────────────────────────────────
-
-def test_named_mailbox_wins(db, auth_name):
+def _resolve(db, cid, purpose=C.EVENT_AUTH_VERIFY):
     from src.services.email_service import resolve_auth_sender
-    cid = _make_company(db)
-    _make_mailbox(db, cid, auth_name, user="auth@acme.com")
-    _make_company_override(db, cid)
-
-    cfg = resolve_auth_sender(db, cid)
-
-    assert cfg["from_email"] == "auth@acme.com"
-    assert cfg["password"] == "mailbox-secret"   # decrypted, not the ciphertext
+    return resolve_auth_sender(db, cid, purpose)
 
 
-def test_falls_through_to_the_company_override(db, auth_name):
-    """The layer below the mailbox. Before this was unified, two of the three call
-    sites skipped it entirely for the platform company and went straight to env."""
-    from src.services.email_service import resolve_auth_sender
-    cid = _make_company(db)
-    _make_company_override(db, cid, user="company@acme.com")
+# ── the chain ───────────────────────────────────────────────────────────────
 
-    cfg = resolve_auth_sender(db, cid)
-
-    assert cfg["from_email"] == "company@acme.com"
-
-
-def test_falls_through_to_env_when_nothing_is_configured(db):
-    """None means "use the env SMTP_* default" — the address being complained about."""
-    from src.services.email_service import resolve_auth_sender
-    cid = _make_company(db)
-
-    assert resolve_auth_sender(db, cid) is None
+def test_company_auth_route_wins(db, platform_auth):
+    co = make_company(db)
+    auth, _ = make_smtp_sender(db, co.id, "Auth", email="auth@acme.example")
+    default, _ = make_smtp_sender(db, co.id, "Default", email="hello@acme.example")
+    make_route(db, co.id, C.EVENT_AUTH_VERIFY, auth.id)
+    make_route(db, co.id, C.DEFAULT_ROUTE, default.id)
+    ref = _resolve(db, co.id)
+    assert ref.ok and ref["from_email"] == "auth@acme.example"
+    assert "password" not in ref and "app-pw" not in repr(dict(ref))
 
 
-def test_a_differently_named_mailbox_is_not_used(db):
-    """The lookup is on the exact name. A mailbox renamed in the UI stops being found,
-    which is how auth mail went out from a personal address on this deployment."""
-    from src.services.email_service import resolve_auth_sender
-    cid = _make_company(db)
-    _make_mailbox(db, cid, "Auth Mailbox", user="auth@acme.com")
-    _make_company_override(db, cid, user="company@acme.com")
-
-    cfg = resolve_auth_sender(db, cid)
-
-    assert cfg["from_email"] == "company@acme.com"
+def test_each_purpose_has_its_own_route(db, platform_auth):
+    co = make_company(db)
+    verify, _ = make_smtp_sender(db, co.id, "Verify", email="verify@acme.example")
+    make_route(db, co.id, C.EVENT_AUTH_VERIFY, verify.id)
+    assert _resolve(db, co.id, C.EVENT_AUTH_VERIFY)["from_email"] == "verify@acme.example"
+    # No reset route and no default: the platform route answers for reset codes.
+    assert _resolve(db, co.id, C.EVENT_AUTH_RESET)["from_email"] == "system@platform.example"
 
 
-def test_another_companys_mailbox_is_not_used(db, auth_name):
-    from src.services.email_service import resolve_auth_sender
-    mine = _make_company(db, "Mine")
-    theirs = _make_company(db, "Theirs")
-    _make_mailbox(db, theirs, auth_name, user="auth@theirs.com")
-
-    assert resolve_auth_sender(db, mine) is None
-
-
-def test_no_company_bound_resolves_to_env(db):
-    from src.services.email_service import resolve_auth_sender
-    assert resolve_auth_sender(db, None) is None
+def test_falls_through_to_the_company_default(db, platform_auth):
+    co = make_company(db)
+    default, _ = make_smtp_sender(db, co.id, "Default", email="hello@acme.example")
+    make_route(db, co.id, C.DEFAULT_ROUTE, default.id)
+    ref = _resolve(db, co.id)
+    assert ref["from_email"] == "hello@acme.example"
+    assert ref["route_source"] == C.SRC_DEFAULT
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Saying why — the fallback used to be completely silent
-# ─────────────────────────────────────────────────────────────────────────────
+def test_unconfigured_company_uses_the_explicit_platform_route(db, platform_auth):
+    co = make_company(db)
+    ref = _resolve(db, co.id)
+    assert ref.ok and ref["route_source"] == C.SRC_PLATFORM_AUTH
+    assert ref["from_email"] == "system@platform.example"
+    assert ref["sender_company_id"] != co.id and ref["company_id"] == co.id
 
-@pytest.mark.parametrize("kwargs,expected", [
-    ({"password": None},   "no password set"),
-    ({"is_active": False}, "mailbox is inactive"),
-    ({"user": None},       "no SMTP user"),
+
+def test_without_a_platform_route_auth_mail_is_blocked_not_sent_from_env(db, monkeypatch):
+    monkeypatch.setenv("SMTP_USER", "platform@gmail.com")
+    monkeypatch.setenv("SMTP_PASS", "env-secret")
+    ensure_platform_company(db)
+    co = make_company(db)
+    ref = _resolve(db, co.id)
+    assert ref["status"] == "blocked" and ref["reason_code"] == C.R_NO_SENDER
+    assert ref["from_email"] is None
+
+
+def test_another_companys_auth_route_is_not_used(db, platform_auth):
+    mine, theirs = make_company(db, "Mine"), make_company(db, "Theirs")
+    s, _ = make_smtp_sender(db, theirs.id, "Auth", email="auth@theirs.example")
+    make_route(db, theirs.id, C.EVENT_AUTH_VERIFY, s.id)
+    assert _resolve(db, mine.id)["from_email"] == "system@platform.example"
+
+
+def test_no_company_is_blocked(db):
+    ref = _resolve(db, None)
+    assert ref["status"] == "blocked" and ref["from_email"] is None
+
+
+@pytest.mark.parametrize("kwargs,words", [
+    ({"password": None}, "no password"),
+    ({"enabled": False}, "disabled"),
+    ({"conn_status": C.CONN_FAILED}, "failed"),
 ])
-def test_unusable_mailbox_falls_back_and_logs_why(db, caplog, auth_name,
-                                                  kwargs, expected):
-    """A mailbox that exists but cannot send is a misconfiguration; say so.
-
-    The password branch is the one that bit us: seed_innomax_mailboxes.py inserts
-    smtp_pass=None deliberately, and nothing anywhere said the mailbox was inert.
-    """
-    from src.services.email_service import resolve_auth_sender
-    cid = _make_company(db)
-    _make_mailbox(db, cid, auth_name, **kwargs)
-
-    caplog.set_level(logging.WARNING, logger=_EMAIL_LOGGER)
-    assert resolve_auth_sender(db, cid) is None
-
-    logged = _warnings(caplog)
-    assert expected in logged
-    assert "Falling back to the default sender" in logged
+def test_broken_company_auth_sender_blocks_and_says_why(db, platform_auth, kwargs, words):
+    """A sender the company configured but that cannot send is a fault to fix,
+    not a cue to send from somewhere else — the old chain fell through silently."""
+    co = make_company(db)
+    s, _ = make_smtp_sender(db, co.id, "Auth", email="auth@acme.example", **kwargs)
+    make_route(db, co.id, C.EVENT_AUTH_VERIFY, s.id)
+    ref = _resolve(db, co.id)
+    assert ref["status"] == "blocked" and ref["reason_code"] == C.R_ROUTE_SENDER_UNAVAILABLE
+    assert words in ref["reason"].lower()
 
 
-def test_inactive_is_not_reported_as_missing(db, caplog, auth_name):
-    """is_active used to be in the WHERE clause, which turned a disabled mailbox into
-    "no such mailbox" and hid the one switch the admin needed to flip."""
-    from src.services.email_service import resolve_auth_sender
-    cid = _make_company(db)
-    _make_mailbox(db, cid, auth_name, is_active=False)
-
-    caplog.set_level(logging.WARNING, logger=_EMAIL_LOGGER)
-    resolve_auth_sender(db, cid)
-
-    logged = _warnings(caplog)
-    assert "mailbox is inactive" in logged
-    assert "no such mailbox" not in logged
-
-
-def test_absent_mailbox_logs_nothing(db, caplog, auth_name):
-    """A company that never created one is not misconfigured. Warning on every send
-    would train everyone to ignore the line that matters."""
-    from src.services.email_service import resolve_auth_sender
-    cid = _make_company(db)
-
-    caplog.set_level(logging.WARNING, logger=_EMAIL_LOGGER)
-    resolve_auth_sender(db, cid)
-
-    assert _warnings(caplog) == ""
-
-
-def test_usable_mailbox_logs_nothing(db, caplog, auth_name):
-    from src.services.email_service import resolve_auth_sender
-    cid = _make_company(db)
-    _make_mailbox(db, cid, auth_name)
-
-    caplog.set_level(logging.WARNING, logger=_EMAIL_LOGGER)
-    resolve_auth_sender(db, cid)
-
-    assert _warnings(caplog) == ""
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# All three call sites share the chain
-# ─────────────────────────────────────────────────────────────────────────────
+# ── the three call sites ───────────────────────────────────────────────────
 
 def test_every_auth_call_site_uses_the_shared_resolver():
-    """They each inlined this and drifted: src/auth.py fell back to the company
-    override while auth_routes.py used resolve_sender(), whose default
-    category="system" returns None for the platform company without consulting
-    tenant_configs — so one user could get two codes from two addresses."""
+    """They each inlined the chain once and drifted, so one user could get two
+    codes from two addresses. Each must name the purpose it sends for."""
     import pathlib
-    import re
-
     backend = pathlib.Path(__file__).resolve().parent.parent
-    for rel in ("src/auth.py", "routes/auth_routes.py"):
-        source = (backend / rel).read_text(encoding="utf-8")
-        assert "resolve_auth_sender" in source, f"{rel} must use the shared resolver"
-        assert not re.search(r"resolve_company_mailbox\(.*AUTH_MAILBOX_NAME", source), (
-            f"{rel} re-inlines the auth chain — call resolve_auth_sender instead"
-        )
+    auth = (backend / "src/auth.py").read_text(encoding="utf-8")
+    routes = (backend / "routes/auth_routes.py").read_text(encoding="utf-8")
+    assert 'resolve_auth_sender(db, db_user.company_id, "auth.verify_email")' in auth
+    assert "resolve_auth_sender(session, company_id, purpose)" in routes
+    assert '"auth.verify_email"' in routes and '"auth.password_reset"' in routes
+
+
+def _messages(db, company_id):
+    db.expire_all()
+    return (db.query(EmailMessage)
+            .filter(EmailMessage.company_id == company_id)
+            .order_by(EmailMessage.created_at)
+            .all())
+
+
+def test_registration_resend_and_reset_send_auth_mail(client, db, platform_auth, monkeypatch):
+    """End to end through the API: each produces an auth-priority message from
+    the platform route, recorded like any other email, OTP content never kept."""
+    monkeypatch.setattr("src.mailq.queue.redis_available", lambda: False)
+    db.commit()
+    reg = client.post("/api/v1/auth/register", json={
+        "email": "newcandidate@example.net", "password": "Str0ng!Passw0rd#",
+        "role": "candidate", "first_name": "New", "last_name": "Person"})
+    assert reg.status_code in (200, 201), reg.text
+    platform = platform_auth.company_id
+    client.post("/api/v1/auth/resend-otp", json={"email": "newcandidate@example.net"})
+    client.post("/api/v1/auth/forgot-password", json={"email": "newcandidate@example.net"})
+    msgs = _messages(db, platform)
+    # Same-second rows have no order (DATETIME has no fraction), so compare as a multiset.
+    assert sorted(m.event_type for m in msgs) == sorted(
+        [C.EVENT_AUTH_VERIFY, C.EVENT_AUTH_VERIFY, C.EVENT_AUTH_RESET])
+    for m in msgs:
+        assert m.priority == C.PRIORITY_AUTH and m.is_sensitive
+        assert m.from_email == "system@platform.example"
+        # Redis is down: auth mail is delivered in-process, then its code is purged.
+        assert m.status == C.ACCEPTED and m.content_enc is None

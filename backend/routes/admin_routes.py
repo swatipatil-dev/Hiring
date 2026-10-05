@@ -15,9 +15,8 @@ from src.auth import get_current_user, AuthMiddleware, create_user, create_user_
 from src.models.models import (
     User, Department, HRProfile, InterviewerProfile, JobPosting,
     Candidate, ATSResult, Interview, InterviewFeedback, Offer, SystemConfig,
-    TenantConfig, CompanyMailbox, PipelineStepConfig
+    TenantConfig
 )
-from src.security import encrypt, decrypt
 from src.services.interviewer_deactivation import deactivate_interviewer_assignments
 from pydantic import BaseModel, EmailStr, field_validator
 from datetime import datetime, timedelta
@@ -1428,7 +1427,24 @@ async def get_system_health(
     }
 
 
-# ==================== EMAIL TEST ====================
+# ==================== EMAIL SETTINGS ====================
+# Backed by the email API (src/email_api/facade.py). The response shapes are the
+# ones the Email Settings tab, MailboxManager and MailRoutingPanel already read,
+# plus status fields. No credential is ever returned.
+
+def _facade_call(fn, *args, **kwargs):
+    from src.email_api.facade import FacadeError
+    try:
+        return fn(*args, **kwargs)
+    except FacadeError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
+
+
+def _admin_company(current_user: User) -> str:
+    if not current_user.company_id:
+        raise HTTPException(status_code=400, detail="Admin is not associated with a company")
+    return current_user.company_id
+
 
 class EmailTestRequest(BaseModel):
     to: EmailStr
@@ -1442,40 +1458,31 @@ async def send_test_email(
     current_user: User = Depends(require_role(["admin", "hr"])),
     db: Session = Depends(get_db),
 ):
-    """Admin/HR: send a real SMTP test email through the company's own SMTP and return
-    the actual delivery result.
+    """Send a real test email through the company's default sender, now, and
+    return what the mail server said.
 
-    A company with no SMTP configured gets a 400, not a send through the platform's
-    mailbox: the fallback let any tenant send as the platform and echoed the platform's
-    SMTP host and account back to them.
+    A company with no default sender gets a 400 — never a send through the
+    platform's mailbox. The recipient must be the sender's own address or an
+    active user of the company.
     """
-    from src.services import email_service
-    smtp_config = email_service.resolve_smtp_for_company(db, current_user.company_id)
-    if not smtp_config:
+    from src.email_api import facade
+    cid = current_user.company_id
+    sender, conn = facade.default_sender(db, cid) if cid else (None, None)
+    if sender is None:
         raise HTTPException(
             status_code=400,
             detail="Your company has no SMTP configured. Save it under Email settings first.",
         )
-    result = email_service._send(payload.to, payload.subject, payload.body, smtp_config=smtp_config)
-    return {
-        "using_company_smtp": True,
-        "config": {
-            "smtp_host": smtp_config.get("host"),
-            "smtp_port": smtp_config.get("port"),
-            "smtp_user": smtp_config.get("user"),
-            "from_email": smtp_config.get("from_email"),
-            "email_enabled": email_service.EMAIL_ENABLED,
-        },
-        **result,
-    }
+    result = _facade_call(facade.test_send, db, cid, sender, conn, str(payload.to),
+                          subject=payload.subject, html=payload.body)
+    db.commit()
+    return {"using_company_smtp": True, "config": facade.public_config(sender, conn), **result}
 
-
-# ==================== PER-COMPANY EMAIL CONFIG ====================
 
 class EmailConfigPayload(BaseModel):
     smtp_host:       Optional[str] = "smtp.gmail.com"
     smtp_port:       Optional[int] = 587
-    smtp_user:       EmailStr           # the FROM email / Gmail account
+    smtp_user:       EmailStr           # the mailbox login
     smtp_pass:       Optional[str] = None    # app password — omit to keep existing
     smtp_from_email: Optional[EmailStr] = None  # defaults to smtp_user if not set
 
@@ -1485,28 +1492,9 @@ async def get_email_config(
     current_user: User = Depends(require_role(["admin"])),
     db: Session = Depends(get_db),
 ):
-    """Return this company's saved SMTP config. Password is never returned —
-    only a boolean ``has_password`` indicating whether one is stored."""
-    if not current_user.company_id:
-        raise HTTPException(status_code=400, detail="Admin is not associated with a company")
-    tc = db.query(TenantConfig).filter(TenantConfig.company_id == current_user.company_id).first()
-    if not tc:
-        return {
-            "smtp_host": "smtp.gmail.com",
-            "smtp_port": 587,
-            "smtp_user": "",
-            "smtp_from_email": "",
-            "has_password": False,
-            "configured": False,
-        }
-    return {
-        "smtp_host":       tc.smtp_host or "smtp.gmail.com",
-        "smtp_port":       tc.smtp_port or 587,
-        "smtp_user":       tc.smtp_user or "",
-        "smtp_from_email": tc.smtp_from_email or "",
-        "has_password":    bool(tc.smtp_pass),
-        "configured":      bool(tc.smtp_user and tc.smtp_pass),
-    }
+    """This company's default sender. Only ``has_password`` is reported, never the password."""
+    from src.email_api import facade
+    return facade.company_smtp_view(db, _admin_company(current_user))
 
 
 @router.put("/email-config")
@@ -1515,39 +1503,21 @@ async def update_email_config(
     current_user: User = Depends(require_role(["admin"])),
     db: Session = Depends(get_db),
 ):
-    """Save / update this company's SMTP credentials. Encrypts the app password
-    at rest. Omit ``smtp_pass`` to keep the existing stored password."""
-    if not current_user.company_id:
-        raise HTTPException(status_code=400, detail="Admin is not associated with a company")
+    """Save the company's default sender and verify it (TLS + login).
 
-    tc = db.query(TenantConfig).filter(TenantConfig.company_id == current_user.company_id).first()
-    if not tc:
-        tc = TenantConfig(company_id=current_user.company_id)
-        db.add(tc)
-
-    tc.smtp_host       = payload.smtp_host or "smtp.gmail.com"
-    tc.smtp_port       = int(payload.smtp_port or 587)
-    tc.smtp_user       = payload.smtp_user
-    tc.smtp_from_email = payload.smtp_from_email or payload.smtp_user
-    if payload.smtp_pass:  # only overwrite if a fresh password is supplied
-        tc.smtp_pass = encrypt(payload.smtp_pass)
-    tc.updated_at = datetime.utcnow()
-
-    try:
-        db.commit()
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to save email config: {e}")
-
-    return {
-        "saved": True,
-        "smtp_host":       tc.smtp_host,
-        "smtp_port":       tc.smtp_port,
-        "smtp_user":       tc.smtp_user,
-        "smtp_from_email": tc.smtp_from_email,
-        "has_password":    bool(tc.smtp_pass),
-        "configured":      bool(tc.smtp_user and tc.smtp_pass),
-    }
+    The host must be a public mail server on port 465 or 587. A mailbox that is
+    reachable but rejects the login is saved as ``failed`` with the reason, so
+    the screen shows what to fix. Omit ``smtp_pass`` to keep the stored password.
+    """
+    from src.email_api import facade
+    view = _facade_call(
+        facade.save_company_smtp, db, _admin_company(current_user),
+        host=payload.smtp_host or "smtp.gmail.com", port=int(payload.smtp_port or 587),
+        user=str(payload.smtp_user), password=payload.smtp_pass,
+        from_email=str(payload.smtp_from_email or payload.smtp_user),
+        actor_user_id=current_user.id)
+    db.commit()
+    return {"saved": True, **view}
 
 
 @router.delete("/email-config")
@@ -1555,22 +1525,20 @@ async def clear_email_config(
     current_user: User = Depends(require_role(["admin"])),
     db: Session = Depends(get_db),
 ):
-    """Remove this company's SMTP override so it falls back to the global default."""
-    if not current_user.company_id:
-        raise HTTPException(status_code=400, detail="Admin is not associated with a company")
-    tc = db.query(TenantConfig).filter(TenantConfig.company_id == current_user.company_id).first()
-    if tc:
-        tc.smtp_host = None
-        tc.smtp_user = None
-        tc.smtp_pass = None
-        tc.smtp_from_email = None
-        tc.updated_at = datetime.utcnow()
-        db.commit()
+    """Disconnect the company's default sender and destroy its stored password.
+
+    Mail that relied on it is then blocked (visible in Mail Routing), never
+    sent from the platform's account instead.
+    """
+    from src.email_api import facade
+    facade.clear_company_smtp(db, _admin_company(current_user), actor_user_id=current_user.id)
+    db.commit()
     return {"cleared": True}
 
 
 # ==================== NAMED SENDER MAILBOXES ====================
-# Admin defines multiple named mailboxes; HR selects one per pipeline step.
+# A "mailbox" is a sender and its connection. Admin defines them; HR picks one per
+# pipeline step or per send.
 
 class MailboxPayload(BaseModel):
     name:            str
@@ -1583,35 +1551,14 @@ class MailboxPayload(BaseModel):
     is_active:       bool = True
 
 
-def _serialize_mailbox(mb: CompanyMailbox) -> dict:
-    return {
-        "id":              mb.id,
-        "name":            mb.name,
-        "smtp_host":       mb.smtp_host or "smtp.gmail.com",
-        "smtp_port":       mb.smtp_port or 587,
-        "smtp_user":       mb.smtp_user or "",
-        "smtp_from_email": mb.smtp_from_email or "",
-        "hourly_limit":    mb.hourly_limit,
-        "has_password":    bool(mb.smtp_pass),
-        "is_active":       bool(mb.is_active),
-    }
-
-
 @router.get("/mailboxes")
 async def list_mailboxes(
     current_user: User = Depends(require_role(["admin"])),
     db: Session = Depends(get_db),
 ):
-    """List this company's named sender mailboxes (passwords never returned)."""
-    if not current_user.company_id:
-        raise HTTPException(status_code=400, detail="Admin is not associated with a company")
-    rows = (
-        db.query(CompanyMailbox)
-        .filter(CompanyMailbox.company_id == current_user.company_id)
-        .order_by(CompanyMailbox.name)
-        .all()
-    )
-    return [_serialize_mailbox(m) for m in rows]
+    """This company's sender mailboxes, with connection status (passwords never returned)."""
+    from src.email_api import facade
+    return facade.list_mailboxes(db, _admin_company(current_user))
 
 
 @router.post("/mailboxes")
@@ -1620,41 +1567,18 @@ async def create_mailbox(
     current_user: User = Depends(require_role(["admin"])),
     db: Session = Depends(get_db),
 ):
-    """Create a named sender mailbox. The app password is encrypted at rest."""
-    if not current_user.company_id:
-        raise HTTPException(status_code=400, detail="Admin is not associated with a company")
-    name = (payload.name or "").strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="Mailbox name is required")
-    exists = (
-        db.query(CompanyMailbox)
-        .filter(CompanyMailbox.company_id == current_user.company_id,
-                CompanyMailbox.name == name)
-        .first()
-    )
-    if exists:
-        raise HTTPException(status_code=409, detail="A mailbox with that name already exists")
-
-    mb = CompanyMailbox(
-        company_id=current_user.company_id,
-        name=name,
-        smtp_host=payload.smtp_host or "smtp.gmail.com",
-        smtp_port=int(payload.smtp_port or 587),
-        smtp_user=payload.smtp_user,
-        smtp_from_email=payload.smtp_from_email or payload.smtp_user,
-        hourly_limit=payload.hourly_limit,
-        is_active=payload.is_active,
-    )
-    if payload.smtp_pass:
-        mb.smtp_pass = encrypt(payload.smtp_pass)
-    db.add(mb)
-    try:
-        db.commit()
-        db.refresh(mb)
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to create mailbox: {e}")
-    return _serialize_mailbox(mb)
+    """Create a mailbox. With a password it is verified now; without one it is
+    saved but cannot send until a password is added."""
+    from src.email_api import facade
+    view = _facade_call(
+        facade.create_mailbox, db, _admin_company(current_user), name=payload.name,
+        host=payload.smtp_host or "smtp.gmail.com", port=int(payload.smtp_port or 587),
+        user=str(payload.smtp_user), password=payload.smtp_pass,
+        from_email=str(payload.smtp_from_email or payload.smtp_user),
+        hourly_limit=payload.hourly_limit, is_active=payload.is_active,
+        actor_user_id=current_user.id)
+    db.commit()
+    return view
 
 
 @router.put("/mailboxes/{mailbox_id}")
@@ -1665,45 +1589,15 @@ async def update_mailbox(
     db: Session = Depends(get_db),
 ):
     """Update a mailbox. Omit ``smtp_pass`` to keep the stored password."""
-    if not current_user.company_id:
-        raise HTTPException(status_code=400, detail="Admin is not associated with a company")
-    mb = (
-        db.query(CompanyMailbox)
-        .filter(CompanyMailbox.id == mailbox_id,
-                CompanyMailbox.company_id == current_user.company_id)
-        .first()
-    )
-    if not mb:
-        raise HTTPException(status_code=404, detail="Mailbox not found")
-    name = (payload.name or "").strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="Mailbox name is required")
-    clash = (
-        db.query(CompanyMailbox)
-        .filter(CompanyMailbox.company_id == current_user.company_id,
-                CompanyMailbox.name == name, CompanyMailbox.id != mailbox_id)
-        .first()
-    )
-    if clash:
-        raise HTTPException(status_code=409, detail="A mailbox with that name already exists")
-
-    mb.name            = name
-    mb.smtp_host       = payload.smtp_host or "smtp.gmail.com"
-    mb.smtp_port       = int(payload.smtp_port or 587)
-    mb.smtp_user       = payload.smtp_user
-    mb.smtp_from_email = payload.smtp_from_email or payload.smtp_user
-    mb.hourly_limit    = payload.hourly_limit
-    mb.is_active       = payload.is_active
-    if payload.smtp_pass:
-        mb.smtp_pass = encrypt(payload.smtp_pass)
-    mb.updated_at = datetime.utcnow()
-    try:
-        db.commit()
-        db.refresh(mb)
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to update mailbox: {e}")
-    return _serialize_mailbox(mb)
+    from src.email_api import facade
+    view = _facade_call(
+        facade.update_mailbox, db, _admin_company(current_user), mailbox_id,
+        name=payload.name, host=payload.smtp_host or "smtp.gmail.com",
+        port=int(payload.smtp_port or 587), user=str(payload.smtp_user),
+        password=payload.smtp_pass, from_email=str(payload.smtp_from_email or payload.smtp_user),
+        hourly_limit=payload.hourly_limit, is_active=payload.is_active)
+    db.commit()
+    return view
 
 
 @router.delete("/mailboxes/{mailbox_id}")
@@ -1712,23 +1606,9 @@ async def delete_mailbox(
     current_user: User = Depends(require_role(["admin"])),
     db: Session = Depends(get_db),
 ):
-    """Delete a mailbox. Any pipeline steps using it revert to the company default."""
-    if not current_user.company_id:
-        raise HTTPException(status_code=400, detail="Admin is not associated with a company")
-    mb = (
-        db.query(CompanyMailbox)
-        .filter(CompanyMailbox.id == mailbox_id,
-                CompanyMailbox.company_id == current_user.company_id)
-        .first()
-    )
-    if not mb:
-        raise HTTPException(status_code=404, detail="Mailbox not found")
-    # Detach any steps pointing at this mailbox so they fall back to the default.
-    db.query(PipelineStepConfig).filter(
-        PipelineStepConfig.company_id == current_user.company_id,
-        PipelineStepConfig.mailbox_id == mailbox_id,
-    ).update({"mailbox_id": None})
-    db.delete(mb)
+    """Retire a mailbox. Steps that used it go back to the company default."""
+    from src.email_api import facade
+    _facade_call(facade.delete_mailbox, db, _admin_company(current_user), mailbox_id)
     db.commit()
     return {"deleted": True}
 
@@ -1740,69 +1620,24 @@ async def test_mailbox(
     current_user: User = Depends(require_role(["admin"])),
     db: Session = Depends(get_db),
 ):
-    """Send a real message using THIS mailbox's own credentials.
+    """Send a real message through THIS mailbox, now, and report the server's answer.
 
-    Saving a mailbox does not verify anything — create/update just encrypt
-    whatever password was typed. Without this, a typo is only discovered when a
-    candidate-facing send fails later, and the mailbox quietly falls back to the
-    company default in the meantime. This is the one place that proves the
-    credential actually works.
-
-    Deliberately synchronous (``_send``, not ``dispatch``): a queued send returns
-    "accepted onto the queue" and the auth failure surfaces in the worker log
-    minutes later, which is exactly the false confidence this endpoint exists to
-    remove.
+    Saving verifies the login; this proves a message actually goes out. It is
+    synchronous on purpose — a queued test would report "accepted" and surface
+    an authentication failure minutes later — and it is recorded like any
+    other message.
     """
-    if not current_user.company_id:
-        raise HTTPException(status_code=400, detail="Admin is not associated with a company")
-
-    from src.services import email_service
-    from src.services.pipeline_notifications import mailbox_smtp_config, mailbox_unusable_reason
-
-    mb = (
-        db.query(CompanyMailbox)
-        .filter(CompanyMailbox.id == mailbox_id,
-                CompanyMailbox.company_id == current_user.company_id)
-        .first()
-    )
-    if not mb:
+    from src.email_api import facade, senders as S
+    cid = _admin_company(current_user)
+    sender, conn = S.load(db, cid, mailbox_id)
+    if sender is None or sender.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Mailbox not found")
-
-    summary = {"id": mb.id, "name": mb.name,
-               "from_email": mb.smtp_from_email or mb.smtp_user}
-
-    # A missing password is a configuration answer, not an SMTP round trip.
-    # Sharing mailbox_unusable_reason keeps this wording identical to the routing
-    # panel and to what the real send path decides.
-    reason = mailbox_unusable_reason(mb)
-    if reason:
-        return {"mailbox": summary, "config": None, "sent": False,
-                "error": reason, "error_type": "unusable"}
-
-    # Company-scoped lookup: never the id-only _mailbox_smtp_config, which would
-    # let a guessed id reach another tenant's SMTP credentials.
-    smtp_config = mailbox_smtp_config(db, current_user.company_id, mailbox_id)
-    if not smtp_config:
-        return {"mailbox": summary, "config": None, "sent": False,
-                "error": "Mailbox could not be resolved for sending",
-                "error_type": "unusable"}
-
-    result = email_service._send(
-        payload.to, payload.subject, payload.body,
-        smtp_config=smtp_config, db=db,
-    )
-    return {
-        "mailbox": summary,
-        # Non-secret fields only — the password never leaves the server.
-        "config": {
-            "smtp_host": smtp_config.get("host"),
-            "smtp_port": smtp_config.get("port"),
-            "smtp_user": smtp_config.get("user"),
-            "from_email": smtp_config.get("from_email"),
-            "email_enabled": email_service.EMAIL_ENABLED,
-        },
-        **result,
-    }
+    summary = {"id": sender.id, "name": sender.label, "from_email": sender.email}
+    result = _facade_call(facade.test_send, db, cid, sender, conn, str(payload.to),
+                          subject=payload.subject, html=payload.body)
+    db.commit()
+    config = facade.public_config(sender, conn) if result.get("error_type") != "unusable" else None
+    return {"mailbox": summary, "config": config, **result}
 
 
 # ==================== MAIL ROUTING (read-only diagnostics) ====================
@@ -1813,45 +1648,103 @@ async def get_email_routing(
     current_user: User = Depends(require_role(["admin"])),
     db: Session = Depends(get_db),
 ):
-    """Show the full sender-resolution chain and per-step routing for this company.
+    """Which sender every kind of email uses, and why any of it is blocked.
 
-    Read-only. Answers the questions the individual config screens can't: which
-    address a given pipeline step actually sends from, why a configured mailbox
-    is being ignored, and whether mail is being queued or sent inline.
+    Read-only. ``steps`` covers the pipeline steps (sender, CC, effective
+    decision); ``events`` covers everything the company sends, including
+    verification codes and — for the platform company — its own operational
+    mail; ``chain`` lists the layers the sender policy consults, in order;
+    ``delivery`` shows the queue, the outbox backlog and the dispatcher.
 
-    Never returns SMTP passwords — neither plaintext nor the stored ciphertext.
+    Never returns a password, plaintext or encrypted.
     """
-    if not current_user.company_id:
-        raise HTTPException(status_code=400, detail="Admin is not associated with a company")
-
-    from src.services import email_service
+    cid = _admin_company(current_user)
+    from src.email_api import constants as EC, facade, outbox, policy, senders as S
     from src.services.pipeline_notifications import STEP_KEYS, describe_step_dispatch
+    from src.services import email_service
+    from src.models.models import EmailMessage
 
-    chain = email_service.describe_sender_chain(db, current_user.company_id, "candidate")
-    steps = [describe_step_dispatch(db, current_user.company_id, k) for k in STEP_KEYS]
+    steps = [describe_step_dispatch(db, cid, k) for k in STEP_KEYS]
+    events = policy.describe_routing(db, cid)
+    sender, conn = facade.default_sender(db, cid)
+    default_reason = S.usable_reason(sender, conn) if sender is not None else None
+    if sender is None:
+        default_detail = "Not configured — company mail is blocked until a sender is connected"
+    elif default_reason is None:
+        default_detail = "Saved under Email Settings above"
+    else:
+        default_detail = S.describe_reason(default_reason, conn)
+    auth = next((e for e in events if e["event_type"] == EC.EVENT_AUTH_VERIFY), None)
+    via_platform = bool(auth and auth["route_source"] == EC.SRC_PLATFORM_AUTH)
+    chain = [
+        {"layer": "requested_sender", "label": "Sender chosen when sending",
+         "applies_to": "HR's 'Send from' choice", "configured": None, "active": False,
+         "sender": None,
+         "detail": "Used if it can send; otherwise the email is blocked, never re-routed."},
+        {"layer": "step_sender", "label": "Sender set for the step",
+         "applies_to": "Pipeline Notifications", "configured": None, "active": False,
+         "sender": None,
+         "detail": "Per-step sender; a step can also be switched off entirely."},
+        {"layer": "tenant_default", "label": "Company default sender",
+         "applies_to": "All company mail",
+         "configured": sender is not None,
+         "active": sender is not None and default_reason is None,
+         "sender": ({"from_email": sender.email, "host": conn.host if conn else None,
+                     "port": conn.port if conn else None,
+                     "user": conn.username if conn else None} if sender else None),
+         "detail": default_detail},
+        {"layer": "platform_auth_route", "label": "Platform sender for verification codes",
+         "applies_to": "Verification and password-reset codes only",
+         "configured": via_platform,
+         "active": via_platform and auth["status"] == "ok",
+         "sender": {"from_email": auth["from_email"]} if via_platform and auth["from_email"] else None,
+         "detail": "Used only when the company has no sender of its own for these codes."},
+        {"layer": "environment", "label": "Environment SMTP settings",
+         "applies_to": "Nothing", "configured": False, "active": False, "sender": None,
+         "detail": "Never used at send time. The platform's own mailboxes are seeded "
+                   "from them as explicit senders."},
+    ]
 
-    # Delivery mode. redis_available() caches process-wide (src/mailq/queue.py:39),
-    # so this reflects the state observed when this worker first checked, not now.
     redis_ok, queue_depth, sync_forced = False, None, False
     try:
         from src.mailq import queue as mailq
         sync_forced = mailq._sync_forced()
         redis_ok = mailq.redis_available()
         if redis_ok:
-            r = mailq.get_redis()
-            queue_depth = r.llen(f"rq:queue:{mailq._QUEUE_NAME}")
+            queue_depth = mailq.get_redis().llen(f"rq:queue:{mailq._QUEUE_NAME}")
     except Exception as e:
         logger.warning(f"email routing: queue probe failed: {e}")
 
-    queued = redis_ok and not sync_forced
+    since = datetime.utcnow() - timedelta(hours=24)
+    counts = dict(
+        db.query(EmailMessage.status, func.count(EmailMessage.id))
+        .filter(EmailMessage.company_id == cid, EmailMessage.created_at >= since)
+        .group_by(EmailMessage.status).all())
+    backlog = {"pending": None, "oldest_age_s": None}
+    try:
+        backlog = outbox.backlog(db)
+    except Exception as e:
+        logger.warning(f"email routing: outbox probe failed: {e}")
+
     return {
         "chain": chain,
         "steps": steps,
+        "events": events,
         "delivery": {
             "email_enabled":   email_service.EMAIL_ENABLED,
             "sync_forced":     sync_forced,
             "redis_available": redis_ok,
             "queue_depth":     queue_depth,
-            "mode":            "queued" if queued else "inline",
+            # inline: EMAIL_SYNC delivers in-process; outbox_waiting: no Redis, so
+            # only auth mail goes out now and the rest waits for the dispatcher.
+            "mode":            ("inline" if sync_forced else
+                                "queued" if redis_ok else "outbox_waiting"),
+            "outbox": {**backlog,
+                       "blocked_24h": counts.get("blocked", 0),
+                       "deferred_24h": counts.get("deferred", 0),
+                       "unknown_24h": counts.get("unknown", 0),
+                       "failed_24h": counts.get("failed", 0),
+                       "accepted_24h": counts.get("accepted", 0)},
+            "dispatcher_heartbeat_age_s": outbox.heartbeat_age_s(),
         },
     }

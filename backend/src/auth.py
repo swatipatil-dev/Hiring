@@ -534,6 +534,10 @@ async def get_current_user(user: User = Depends(_authenticate_request)) -> User:
     cross-tenant access.
     """
     set_current_company(user.company_id if user.role != "superadmin" else None)
+    # Who initiated any email this request sends (email_messages.actor_user_id).
+    from src.email_api.compat import set_current_actor
+    from src.email_api.policy import Actor
+    set_current_actor(Actor(type="user", user_id=str(user.id)))
     return user
 
 # ==================== ROLE-BASED ACCESS CONTROL ====================
@@ -600,18 +604,21 @@ def create_user(db: Session, user_data: UserCreate, company_id: Optional[str] = 
     db.commit()
     db.refresh(db_user)
 
-    # Generate and send OTP using the company's SMTP if configured.
+    # Generate and send the OTP from the company's sender, or the platform's
+    # explicit auth route when the company has none (src/email_api/policy.py).
     otp = set_user_otp(db_user, db, purpose="verify")
     try:
         from .services.email_service import send_otp_email, resolve_auth_sender
-        smtp_config = resolve_auth_sender(db, db_user.company_id)
-        result = send_otp_email(db_user.email, db_user.first_name, otp, smtp_config=smtp_config)
-        if isinstance(result, dict) and not result.get("sent"):
-            # Surface the underlying SMTP error so ops can see why the user
-            # didn't receive their code. OTP stays in DB; /resend-otp retries.
+        smtp_config = resolve_auth_sender(db, db_user.company_id, "auth.verify_email")
+        result = send_otp_email(db_user.email, db_user.first_name, otp,
+                                smtp_config=smtp_config, db=db)
+        # Commit here so the outbox publishes now (or, without Redis, delivers it).
+        db.commit()
+        if isinstance(result, dict) and result.get("status") in ("blocked", "failed", "disabled"):
+            # Say why the user won't receive their code. OTP stays in DB; /resend-otp retries.
             logger.error(
-                f"OTP email send failed for {db_user.email}: "
-                f"{result.get('error_type')} — {result.get('error')}"
+                f"OTP email for {db_user.email} not sent: "
+                f"{result.get('status')} — {result.get('status_reason') or result.get('error')}"
             )
     except Exception as e:
         logger.exception(f"OTP email dispatch crashed for {db_user.email}: {e}")

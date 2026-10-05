@@ -142,5 +142,7 @@ def test_create_offer_for_candidate(client, hr_headers, candidate_headers, db):
     # The offer creation response confirms success via the message/offer_id
     # fields; the persisted status is asserted in the security tests instead.
     assert offer.get("offer_id"), f"Offer ID missing in response: {offer}"
-    assert "sent" in offer.get("message", "").lower() or offer.get("status") in ("sent", "pending"), \
+    # The test company has connected no mailbox, so the offer letter is blocked
+    # and says so — it is never sent from the platform's own account instead.
+    assert offer.get("email_status") == "blocked" and "blocked" in offer.get("message", "").lower(), \
         f"Unexpected offer response: {offer}"

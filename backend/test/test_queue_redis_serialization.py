@@ -122,14 +122,14 @@ def test_enqueue_email_uses_raw_client(monkeypatch):
     assert rec.connections and all(_decode_flag(c) is False for c in rec.connections)
 
 
-def test_email_reschedule_uses_raw_client(monkeypatch):
-    """The retry/rate-limit deferral path enqueues too — easy one to miss."""
-    from src.mailq import worker as mw
+def test_email_outbox_publish_uses_raw_client(monkeypatch):
+    """The outbox publishes delivery jobs too — easy one to miss."""
+    from src.email_api import outbox
 
     rec = _Recorder()
     rec.install(monkeypatch)
     monkeypatch.setattr(mq, "redis_available", lambda: True)
 
-    mw._reschedule({"to": "a@b.c"}, attempt=1, delay=5, reason="test")
+    outbox._enqueue("msg-1", "co-1")
 
     assert rec.connections and all(_decode_flag(c) is False for c in rec.connections)

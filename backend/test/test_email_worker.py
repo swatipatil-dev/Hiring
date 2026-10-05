@@ -27,6 +27,8 @@ def adapter(monkeypatch):
     fake = FakeAdapter()
     monkeypatch.setattr(A, "get_adapter", lambda conn, is_test=False: fake)
     monkeypatch.setattr("src.mailq.queue.redis_available", lambda: False)
+    # Real delivery mode, so the worker decrypts the credential as in production.
+    monkeypatch.delenv("EMAIL_DELIVERY_MODE", raising=False)
     return fake
 
 

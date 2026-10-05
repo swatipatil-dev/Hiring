@@ -248,6 +248,7 @@ def test_null_adapter_simulations():
 
 
 def test_get_adapter(monkeypatch):
+    monkeypatch.delenv("EMAIL_DELIVERY_MODE", raising=False)
     smtp_conn = SimpleNamespace(type="smtp")
     assert isinstance(get_adapter(smtp_conn, is_test=True), NullAdapter)
     assert isinstance(get_adapter(smtp_conn), SMTPAdapter)

@@ -138,7 +138,19 @@ def _migration_pending(db, company_id: str) -> bool:
 def resolve_sender(db, tenant_id: str, event_type: str, *,
                    requested_sender_id: Optional[str] = None,
                    actor: Actor = SYSTEM) -> SenderDecision:
-    """Decide the sender for one email. See the module docstring for the order."""
+    """Decide the sender for one email. See the module docstring for the order.
+
+    ``tenant_id`` is the authority here, and every query below filters on it
+    explicitly. The request's bound tenant is bypassed so that a decision made
+    *for* another company — the platform's support mail, sent while a client
+    admin's request is bound to the client — sees that company's rows.
+    """
+    from src.tenancy import tenant_bypass
+    with tenant_bypass():
+        return _resolve(db, tenant_id, event_type, requested_sender_id, actor)
+
+
+def _resolve(db, tenant_id, event_type, requested_sender_id, actor) -> SenderDecision:
     category = C.event_category(event_type)
     if not tenant_id or category is None:
         return _blocked(tenant_id, event_type, C.R_EVENT_NOT_ALLOWED)
@@ -177,23 +189,19 @@ def resolve_sender(db, tenant_id: str, event_type: str, *,
 def _platform_auth(db, tenant_id: str, event_type: str, actor: Actor) -> Optional[SenderDecision]:
     """The explicit platform route for verification / reset mail.
 
-    The request is bound to the client company, whose tenant filter would hide
-    the platform's rows, so this one lookup runs under ``tenant_bypass()``. It
-    is the only place the email policy reaches across companies, and only for
-    the auth category.
+    The only place the email policy uses another company's sender for a
+    company's mail, and only for the auth category.
     """
-    from src.tenancy import tenant_bypass
     from src.tenancy.platform_company import get_platform_company_id
-    with tenant_bypass():
-        platform_id = get_platform_company_id(db)
-        if not platform_id:
-            return None
-        route = _route(db, platform_id, event_type)
-        if route is None or not route.enabled or not route.sender_id:
-            return None
-        return _use(db, tenant_id, event_type, route.sender_id, C.SRC_PLATFORM_AUTH,
-                    route.policy_version, actor, unusable_code=C.R_ROUTE_SENDER_UNAVAILABLE,
-                    owner_id=platform_id)
+    platform_id = get_platform_company_id(db)
+    if not platform_id:
+        return None
+    route = _route(db, platform_id, event_type)
+    if route is None or not route.enabled or not route.sender_id:
+        return None
+    return _use(db, tenant_id, event_type, route.sender_id, C.SRC_PLATFORM_AUTH,
+                route.policy_version, actor, unusable_code=C.R_ROUTE_SENDER_UNAVAILABLE,
+                owner_id=platform_id)
 
 
 def describe_routing(db, company_id: str) -> list:

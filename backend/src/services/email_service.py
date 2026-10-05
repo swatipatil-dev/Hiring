@@ -1,32 +1,30 @@
 """
 📧 EMAIL NOTIFICATION SERVICE
-Sends automated emails at each hiring workflow stage.
-Uses SMTP (configurable). Falls back to console logging if not configured.
+Builds the hiring workflow's emails and hands them to the email API.
+
+Sending itself lives in ``src/email_api`` (docs/EMAIL_SYSTEM.md). This module
+keeps the message templates and the helpers the routes already call:
+
+* ``resolve_sender`` / ``resolve_auth_sender`` / ``resolve_smtp_for_company``
+  ask the sender policy and return a ``SenderRef`` — a decision, never a
+  credential. Nothing here reads SMTP settings from the environment.
+* ``dispatch`` persists the message (with its outbox row) through
+  ``email_api.messages.submit``; the outbox publishes it after the transaction
+  commits and the worker delivers it.
 """
 
-import smtplib
-import socket
-import ssl
 import logging
-from email.utils import formataddr
 from typing import Optional, Dict, Any
 import os
 
+from src.email_api import constants as EC
+from src.email_api.compat import SenderRef, current_actor
+
 logger = logging.getLogger(__name__)
 
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASS = os.getenv("SMTP_PASS", "")
-FROM_EMAIL = os.getenv("FROM_EMAIL", "")
+# Kill switch, read by the delivery worker: false defers every message (nothing is
+# dropped). Kept here because the admin views report it.
 EMAIL_ENABLED = os.getenv("EMAIL_ENABLED", "true").lower() == "true"
-# Implicit SSL (SMTPS). Auto-detected for port 465; force with SMTP_USE_SSL=true.
-# Note: Cloud Run blocks outbound port 25 — use 587 (STARTTLS) or 465 (SSL) to a relay.
-SMTP_USE_SSL = os.getenv("SMTP_USE_SSL", "").lower() in ("1", "true", "yes")
-MSGID_DOMAIN = os.getenv("EMAIL_MSGID_DOMAIN", "hireflow.io")
-# Connect/read timeout for the SMTP socket. Keep it well under EMAIL_JOB_TIMEOUT_S
-# (default 60) so a hung relay fails the send rather than the whole RQ job.
-SMTP_TIMEOUT_S = int(os.getenv("SMTP_TIMEOUT_S", "15"))
 
 # ── Body logging ──────────────────────────────────────────────────────────────
 # Message bodies are never logged by default. They carry OTP and password-reset
@@ -52,378 +50,52 @@ def _log_bodies_allowed(is_otp: bool) -> bool:
         return False
     return logger.isEnabledFor(logging.DEBUG)
 
-# ── TLS ───────────────────────────────────────────────────────────────────────
-# smtplib defaults to ssl._create_stdlib_context() when no context is passed,
-# which is check_hostname=False / verify_mode=CERT_NONE — encrypted but NOT
-# authenticated. That let anyone on the path present their own certificate and
-# read the mailbox password out of server.login(). Both connection styles below
-# get this verified context instead.
-#
-# SMTP_TLS_VERIFY=false is an escape hatch for an internal relay with a
-# self-signed certificate. It restores the old, unauthenticated behaviour — the
-# credential is exposed to an on-path attacker — so prefer trusting the relay's
-# CA over setting it.
-SMTP_TLS_VERIFY = os.getenv("SMTP_TLS_VERIFY", "true").lower() not in ("0", "false", "no")
 
-if SMTP_TLS_VERIFY:
-    _SSL_CONTEXT = ssl.create_default_context()
-else:
-    _SSL_CONTEXT = ssl._create_unverified_context()
-    logger.warning(
-        "SMTP_TLS_VERIFY is disabled — SMTP server certificates are NOT verified. "
-        "Mailbox credentials can be intercepted by an on-path attacker."
-    )
-
-# ── Innomax (platform) per-category sender mailboxes ──
-# For the platform's OWN company only, route mail by category to dedicated domain
-# mailboxes: candidate-handling → hr@, client-company-handling → official@.
-# support/system mail keeps the default SMTP_* (Gmail). Client companies are
-# unaffected (they keep resolve_smtp_for_company). Passwords come from env/Secret Mgr.
-INNOMAX_SMTP_HOST = os.getenv("INNOMAX_SMTP_HOST", "mail.innomaxsol.com")
-INNOMAX_SMTP_PORT = int(os.getenv("INNOMAX_SMTP_PORT", "465"))
-INNOMAX_HR_USER = os.getenv("INNOMAX_HR_USER", "")
-INNOMAX_HR_PASS = os.getenv("INNOMAX_HR_PASS", "")
-INNOMAX_OFFICIAL_USER = os.getenv("INNOMAX_OFFICIAL_USER", "")
-INNOMAX_OFFICIAL_PASS = os.getenv("INNOMAX_OFFICIAL_PASS", "")
+if os.getenv("SMTP_TLS_VERIFY", "true").lower() in ("0", "false", "no"):
+    # The escape hatch is gone: the email API always verifies certificates
+    # (src/email_api/ssrf.py). Say so rather than ignore the setting silently.
+    logger.error("SMTP_TLS_VERIFY=false is set but no longer honoured: SMTP certificates "
+                 "are always verified. Trust the relay's CA instead.")
 
 
 # Kept under its old name; the implementation moved with the MIME builder.
-from src.email_api.mime import html_to_text as _html_to_text  # noqa: E402
+from src.email_api.mime import html_to_text as _html_to_text  # noqa: E402,F401
 
 
-def resolve_smtp_for_company(db, company_id: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Look up per-company SMTP override from tenant_configs.
+# ==================== SENDER RESOLUTION ====================
+#
+# Each returns a SenderRef: the sender policy's decision for one event
+# (src/email_api/policy.py). A blocked or disabled decision is returned as such;
+# it is never replaced by some other sender.
 
-    Returns a dict suitable for passing as `smtp_config` to _send() / send_*,
-    or None if the company has not configured custom SMTP (caller falls back
-    to env-var defaults).
+# Which event a legacy "category" stands for, for the callers that still pass
+# one without an event_type.
+_CATEGORY_EVENTS = {
+    "candidate": "custom_mail",
+    "client": "platform.tenant_welcome",
+    "system": "workflow.reminder_digest",
+}
+
+
+def resolve_sender(db, company_id: Optional[str], category: str = "system", *,
+                   event_type: Optional[str] = None,
+                   requested_sender_id: Optional[str] = None) -> SenderRef:
+    """The sender for one email, as decided by the sender policy."""
+    from src.email_api.policy import resolve_sender as _policy
+    event = event_type or _CATEGORY_EVENTS.get(category, "custom_mail")
+    decision = _policy(db, company_id, event, requested_sender_id=requested_sender_id,
+                       actor=current_actor())
+    return SenderRef(decision, step_key=event if event in EC.EVENT_CATALOG else None)
+
+
+def resolve_auth_sender(db, company_id: Optional[str],
+                        purpose: str = EC.EVENT_AUTH_VERIFY) -> SenderRef:
+    """The sender for verification / password-reset codes.
+
+    The company's own auth route or default sender; otherwise the platform's
+    explicit auth route (shown in Admin → Mail Routing). Never the environment.
     """
-    if not company_id or db is None:
-        return None
-    try:
-        from src.models.models import TenantConfig
-        from src.security import decrypt
-        tc = db.query(TenantConfig).filter(TenantConfig.company_id == company_id).first()
-        if not tc or not tc.smtp_user or not tc.smtp_pass:
-            return None
-        password = decrypt(tc.smtp_pass) or tc.smtp_pass  # tolerate legacy plain values
-        return {
-            "host": tc.smtp_host or "smtp.gmail.com",
-            "port": int(tc.smtp_port or 587),
-            "user": tc.smtp_user,
-            "password": password,
-            "from_email": tc.smtp_from_email or tc.smtp_user,
-            # Carried for the delivery log, not for SMTP. _send/dispatch only
-            # ever .get() from this dict, so extra keys are inert -- the same
-            # trick _mailbox_smtp_config already uses to carry hourly_limit.
-            "company_id": company_id,
-        }
-    except Exception as e:
-        logger.warning(f"resolve_smtp_for_company failed for {company_id}: {e}")
-        return None
-
-
-def _innomax_mailbox(user: str, password: str,
-                     company_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Build an smtp_config for an Innomax domain mailbox, or None if not configured."""
-    if not user or not password:
-        return None
-    return {
-        "host": INNOMAX_SMTP_HOST,
-        "port": INNOMAX_SMTP_PORT,
-        "user": user,
-        "password": password,
-        "from_email": user,
-        "company_id": company_id,
-    }
-
-
-def _is_platform_company(db, company_id: Optional[str]) -> bool:
-    """True if company_id is the platform's own (Innomax) company."""
-    if not company_id or db is None:
-        return False
-    try:
-        from src.tenancy.platform_company import get_platform_company
-        platform = get_platform_company(db)
-        return bool(platform and platform.id == company_id)
-    except Exception as e:
-        logger.warning(f"_is_platform_company check failed: {e}")
-        return False
-
-
-def resolve_sender(db, company_id: Optional[str], category: str = "system") -> Optional[Dict[str, Any]]:
-    """Resolve the SMTP sender for an email, routing by category for the Innomax tenant.
-
-    category: "candidate" (→ hr@innomaxsol.com), "client" (→ official@innomaxsol.com),
-    or "system" (→ default SMTP_* env, i.e. the Innomax Gmail). Client companies are
-    unaffected — they always resolve via resolve_smtp_for_company. Returns None to mean
-    "use the default SMTP_* env fallback".
-    """
-    if _is_platform_company(db, company_id):
-        if category == "candidate":
-            return _innomax_mailbox(INNOMAX_HR_USER, INNOMAX_HR_PASS, company_id) \
-                or resolve_smtp_for_company(db, company_id)
-        if category == "client":
-            return _innomax_mailbox(INNOMAX_OFFICIAL_USER, INNOMAX_OFFICIAL_PASS, company_id) \
-                or resolve_smtp_for_company(db, company_id)
-        # system/support → default env (Gmail)
-        return None
-    # Any other (client) company: unchanged behaviour.
-    return resolve_smtp_for_company(db, company_id)
-
-
-# Named mailbox used for OTP / email-verification / password-reset ("system auth")
-# mail, matching the Admin-created mailbox of the same name. Override via env.
-AUTH_MAILBOX_NAME = os.getenv("AUTH_MAILBOX_NAME", "Auth")
-
-
-_NO_MAILBOX = "no such mailbox"   # mailbox_unusable_reason(None); absence, not misconfiguration
-
-
-def _resolve_named_mailbox(db, company_id: Optional[str],
-                           name: str) -> tuple:
-    """Resolve a named CompanyMailbox to ``(smtp_config, unusable_reason)``.
-
-    Exactly one side is ever populated: a usable mailbox gives ``(cfg, None)``, an
-    absent or unusable one ``(None, reason)``. ``(None, None)`` means there was
-    nothing to look up at all — no company bound, no session, no name.
-
-    Split out from ``resolve_company_mailbox`` so the read-only Admin routing view
-    can report the reason without the send path's log line firing every time
-    somebody opens the page.
-    """
-    if not company_id or db is None or not name:
-        return None, None
-    try:
-        from src.models.models import CompanyMailbox
-        from src.services.pipeline_notifications import mailbox_unusable_reason
-        # is_active deliberately NOT in the WHERE clause. Filtering on it here
-        # would collapse a disabled mailbox into "no such mailbox" and lose the
-        # one detail that tells an admin which switch to flip.
-        mb = (
-            db.query(CompanyMailbox)
-            .filter(CompanyMailbox.company_id == company_id,
-                    CompanyMailbox.name == name)
-            .first()
-        )
-        reason = mailbox_unusable_reason(mb)
-        if reason:
-            return None, reason
-        from src.security import decrypt
-        password = decrypt(mb.smtp_pass) or mb.smtp_pass  # tolerate legacy plain
-        return {
-            "host": mb.smtp_host or "smtp.gmail.com",
-            "port": int(mb.smtp_port or 587),
-            "user": mb.smtp_user,
-            "password": password,
-            "from_email": mb.smtp_from_email or mb.smtp_user,
-            "company_id": company_id,
-            # Was never set here, so Auth-mailbox sends silently used the env
-            # default cap rather than the one Admin configured for the mailbox.
-            "hourly_limit": mb.hourly_limit,
-        }, None
-    except Exception as e:
-        logger.warning(f"resolve_company_mailbox({name!r}) failed for {company_id}: {e}")
-        return None, "mailbox lookup failed"
-
-
-def resolve_company_mailbox(db, company_id: Optional[str], name: str) -> Optional[Dict[str, Any]]:
-    """Return an smtp_config for a named, usable CompanyMailbox, or None.
-
-    None when the company/name is missing, the mailbox is absent/inactive, or it
-    has no credentials — the caller then falls back to its previous sender
-    resolution (so this is always safe to prepend).
-
-    A mailbox that EXISTS but cannot send is logged. That case used to return None
-    in silence, and it is how auth mail went out from the env Gmail account with
-    nothing anywhere to explain it: ``seed_innomax_mailboxes.py`` creates mailboxes
-    with ``smtp_pass=None`` by design, and one left that way is inert. An ABSENT
-    mailbox is not logged — a company that never configured one is not misconfigured
-    and would otherwise warn on every single send.
-    """
-    cfg, reason = _resolve_named_mailbox(db, company_id, name)
-    if reason and reason != _NO_MAILBOX:
-        logger.warning("Mailbox %r unusable for company %s: %s. "
-                       "Falling back to the default sender.", name, company_id, reason)
-    return cfg
-
-
-def resolve_auth_sender(db, company_id: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Resolve the sender for OTP / email-verification / password-reset mail.
-
-    The chain, in one place: the mailbox named ``AUTH_MAILBOX_NAME`` → the company's
-    own SMTP override → None, meaning the env ``SMTP_*`` default.
-
-    The three auth call sites each inlined this and had drifted apart. ``src/auth.py``
-    fell back to ``resolve_smtp_for_company``; ``auth_routes.py`` used
-    ``resolve_sender()``, whose default ``category="system"`` returns None for the
-    PLATFORM company without consulting ``tenant_configs`` at all. So registration and
-    resend could send one user two codes from two different addresses.
-
-    ``resolve_smtp_for_company`` is the survivor: auth mail should reach for the
-    company's configured sender before it falls back to the platform's env account,
-    which is a generic address and the reason this was reported in the first place.
-    """
-    return (resolve_company_mailbox(db, company_id, AUTH_MAILBOX_NAME)
-            or resolve_smtp_for_company(db, company_id))
-
-
-def _auth_layer_detail(cfg: Optional[Dict[str, Any]], reason: Optional[str]) -> str:
-    """One line explaining what the auth mailbox is doing, for the Admin routing view."""
-    if cfg:
-        return "Verification and reset codes send from this mailbox"
-    tail = "auth mail uses the layers below"
-    if not reason or reason == _NO_MAILBOX:
-        return f"No mailbox named “{AUTH_MAILBOX_NAME}” — {tail}"
-    return f"Mailbox “{AUTH_MAILBOX_NAME}” cannot send: {reason} — {tail}"
-
-
-def _public_sender(cfg: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Strip an smtp_config down to the non-secret fields safe to return over the API.
-
-    Deliberately allow-lists keys rather than popping ``password`` — a future key
-    added to smtp_config dicts must not silently start leaking.
-    """
-    if not cfg:
-        return None
-    return {
-        "host":       cfg.get("host") or SMTP_HOST,
-        "port":       int(cfg.get("port") or SMTP_PORT),
-        "user":       cfg.get("user") or "",
-        # Mirror _send's derivation exactly (see :241) so this shows the real
-        # From address rather than a plausible-looking guess.
-        "from_email": cfg.get("from_email") or FROM_EMAIL or cfg.get("user") or "",
-    }
-
-
-def describe_sender_chain(db, company_id: Optional[str],
-                          category: str = "candidate") -> list:
-    """Describe the sender-resolution chain for the Admin routing view.
-
-    Returns one entry per layer, in resolution order, shaped as::
-
-        {"layer", "label", "applies_to", "configured", "active",
-         "sender": {host, port, user, from_email}|None, "detail"}
-
-    ``active`` marks the layer that actually wins for ``category`` among the
-    company-wide layers. The per-step and auth layers are reported as
-    ``applies_to``-scoped because they only apply to some mail, so marking them
-    "active" for a generic send would be misleading.
-
-    Never returns a password. The winning entry is derived by calling the real
-    ``resolve_sender`` and passing it through ``_public_sender``, so this view
-    cannot drift from what the send path does.
-    """
-    is_platform = _is_platform_company(db, company_id)
-    company_cfg = resolve_smtp_for_company(db, company_id)
-    # The underscore form, not resolve_company_mailbox: this view is read-only and
-    # gets opened repeatedly while somebody debugs exactly this, so it must not emit
-    # the send path's warning each time. It wants the reason to display, not to log.
-    auth_cfg, auth_reason = _resolve_named_mailbox(db, company_id, AUTH_MAILBOX_NAME)
-    winner      = resolve_sender(db, company_id, category)
-
-    # Which company-wide layer produced `winner`? None means "fell through to env".
-    if winner is None:
-        active_layer = "env_default"
-    elif is_platform and category in ("candidate", "client") and (
-        winner.get("user") in (INNOMAX_HR_USER, INNOMAX_OFFICIAL_USER)
-        and winner.get("user")
-    ):
-        active_layer = "platform_category"
-    else:
-        active_layer = "company_override"
-
-    # How many pipeline steps point at a mailbox that is genuinely usable.
-    step_total, step_usable = 0, 0
-    try:
-        from src.models.models import PipelineStepConfig, CompanyMailbox
-        from src.services.pipeline_notifications import mailbox_unusable_reason
-        rows = (db.query(PipelineStepConfig)
-                  .filter(PipelineStepConfig.company_id == company_id,
-                          PipelineStepConfig.mailbox_id.isnot(None))
-                  .all()) if company_id and db is not None else []
-        step_total = len(rows)
-        for r in rows:
-            mb = db.query(CompanyMailbox).filter(CompanyMailbox.id == r.mailbox_id).first()
-            if mailbox_unusable_reason(mb) is None:
-                step_usable += 1
-    except Exception as e:
-        logger.warning(f"describe_sender_chain step scan failed for {company_id}: {e}")
-
-    innomax_user = (INNOMAX_HR_USER if category == "candidate"
-                    else INNOMAX_OFFICIAL_USER if category == "client" else "")
-
-    return [
-        {
-            "layer": "step_mailbox",
-            "label": "Per-step mailbox",
-            "applies_to": "Pipeline step mail",
-            "configured": step_total > 0,
-            "active": False,
-            "sender": None,
-            "detail": (
-                f"{step_usable} of {step_total} configured step(s) resolve to a usable mailbox"
-                if step_total else "No pipeline step has a mailbox assigned"
-            ),
-        },
-        {
-            "layer": "auth_mailbox",
-            "label": f"Named “{AUTH_MAILBOX_NAME}” mailbox",
-            "applies_to": "OTP & password reset",
-            "configured": auth_cfg is not None,
-            "active": False,
-            "sender": _public_sender(auth_cfg),
-            # Name the actual reason. "No active mailbox" reads as "create one",
-            # which is wrong and slow when the mailbox is sitting right there in the
-            # UI with no password — the case this panel exists to catch.
-            "detail": _auth_layer_detail(auth_cfg, auth_reason),
-        },
-        {
-            "layer": "platform_category",
-            "label": "Platform category routing",
-            "applies_to": "Platform company only",
-            "configured": bool(is_platform and innomax_user),
-            "active": active_layer == "platform_category",
-            "sender": _public_sender(
-                {"host": INNOMAX_SMTP_HOST, "port": INNOMAX_SMTP_PORT,
-                 "user": innomax_user, "from_email": innomax_user}
-            ) if (is_platform and innomax_user) else None,
-            "detail": (
-                "Not applicable — this is a client company"
-                if not is_platform else
-                f"{category} mail routes to the dedicated Innomax mailbox"
-                if innomax_user else
-                "Platform company, but no Innomax mailbox is set for this category"
-            ),
-        },
-        {
-            "layer": "company_override",
-            "label": "Company SMTP",
-            "applies_to": "All company mail",
-            "configured": company_cfg is not None,
-            "active": active_layer == "company_override",
-            "sender": _public_sender(company_cfg),
-            "detail": (
-                "Saved under Email Settings above"
-                if company_cfg else
-                "Not configured — mail falls through to the platform default"
-            ),
-        },
-        {
-            "layer": "env_default",
-            "label": "Platform default (environment)",
-            "applies_to": "Fallback for all mail",
-            "configured": bool(SMTP_USER),
-            "active": active_layer == "env_default",
-            "sender": _public_sender({"user": SMTP_USER}) if SMTP_USER else None,
-            "detail": (
-                "Set by SMTP_* environment variables"
-                if SMTP_USER else
-                "SMTP_USER is not set — with no other layer configured, mail cannot send"
-            ),
-        },
-    ]
-
+    return resolve_sender(db, company_id, event_type=purpose)
 
 def _build_email(title: str, body_html: str, branding: Optional[Dict[str, Any]] = None) -> str:
     """Wrap body_html in a minimal, transactional-looking shell.
@@ -458,149 +130,21 @@ def _build_email(title: str, body_html: str, branding: Optional[Dict[str, Any]] 
     </div>"""
 
 
-def _send(to: str, subject: str, body: str, reply_to: Optional[str] = None,
-          smtp_config: Optional[Dict[str, Any]] = None,
-          branding: Optional[Dict[str, Any]] = None,
-          is_otp: bool = False,
-          cc: Optional[list] = None,
-          db=None, log_id: Optional[str] = None,
-          attempt: int = 0,
-          reference_type: Optional[str] = None,
-          reference_id: Optional[str] = None) -> Dict[str, Any]:
-    """Send email and return delivery result.
-
-    If ``smtp_config`` is provided (host/port/user/password/from_email keys),
-    those credentials are used. Otherwise the global env-var defaults apply.
-
-    ``branding`` and ``is_otp`` shape headers to reduce spam-folder placement:
-      * A branded display name is composed for ``From`` when ``branding`` is set.
-      * ``Message-ID`` and ``Date`` are always emitted explicitly.
-      * A ``text/plain`` alternative is attached alongside the HTML body.
-      * Transactional OTP mail gets ``Auto-Submitted: auto-generated`` and
-        ``Precedence: bulk``; non-OTP mail with a known support address gets a
-        ``List-Unsubscribe`` mailto pointer (RFC 8058).
-
-    Returns:
-        {"sent": bool, "error": str | None, "error_type": str | None}
-        error_type is one of: None, "disabled", "auth", "tls", "smtp", "network",
-        "unknown". Only "smtp" and "network" are retried by the queue worker —
-        "tls" is a configuration fault, so retrying it just delays the report.
-    """
-    cfg = smtp_config or {}
-    result = _deliver(to, subject, body, reply_to, cfg, branding, is_otp, cc)
-    # Record the outcome. The queued path passes the log_id dispatch() already
-    # created, so this UPDATEs that row rather than adding a second; an inline
-    # send that supplied a session gets its own row.
-    #
-    # With neither a log_id nor a session there is nothing safe to write to:
-    # opening a private session here would target DATABASE_URL rather than the
-    # caller's, escape the caller's transaction, and in tests write to the dev
-    # database. Inline senders that want a row pass db= instead.
-    if log_id or db is not None:
-        try:
-            from src.services import email_log
-            email_log.finalize(
-                db, log_id,
-                status=email_log.SENT if result.get("sent") else email_log.FAILED,
-                to_email=to, subject=subject,
-                error=result.get("error"), error_type=result.get("error_type"),
-                attempt=attempt, sender_user=cfg.get("user") or SMTP_USER,
-                company_id=cfg.get("company_id"), step_key=cfg.get("step_key"),
-                commit=db is None,
-            )
-        except Exception as e:      # bookkeeping must never fail a send
-            logger.warning(f"email_log write failed for {to}: {e}")
-    return result
-
-
-def _deliver(to: str, subject: str, body: str, reply_to, cfg, branding,
-             is_otp: bool, cc) -> Dict[str, Any]:
-    """The actual SMTP transaction. Split out so _send can record every outcome."""
-    host = cfg.get("host") or SMTP_HOST
-    port = int(cfg.get("port") or SMTP_PORT)
-    user = cfg.get("user") or SMTP_USER
-    password = cfg.get("password") or SMTP_PASS
-    from_email = cfg.get("from_email") or FROM_EMAIL or user
-
-    # Build a branded display name so recipients see "HEALTOURE via HireFlow"
-    # rather than a bare gmail address.
+def _display_name(ref: SenderRef, branding: Optional[Dict[str, Any]]) -> str:
+    """The From display name: the sender's own, else the legacy branded form."""
+    if ref.get("from_name"):
+        return ref["from_name"]
     company_name = (branding or {}).get("company_name")
     if company_name and company_name.lower() != "hireflow":
-        from_name = f"{company_name} via HireFlow"
-    else:
-        from_name = "HireFlow"
-    from_header = formataddr((from_name, from_email))
+        return f"{company_name} via HireFlow"
+    return "HireFlow"
 
-    support_email = (branding or {}).get("support_email") or reply_to
 
-    # Normalise CC: drop blanks/the primary recipient, de-dupe (case-insensitive),
-    # preserve order. Recipients beyond ``to`` get the same copy of the message.
-    cc_list = []
-    if cc:
-        _seen = {(to or "").strip().lower()}
-        for addr in cc:
-            a = (addr or "").strip()
-            if a and a.lower() not in _seen:
-                _seen.add(a.lower())
-                cc_list.append(a)
-
-    # Envelope only. The body is NOT logged: OTP and password-reset codes are
-    # rendered directly into it, so this line used to put live authentication
-    # material into journald and anything downstream of it (log shipping,
-    # aggregation, crash reporters) — as well as offer salaries and terms.
-    logger.info(f"[EMAIL] To: {to} | Cc: {', '.join(cc_list) or '-'} | From: {from_header} | Subject: {subject}")
-    if _log_bodies_allowed(is_otp):
-        logger.debug(f"[EMAIL BODY]\n{body}\n{'=' * 60}")
-    if not EMAIL_ENABLED or not user:
-        return {"sent": False, "error": "EMAIL_ENABLED is false or SMTP user not set", "error_type": "disabled"}
-    try:
-        from src.email_api.mime import build_mime
-        msg = build_mime(
-            from_email=from_email, from_name=from_name, to=[to], cc=cc_list,
-            subject=subject, html=body, reply_to=reply_to,
-            auto_submitted=is_otp, unsubscribe_to=support_email,
-            msgid_domain=MSGID_DOMAIN,
-        )
-
-        # Port 465 = implicit SSL (SMTPS); 587/25 = plain + STARTTLS upgrade.
-        use_ssl = bool(cfg.get("use_ssl")) or SMTP_USE_SSL or port == 465
-        recipients = [to] + cc_list
-        if use_ssl:
-            with smtplib.SMTP_SSL(host, port, timeout=SMTP_TIMEOUT_S,
-                                  context=_SSL_CONTEXT) as server:
-                server.login(user, password)
-                server.sendmail(from_email, recipients, msg.as_string())
-        else:
-            with smtplib.SMTP(host, port, timeout=SMTP_TIMEOUT_S) as server:
-                server.ehlo()
-                server.starttls(context=_SSL_CONTEXT)
-                server.ehlo()
-                server.login(user, password)
-                server.sendmail(from_email, recipients, msg.as_string())
-        return {"sent": True, "error": None, "error_type": None}
-    except smtplib.SMTPAuthenticationError as e:
-        logger.error(f"SMTP authentication failed for {user}: {e}")
-        return {"sent": False, "error": f"{e.smtp_code} {e.smtp_error!r}", "error_type": "auth"}
-    except smtplib.SMTPException as e:
-        logger.error(f"SMTP error sending to {to}: {e}")
-        return {"sent": False, "error": str(e), "error_type": "smtp"}
-    except ssl.SSLError as e:
-        # Must precede the OSError arm — SSLError subclasses OSError, so without
-        # this a certificate failure would be filed as "network" and the worker
-        # would retry it five times with backoff. It is a configuration fault,
-        # not a transient one, so it is deliberately outside the retry set.
-        logger.error(
-            f"SMTP TLS verification failed for {host}:{port} sending to {to}: {e}. "
-            f"Check the relay's certificate chain, or set SMTP_TLS_VERIFY=false "
-            f"if it uses a self-signed certificate (this exposes the credential)."
-        )
-        return {"sent": False, "error": str(e), "error_type": "tls"}
-    except (socket.gaierror, socket.timeout, TimeoutError, ConnectionError, OSError) as e:
-        logger.error(f"Network error sending to {to}: {e}")
-        return {"sent": False, "error": str(e), "error_type": "network"}
-    except Exception as e:
-        logger.error(f"Unexpected email send failure to {to}: {e}")
-        return {"sent": False, "error": str(e), "error_type": "unknown"}
+def _not_resolved(to: str) -> Dict[str, Any]:
+    logger.error("[EMAIL] refusing to send to %s: no sender decision was passed. Resolve the "
+                 "sender with resolve_sender / resolve_step_sender first.", to)
+    return {"status": "blocked", "sent": False, "ok": False, "error_type": "blocked",
+            "error": "sender not resolved", "message_id": None}
 
 
 def dispatch(to: str, subject: str, body: str, reply_to: Optional[str] = None,
@@ -609,143 +153,170 @@ def dispatch(to: str, subject: str, body: str, reply_to: Optional[str] = None,
              is_otp: bool = False, cc: Optional[list] = None,
              hourly_limit: Optional[int] = None, db=None,
              reference_type: Optional[str] = None,
-             reference_id: Optional[str] = None) -> Dict[str, Any]:
-    """Queue an email for rate-limited async delivery, or send inline.
+             reference_id: Optional[str] = None, *,
+             idempotency_key: Optional[str] = None,
+             defer_inline: bool = False) -> Dict[str, Any]:
+    """Accept one email for delivery through the email API.
 
-    Used by the fire-and-forget stage notifications so a provider's per-hour cap
-    defers (not drops) mail. Falls back to a synchronous ``_send`` when the queue
-    module/Redis is unavailable or ``EMAIL_SYNC`` is set — i.e. dev is unchanged.
-    The sender password is Fernet-encrypted in the queued payload so no plaintext
-    credential sits in Redis.
+    ``smtp_config`` must be the ``SenderRef`` a resolver returned; it fixes the
+    company, the event and the sender. Anything else is refused — there is no
+    default sender to fall back to.
+
+    With ``db`` the message joins the caller's transaction and is published
+    when that commits (the request's ``get_db`` commits at the end). Without it,
+    a session is opened, committed and closed here.
+
+    Returns ``{"mode": "outbox", "message_id", "status", "status_reason"}``; a
+    ``sent`` key appears only once the outcome is final. ``hourly_limit`` is
+    ignored: limits belong to the sender and its connection.
     """
-    cfg = smtp_config or {}
-    try:
-        from src.mailq.queue import enqueue_email
-    except Exception:
-        return _send(to, subject, body, reply_to=reply_to, smtp_config=smtp_config,
-                     branding=branding, is_otp=is_otp, cc=cc, db=db,
-                     reference_type=reference_type, reference_id=reference_id)
+    if not isinstance(smtp_config, SenderRef):
+        return _not_resolved(to)
+    ref = smtp_config
+    decision = ref.decision
+    if decision.status == "disabled":
+        return {"status": "disabled", "mode": "skipped", "sent": False, "ok": False,
+                "error": decision.reason, "error_type": "disabled", "message_id": None}
 
-    # Record the message as queued BEFORE handing it to RQ. A worker that never
-    # runs would otherwise leave no trace at all, which is exactly the failure
-    # the Admin routing panel warns about ("reported as successful while no mail
-    # is delivered"). The worker updates this same row by id.
-    log_id = None
+    from src.email_api import db as email_db
+    from src.email_api.messages import submit, SubmitError
+    own = db is None
+    session = email_db.open_session() if own else db
     try:
-        from src.services import email_log
-        log_id = email_log.new_log_id()
-        email_log.record(
-            db, log_id=log_id, to_email=to, subject=subject,
-            status=email_log.QUEUED,
-            company_id=cfg.get("company_id"), step_key=cfg.get("step_key"),
-            sender_user=cfg.get("user") or SMTP_USER,
+        result = submit(
+            session, tenant_id=decision.company_id, decision=decision,
+            event_type=decision.event_type, to=[to], cc=cc or (), subject=subject, html=body,
+            actor=current_actor(), idempotency_key=idempotency_key,
             reference_type=reference_type, reference_id=reference_id,
-            commit=db is None,
+            step_key=ref.get("step_key"),
+            priority=EC.PRIORITY_AUTH if is_otp else EC.PRIORITY_NORMAL,
+            is_sensitive=is_otp, from_name=_display_name(ref, branding),
+            reply_to=reply_to,
+            unsubscribe_to=None if is_otp else ((branding or {}).get("support_email") or reply_to),
+            defer_inline=defer_inline,
         )
-    except Exception as e:      # never let bookkeeping stop a send
-        logger.warning(f"email_log queued-row write failed for {to}: {e}")
+        msg = result.message
+        message_id = msg.id if msg is not None else None
+        if own:
+            session.commit()       # publishes (or, for auth mail without Redis, delivers)
+            if message_id:
+                # Re-read: delivery may already have happened in the commit hook
+                # (auth mail without Redis). The message can belong to another
+                # company than the bound one (platform support mail).
+                from src.tenancy import tenant_bypass
+                session.expire_all()
+                with tenant_bypass():
+                    msg = session.get(type(msg), message_id)
+        status = msg.status if msg is not None else result.status
+        out = {"mode": "outbox", "message_id": message_id, "status": status,
+               "status_reason": getattr(msg, "status_reason", None)}
+    except SubmitError as e:
+        if own:
+            session.rollback()
+        logger.warning("[EMAIL] %s to %s rejected: %s", decision.event_type, to, e)
+        return {"status": "failed", "sent": False, "ok": False, "error_type": "invalid",
+                "error": str(e), "message_id": None}
+    finally:
+        if own:
+            session.close()
 
-    sender = None
-    if smtp_config:
-        pw = smtp_config.get("password") or ""
-        try:
-            from src.security import encrypt
-            pw_enc = encrypt(pw) if pw else ""
-        except Exception:
-            pw_enc = ""
-        sender = {
-            "host": smtp_config.get("host"),
-            "port": smtp_config.get("port"),
-            "user": smtp_config.get("user"),
-            "from_email": smtp_config.get("from_email"),
-            "password_enc": pw_enc,
-        }
-    payload = {
-        "to": to, "subject": subject, "body": body, "reply_to": reply_to,
-        "branding": branding, "is_otp": is_otp, "cc": cc, "sender": sender,
-        "hourly_limit": hourly_limit if hourly_limit is not None
-        else cfg.get("hourly_limit"),
-        # Plain strings only — this dict is pickled into Redis. The worker has no
-        # tenant bound, so it needs company_id explicitly or the row lands with
-        # company_id NULL and becomes invisible to every tenant-scoped read.
-        "log_id": log_id,
-        "company_id": cfg.get("company_id"),
-        "step_key": cfg.get("step_key"),
-    }
-    try:
-        return enqueue_email(payload, db=db)
-    except Exception as e:
-        logger.warning(f"email enqueue failed ({e}); sending inline")
-        return _send(to, subject, body, reply_to=reply_to, smtp_config=smtp_config,
-                     branding=branding, is_otp=is_otp, cc=cc, db=db, log_id=log_id,
-                     reference_type=reference_type, reference_id=reference_id)
+    if status == EC.ACCEPTED:
+        out["sent"] = True
+    elif status in (EC.BLOCKED, EC.FAILED, EC.UNKNOWN, EC.CANCELLED):
+        out.update(sent=False, error=out["status_reason"], error_type=status)
+    logger.info("[EMAIL] %s -> %s from %s (%s, %s)", decision.event_type, to,
+                decision.from_email or "-", status, out["status_reason"] or "-")
+    if _log_bodies_allowed(is_otp):
+        logger.debug(f"[EMAIL BODY]\n{body}\n{'=' * 60}")
+    return out
+
+
+def _send(to: str, subject: str, body: str, reply_to: Optional[str] = None,
+          smtp_config: Optional[Dict[str, Any]] = None,
+          branding: Optional[Dict[str, Any]] = None,
+          is_otp: bool = False, cc: Optional[list] = None, db=None, **_ignored) -> Dict[str, Any]:
+    """Deprecated alias of ``dispatch``.
+
+    There is no synchronous SMTP path any more: everything goes through the
+    outbox. Connection tests use ``src.email_api.connections.send_test``.
+    """
+    return dispatch(to, subject, body, reply_to=reply_to, smtp_config=smtp_config,
+                    branding=branding, is_otp=is_otp, cc=cc, db=db)
 
 
 def delivery_outcome(result: Any) -> Dict[str, Any]:
-    """Classify what ``_send`` / ``dispatch`` / ``enqueue_email`` reported.
+    """Classify what ``dispatch`` reported, for routes that tell the user.
 
-    Delivery is three-state, not boolean: mail can be sent inline, accepted onto
-    the queue for a worker to send later, or fail outright. These paths return
-    different shapes — ``_send`` gives ``{"sent": bool, ...}`` while a queued
-    ``dispatch`` gives ``{"mode": "async", "job_id": ...}`` with no ``sent`` key
-    at all. Reading ``.get("sent")`` directly would therefore mis-report every
-    healthy async send as a failure.
+    Delivery is not boolean. ``accepted`` means the customer's mail server took
+    the message; ``queued``/``deferred``/``sending`` mean it is on its way;
+    ``blocked`` means configuration stopped it (no sender, a broken mailbox) and
+    nothing will be sent until someone fixes it; ``disabled`` means the email
+    type is switched off.
 
     Returns:
-        {"status": "sent" | "queued" | "failed", "error": str | None,
-         "error_type": str | None, "ok": bool} — ``ok`` is sent-or-queued.
+        {"status": "sent" | "queued" | "failed" | "blocked" | "disabled",
+         "error": str | None, "error_type": str | None, "ok": bool} —
+        ``ok`` is sent-or-queued.
     """
     # Legacy senders that return None: absence of a result is not evidence of
     # failure, so don't manufacture one.
     if not isinstance(result, dict):
         return {"status": "sent", "error": None, "error_type": None, "ok": True}
 
-    if result.get("sent") is True:
+    status = result.get("status")
+    if result.get("sent") is True or status == EC.ACCEPTED:
         return {"status": "sent", "error": None, "error_type": None, "ok": True}
-
-    if "sent" in result:  # present and falsy — an actual, reported failure
+    if status == "disabled":
+        return {"status": "disabled", "error": result.get("error"), "error_type": "disabled",
+                "ok": False}
+    if status == EC.BLOCKED:
+        return {"status": "blocked", "error": result.get("error") or result.get("status_reason"),
+                "error_type": "blocked", "ok": False}
+    if "sent" in result or status in (EC.FAILED, EC.UNKNOWN, EC.CANCELLED):
         return {
             "status": "failed",
             "error": result.get("error"),
             "error_type": result.get("error_type"),
             "ok": False,
         }
-
-    # Queued: "async" from RQ, or the worker deferring/retrying. Outcome is not
-    # known yet, but the message was accepted for delivery.
+    # queued / deferred / sending: accepted for delivery, outcome not known yet.
     return {"status": "queued", "error": None, "error_type": None, "ok": True}
 
 
 # ==================== OTP / AUTH EMAILS ====================
 
 def send_password_reset_otp(to: str, name: str, otp: str, branding: Optional[Dict[str, Any]] = None,
-                            smtp_config: Optional[Dict[str, Any]] = None):
+                            smtp_config: Optional[Dict[str, Any]] = None, db=None,
+                            defer_inline: bool = False):
     body = f"""
         <p style="margin:0 0 16px">Hi {name},</p>
         <p style="margin:0 0 12px">Use this code to reset your password:</p>
         <p style="margin:0 0 16px;font-size:1.6rem;font-weight:600;letter-spacing:0.2em;font-family:Consolas,Menlo,monospace">{otp}</p>
         <p style="margin:0;color:#6b7280">The code expires in 10 minutes. If you did not request a reset, you can ignore this email.</p>"""
-    return _send(to, "Your password reset code", _build_email("Password Reset", body, branding),
-                 reply_to=(branding or {}).get("support_email"),
-                 smtp_config=smtp_config, branding=branding, is_otp=True)
+    return dispatch(to, "Your password reset code", _build_email("Password Reset", body, branding),
+                    reply_to=(branding or {}).get("support_email"),
+                    smtp_config=smtp_config, branding=branding, is_otp=True, db=db,
+                    defer_inline=defer_inline)
 
 
 def send_otp_email(to: str, name: str, otp: str, branding: Optional[Dict[str, Any]] = None,
-                   smtp_config: Optional[Dict[str, Any]] = None):
+                   smtp_config: Optional[Dict[str, Any]] = None, db=None,
+                   defer_inline: bool = False):
     body = f"""
         <p style="margin:0 0 16px">Hi {name},</p>
         <p style="margin:0 0 12px">Use this code to verify your email address:</p>
         <p style="margin:0 0 16px;font-size:1.6rem;font-weight:600;letter-spacing:0.2em;font-family:Consolas,Menlo,monospace">{otp}</p>
         <p style="margin:0;color:#6b7280">The code expires in 10 minutes. If you did not create an account, you can ignore this email.</p>"""
-    return _send(to, "Your verification code", _build_email("Email Verification", body, branding),
-                 reply_to=(branding or {}).get("support_email"),
-                 smtp_config=smtp_config, branding=branding, is_otp=True)
+    return dispatch(to, "Your verification code", _build_email("Email Verification", body, branding),
+                    reply_to=(branding or {}).get("support_email"),
+                    smtp_config=smtp_config, branding=branding, is_otp=True, db=db,
+                    defer_inline=defer_inline)
 
 
 def send_admin_welcome_email(to: str, name: str, company_name: str,
                               login_url: Optional[str] = None,
                               branding: Optional[Dict[str, Any]] = None,
-                              smtp_config: Optional[Dict[str, Any]] = None):
+                              smtp_config: Optional[Dict[str, Any]] = None, db=None):
     """Sent to the first admin user of a freshly-onboarded tenant.
 
     Note: the email intentionally does NOT contain the temporary password.
@@ -764,10 +335,10 @@ def send_admin_welcome_email(to: str, name: str, company_name: str,
         {link_block}
         <p style="margin:0 0 12px;color:#374151">Sign in using your email <b>{to}</b> and the temporary password your account manager shared with you. Please change it from <i>Account → Settings</i> after your first login.</p>
         <p style="margin:0;color:#6b7280;font-size:0.85rem">If you weren't expecting this email, you can safely ignore it.</p>"""
-    return _send(to, f"Your {company_name} workspace is ready",
-                 _build_email(f"Welcome to {company_name}", body, branding),
-                 reply_to=(branding or {}).get("support_email"),
-                 smtp_config=smtp_config, branding=branding)
+    return dispatch(to, f"Your {company_name} workspace is ready",
+                    _build_email(f"Welcome to {company_name}", body, branding),
+                    reply_to=(branding or {}).get("support_email"),
+                    smtp_config=smtp_config, branding=branding, db=db)
 
 
 # ==================== STAGE EMAILS ====================
@@ -834,7 +405,7 @@ def notify_candidate_rejected(db, candidate) -> Dict[str, Any]:
     Safe to call from any rejection workflow:
     - No-op if candidate has no email address.
     - Falls back to "the position" if the job lookup fails.
-    - Uses candidate's company SMTP if configured; otherwise global defaults.
+    - Sends from the company's routed sender; blocked (not sent) if it has none.
     - All exceptions are caught and logged; never raises.
 
     Returns a ``delivery_outcome`` dict so callers can tell what happened. It used
@@ -861,9 +432,8 @@ def notify_candidate_rejected(db, candidate) -> Dict[str, Any]:
         company_id = getattr(candidate, "company_id", None)
         from src.services.pipeline_notifications import resolve_step_dispatch
         disp = resolve_step_dispatch(db, company_id, "candidate_rejected", job=job)
-        smtp_config = disp["smtp_config"] or resolve_sender(db, company_id, "candidate")
         result = send_candidate_rejected(candidate.email, name, job_title,
-                                         smtp_config=smtp_config, cc=disp["cc"])
+                                         smtp_config=disp["smtp_config"], cc=disp["cc"])
         outcome = delivery_outcome(result)
         if not outcome["ok"]:
             logger.warning(
@@ -1072,7 +642,7 @@ PRIORITY_COLORS = {
 def send_support_new_to_superadmin(to: str, company_name: str, requester_name: str,
                                     subject: str, priority: str, body_text: str,
                                     ticket_url: str,
-                                    smtp_config: Optional[Dict[str, Any]] = None):
+                                    smtp_config: Optional[Dict[str, Any]] = None, db=None):
     """Notify the platform superadmin that a client admin opened a new ticket."""
     color = PRIORITY_COLORS.get((priority or "normal").lower(), "#2b7cba")
     body = f"""
@@ -1083,34 +653,34 @@ def send_support_new_to_superadmin(to: str, company_name: str, requester_name: s
         </table>
         <div style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px;padding:14px;margin:0 0 20px;white-space:pre-wrap;color:#374151;font-size:0.92rem">{body_text}</div>
         <p style="margin:0"><a href="{ticket_url}" style="background:#1a6b5a;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:600;font-size:0.9rem">Open ticket</a></p>"""
-    return _send(to, f"[Support] {subject}",
-                 _build_email("New Support Ticket", body), smtp_config=smtp_config)
+    return dispatch(to, f"[Support] {subject}",
+                    _build_email("New Support Ticket", body), smtp_config=smtp_config, db=db)
 
 
 def send_support_reply_to_admin(to: str, requester_name: str, subject: str,
                                  body_text: str, ticket_url: str,
                                  branding: Optional[Dict[str, Any]] = None,
-                                 smtp_config: Optional[Dict[str, Any]] = None):
+                                 smtp_config: Optional[Dict[str, Any]] = None, db=None):
     """Notify a client admin that the platform team replied on their ticket."""
     body = f"""
         <p style="color:#374151;font-size:1rem;margin:0 0 16px">Hi <b>{requester_name}</b>,</p>
         <p style="color:#374151;font-size:0.95rem;margin:0 0 16px">The platform team replied on your ticket <b>{subject}</b>:</p>
         <div style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px;padding:14px;margin:0 0 20px;white-space:pre-wrap;color:#374151;font-size:0.92rem">{body_text}</div>
         <p style="margin:0"><a href="{ticket_url}" style="background:#1a6b5a;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:600;font-size:0.9rem">View ticket</a></p>"""
-    return _send(to, f"[Support] Re: {subject}",
-                 _build_email("Support Reply", body, branding),
-                 reply_to=(branding or {}).get("support_email"),
-                 smtp_config=smtp_config, branding=branding)
+    return dispatch(to, f"[Support] Re: {subject}",
+                    _build_email("Support Reply", body, branding),
+                    reply_to=(branding or {}).get("support_email"),
+                    smtp_config=smtp_config, branding=branding, db=db)
 
 
 def send_support_reply_to_superadmin(to: str, company_name: str, requester_name: str,
                                       subject: str, body_text: str, ticket_url: str,
-                                      smtp_config: Optional[Dict[str, Any]] = None):
+                                      smtp_config: Optional[Dict[str, Any]] = None, db=None):
     """Notify superadmin when an admin replies on their open ticket."""
     body = f"""
         <p style="color:#374151;font-size:1rem;margin:0 0 16px"><b>{requester_name}</b> from <b>{company_name}</b> replied on a ticket.</p>
         <p style="color:#6b7280;font-size:0.88rem;margin:0 0 12px">Subject: <b>{subject}</b></p>
         <div style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px;padding:14px;margin:0 0 20px;white-space:pre-wrap;color:#374151;font-size:0.92rem">{body_text}</div>
         <p style="margin:0"><a href="{ticket_url}" style="background:#1a6b5a;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:600;font-size:0.9rem">Open ticket</a></p>"""
-    return _send(to, f"[Support] Re: {subject}",
-                 _build_email("Support Reply", body), smtp_config=smtp_config)
+    return dispatch(to, f"[Support] Re: {subject}",
+                    _build_email("Support Reply", body), smtp_config=smtp_config, db=db)

@@ -178,3 +178,31 @@ def test_reencrypt_script(db, legacy):
     assert auth_conn.status == C.CONN_NEEDS_ATTENTION
     assert auth_conn.error_code == C.R_CREDENTIAL_UNREADABLE
     assert script.reencrypt(db)["rewritten"] == 0   # nothing left to do
+
+
+def test_rollback_script_copies_new_settings_back(db, legacy):
+    """After the upgrade, edits land only in the new tables; the rollback aid puts
+    them where the previous release reads them."""
+    import importlib
+    from src.email_api import facade
+    from src.security import decrypt as legacy_decrypt
+    script = importlib.import_module("scripts.email_connections_to_legacy")
+    co, mbs = legacy
+    _run(db, _rev().upgrade)
+    facade.update_mailbox(db, co.id, mbs["HR"].id, name="Hiring", host="mail.acme.example",
+                          port=587, user="hr@acme.example", password="new-pw",
+                          from_email="hr@acme.example")
+    # The migration left offer_letter on the default (its mailbox could not send);
+    # an admin now routes it to Hiring.
+    db.add(EmailRoute(company_id=co.id, event_type="offer_letter", sender_id=mbs["HR"].id))
+    db.flush()
+    stats = script.copy_back(db)
+    db.expire_all()
+    mb = db.query(CompanyMailbox).filter_by(id=mbs["HR"].id).one()
+    assert (mb.name, mb.smtp_port) == ("Hiring", 587)
+    assert legacy_decrypt(mb.smtp_pass) == "new-pw"
+    tc = db.query(TenantConfig).filter_by(company_id=co.id).one()
+    assert legacy_decrypt(tc.smtp_pass) == "default-pw"
+    step = db.query(PipelineStepConfig).filter_by(company_id=co.id, step_key="offer_letter").one()
+    assert step.mailbox_id == mbs["HR"].id
+    assert stats["tenant_configs"] == 1 and stats["mailboxes"] >= 5

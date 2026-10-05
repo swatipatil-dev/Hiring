@@ -201,6 +201,7 @@ def _email_superadmins_new(db: Session, req: SupportRequest, body_text: str) -> 
                 ref_id=req.id)
         try:
             email_service.send_support_new_to_superadmin(
+                smtp_config=_platform_sender(db, "support.ticket_to_platform"),
                 to=sa.email,
                 company_name=company_name,
                 requester_name=requester_name,
@@ -211,6 +212,12 @@ def _email_superadmins_new(db: Session, req: SupportRequest, body_text: str) -> 
             )
         except Exception as e:
             logger.warning(f"Support email to superadmin {sa.email} failed: {e}")
+
+
+def _platform_sender(db: Session, event_type: str):
+    """The platform company's routed sender for one support event."""
+    from src.tenancy.platform_company import get_platform_company_id
+    return email_service.resolve_sender(db, get_platform_company_id(db), event_type=event_type)
 
 
 def _email_superadmins_reply(db: Session, req: SupportRequest, body_text: str) -> None:
@@ -229,6 +236,7 @@ def _email_superadmins_reply(db: Session, req: SupportRequest, body_text: str) -
                 ref_id=req.id)
         try:
             email_service.send_support_reply_to_superadmin(
+                smtp_config=_platform_sender(db, "support.reply_to_platform"),
                 to=sa.email,
                 company_name=company_name,
                 requester_name=requester_name,
@@ -248,7 +256,9 @@ def _email_admin_reply(db: Session, req: SupportRequest, body_text: str) -> None
             title=f"Support reply: {req.subject}",
             message="The platform team replied on your ticket.",
             ref_id=req.id)
-    smtp_cfg = email_service.resolve_sender(db, admin.company_id)
+    # Platform → client: the platform's own support sender, not the client's
+    # (which used to be resolved here, falling back to the environment).
+    smtp_cfg = _platform_sender(db, "support.reply_to_admin")
     company = db.query(Company).filter(Company.id == admin.company_id).first()
     branding = None
     if company:

@@ -3,8 +3,10 @@
 The send helpers report failure by return value rather than by raising, so the
 prevailing `try/except Exception` around a discarded return caught nothing that
 actually occurred — a failed offer letter produced no row, no log line, and a
-response saying it had been sent. These tests pin both halves of the fix: the
-email_log row, and the honest response.
+response saying it had been sent. Every email is now an ``email_messages`` row
+from the moment it is accepted (or blocked); these tests pin that record, the
+honest responses, and the history endpoint built on it. ``email_log`` itself is
+kept read-only for one release (``/hr/email-log?source=legacy``).
 """
 import uuid
 from unittest.mock import patch
@@ -76,90 +78,103 @@ def _cfg(company_id=None, step_key=None):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# The writer
+# The record: every accepted (or refused) email is a row from the start
 # ─────────────────────────────────────────────────────────────────────────────
 
-@pytest.mark.security
-def test_failed_inline_send_is_recorded(db):
-    """A send that fails must leave a row saying so."""
-    from src.services import email_service as es
+def _sender(db, company_id):
+    from src.email_api import constants as C
+    from test.email_factories import make_route, make_smtp_sender
+    s, _ = make_smtp_sender(db, company_id, "HR", email="mailbox@tenant.example")
+    make_route(db, company_id, C.DEFAULT_ROUTE, s.id)
+    return s
 
-    to = f"fail_{uuid.uuid4().hex[:6]}@example.com"
-    with patch.object(es, "EMAIL_ENABLED", True), \
-         patch.object(es, "_deliver", return_value={
-             "sent": False, "error": "535 auth", "error_type": "auth"}):
-        result = es._send(to, "Subject", "<p>b</p>", smtp_config=_cfg(), db=db)
 
-    assert result["sent"] is False
-    rows = _rows(db, to)
-    assert len(rows) == 1
-    assert rows[0].status == email_log.FAILED
-    assert rows[0].error_type == "auth"
-    assert rows[0].sender_user == "mailbox@tenant.com"
+def _messages(db, to_email):
+    from src.models.models import EmailMessage, EmailRecipient
+    ids = db.query(EmailRecipient.message_id).filter(EmailRecipient.email == to_email)
+    return db.query(EmailMessage).filter(EmailMessage.id.in_(ids)).all()
 
 
 @pytest.mark.security
-def test_successful_inline_send_is_recorded_with_context(db):
-    from src.services import email_service as es
-
-    to = f"ok_{uuid.uuid4().hex[:6]}@example.com"
-    cid = _make_company(db, "Ctx Co")
-    with patch.object(es, "EMAIL_ENABLED", True), \
-         patch.object(es, "_deliver", return_value={
-             "sent": True, "error": None, "error_type": None}):
-        es._send(to, "Subject", "<p>b</p>",
-                 smtp_config=_cfg(company_id=cid, step_key="offer_letter"), db=db)
-
-    row = _rows(db, to)[0]
-    assert row.status == email_log.SENT
-    # company_id/step_key ride in smtp_config; without them the row would be
-    # invisible to the tenant-scoped listing endpoint.
-    assert row.company_id == cid
-    assert row.step_key == "offer_letter"
-
-
-@pytest.mark.security
-def test_queued_row_is_written_before_the_worker_runs(db):
+def test_queued_message_is_recorded_before_the_worker_runs(db):
     """A worker that never runs must still leave evidence of the attempt."""
     from src.services import email_service as es
 
     to = f"queued_{uuid.uuid4().hex[:6]}@example.com"
     cid = _make_company(db, "Queued Co")
-    with patch("src.mailq.queue.enqueue_email",
-               return_value={"mode": "async", "job_id": "job-1"}):
-        result = es.dispatch(to, "Subject", "<p>b</p>",
-                             smtp_config=_cfg(company_id=cid, step_key="offer_letter"),
-                             db=db)
+    _sender(db, cid)
+    result = es.dispatch(to, "Subject", "<p>b</p>",
+                         smtp_config=es.resolve_sender(db, cid, event_type="offer_letter"), db=db)
 
-    assert result["mode"] == "async"
-    row = _rows(db, to)[0]
-    assert row.status == email_log.QUEUED
-    assert row.company_id == cid
+    assert result["status"] == "queued" and es.delivery_outcome(result)["status"] == "queued"
+    [row] = _messages(db, to)
+    assert (row.company_id, row.event_type, row.from_email) == (cid, "offer_letter",
+                                                                "mailbox@tenant.example")
+    assert row.id == result["message_id"]
 
 
 @pytest.mark.security
-def test_inline_fallback_updates_the_queued_row_on_the_callers_session(db):
-    """With Redis down the job runs inside the request that flushed the queued
-    row. A second session would block on that uncommitted insert until
-    innodb_lock_wait_timeout — 50s per email — and then drop the outcome."""
+def test_blocked_email_is_recorded_with_its_reason(db):
+    """A company with no sender used to send from the platform's account. Now the
+    email is kept, marked blocked, and the caller is told — not told "sent"."""
     from src.services import email_service as es
-    from src.mailq import queue as mq, ratelimit
 
-    to = f"inline_{uuid.uuid4().hex[:6]}@example.com"
-    cid = _make_company(db, "Inline Co")
-    with patch.object(mq, "redis_available", return_value=False), \
-         patch.object(ratelimit, "get_redis", return_value=None), \
-         patch.object(es, "_deliver", return_value={
-             "sent": True, "error": None, "error_type": None}), \
-         patch.object(email_log, "_open_session",
-                      side_effect=AssertionError("inline send opened its own session")):
-        result = es.dispatch(to, "Subject", "<p>b</p>",
-                             smtp_config=_cfg(company_id=cid), db=db)
+    to = f"blocked_{uuid.uuid4().hex[:6]}@example.com"
+    cid = _make_company(db, "Bare Co")
+    result = es.dispatch(to, "Subject", "<p>b</p>",
+                         smtp_config=es.resolve_sender(db, cid, event_type="offer_letter"), db=db)
 
-    assert result["mode"] == "sync"
-    rows = _rows(db, to)
-    assert len(rows) == 1, "inline send added a second row"
-    assert rows[0].status == email_log.SENT
+    outcome = es.delivery_outcome(result)
+    assert outcome["status"] == "blocked" and outcome["ok"] is False
+    [row] = _messages(db, to)
+    assert row.status == "blocked" and row.status_reason == "no_sender_configured"
+
+
+@pytest.mark.security
+def test_disabled_step_records_nothing_and_says_so(db):
+    from src.services import email_service as es
+    from test.email_factories import make_route
+
+    to = f"off_{uuid.uuid4().hex[:6]}@example.com"
+    cid = _make_company(db, "Off Co")
+    _sender(db, cid)
+    make_route(db, cid, "candidate_rejected", enabled=False)
+    result = es.dispatch(to, "S", "<p>b</p>",
+                         smtp_config=es.resolve_sender(db, cid, event_type="candidate_rejected"),
+                         db=db)
+    assert es.delivery_outcome(result)["status"] == "disabled"
+    assert _messages(db, to) == []
+
+
+@pytest.mark.security
+def test_a_hand_built_smtp_config_is_refused(db):
+    """Only a sender decision is accepted. A dict of SMTP settings — the old way —
+    would otherwise be a way around the sender policy."""
+    from src.services import email_service as es
+
+    to = f"raw_{uuid.uuid4().hex[:6]}@example.com"
+    raw = {"host": "smtp.example.com", "port": 587, "user": "x@y.z", "password": "pw",
+           "from_email": "x@y.z"}
+    result = es.dispatch(to, "S", "<p>b</p>", smtp_config=raw, db=db)
+    assert es.delivery_outcome(result)["status"] == "blocked"
+    assert _messages(db, to) == []
+
+
+@pytest.mark.security
+def test_dispatch_without_a_session_commits_its_own(db):
+    """Notification helpers call dispatch(db=None): the message must still be
+    recorded (and committed) rather than lost with no session to write to."""
+    from src.services import email_service as es
+
+    to = f"nodb_{uuid.uuid4().hex[:6]}@example.com"
+    cid = _make_company(db, "NoDb Co")
+    _sender(db, cid)
+    db.commit()
+    result = es.dispatch(to, "S", "<p>b</p>",
+                         smtp_config=es.resolve_sender(db, cid, event_type="offer_letter"))
+    db.expire_all()
+    [row] = _messages(db, to)
+    assert row.id == result["message_id"] and row.status == "queued"
 
 
 @pytest.mark.security
@@ -188,38 +203,6 @@ def test_finalize_recreates_a_missing_row_rather_than_losing_the_outcome(db):
     rows = _rows(db, to)
     assert len(rows) == 1
     assert rows[0].status == email_log.FAILED
-
-
-@pytest.mark.security
-def test_a_logging_failure_cannot_fail_a_send(db):
-    """Bookkeeping must never be the reason a message fails to send."""
-    from src.services import email_service as es
-
-    to = f"boom_{uuid.uuid4().hex[:6]}@example.com"
-    with patch.object(es, "EMAIL_ENABLED", True), \
-         patch.object(es, "_deliver", return_value={
-             "sent": True, "error": None, "error_type": None}), \
-         patch.object(email_log, "finalize", side_effect=RuntimeError("db down")):
-        result = es._send(to, "Subject", "<p>b</p>", smtp_config=_cfg(), db=db)
-
-    assert result["sent"] is True, "a logging error broke the send"
-
-
-@pytest.mark.security
-def test_no_session_and_no_log_id_writes_nothing(db):
-    """_send must not open a private session — it would escape the caller's
-    transaction and, locally, target a different database entirely."""
-    from src.services import email_service as es
-
-    to = f"nodb_{uuid.uuid4().hex[:6]}@example.com"
-    with patch.object(es, "EMAIL_ENABLED", True), \
-         patch.object(es, "_deliver", return_value={"sent": True, "error": None,
-                                                    "error_type": None}), \
-         patch.object(email_log, "_open_session",
-                      side_effect=AssertionError("must not open its own session")):
-        es._send(to, "Subject", "<p>b</p>", smtp_config=_cfg())
-
-    assert _rows(db, to) == []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -260,16 +243,23 @@ def test_rejection_wrapper_reports_failure_instead_of_none(db):
 # The read endpoint
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _message(db, company_id, to, *, status="accepted", event="offer_letter", reason=None):
+    from src.models.models import EmailMessage, EmailRecipient
+    m = EmailMessage(company_id=company_id, event_type=event, status=status, subject="S",
+                     status_reason=reason, from_email="mailbox@tenant.example")
+    db.add(m)
+    db.flush()
+    db.add(EmailRecipient(company_id=company_id, message_id=m.id, email=to, kind="to"))
+    db.flush()
+    return m
+
+
 @pytest.mark.security
 def test_email_log_endpoint_is_company_scoped(client, db, two_companies_email_log):
     """Company A must not see company B's delivery history."""
     a, b = two_companies_email_log["a"], two_companies_email_log["b"]
-
-    email_log.record(db, to_email="a-side@example.com", subject="A",
-                     status=email_log.SENT, company_id=a["company_id"], commit=False)
-    email_log.record(db, to_email="b-side@example.com", subject="B",
-                     status=email_log.SENT, company_id=b["company_id"], commit=False)
-    db.flush()
+    _message(db, a["company_id"], "a-side@example.com")
+    _message(db, b["company_id"], "b-side@example.com")
 
     resp = client.get("/api/v1/hr/email-log", headers=a["hr"])
     assert resp.status_code == 200, resp.text
@@ -284,30 +274,38 @@ def test_email_log_endpoint_filters_by_recipient_and_status(client, db,
     """The "did candidate X get their offer?" query."""
     a = two_companies_email_log["a"]
     target = f"target_{uuid.uuid4().hex[:6]}@example.com"
+    _message(db, a["company_id"], target, status="blocked", reason="no_sender_configured")
+    _message(db, a["company_id"], "someone-else@example.com")
 
-    email_log.record(db, to_email=target, subject="Offer", status=email_log.FAILED,
-                     error_type="auth", step_key="offer_letter",
-                     company_id=a["company_id"], commit=False)
-    email_log.record(db, to_email="someone-else@example.com", subject="Other",
-                     status=email_log.SENT, company_id=a["company_id"], commit=False)
-    db.flush()
-
-    resp = client.get("/api/v1/hr/email-log", headers=a["hr"],
-                      params={"to_email": target})
+    resp = client.get("/api/v1/hr/email-log", headers=a["hr"], params={"to_email": target})
     assert resp.status_code == 200, resp.text
     entries = resp.json()["entries"]
     assert len(entries) == 1
-    assert entries[0]["status"] == "failed"
-    assert entries[0]["error_type"] == "auth"
+    assert entries[0]["status"] == "blocked"
+    assert entries[0]["error_type"] == "no_sender_configured"
     assert entries[0]["step_key"] == "offer_letter"
+    assert entries[0]["sender_user"] == "mailbox@tenant.example"
 
-    resp = client.get("/api/v1/hr/email-log", headers=a["hr"],
-                      params={"status": "sent"})
-    assert all(e["status"] == "sent" for e in resp.json()["entries"])
+    resp = client.get("/api/v1/hr/email-log", headers=a["hr"], params={"status": "accepted"})
+    assert resp.json()["entries"] and all(e["status"] == "accepted"
+                                          for e in resp.json()["entries"])
 
-    resp = client.get("/api/v1/hr/email-log", headers=a["hr"],
-                      params={"since": "not-a-date"})
+    resp = client.get("/api/v1/hr/email-log", headers=a["hr"], params={"since": "not-a-date"})
     assert resp.status_code == 400
+
+
+@pytest.mark.security
+def test_legacy_email_log_is_still_readable(client, db, two_companies_email_log):
+    """For one release, history written before the upgrade stays reachable."""
+    a, b = two_companies_email_log["a"], two_companies_email_log["b"]
+    email_log.record(db, to_email="old-a@example.com", subject="A", status=email_log.SENT,
+                     company_id=a["company_id"], commit=False)
+    email_log.record(db, to_email="old-b@example.com", subject="B", status=email_log.SENT,
+                     company_id=b["company_id"], commit=False)
+    db.flush()
+    resp = client.get("/api/v1/hr/email-log", headers=a["hr"], params={"source": "legacy"})
+    addresses = {e["to_email"] for e in resp.json()["entries"]}
+    assert addresses == {"old-a@example.com"}
 
 
 @pytest.mark.security
@@ -389,69 +387,3 @@ def test_offer_endpoint_reports_queued_when_the_worker_will_send(
     assert data["email_status"] == "queued"
     assert data["email_sent"] is True          # accepted for delivery
     assert "queued" in data["message"]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# The worker path
-#
-# The worker opens its own session, so these assert the wiring rather than
-# standing up a second real one (same approach as test_queue_redis_serialization).
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _payload(**over):
-    p = {"to": "w@example.com", "subject": "S", "body": "<p>b</p>",
-         "sender": {"user": "mailbox@tenant.com", "host": "h", "port": 587,
-                    "from_email": "mailbox@tenant.com", "password_enc": ""},
-         "log_id": "log-1", "company_id": "co-1", "step_key": "offer_letter",
-         "hourly_limit": None}
-    p.update(over)
-    return p
-
-
-@pytest.mark.security
-def test_worker_records_company_id_explicitly():
-    """Nothing binds the tenant contextvar in the worker.
-
-    before_flush therefore stamps nothing, so a row written without an explicit
-    company_id lands NULL and becomes invisible to every tenant-scoped read —
-    including the email-log endpoint that exists to answer "did X get it?".
-    """
-    from src.mailq import worker
-
-    seen = {}
-    with patch.object(email_log, "finalize",
-                      side_effect=lambda db, log_id, **kw: seen.update(
-                          db=db, log_id=log_id, **kw)):
-        worker._log(_payload(), "sent", 0, {"error": None, "error_type": None})
-
-    assert seen["company_id"] == "co-1", "worker wrote a NULL-company row"
-    assert seen["step_key"] == "offer_letter"
-    assert seen["log_id"] == "log-1"
-    assert seen["db"] is None, "worker must open its own session, not borrow one"
-    assert seen["sender_user"] == "mailbox@tenant.com"
-
-
-@pytest.mark.security
-def test_worker_log_failure_never_propagates():
-    from src.mailq import worker
-
-    with patch.object(email_log, "finalize", side_effect=RuntimeError("db down")):
-        worker._log(_payload(), "sent", 0, {})   # must not raise
-
-
-@pytest.mark.security
-def test_worker_marks_a_rate_limit_hold_as_deferred(monkeypatch):
-    """A deferral is a hold, not a delivery and not a loss."""
-    from src.mailq import worker, ratelimit
-
-    monkeypatch.setattr(ratelimit, "reserve", lambda *a, **k: False)
-    monkeypatch.setattr(worker, "_reschedule", lambda *a, **k: None)
-
-    statuses = []
-    monkeypatch.setattr(worker, "_log",
-                        lambda payload, status, attempt, result=None, db=None:
-                        statuses.append(status))
-
-    out = worker.send_email_job(_payload())
-    assert out.get("deferred") is True
-    assert statuses == ["deferred"]

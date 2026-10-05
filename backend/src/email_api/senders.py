@@ -48,8 +48,14 @@ def describe_reason(code: Optional[str], conn=None) -> Optional[str]:
     if code == C.R_CONNECTION_UNAVAILABLE and conn is not None:
         if conn.status == C.CONN_ACTIVE and not conn.credential_enc:
             return "The mailbox has no password stored. Re-enter it in Email Settings."
-        detail = f" ({conn.error_code})" if conn.error_code else ""
-        return f"The mailbox connection is {conn.status.replace('_', ' ')}{detail}. Reconnect it in Email Settings."
+        state = {
+            C.CONN_FAILED: "has failed",
+            C.CONN_NEEDS_ATTENTION: "needs attention",
+            C.CONN_DISCONNECTED: "is disconnected",
+            C.CONN_PENDING: "has not been verified yet",
+        }.get(conn.status, f"is {conn.status.replace('_', ' ')}")
+        detail = f" ({conn.error_code.replace('_', ' ')})" if conn.error_code else ""
+        return f"The mailbox connection {state}{detail}. Fix it in Email Settings."
     return {
         C.R_SENDER_NOT_FOUND: "The selected sender does not exist in this company.",
         C.R_SENDER_DISABLED: "The selected sender is disabled.",

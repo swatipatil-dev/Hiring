@@ -71,7 +71,7 @@ def test_reset_email_is_sent_after_the_response(client, db, monkeypatch):
     u = _user(db, "candidate", _company(db).id)
     sent, in_request = [], []
 
-    def fake_send(to, name, otp, smtp_config=None):
+    def fake_send(to, name, otp, smtp_config=None, **_kw):
         sent.append(to)
         in_request.append(getattr(fake_send, "handler_running", False))
 

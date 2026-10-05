@@ -16,10 +16,8 @@ def co(db):
 
 def test_env_smtp_never_used(db, co, monkeypatch):
     """Core rule: an unconfigured client company is blocked, never sent from env."""
-    import src.services.email_service as es
-    monkeypatch.setattr(es, "SMTP_USER", "platform@gmail.com")
-    monkeypatch.setattr(es, "SMTP_PASS", "env-secret")
     monkeypatch.setenv("SMTP_USER", "platform@gmail.com")
+    monkeypatch.setenv("SMTP_PASS", "env-secret")
     d = resolve_sender(db, co.id, "interview_scheduled")
     assert d.status == "blocked" and d.reason_code == C.R_NO_SENDER
     assert d.sender_id is None and d.from_email is None

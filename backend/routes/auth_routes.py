@@ -255,29 +255,33 @@ async def verify_otp(request: Request, data: OTPVerifyRequest, db: Session = Dep
     return _issue_login(user, db)
 
 
-def _send_auth_mail_later(background_tasks, db, user, send, otp, what):
+def _send_auth_mail_later(background_tasks, db, user, send, otp, what, purpose):
     """Send an OTP email after the response has gone.
 
     Sent inline, the SMTP round trip happened only when the account existed, so the
     response time told a caller whether an email was registered even though the body
-    was identical — and it blocked the event loop while it waited. The sender is
-    resolved now, while the request's session is open; only the network send is deferred.
+    was identical — and it blocked the event loop while it waited. So everything —
+    resolving the sender, recording the message, publishing it — happens in the
+    background task, on a session of its own (the request's is closed by then).
+    With Redis down the outbox delivers auth mail in that same task.
     Failures are logged, never returned: whether the mail left is not the caller's
     business, and reporting it would re-open the oracle.
     """
-    from src.services.email_service import resolve_auth_sender
-    try:
-        smtp_config = resolve_auth_sender(db, user.company_id)
-    except Exception as e:
-        logger.warning(f"{what} email to {user.email}: sender lookup failed: {e}")
-        return
-    email, name = user.email, user.first_name
+    email, name, company_id = user.email, user.first_name, user.company_id
 
     def _run():
+        from src.email_api import db as email_db
+        from src.services.email_service import resolve_auth_sender
+        session = email_db.open_session()
         try:
-            send(email, name, otp, smtp_config=smtp_config)
+            smtp_config = resolve_auth_sender(session, company_id, purpose)
+            send(email, name, otp, smtp_config=smtp_config, db=session)
+            session.commit()
         except Exception as e:
+            session.rollback()
             logger.warning(f"{what} email to {email} failed: {e}")
+        finally:
+            session.close()
 
     background_tasks.add_task(_run)
 
@@ -299,7 +303,8 @@ async def resend_otp(request: Request, data: ResendOTPRequest, background_tasks:
         return SENT
     otp = set_user_otp(user, db, purpose="verify")
     from src.services.email_service import send_otp_email
-    _send_auth_mail_later(background_tasks, db, user, send_otp_email, otp, "resend OTP")
+    _send_auth_mail_later(background_tasks, db, user, send_otp_email, otp, "resend OTP",
+                          "auth.verify_email")
     return SENT
 
 @router.post("/login")
@@ -926,7 +931,8 @@ async def forgot_password(request: Request, data: ForgotPasswordRequest,
         return OTP_SENT
     otp = set_user_otp(user, db, purpose="reset")
     from src.services.email_service import send_password_reset_otp
-    _send_auth_mail_later(background_tasks, db, user, send_password_reset_otp, otp, "password-reset OTP")
+    _send_auth_mail_later(background_tasks, db, user, send_password_reset_otp, otp,
+                          "password-reset OTP", "auth.password_reset")
     return OTP_SENT
 
 
