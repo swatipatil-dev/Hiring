@@ -23,6 +23,9 @@ os.environ.setdefault("MFA_REQUIRED_ROLES", "")
 # also not start the proctoring warm-up or attempt CREATE DATABASE / CREATE USER.
 os.environ.setdefault("PROCTOR_PREWARM", "0")
 os.environ.setdefault("DB_BOOTSTRAP", "0")
+# The email API refuses to store a credential without a key (src/email_api/crypto.py).
+# A fixed, test-only key; it protects nothing.
+os.environ.setdefault("EMAIL_CREDENTIAL_KEYS", "k1:1Cwutj66M7kQjcOhEKI8L4e1dk9lra3tx0O05CThawI=")
 
 # Point at the test DB — CI sets TEST_DB env var; local default works too
 _db_host = os.getenv("DB_HOST", "127.0.0.1")

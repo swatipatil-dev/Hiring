@@ -4,14 +4,11 @@ Sends automated emails at each hiring workflow stage.
 Uses SMTP (configurable). Falls back to console logging if not configured.
 """
 
-import re
 import smtplib
 import socket
 import ssl
 import logging
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from email.utils import formataddr, formatdate, make_msgid
+from email.utils import formataddr
 from typing import Optional, Dict, Any
 import os
 
@@ -90,28 +87,8 @@ INNOMAX_OFFICIAL_USER = os.getenv("INNOMAX_OFFICIAL_USER", "")
 INNOMAX_OFFICIAL_PASS = os.getenv("INNOMAX_OFFICIAL_PASS", "")
 
 
-_TAG_RE   = re.compile(r"<[^>]+>")
-_WS_RE    = re.compile(r"[ \t]+")
-_BLANK_RE = re.compile(r"\n{3,}")
-
-
-def _html_to_text(html: str) -> str:
-    """Cheap HTML→text fallback used as the multipart/alternative text part.
-
-    Spam scorers add weight to HTML-only mail; even a rough text alt removes
-    that penalty. We don't pull in BeautifulSoup just for this.
-    """
-    if not html:
-        return ""
-    text = html.replace("<br/>", "\n").replace("<br>", "\n")
-    text = text.replace("</p>", "\n\n").replace("</tr>", "\n")
-    text = _TAG_RE.sub("", text)
-    # Decode the two HTML entities our templates actually use.
-    text = text.replace("&nbsp;", " ").replace("&amp;", "&")
-    text = text.replace("&rarr;", "→").replace("&#8377;", "₹")
-    text = _WS_RE.sub(" ", text)
-    text = _BLANK_RE.sub("\n\n", text)
-    return text.strip()
+# Kept under its old name; the implementation moved with the MIME builder.
+from src.email_api.mime import html_to_text as _html_to_text  # noqa: E402
 
 
 def resolve_smtp_for_company(db, company_id: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -549,9 +526,10 @@ def _deliver(to: str, subject: str, body: str, reply_to, cfg, branding,
     # rather than a bare gmail address.
     company_name = (branding or {}).get("company_name")
     if company_name and company_name.lower() != "hireflow":
-        from_header = formataddr((f"{company_name} via HireFlow", from_email))
+        from_name = f"{company_name} via HireFlow"
     else:
-        from_header = formataddr(("HireFlow", from_email))
+        from_name = "HireFlow"
+    from_header = formataddr((from_name, from_email))
 
     support_email = (branding or {}).get("support_email") or reply_to
 
@@ -576,33 +554,13 @@ def _deliver(to: str, subject: str, body: str, reply_to, cfg, branding,
     if not EMAIL_ENABLED or not user:
         return {"sent": False, "error": "EMAIL_ENABLED is false or SMTP user not set", "error_type": "disabled"}
     try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"] = from_header
-        msg["To"] = to
-        if cc_list:
-            msg["Cc"] = ", ".join(cc_list)
-        msg["Date"] = formatdate(localtime=True)
-        msg["Message-ID"] = make_msgid(domain=MSGID_DOMAIN)
-        msg["X-Mailer"] = "HireFlow Notifications"
-        if reply_to:
-            msg["Reply-To"] = reply_to
-        if is_otp:
-            # Tells receivers this is automated transactional mail, not a
-            # broadcast — reduces spam weight without harming inbox placement.
-            msg["Auto-Submitted"] = "auto-generated"
-            msg["Precedence"] = "bulk"
-            msg["X-Auto-Response-Suppress"] = "All"
-        elif support_email:
-            # Non-OTP mail (offers, reminders, etc.) should expose an unsubscribe
-            # pointer; mailto works without a separate web endpoint.
-            msg["List-Unsubscribe"] = f"<mailto:{support_email}?subject=unsubscribe>"
-            msg["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
-
-        # text/plain MUST be attached before text/html in multipart/alternative
-        # so older clients pick the plain version and spam filters see balance.
-        msg.attach(MIMEText(_html_to_text(body), "plain", "utf-8"))
-        msg.attach(MIMEText(body, "html", "utf-8"))
+        from src.email_api.mime import build_mime
+        msg = build_mime(
+            from_email=from_email, from_name=from_name, to=[to], cc=cc_list,
+            subject=subject, html=body, reply_to=reply_to,
+            auto_submitted=is_otp, unsubscribe_to=support_email,
+            msgid_domain=MSGID_DOMAIN,
+        )
 
         # Port 465 = implicit SSL (SMTPS); 587/25 = plain + STARTTLS upgrade.
         use_ssl = bool(cfg.get("use_ssl")) or SMTP_USE_SSL or port == 465
