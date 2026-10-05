@@ -4,6 +4,7 @@
 #   proctor          → the same app, one worker, fixed port — see below
 #   worker           → coding-judge RQ worker (run on a host that HAS Docker)
 #   email-worker     → outbound-email RQ worker (rate-limited; needs the scheduler)
+#   email-dispatcher → publishes committed email outbox rows to the email queue
 set -e
 
 # Every role branch below ends in `exit 1` after its `exec`. That line is
@@ -108,6 +109,25 @@ if [ "$ROLE" = "email-worker" ]; then
         --job-class src.mailq.safety.SafeEmailJob \
         --serializer rq.serializers.JSONSerializer \
         --url "$EMAIL_QUEUE_URL"
+    exit 1   # see the note above: a role branch must never fall through
+fi
+
+if [ "$ROLE" = "email-dispatcher" ]; then
+    # Moves committed email_outbox rows onto the email queue: rows Redis was down
+    # for, retries and deferrals that came due, and jobs whose lease ran out
+    # because a Redis flush or a dead worker lost them (src/email_api/outbox.py).
+    # The database is the record of what still has to be sent; this loop is what
+    # makes that true.
+    #
+    # It only reads the outbox and writes job ids (message_id, tenant_id) to
+    # Redis. It never decrypts or sends anything, so it gets no secret at all
+    # beyond DATABASE_URL and the Redis URL.
+    unset SECRET_KEY EMAIL_ENCRYPTION_KEY EMAIL_CREDENTIAL_KEYS JUDGE_REGRADE_TOKEN \
+          SMTP_USER SMTP_PASS INNOMAX_HR_USER INNOMAX_HR_PASS \
+          INNOMAX_OFFICIAL_USER INNOMAX_OFFICIAL_PASS \
+          SUPERADMIN_PASSWORD PLATFORM_ADMIN_PASSWORD GEMINI_API_KEY
+    echo "Starting email outbox dispatcher..."
+    exec python -m src.email_api.outbox --loop
     exit 1   # see the note above: a role branch must never fall through
 fi
 

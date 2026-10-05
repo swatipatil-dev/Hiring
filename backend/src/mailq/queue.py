@@ -10,6 +10,7 @@ Jobs travel as JSON and the worker runs only the send job (src/mailq/safety.py).
 from __future__ import annotations
 
 import os
+import time
 from urllib.parse import urlsplit, urlunsplit
 
 from .safety import SEND_JOB, SERIALIZER
@@ -41,8 +42,12 @@ _JOB_TIMEOUT = int(os.getenv("EMAIL_JOB_TIMEOUT_S", "60"))
 
 _redis = None          # decode_responses=True  — plain string keys (rate limits, llen)
 _redis_raw = None      # decode_responses=False — RQ (job hashes hold compressed bytes)
-_redis_checked = False
+_redis_checked_at = None
 _redis_ok = False
+# How long one liveness answer is trusted. It used to be cached for the life of
+# the process, so an API that started while Redis was down never used the queue
+# again until it was restarted.
+REDIS_CHECK_TTL_S = float(os.getenv("EMAIL_REDIS_CHECK_TTL_S", "30"))
 
 
 def get_redis():
@@ -84,10 +89,11 @@ def get_redis_raw():
 
 
 def redis_available() -> bool:
-    """Cached liveness check so we don't ping Redis on every send."""
-    global _redis_checked, _redis_ok
-    if not _redis_checked:
-        _redis_checked = True
+    """Liveness check, cached for ``REDIS_CHECK_TTL_S`` so we don't ping on every send."""
+    global _redis_checked_at, _redis_ok
+    now = time.monotonic()
+    if _redis_checked_at is None or now - _redis_checked_at >= REDIS_CHECK_TTL_S:
+        _redis_checked_at = now
         r = get_redis()
         try:
             _redis_ok = bool(r) and r.ping()

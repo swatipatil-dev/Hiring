@@ -98,16 +98,23 @@ def _tenant_bucket(account: str, company_id) -> str:
     return f"{account}|co:{company_id or 'none'}"
 
 
-def reserve_send(account: str, limit, company_id=None, priority: bool = False):
+def reserve_send(account: str, limit, company_id=None, priority: bool = False,
+                 shared=None):
     """Claim a slot for one message, applying the fairness rules in the module doc.
 
     Returns the list of bucket names claimed (pass it to ``release_send`` to give
     them back), or None when the message must be deferred. Fail-open like
     ``reserve``.
+
+    ``shared`` says outright whether the account sends for several companies;
+    the email API knows this from the connection row. Left as None, the legacy
+    guess from the environment's mailbox names applies.
     """
     lim = effective_limit(limit)
     claimed = []
-    if not priority and is_shared_account(account):
+    if shared is None:
+        shared = is_shared_account(account)
+    if not priority and shared:
         tenant_lim = TENANT_HOURLY_LIMIT if TENANT_HOURLY_LIMIT > 0 else max(1, lim // 2)
         bucket = _tenant_bucket(account, company_id)
         if not reserve(bucket, tenant_lim):

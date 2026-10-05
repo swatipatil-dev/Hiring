@@ -54,3 +54,47 @@ def make_route(db, company_id, event_type, sender_id=None, *, enabled=True):
     db.add(route)
     db.flush()
     return route
+
+
+def queue_message(db, company_id, event_type="offer_letter", *, to=("cand@example.net",),
+                  subject="Your offer", html="<p>Welcome</p>", **kw):
+    """Resolve the sender through the real policy and submit, without committing."""
+    from src.email_api.messages import submit
+    from src.email_api.policy import resolve_sender
+    decision = resolve_sender(db, company_id, event_type,
+                              requested_sender_id=kw.pop("requested_sender_id", None))
+    return submit(db, tenant_id=company_id, decision=decision, event_type=event_type, to=to,
+                  subject=subject, html=html, **kw)
+
+
+class FakeAdapter:
+    """Records every send; ``respond(snapshot)`` returns the SubmissionResult."""
+
+    def __init__(self, respond=None):
+        self.calls = []
+        self.respond = respond or accepted
+
+    def send(self, conn, snapshot, secret):
+        self.calls.append({"conn": conn.id, "snapshot": snapshot, "secret": secret})
+        return self.respond(snapshot)
+
+    def validate_connection(self, conn, secret):
+        from src.email_api.adapters.base import ValidationResult
+        return ValidationResult(True, "done")
+
+
+def accepted(snapshot):
+    from src.email_api.adapters.base import SubmissionResult, RecipientResult
+    return SubmissionResult(C.OUT_ACCEPTED, "done",
+                            [RecipientResult(a, C.RCPT_ACCEPTED, 250, "OK")
+                             for a in snapshot.envelope_recipients], smtp_code=250)
+
+
+def failing(outcome, code, kind, *, connection_status=None, retry_after=None):
+    from src.email_api.adapters.base import SubmissionResult, DeliveryError
+
+    def respond(snapshot):
+        return SubmissionResult(outcome, "auth", error=DeliveryError(
+            code, kind, f"simulated {code}", connection_status=connection_status,
+            retry_after=retry_after))
+    return respond

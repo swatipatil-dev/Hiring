@@ -29,8 +29,11 @@ from rq.serializers import JSONSerializer
 SERIALIZER = JSONSerializer
 
 SEND_JOB = "src.mailq.worker.send_email_job"
+# The email API's job. Its payload is only {"message_id", "tenant_id"}; the
+# worker loads everything else from the database (src/email_api/worker.py).
+DELIVER_JOB = "src.email_api.worker.deliver_message_job"
 
-ALLOWED_JOBS = frozenset({SEND_JOB})
+ALLOWED_JOBS = frozenset({SEND_JOB, DELIVER_JOB})
 
 
 class ForbiddenJob(RuntimeError):

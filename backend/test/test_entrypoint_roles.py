@@ -99,7 +99,7 @@ def test_web_and_proctor_ports_differ(script):
 
 # ── no role may fall through into the web role ───────────────────────────────
 
-@pytest.mark.parametrize("role", ["worker", "proctor", "email-worker"])
+@pytest.mark.parametrize("role", ["worker", "proctor", "email-worker", "email-dispatcher"])
 def test_role_branch_cannot_fall_through(script, role):
     """If exec ever failed to replace the process, the next branch would run —
     starting a second API on 8000 and recreating the port collision."""
@@ -107,3 +107,13 @@ def test_role_branch_cannot_fall_through(script, role):
     assert re.search(r"^\s*exit 1", body, re.MULTILINE), (
         f"ROLE={role} does not terminate; execution could reach the web role"
     )
+
+
+def test_email_dispatcher_holds_no_secrets(script):
+    """It only moves ids from the outbox to Redis; it must not be able to decrypt
+    a mailbox password or sign a session."""
+    body = _branch(script, "email-dispatcher")
+    for secret in ("SECRET_KEY", "EMAIL_ENCRYPTION_KEY", "EMAIL_CREDENTIAL_KEYS",
+                   "SMTP_PASS", "INNOMAX_HR_PASS", "INNOMAX_OFFICIAL_PASS"):
+        assert re.search(r"\b%s\b" % secret, body.split("exec", 1)[0]), f"{secret} not unset"
+    assert "src.email_api.outbox --loop" in _exec_line(body)

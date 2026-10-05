@@ -1,0 +1,47 @@
+# HireFlow email outbox dispatcher.
+#
+# The email API writes every accepted message to the email_outbox table in the
+# same transaction as the message itself. This loop moves those rows onto the
+# email queue: rows that were committed while Redis was down, retries and
+# rate-limit deferrals that have come due, and jobs whose lease expired because
+# a Redis flush or a dead worker lost them (src/email_api/outbox.py).
+#
+# Without it, mail committed during a Redis outage waits forever and every retry
+# is lost. It never decrypts or sends anything; entrypoint.sh strips every secret
+# except DATABASE_URL and the Redis URL before it starts.
+
+[Unit]
+Description=HireFlow email outbox dispatcher
+After=network.target redis.service mysqld.service
+Wants=redis.service
+
+[Service]
+Type=exec
+User=hireflow
+Group=hireflow
+WorkingDirectory=/opt/hireflow/backend
+EnvironmentFile=/opt/hireflow/backend/.env
+
+Environment=ROLE=email-dispatcher
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/opt/hireflow/venv/bin:/usr/local/bin:/usr/bin:/bin
+
+ExecStart=/bin/sh /opt/hireflow/backend/entrypoint.sh
+
+Restart=always
+RestartSec=10
+
+# ── Resource limits: this server also hosts other cPanel accounts ────────────
+# One small SELECT/UPDATE every few seconds.
+MemoryMax=512M
+CPUWeight=20
+IOWeight=20
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/hireflow
+
+[Install]
+WantedBy=multi-user.target
