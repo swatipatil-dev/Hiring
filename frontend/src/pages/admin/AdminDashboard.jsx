@@ -5,8 +5,9 @@ import { Users, Building2, Briefcase, TrendingUp, Plus, Edit3, Trash2, UserX, Us
 import api from '../../api/client'
 import Header from '../../components/Header'
 import SupportPanel from './SupportPanel'
-import MailboxManager from './MailboxManager'
+import MailboxManager, { SMTP_PORTS } from './MailboxManager'
 import MailRoutingPanel from './MailRoutingPanel'
+import ApiKeysPanel from './ApiKeysPanel'
 
 const CHART_COLORS = ['#2b7cba', '#3b82f6', '#22c55e', '#8b5cf6', '#ef4444', '#06b6d4']
 
@@ -329,8 +330,11 @@ export default function AdminDashboard() {
         smtp_from_email: emailForm.smtp_from_email || emailForm.smtp_user,
       }
       if (emailForm.smtp_pass) payload.smtp_pass = emailForm.smtp_pass
-      await api.put('/admin/email-config', payload)
-      setEmailMessage({ type: 'success', text: 'Email configuration saved.' })
+      // Saving connects to the server and logs in, so the answer says whether it works.
+      const r = await api.put('/admin/email-config', payload)
+      setEmailMessage(r.data?.status === 'active'
+        ? { type: 'success', text: 'Saved and verified — company mail will be sent from this mailbox.' }
+        : { type: 'warn', text: `Saved, but the mailbox could not be verified: ${r.data?.error_detail || r.data?.error_code || 'unknown error'}. Company mail is blocked until this is fixed.` })
       loadEmailConfig()
     } catch (err) {
       setEmailMessage({ type: 'error', text: err.response?.data?.detail || 'Failed to save configuration' })
@@ -356,7 +360,7 @@ export default function AdminDashboard() {
   }
 
   const handleClearEmailConfig = async () => {
-    if (!confirm('Clear the company email config? Emails will fall back to the global default.')) return
+    if (!confirm('Disconnect the company mailbox? Its password is deleted, and company emails will not be sent until a mailbox is connected again.')) return
     try {
       await api.delete('/admin/email-config')
       setEmailMessage({ type: 'success', text: 'Email configuration cleared.' })
@@ -1638,29 +1642,38 @@ export default function AdminDashboard() {
 
       {tab === 'email' && (
         <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr)', gap: 20, maxWidth: 760 }}>
-          {/* Status banner */}
-          <div className="card" style={{
-            display: 'flex', alignItems: 'center', gap: 14,
-            padding: '14px 18px',
-            background: emailConfig?.configured
-              ? 'linear-gradient(135deg, rgba(34,197,94,0.10), rgba(34,197,94,0.02))'
-              : 'linear-gradient(135deg, rgba(245,158,11,0.10), rgba(245,158,11,0.02))',
-            borderLeft: `3px solid ${emailConfig?.configured ? '#22c55e' : '#f59e0b'}`,
-          }}>
-            {emailConfig?.configured
-              ? <CheckCircle2 size={20} style={{ color: '#22c55e' }} />
-              : <AlertCircle size={20} style={{ color: '#f59e0b' }} />}
-            <div style={{ flex: 1 }}>
-              <div style={{ fontWeight: 600, fontSize: '0.92rem' }}>
-                {emailConfig?.configured ? 'Company SMTP is configured' : 'No company SMTP configured'}
+          {/* Status banner: working, broken (blocked), or not connected (blocked) */}
+          {(() => {
+            const ok = !!emailConfig?.configured
+            const broken = !ok && !!emailConfig?.sender_id
+            const color = ok ? '#22c55e' : broken ? '#dc2626' : '#f59e0b'
+            return (
+              <div className="card" style={{
+                display: 'flex', alignItems: 'center', gap: 14,
+                padding: '14px 18px',
+                background: `linear-gradient(135deg, ${color}1A, ${color}05)`,
+                borderLeft: `3px solid ${color}`,
+              }}>
+                {ok
+                  ? <CheckCircle2 size={20} style={{ color }} />
+                  : <AlertCircle size={20} style={{ color }} />}
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontWeight: 600, fontSize: '0.92rem' }}>
+                    {ok ? 'Company mailbox is connected'
+                      : broken ? 'Company mailbox cannot send'
+                      : 'No company mailbox connected'}
+                  </div>
+                  <div style={{ fontSize: '0.78rem', color: 'var(--text-tertiary)', marginTop: 2 }}>
+                    {ok
+                      ? `Company emails are sent from ${emailConfig.smtp_from_email || emailConfig.smtp_user}`
+                      : broken
+                        ? `${emailConfig.error_detail || emailConfig.error_code || 'The connection failed'}. Company emails are blocked until this is fixed.`
+                        : 'Company emails are not sent until a mailbox is connected. Verification and password-reset codes still go out from the platform.'}
+                  </div>
+                </div>
               </div>
-              <div style={{ fontSize: '0.78rem', color: 'var(--text-tertiary)', marginTop: 2 }}>
-                {emailConfig?.configured
-                  ? `All emails are sent from ${emailConfig.smtp_from_email || emailConfig.smtp_user}`
-                  : 'Until configured, emails are sent from the platform default address.'}
-              </div>
-            </div>
-          </div>
+            )
+          })()}
 
           {/* Save form */}
           <form onSubmit={handleSaveEmailConfig} className="card" style={{ padding: 24 }}>
@@ -1684,9 +1697,14 @@ export default function AdminDashboard() {
               </div>
               <div className="input-group">
                 <label>Port</label>
-                <input className="input" type="number" required
-                  value={emailForm.smtp_port}
-                  onChange={e => setEmailForm({ ...emailForm, smtp_port: e.target.value })} />
+                <select className="input" required
+                  value={Number(emailForm.smtp_port) || 587}
+                  onChange={e => setEmailForm({ ...emailForm, smtp_port: Number(e.target.value) })}>
+                  {SMTP_PORTS.map(p => <option key={p.value} value={p.value}>{p.label}</option>)}
+                  {!SMTP_PORTS.some(p => p.value === Number(emailForm.smtp_port)) && emailForm.smtp_port && (
+                    <option value={emailForm.smtp_port} disabled>{emailForm.smtp_port} — no longer allowed</option>
+                  )}
+                </select>
               </div>
             </div>
 
@@ -1714,17 +1732,19 @@ export default function AdminDashboard() {
             {emailMessage && (
               <div style={{
                 marginTop: 8, padding: '10px 14px', borderRadius: 8, fontSize: '0.85rem',
-                background: emailMessage.type === 'success' ? 'rgba(34,197,94,0.10)' : 'rgba(239,68,68,0.10)',
-                color: emailMessage.type === 'success' ? '#16a34a' : '#dc2626',
+                background: emailMessage.type === 'success' ? 'rgba(34,197,94,0.10)'
+                  : emailMessage.type === 'warn' ? 'rgba(245,158,11,0.10)' : 'rgba(239,68,68,0.10)',
+                color: emailMessage.type === 'success' ? '#16a34a'
+                  : emailMessage.type === 'warn' ? '#b45309' : '#dc2626',
               }}>
                 {emailMessage.text}
               </div>
             )}
 
             <div className="flex gap-12" style={{ justifyContent: 'flex-end', marginTop: 16 }}>
-              {emailConfig?.configured && (
+              {emailConfig?.sender_id && (
                 <button type="button" className="btn btn-secondary" onClick={handleClearEmailConfig}>
-                  Clear
+                  Disconnect
                 </button>
               )}
               <button type="submit" className="btn btn-primary" disabled={emailSaving}>
@@ -1740,10 +1760,11 @@ export default function AdminDashboard() {
               <h3 style={{ margin: 0, fontSize: '1rem' }}>Send Test Email</h3>
             </div>
             <p style={{ fontSize: '0.82rem', color: 'var(--text-tertiary)', marginBottom: 16 }}>
-              Send a test message using {emailConfig?.configured ? 'this company\'s' : 'the global'} SMTP configuration.
+              Send a real message through the company mailbox now. It can go to the mailbox's
+              own address or to any user of your company.
             </p>
             <div style={{ display: 'flex', gap: 10 }}>
-              <input className="input" type="email" placeholder="recipient@example.com" style={{ flex: 1 }}
+              <input className="input" type="email" placeholder={emailConfig?.smtp_from_email || 'you@yourcompany.com'} style={{ flex: 1 }}
                 value={testTo} onChange={e => setTestTo(e.target.value)} />
               <button type="button" className="btn btn-primary" onClick={handleSendTestEmail} disabled={testing}>
                 {testing ? 'Sending…' : 'Send Test'}
@@ -1757,8 +1778,8 @@ export default function AdminDashboard() {
               }}>
                 {testResult.sent ? (
                   <>
-                    <b>Success:</b> Email delivered via {testResult.config?.smtp_host}
-                    {testResult.using_company_smtp ? ' (company SMTP)' : ' (global default)'}.
+                    <b>Accepted:</b> {testResult.config?.smtp_host} took the message for delivery
+                    from {testResult.config?.from_email}. Check the inbox to confirm it arrived.
                   </>
                 ) : (
                   <>
@@ -1772,8 +1793,11 @@ export default function AdminDashboard() {
           {/* Named sender mailboxes (HR picks these per pipeline step) */}
           <MailboxManager />
 
-          {/* Read-only: which sender each step resolves to, and queued vs inline */}
+          {/* Read-only: which sender each email resolves to, what is blocked, delivery health */}
           <MailRoutingPanel />
+
+          {/* Keys for the company's own applications to use the email API */}
+          <ApiKeysPanel />
         </div>
       )}
 

@@ -33,20 +33,29 @@ function StepCard({ step, mailboxes, onChange, onTest }) {
                 onChange={e => onChange({ ...step, mailbox_id: e.target.value || null })}>
           <option value="">Company default</option>
           {mailboxes.map(m => (
-            // A mailbox with no password is silently unusable: the server skips it and
-            // this step falls back to the company default sender. Label it here so it is
-            // not chosen believing it works — selecting it still saves, since an admin
-            // may be about to add the credentials.
+            // A mailbox that cannot send is not replaced by the default: this step's
+            // mail is blocked until it is fixed. Selecting it still saves, since an
+            // admin may be about to add the credentials.
             <option key={m.id} value={m.id}>
               {m.name}{m.from_email ? ` — ${m.from_email}` : ''}
-              {m.has_password === false ? '  (no password — will not send)' : ''}
+              {(m.usable ?? m.has_password !== false) ? '' : '  (cannot send — mail will be blocked)'}
             </option>
           ))}
         </select>
-        {selectedMailbox && selectedMailbox.has_password === false && (
-          <span style={{ fontSize: '0.74rem', color: '#b45309', marginTop: 4, fontWeight: 600 }}>
-            {selectedMailbox.name} has no password set, so this step will still send from
-            the company default. An admin can add it under Email Settings.
+        {selectedMailbox && !(selectedMailbox.usable ?? selectedMailbox.has_password !== false) && (
+          <span style={{ fontSize: '0.74rem', color: '#dc2626', marginTop: 4, fontWeight: 600 }}>
+            {selectedMailbox.name} cannot send{selectedMailbox.unusable_reason ? ` — ${selectedMailbox.unusable_reason}` : ''}.
+            This step's emails will not be sent until an admin fixes it under Email Settings.
+          </span>
+        )}
+        {step.enabled && step.effective?.status === 'blocked' && !(selectedMailbox && !(selectedMailbox.usable ?? true)) && (
+          <span style={{ fontSize: '0.74rem', color: '#dc2626', marginTop: 4, fontWeight: 600 }}>
+            Not sent: {step.effective.reason || 'no working sender is configured'}
+          </span>
+        )}
+        {step.enabled && step.effective?.status === 'ok' && step.effective.from_email && (
+          <span style={{ fontSize: '0.74rem', color: 'var(--text-tertiary)', marginTop: 4 }}>
+            Currently sends from {step.effective.from_email}
           </span>
         )}
         {mailboxes.length === 0 && (
@@ -117,7 +126,9 @@ export default function PipelineNotifications() {
   }
 
   const handleTest = async (step) => {
-    const to = window.prompt(`Send a test "${step.label}" notification to which email?`)
+    const to = window.prompt(
+      `Send a test "${step.label}" notification to which email?\n` +
+      `(the sender's own address, or a user of your company)`)
     if (!to) return
     setTestResult(null)
     try {
@@ -125,16 +136,17 @@ export default function PipelineNotifications() {
         params: { step_key: step.step_key, to },
       })
       const cc = r.data?.cc?.length ? ` (CC: ${r.data.cc.join(', ')})` : ''
-      if (!r.data?.sent) {
+      if (r.data?.error_type === 'disabled') {
+        setTestResult({ type: 'warn', text: `"${step.label}" is switched off, so nothing was sent. Save it as enabled first.` })
+      } else if (r.data?.error_type === 'blocked') {
+        setTestResult({ type: 'error', text: `"${step.label}" emails are blocked: ${r.data?.error || 'no working sender'}. Nothing was sent.` })
+      } else if (!r.data?.sent) {
         setTestResult({ type: 'error', text: `Test failed: ${r.data?.error || 'unknown error'}` })
-      } else if (r.data?.using_step_smtp === false) {
-        // The send worked, but NOT from the mailbox chosen for this step — it was
-        // missing, inactive or has no password, so it silently fell back to the
-        // company default. Reporting this as a plain success is what made a
-        // misconfigured mailbox look correct.
-        setTestResult({ type: 'warn', text: `Sent to ${to}${cc}, but NOT from this step's mailbox — it is unset or unusable, so the company default sender was used. Check Admin → Email Settings.` })
       } else {
-        setTestResult({ type: 'success', text: `Test sent to ${to}${cc}.` })
+        // The test goes out from the sender this step really uses — its own, or
+        // the company default when none is chosen; never anything else.
+        const source = r.data?.using_step_smtp ? "this step's mailbox" : 'the company default sender'
+        setTestResult({ type: 'success', text: `Test accepted for ${to}${cc}, sent from ${source}.` })
       }
     } catch (err) {
       setTestResult({ type: 'error', text: err.response?.data?.detail || 'Test failed.' })

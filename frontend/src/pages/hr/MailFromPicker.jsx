@@ -62,11 +62,13 @@ export default function MailFromPicker({ stepKey, value, onChange, label = 'Send
   }
 
   const selected = data.mailboxes.find(m => m.id === value) || null
-  // A mailbox with no password is skipped server-side, so the real From address
-  // stays the stage/company default. Reflect that rather than the chosen name.
-  const usable = selected ? selected.has_password !== false : false
-  const from = usable ? selected.from_email : data.from_email
-  const via  = usable ? selected.name : data.source_label
+  // A chosen mailbox that cannot send is NOT replaced by another sender: the
+  // email is blocked. Say so here, before HR presses send.
+  const usable = selected ? (selected.usable ?? selected.has_password !== false) : false
+  const blocked = selected ? !usable : data.source === 'blocked'
+  const disabled = !selected && data.source === 'disabled'
+  const from = selected ? (usable ? selected.from_email : null) : data.from_email
+  const via  = selected ? selected.name : data.source_label
 
   return (
     <div className="input-group" style={{ marginBottom: 12 }}>
@@ -80,19 +82,21 @@ export default function MailFromPicker({ stepKey, value, onChange, label = 'Send
           <option key={m.id} value={m.id}>
             {m.name}{m.from_email ? ` — ${m.from_email}` : ''}
             {m.id === data.default_mailbox_id ? '  (stage default)' : ''}
-            {m.has_password === false ? '  (no password — will not send)' : ''}
+            {(m.usable ?? m.has_password !== false) ? '' : '  (cannot send — will be blocked)'}
           </option>
         ))}
       </select>
 
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 5,
-                    fontSize: '0.78rem', color: 'var(--text-tertiary)' }}>
-        <Mail size={13} style={{ flexShrink: 0 }} />
-        <span>
-          Sending from <strong style={{ color: 'var(--text-primary)' }}>{from || 'the platform default address'}</strong>
-          {via ? ` · ${via}` : ''}
-        </span>
-      </div>
+      {!blocked && !disabled && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 5,
+                      fontSize: '0.78rem', color: 'var(--text-tertiary)' }}>
+          <Mail size={13} style={{ flexShrink: 0 }} />
+          <span>
+            Sending from <strong style={{ color: 'var(--text-primary)' }}>{from}</strong>
+            {via ? ` · ${via}` : ''}
+          </span>
+        </div>
+      )}
 
       {data.cc?.length > 0 && (
         <div style={{ fontSize: '0.75rem', color: 'var(--text-tertiary)', marginTop: 3 }}>
@@ -100,24 +104,31 @@ export default function MailFromPicker({ stepKey, value, onChange, label = 'Send
         </div>
       )}
 
-      {/* Chosen a mailbox the server will skip — say so before they hit send. */}
+      {/* The chosen mailbox cannot send — the email will be blocked, not re-routed. */}
       {selected && !usable && (
         <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6, marginTop: 5,
-                      fontSize: '0.75rem', color: '#b45309', fontWeight: 600 }}>
+                      fontSize: '0.75rem', color: '#dc2626', fontWeight: 600 }}>
           <AlertTriangle size={13} style={{ flexShrink: 0, marginTop: 1 }} />
           <span>
-            {selected.name} has no password set, so this will still send from {from || 'the default address'}.
-            An admin can add it under Email Settings.
+            {selected.name} cannot send{selected.unusable_reason ? ` — ${selected.unusable_reason}` : ''}.
+            This email will not be sent. Pick another mailbox, or ask an admin to fix it under Email Settings.
           </span>
         </div>
       )}
 
-      {/* The stage points at a mailbox that can't be used at all. */}
-      {!selected && data.fallback_reason && (
+      {/* Nothing usable for this stage at all. */}
+      {!selected && blocked && (
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6, marginTop: 5,
+                      fontSize: '0.75rem', color: '#dc2626', fontWeight: 600 }}>
+          <AlertTriangle size={13} style={{ flexShrink: 0, marginTop: 1 }} />
+          <span>This email will not be sent: {data.fallback_reason || 'no working sender is configured'}</span>
+        </div>
+      )}
+      {disabled && (
         <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6, marginTop: 5,
                       fontSize: '0.75rem', color: '#b45309' }}>
           <AlertTriangle size={13} style={{ flexShrink: 0, marginTop: 1 }} />
-          <span>Stage mailbox unusable: {data.fallback_reason}.</span>
+          <span>This email is switched off in Pipeline Notifications, so nothing will be sent.</span>
         </div>
       )}
     </div>

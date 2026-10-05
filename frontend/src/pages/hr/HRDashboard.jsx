@@ -495,13 +495,18 @@ HR Team`,
     setRound2Sending(false)
   }
 
-  // Report what actually happened. dispatch() queues the mail when Redis is up, so
-  // the worker may not have sent it yet — claiming "Sent!" here would be the same
-  // lie this button used to tell, just better disguised.
-  const describeSendResult = (data) =>
-    data?.mode === 'async' ? 'Queued for delivery.'
-      : data?.sent === false ? `Could not send: ${data?.error || 'unknown error'}`
-        : 'Sent.'
+  // Report what actually happened. Mail is queued and sent by the email worker, so
+  // claiming "Sent!" here would be the same lie this button used to tell, just
+  // better disguised. "blocked" means it will not go out at all: no working sender.
+  const NOT_SENT = ['blocked', 'disabled', 'failed']
+  const describeSendResult = (data) => {
+    const status = data?.status
+    if (status === 'accepted' || data?.sent === true) return 'Accepted by the mail server.'
+    if (status === 'blocked') return `Not sent: ${data?.error || 'no working sender is configured'}. An admin can fix this under Email Settings.`
+    if (status === 'disabled') return 'Not sent: this kind of email is switched off in Pipeline Notifications.'
+    if (status === 'failed' || data?.sent === false) return `Could not send: ${data?.error || 'unknown error'}`
+    return 'Queued for delivery.'
+  }
 
   const handleSendComposeMail = async () => {
     if (!composeMail.to) { setComposeError('Please enter a recipient email.'); return }
@@ -516,9 +521,14 @@ HR Team`,
         body: composeMail.body,
         mailbox_id: composeMailboxId ?? null,
       })
-      alert(`${describeSendResult(res.data)} (${composeMail.to})`)
-      setShowComposeMail(false)
-      setComposeMail({ to: '', subject: '', body: '' })
+      if (NOT_SENT.includes(res.data?.status)) {
+        // Keep the draft: HR can pick another mailbox and try again.
+        setComposeError(describeSendResult(res.data))
+      } else {
+        alert(`${describeSendResult(res.data)} (${composeMail.to})`)
+        setShowComposeMail(false)
+        setComposeMail({ to: '', subject: '', body: '' })
+      }
     } catch (err) {
       setComposeError(err.response?.data?.detail || 'Failed to send mail')
     }
@@ -536,8 +546,12 @@ HR Team`,
         mailbox_id: offerMailboxId ?? null,
         step_key: 'offer_letter',
       })
-      alert(`${describeSendResult(res.data)} (${offerMailPreview.candidate_name})`)
-      setOfferMailPreview(null)
+      if (NOT_SENT.includes(res.data?.status)) {
+        setOfferMailError(describeSendResult(res.data))
+      } else {
+        alert(`${describeSendResult(res.data)} (${offerMailPreview.candidate_name})`)
+        setOfferMailPreview(null)
+      }
     } catch (err) {
       setOfferMailError(err.response?.data?.detail || 'Failed to send offer email')
     }
@@ -662,8 +676,8 @@ HR Team`,
       // email is a warning, not a failed scheduling.
       const d = res.data
       alert(d.message + '\nCandidate moved to Scheduled Interviews.'
-        + (d.email_status === 'failed'
-            ? `\n\n⚠ The interview was saved, but the candidate email did not send${d.email_error ? `: ${d.email_error}` : ''}.\nCheck Email Settings, or notify them another way.`
+        + (d.email_status === 'failed' || d.email_status === 'blocked'
+            ? `\n\n⚠ The interview was saved, but the candidate email was not sent${d.email_error ? `: ${d.email_error}` : ''}.\nCheck Email Settings, or notify them another way.`
             : ''))
       setScheduleModal(null)
       setTestResultJob(null)

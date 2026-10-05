@@ -64,7 +64,7 @@ describe('HR Compose Mail', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     get.mockResolvedValue({ data: [] })
-    post.mockResolvedValue({ data: { queued: true, mode: 'async', job_id: 'j1' } })
+    post.mockResolvedValue({ data: { queued: true, mode: 'outbox', status: 'queued', message_id: 'm1' } })
     localStorage.clear()
     vi.spyOn(window, 'alert').mockImplementation(() => {})
   })
@@ -108,6 +108,20 @@ describe('HR Compose Mail', () => {
     await waitFor(() => expect(window.alert).toHaveBeenCalled())
     const message = window.alert.mock.calls.flat().join(' ')
     expect(message).toMatch(/queued/i)
+  })
+
+  it('keeps the draft and says why when the email is blocked', async () => {
+    post.mockResolvedValueOnce({ data: { queued: false, status: 'blocked',
+                                         error: 'No sender is configured for this company.' } })
+    const user = userEvent.setup()
+    renderOffersTab()
+    const send = await openComposeAndFill(user)
+
+    await user.click(send)
+
+    expect(await screen.findByText(/Not sent: No sender is configured/i)).toBeInTheDocument()
+    expect(window.alert).not.toHaveBeenCalled()
+    expect(screen.getByPlaceholderText(/write your message here/i)).toHaveValue('Hello there')
   })
 
   it('surfaces a server error instead of closing the dialog silently', async () => {

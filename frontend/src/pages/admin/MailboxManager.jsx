@@ -8,6 +8,40 @@ const BLANK = {
   is_active: true, has_password: false,
 }
 
+// Mail servers accept authenticated submission on these two ports only; the
+// server refuses anything else when the mailbox is saved.
+export const SMTP_PORTS = [
+  { value: 587, label: '587 — STARTTLS' },
+  { value: 465, label: '465 — SSL/TLS' },
+]
+
+const STATUS = {
+  active:               { color: '#16a34a', label: 'Connected' },
+  pending_verification: { color: '#b45309', label: 'Not verified yet' },
+  failed:               { color: '#dc2626', label: 'Connection failed' },
+  needs_attention:      { color: '#b45309', label: 'Needs attention' },
+  disconnected:         { color: '#6b7280', label: 'Disconnected' },
+}
+
+export function ConnectionStatus({ status, detail, reason }) {
+  const s = STATUS[status]
+  if (!s) return null
+  return (
+    <span title={detail || reason || ''} style={{
+      display: 'inline-block', padding: '1px 8px', borderRadius: 20, fontSize: '0.7rem',
+      fontWeight: 600, background: `${s.color}1A`, color: s.color, whiteSpace: 'nowrap',
+    }}>{s.label}</span>
+  )
+}
+
+function savedMessage(m) {
+  if (m?.status === 'active') return { type: 'success', text: `Mailbox saved and verified — ${m.name} can send.` }
+  if (m?.status === 'needs_attention' && !m?.has_password) {
+    return { type: 'warn', text: `Mailbox saved. Add its password before it can send.` }
+  }
+  return { type: 'warn', text: `Mailbox saved, but it could not be verified: ${m?.error_detail || m?.unusable_reason || m?.error_code || 'unknown error'}. Mail routed to it will be blocked until this is fixed.` }
+}
+
 // Admin-managed named sender mailboxes. HR picks from these per pipeline step.
 export default function MailboxManager() {
   const [list, setList]   = useState([])
@@ -44,9 +78,11 @@ export default function MailboxManager() {
         is_active: form.is_active !== false,
       }
       if (form.smtp_pass) payload.smtp_pass = form.smtp_pass
-      if (form.id) await api.put(`/admin/mailboxes/${form.id}`, payload)
-      else         await api.post('/admin/mailboxes', payload)
-      setMsg({ type: 'success', text: 'Mailbox saved.' })
+      const r = form.id
+        ? await api.put(`/admin/mailboxes/${form.id}`, payload)
+        : await api.post('/admin/mailboxes', payload)
+      // Saving connects and logs in; say whether that worked.
+      setMsg(savedMessage(r.data))
       setForm(null)
       load()
     } catch (err) {
@@ -55,11 +91,12 @@ export default function MailboxManager() {
     setSaving(false)
   }
 
-  // Saving a mailbox verifies nothing — the password is encrypted and stored
-  // as typed. Without this button a typo only surfaces when a candidate-facing
-  // send fails, and until then the step silently uses the company default.
+  // Saving checks that the mailbox can log in; this proves a message actually
+  // goes out. Test mail goes only to the mailbox itself or someone in the company.
   const runTest = async (m) => {
-    const to = window.prompt(`Send a test message from "${m.name}" to which address?`)
+    const to = window.prompt(
+      `Send a test message from "${m.name}" to which address?\n` +
+      `(its own address, or the address of a user in your company)`, m.smtp_from_email || '')
     if (!to) return
     setMsg(null)
     setTesting(m.id)
@@ -86,7 +123,7 @@ export default function MailboxManager() {
   }
 
   const remove = async (m) => {
-    if (!confirm(`Delete mailbox "${m.name}"? Steps using it revert to the company default.`)) return
+    if (!confirm(`Delete mailbox "${m.name}"? Steps using it revert to the company default, and anything still queued through it will not be sent.`)) return
     try { await api.delete(`/admin/mailboxes/${m.id}`); load() }
     catch (err) { setMsg({ type: 'error', text: err.response?.data?.detail || 'Failed to delete.' }) }
   }
@@ -129,13 +166,22 @@ export default function MailboxManager() {
             }}>
               {/* The buttons drop below the details when the row is too narrow. */}
               <div style={{ flex: '1 1 220px', minWidth: 0 }}>
-                <div style={{ fontWeight: 600, fontSize: '0.9rem' }}>
-                  {m.name}{!m.is_active && <span style={{ color: 'var(--text-tertiary)', fontWeight: 400 }}> (inactive)</span>}
+                <div style={{ fontWeight: 600, fontSize: '0.9rem', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                  <span>{m.name}{!m.is_active && <span style={{ color: 'var(--text-tertiary)', fontWeight: 400 }}> (inactive)</span>}</span>
+                  <ConnectionStatus status={m.status} detail={m.error_detail} reason={m.unusable_reason} />
+                  {m.source === 'environment' && (
+                    <span style={{ fontSize: '0.7rem', color: 'var(--text-tertiary)', fontWeight: 400 }}>from server settings</span>
+                  )}
                 </div>
                 <div style={{ fontSize: '0.78rem', color: 'var(--text-tertiary)', wordBreak: 'break-word' }}>
                   {m.smtp_from_email || m.smtp_user} · {m.smtp_host}:{m.smtp_port}
                   {!m.has_password && <span style={{ color: '#f59e0b' }}> · no password set</span>}
                 </div>
+                {!m.usable && m.is_active && m.unusable_reason && (
+                  <div style={{ fontSize: '0.76rem', color: '#dc2626', marginTop: 2 }}>
+                    {m.unusable_reason} Mail routed to this mailbox is blocked.
+                  </div>
+                )}
               </div>
               <button type="button" className="btn btn-secondary" style={{ padding: '4px 12px', fontSize: '0.8rem', display: 'inline-flex', alignItems: 'center', gap: 5 }} onClick={() => runTest(m)} disabled={testing === m.id} title={`Send a test message from ${m.name}`}>
                 <Send size={14} /> {testing === m.id ? 'Testing…' : 'Test'}
@@ -184,8 +230,13 @@ export default function MailboxManager() {
             </div>
             <div className="input-group">
               <label>Port</label>
-              <input className="input" type="number" required value={form.smtp_port}
-                     onChange={e => setForm({ ...form, smtp_port: e.target.value })} />
+              <select className="input" required value={Number(form.smtp_port) || 587}
+                      onChange={e => setForm({ ...form, smtp_port: Number(e.target.value) })}>
+                {SMTP_PORTS.map(p => <option key={p.value} value={p.value}>{p.label}</option>)}
+                {!SMTP_PORTS.some(p => p.value === Number(form.smtp_port)) && form.smtp_port && (
+                  <option value={form.smtp_port} disabled>{form.smtp_port} — no longer allowed</option>
+                )}
+              </select>
             </div>
           </div>
 
@@ -203,12 +254,13 @@ export default function MailboxManager() {
             <div style={{ fontSize: '0.75rem', color: 'var(--text-tertiary)', marginTop: 4 }}>
               Gmail hosts need an App Password (Google Account → Security → App
               passwords). Other hosts, including cPanel mail, take the mailbox’s
-              own password. Save, then press <b>Test</b> to confirm it works.
+              own password. Saving connects and logs in to check it; press
+              <b> Test</b> afterwards to send a real message.
             </div>
           </div>
 
           <div className="input-group">
-            <label>Display From Email <span style={{ color: 'var(--text-tertiary)', fontWeight: 400 }}>(optional)</span></label>
+            <label>Display From Email <span style={{ color: 'var(--text-tertiary)', fontWeight: 400 }}>(optional — the mailbox’s own address or another on the same domain)</span></label>
             <input className="input" type="email" value={form.smtp_from_email}
                    onChange={e => setForm({ ...form, smtp_from_email: e.target.value })} />
           </div>
