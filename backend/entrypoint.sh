@@ -100,10 +100,14 @@ if [ "$ROLE" = "email-worker" ]; then
     # A standalone assignment, so `set -e` stops here if it fails instead of letting
     # rq fall back to localhost db 0.
     EMAIL_QUEUE_URL="$(python -c 'from src.mailq.queue import resolve_redis_url; print(resolve_redis_url())')"
-    # Secrets it never uses. It keeps DATABASE_URL (delivery log), EMAIL_ENCRYPTION_KEY
-    # (queued mailbox passwords) and the SMTP/Innomax mailbox credentials it sends with.
+    # Secrets it never uses. It keeps DATABASE_URL (messages and connections),
+    # EMAIL_CREDENTIAL_KEYS (mailbox passwords, decrypted just before each send) and,
+    # until scripts/reencrypt_email_credentials.py has run, EMAIL_ENCRYPTION_KEY for
+    # passwords still under the legacy key. The SMTP_*/INNOMAX_* mailboxes are
+    # database rows now (src/email_api/bootstrap.py), so their env copies go too.
     unset SECRET_KEY JUDGE_REGRADE_TOKEN SUPERADMIN_PASSWORD PLATFORM_ADMIN_PASSWORD \
-          GEMINI_API_KEY
+          GEMINI_API_KEY SMTP_USER SMTP_PASS INNOMAX_HR_USER INNOMAX_HR_PASS \
+          INNOMAX_OFFICIAL_USER INNOMAX_OFFICIAL_PASS
     echo "Starting email RQ worker (with scheduler)..."
     exec rq worker "${EMAIL_QUEUE:-email}" --with-scheduler \
         --job-class src.mailq.safety.SafeEmailJob \

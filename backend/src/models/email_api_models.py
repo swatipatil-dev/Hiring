@@ -1,7 +1,7 @@
 """
 EMAIL API MODELS — connections, senders, routes, messages and their delivery trail.
 
-The multi-tenant email API (docs/EMAIL_SYSTEM.md) separates three things the
+The multi-tenant email API (docs/EMAIL_API.md) separates three things the
 legacy tables blurred together:
 
   * a **connection** is *how* mail leaves (an SMTP account today; OAuth mailboxes

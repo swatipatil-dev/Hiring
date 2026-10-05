@@ -1,8 +1,8 @@
 # Which stages send email, and from which address
 
-Reference for whoever configures Admin → Email Settings. Every other mail
-document here is deployment- or ops-focused; this one is about what the product
-actually sends.
+Reference for whoever configures Admin → Email Settings. How sending works —
+senders, routes, the outbox, blocked mail — is in [EMAIL_API.md](EMAIL_API.md);
+this one is about what the product actually sends.
 
 Derived from the code, not from the UI. A row on the HR → Pipeline Notifications
 screen does **not** prove anything sends mail for it — the authority is which
@@ -16,9 +16,11 @@ Re-run that when stages are added. Anything absent from its output sends nothing
 
 ## Stages that send mail
 
-Each of these resolves its sender through `pipeline_step_configs.mailbox_id`, so
-each can point at a different mailbox. A stage left unmapped falls back to the
-company default and still sends.
+Each of these resolves its sender through the step's route (`email_routes`, edited
+in HR → Pipeline Notifications), so each can point at a different mailbox. A stage
+left unmapped uses the company default. A stage switched off sends nothing. A
+stage whose mailbox cannot send is **blocked** — it does not quietly use another
+address — and Admin → Mail Routing says why.
 
 | Stage (`step_key`) | Fires when | Recipient | Call site |
 |---|---|---|---|
@@ -66,60 +68,52 @@ rate-limit window is keyed on the sending account
 > **A seeded mailbox cannot send until someone types its password.** The script
 > inserts `smtp_pass=None` deliberately (`seed_innomax_mailboxes.py:90-95`) — it has
 > no way to know the passwords. Until one is entered in Admin → Email Settings the
-> mailbox is inert and everything pointed at it falls back to the company default.
-> This is the single most common reason mail goes out from the wrong address. It
-> shows up as `no password set` in Admin → Mail Routing and in the logs.
+> mailbox shows *Needs attention*, and any stage pointed at it is **blocked** (it
+> used to fall back to the company default, which is how mail went out from the
+> wrong address). The settings migration only routed stages to mailboxes that could
+> already send, so the upgrade itself did not block anything that worked before.
 
 ## Mail that is not stage-configurable
 
 | Mail | Recipient | Sender |
 |---|---|---|
-| Verification OTP | Candidate | **`Auth` mailbox, by name** — `resolve_auth_sender` (`src/auth.py`, `auth_routes.py`) |
-| Resend OTP | Candidate | **`Auth` mailbox, by name** — `resolve_auth_sender` (`auth_routes.py`) |
-| Password reset OTP | Any user | **`Auth` mailbox, by name** — `resolve_auth_sender` (`auth_routes.py`) |
-| Admin welcome | New tenant admin | Platform `official@` (`superadmin_routes.py:340`) |
-| Support — new ticket | Superadmins | **env `SMTP_*` only** (`support_routes.py:186`) |
-| Support — admin replied | Superadmins | **env `SMTP_*` only** (`support_routes.py:214`) |
-| Support — superadmin replied | Client admin | Company default (`support_routes.py:234`) |
+| Verification OTP | Candidate | `auth.verify_email` route → company default → **platform auth route** (`src/auth.py`, `auth_routes.py`) |
+| Resend OTP | Candidate | same as verification |
+| Password reset OTP | Any user | `auth.password_reset` route → company default → **platform auth route** |
+| Admin welcome | New tenant admin | Platform company's `platform.tenant_welcome` route — Innomax Official (`superadmin_routes.py`) |
+| Support — new ticket | Superadmins | Platform company's `support.ticket_to_platform` route — Platform System |
+| Support — admin replied | Superadmins | Platform company's `support.reply_to_platform` route |
+| Support — superadmin replied | Client admin | Platform company's `support.reply_to_admin` route (it used to be the client's own default) |
 
-**`Auth` is matched by name, not by a stage mapping.** `AUTH_MAILBOX_NAME`
-(`src/services/email_service.py`, default `"Auth"`) looks up a mailbox called
-exactly that. Create it with that name and map it to nothing; OTP finds it. Rename
-it and auth mail drops to the company default — a real incident on this deployment,
-where it went out from a personal address for that reason.
+**Auth mail has its own chain**, shared by all three call sites through
+`resolve_auth_sender`: the company's `auth.*` route → the company default → the
+**platform company's auth route**. The last step is the only place one company's
+mail uses another company's sender, and only for these codes, so a company that
+has not connected a mailbox can still register users. The platform's auth route is
+seeded from `SMTP_*` (`src/email_api/bootstrap.py`) and shown in Mail Routing.
 
-All three auth call sites share one chain, `resolve_auth_sender`: **named `Auth`
-mailbox → the company's SMTP override → env `SMTP_*`**. They used to inline it and
-had drifted, so registration and resend could send one user two codes from two
-different addresses.
-
-The drop to the default is no longer silent. A mailbox that exists but cannot send
-logs `Mailbox 'Auth' unusable for company <id>: <reason>` and **Admin → Mail
-Routing** names the same reason on the auth layer. A company that has no `Auth`
-mailbox at all logs nothing — that is a configuration choice, not a fault.
-
-**Support mail to superadmins ignores mailboxes entirely.** Those two call sites
-pass no `smtp_config`, so they always use the env `SMTP_*` account. Creating a
-`Support` mailbox will not change them.
+Auth mail is no longer found by mailbox *name*. The settings migration turned a
+working mailbox called `AUTH_MAILBOX_NAME` (default `"Auth"`) into the company's
+`auth.*` routes, so renaming a mailbox no longer changes where codes come from. A
+company auth sender that exists but cannot send blocks the codes — it is a fault
+to fix, shown in Mail Routing — rather than falling through to the platform.
 
 ## Verifying a mailbox actually works
 
-Saving a mailbox verifies nothing — the password is encrypted and stored exactly
-as typed. Two things follow:
+Saving a mailbox now checks it: the host must be a public mail server on port 465
+or 587, and the server must accept the TLS handshake and the login. A mailbox that
+fails is saved with its error (*Connection failed* / *Needs attention*), so the
+screen says what to fix. Then:
 
-1. Press **Test** on the mailbox row in Admin → Email Settings. It sends
-   synchronously using that mailbox's own credentials and reports the real SMTP
-   error (`POST /api/v1/admin/mailboxes/{id}/test`). A wrong password comes back
-   as `535 Authentication failed` immediately.
-2. Then map the stages and check **Admin → Mail Routing**. It shows the effective
-   sender per stage and an amber `fallback_reason` when a mailbox is unusable.
-   That panel proves *configuration*; only the Test button proves the *password*.
+1. Press **Test** on the mailbox row. It sends one real message synchronously
+   through that mailbox — to its own address or a user of your company — and
+   reports the server's answer (`POST /api/v1/admin/mailboxes/{id}/test`).
+2. Map the stages and check **Admin → Mail Routing**. It shows, per stage, the
+   address mail goes out from, or **Blocked** with the reason.
 
-A mailbox is used only when it is active, has an SMTP user, **and** has a password
-— `mailbox_unusable_reason` (`src/services/pipeline_notifications.py`) is the single
-place that decides, shared by the send path, the auth path and this panel so they
-cannot disagree. Fail any one and the company default is used instead, with the
-reason logged and shown.
+`senders.usable_reason` (`src/email_api/senders.py`) is the single place that
+decides whether a mailbox can send — enabled, not deleted, connection active with
+a stored password — shared by the policy, the delivery worker and these screens.
 
 Note "App Password" is a Gmail concept — a token generated because 2FA blocks
 plain passwords. Mailboxes on `mail.innomaxskills.com` (or any cPanel host) take

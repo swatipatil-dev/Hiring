@@ -1,6 +1,6 @@
 """Email API foundation: connections, senders, routes, messages and outbox
 
-The schema for the multi-tenant email API (docs/EMAIL_SYSTEM.md):
+The schema for the multi-tenant email API (docs/EMAIL_API.md):
 
   email_connections   how mail leaves: one upstream account + its credential
   email_senders       authorised From identities on a connection

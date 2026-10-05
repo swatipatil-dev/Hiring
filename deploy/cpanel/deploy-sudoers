@@ -24,6 +24,7 @@
 
 Cmnd_Alias HF_SERVICES = \
     /usr/bin/systemctl restart hireflow-api hireflow-proctor hireflow-judge-worker hireflow-email-worker, \
+    /usr/bin/systemctl restart hireflow-api hireflow-proctor hireflow-judge-worker hireflow-email-worker hireflow-email-dispatcher, \
     /usr/bin/systemctl daemon-reload, \
     /usr/bin/systemctl is-active *, \
     /usr/bin/systemctl status *

@@ -139,6 +139,27 @@ by `src/mailq/queue.resolve_redis_url()`. `entrypoint.sh` calls that same functi
 rather than rebuilding the URL in shell, so the API and the worker can't disagree about
 which database the queue is in.
 
+### Email: the database is the queue of record, and three processes share it
+
+Since the email API ([EMAIL_API.md](EMAIL_API.md)) a message is written to
+`email_messages` + `email_outbox` in the request's transaction; Redis only carries
+`{message_id, tenant_id}` jobs. Three processes are involved and all three must run:
+
+| Process | Role | Holds |
+|---|---|---|
+| `hireflow-api` | accepts mail, publishes after commit | `EMAIL_CREDENTIAL_KEYS` (to save mailboxes) |
+| `hireflow-email-worker` | delivers | `EMAIL_CREDENTIAL_KEYS` (to decrypt passwords) |
+| `hireflow-email-dispatcher` | republishes due/lost outbox rows | **no secrets** — `entrypoint.sh` strips them |
+
+Without the dispatcher nothing is lost, but mail committed while Redis was down,
+every retry and every rate-limit deferral waits forever. Mail Routing shows its
+heartbeat. Without Redis, only verification/reset codes are sent (in-process);
+everything else waits in the outbox — there is no inline fallback any more.
+
+The outbox claim uses `FOR UPDATE SKIP LOCKED` on MySQL 8 and MariaDB 10.6+, and a
+claim-token `UPDATE … LIMIT` on MariaDB 10.5 (detected from `SELECT VERSION()`), so
+running more than one dispatcher is safe but unnecessary.
+
 ### `.env` is not readable by every service user
 
 `backend/.env` is mode 0600 owned by `hireflow` — it holds `SECRET_KEY`, the
@@ -164,7 +185,9 @@ These all leave the deployment looking healthy. Check them explicitly.
 
 | Thing | What you see | What is actually wrong |
 |---|---|---|
-| `EMAIL_ENCRYPTION_KEY` wrong | Mail stops working | `decrypt()` returns `""` instead of raising (`security.py:42`); callers fall back to the raw ciphertext as the password |
+| `EMAIL_CREDENTIAL_KEYS` wrong or missing | That company's mail is **blocked**, visibly | Decryption raises (`src/email_api/crypto.py`); the connection shows `credential_unreadable` in Mail Routing. Missing entirely: mailboxes cannot be saved and the platform's mailboxes are not seeded (CRITICAL at startup) |
+| `EMAIL_ENCRYPTION_KEY` wrong (before re-encryption) | `reencrypt_email_credentials.py` reports unreadable rows | It is now only the *legacy* key; anything still under it fails loudly instead of sending the ciphertext as a password |
+| Email dispatcher not running | New mail still sends | Retries, deferrals and anything committed during a Redis outage never go out; Mail Routing says "dispatcher not reporting" |
 | Admin bootstrap vars unset | Everything green, candidates can register | No account exists that can administer anything |
 | YOLO weights unresolvable | Proctoring runs normally | No object detection — phones, books, second people unflagged |
 | `google-genai` missing | Health checks pass | Every AI feature fails at first use, three retries deep |
@@ -447,8 +470,9 @@ question moot — but the reasoning stands for any future host.)*
 | `hireflow-api` | 8 GB | 50 |
 | `hireflow-judge-worker` | 2 GB | 30 |
 | `hireflow-email-worker` | 1 GB | 30 |
+| `hireflow-email-dispatcher` | 512 MB | 20 |
 
-21 GB of 32 GB, leaving 11 GB for MySQL, Apache, cPanel and the other accounts.
+21.5 GB of 32 GB, leaving 10.5 GB for MySQL, Apache, cPanel and the other accounts.
 
 - **`MemoryMax` is a hard ceiling** so systemd kills *our* service rather than
   letting the kernel OOM killer pick a victim — possibly MySQL or another

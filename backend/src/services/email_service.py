@@ -2,7 +2,7 @@
 📧 EMAIL NOTIFICATION SERVICE
 Builds the hiring workflow's emails and hands them to the email API.
 
-Sending itself lives in ``src/email_api`` (docs/EMAIL_SYSTEM.md). This module
+Sending itself lives in ``src/email_api`` (docs/EMAIL_API.md). This module
 keeps the message templates and the helpers the routes already call:
 
 * ``resolve_sender`` / ``resolve_auth_sender`` / ``resolve_smtp_for_company``

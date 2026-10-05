@@ -246,6 +246,97 @@ That is what a silent proctoring outage looks like.
 
 ---
 
+## Email API: one-time steps
+
+The release that introduces the email API ([EMAIL_API.md](EMAIL_API.md)) moves every
+email onto company senders, an outbox and a new dispatcher service, and stops
+reading `SMTP_*` at send time. Do these once, in this order, inside the normal
+procedure above.
+
+**Before pulling (Steps 1–2)**
+
+1. Generate the email key and add it to `backend/.env` (keep `EMAIL_ENCRYPTION_KEY`
+   and `SECRET_KEY` as they are — they are still needed to read the old passwords
+   once):
+
+   ```bash
+   sudo -u hireflow /opt/hireflow/venv/bin/python -c \
+     "from cryptography.fernet import Fernet; print('EMAIL_CREDENTIAL_KEYS=k1:' + Fernet.generate_key().decode())"
+   ```
+
+   Back it up with the other secrets. **Losing it makes every stored mailbox
+   password unreadable.**
+2. Install the updated sudoers file (it allows the deploy user to restart the new
+   dispatcher):
+
+   ```bash
+   \cp -f /opt/hireflow/deploy/cpanel/deploy-sudoers /etc/sudoers.d/hireflow-deploy && visudo -c
+   ```
+
+**After `alembic upgrade head` (Step 4)** — two revisions run: `t1e2m3a4i5l6`
+(new tables) and `t2e3m4a5i6l7` (copies `tenant_configs`, `company_mailboxes` and
+pipeline step settings into connections, senders and routes; the old rows are left
+as they are).
+
+3. Re-encrypt the copied passwords under the new key:
+
+   ```bash
+   cd /opt/hireflow/backend
+   sudo -u hireflow /opt/hireflow/venv/bin/python scripts/reencrypt_email_credentials.py --dry-run
+   sudo -u hireflow /opt/hireflow/venv/bin/python scripts/reencrypt_email_credentials.py
+   ```
+
+   Any `unreadable` connection is set to *Needs attention*; its mail is blocked
+   until an admin re-enters that password. Note which companies they belong to.
+4. Check what the platform's own mailboxes will become (the API also does this at
+   startup):
+
+   ```bash
+   sudo -u hireflow /opt/hireflow/venv/bin/python scripts/seed_platform_email.py --dry-run
+   ```
+
+   `SMTP_*` becomes "Platform System" — it also sends verification and reset codes
+   for companies with no mailbox of their own — `INNOMAX_HR_*` the platform's
+   default sender, `INNOMAX_OFFICIAL_*` the new-company welcome email.
+
+**Step 5** is required: install the new `hireflow-email-dispatcher.service`, then
+
+```bash
+systemctl enable --now hireflow-email-dispatcher
+```
+
+**Step 8:** restart the dispatcher with the others:
+
+```bash
+systemctl restart hireflow-api hireflow-proctor hireflow-judge-worker hireflow-email-worker hireflow-email-dispatcher
+systemctl is-active hireflow-email-dispatcher
+```
+
+A job queued by the previous release is not lost: the worker re-submits it through
+the new sender rules and ignores the password it carried.
+
+**Step 9, extended**
+
+- Admin → Email Settings → **Mail Routing** shows no `email_migration_pending`, and
+  the delivery card reads *Delivering normally* (Redis up, dispatcher reporting).
+- Every company that has blocked events there is a company whose mail was going out
+  from the platform's account before. Tell its admin: they need to connect a
+  mailbox. Verification and reset codes keep working meanwhile.
+- Send one real email, and request one password reset.
+
+**What admins will notice**
+
+- Saving a mailbox now connects and logs in; ports other than 465 and 587 are
+  refused.
+- A mailbox that cannot send no longer falls back to another address: mail routed
+  to it is blocked, and Mail Routing says why.
+- A step switched off in Pipeline Notifications really sends nothing.
+- Test emails go only to the mailbox's own address or a user of the company.
+
+After the sudoers file is installed everywhere, add `hireflow-email-dispatcher` to
+`SERVICES` in `.github/workflows/deploy.yml` so automated deploys restart it too.
+Until then restart it by hand after each deploy.
+
 ## Rollback
 
 Code and frontend:
@@ -256,6 +347,19 @@ cd frontend && npm install && npm run build && rsync -a --delete dist/ /home/inn
 \cp -f /opt/hireflow/deploy/cpanel/htaccess-spa /home/innomaxskills/public_html/career/.htaccess
 systemctl restart hireflow-api hireflow-proctor hireflow-judge-worker hireflow-email-worker
 ```
+
+Rolling back past the email API release: **first**, while the new code is still
+installed, copy the email settings changed since back to the old tables, then stop
+the dispatcher —
+
+```bash
+sudo -u hireflow /opt/hireflow/venv/bin/python scripts/email_connections_to_legacy.py --dry-run
+sudo -u hireflow /opt/hireflow/venv/bin/python scripts/email_connections_to_legacy.py
+systemctl disable --now hireflow-email-dispatcher
+```
+
+— otherwise the old code sends with the settings as they were before the upgrade.
+Mail still in the outbox is not sent by the old code.
 
 `--delete` removes `.htaccess` along with the old bundle — it lives in the document root
 but not in `dist/`. Step 7 re-copies it; a rollback has to as well, or the SPA loses its

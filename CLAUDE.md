@@ -96,6 +96,7 @@ Three top-level routers are also registered directly in `main.py`:
 - Candidate stage progression is tracked in `candidate_stage_history` table (immutable audit trail)
 - **Recruiter workflows** (full rules in `docs/RECRUITER_WORKFLOWS.md`): move a candidate with `src/services/stage_change.apply_stage_change` so history and the candidate's notice stay in one place. Stage deadlines are computed from history, never stored. Bulk actions are preview-then-confirm (`src/services/bulk_actions.py`). A merged candidate is kept with `merged_into_id` set and hidden from pipeline lists — filter it out of any new list. Panellists see no one's interview scores for an interview until they submit their own (`src/services/scorecards.feedback_visibility`); apply it to any new view that shows feedback to interviewers.
 - Resume files stored in `resumes/` directory
+- **Email** (full model in `docs/EMAIL_API.md`): every email goes through `src/email_api`. Resolve the sender with `resolve_step_sender` / `resolve_sender(..., event_type=...)` / `resolve_auth_sender`, then call `email_service.dispatch` (or a `send_*` helper) with that `SenderRef` — never build an SMTP config by hand (`dispatch` refuses one) and never read `SMTP_*` at send time. A sender that cannot send **blocks** the email; there is no fallback. New kinds of email need an entry in `src/email_api/constants.EVENT_CATALOG`. Delivery is asynchronous through the outbox; report outcomes with `delivery_outcome`, which distinguishes queued, sent, blocked and disabled.
 
 ## Environment
 
