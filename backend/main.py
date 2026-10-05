@@ -70,6 +70,7 @@ from routes.support_routes import router as support_router
 from routes.judge_routes import router as judge_router
 from routes.recruiter_workflow_routes import router as recruiter_workflow_router
 from routes.scorecard_routes import router as scorecard_router
+from routes.email_api_routes import router as email_api_router, keys_router as email_api_keys_router
 try:
     from proctoring.routes import router as proctor_router
 except ImportError:
@@ -449,6 +450,8 @@ app.include_router(support_router, tags=["Support"])
 app.include_router(judge_router, tags=["Coding Judge"])
 app.include_router(recruiter_workflow_router, tags=["Recruiter Workflow"])
 app.include_router(scorecard_router, tags=["Scorecards"])
+app.include_router(email_api_router, tags=["Email API"])
+app.include_router(email_api_keys_router, tags=["Email API keys"])
 
 # Uploaded files.
 #

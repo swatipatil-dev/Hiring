@@ -125,6 +125,32 @@ def create(db, *, company_id: str, conn, email: str, label: str,
     return sender
 
 
+def update(db, sender, *, label=None, display_name=None, reply_to=None,
+           enabled=None) -> None:
+    """Change what a sender shows or whether it is used. The address is immutable:
+    queued mail holds it as its identity, and the worker blocks on a change."""
+    from src.models.models import EmailSender
+    for value in (label, display_name, reply_to):
+        if value and _CRLF.search(value):
+            raise SenderError("header_invalid", "Line breaks are not allowed")
+    if reply_to and not _EMAIL_RE.match(reply_to.strip()):
+        raise SenderError("reply_to_invalid", "Reply-to address is not valid")
+    if label is not None and label != sender.label:
+        taken = (db.query(EmailSender.id)
+                 .filter(EmailSender.company_id == sender.company_id, EmailSender.label == label)
+                 .first())
+        if taken:
+            raise SenderError("sender_label_taken", f"A sender named {label!r} already exists")
+        sender.label = label
+    if display_name is not None:
+        sender.display_name = display_name or None
+    if reply_to is not None:
+        sender.reply_to = reply_to.strip() or None
+    if enabled is not None:
+        sender.enabled = bool(enabled)
+    db.flush()
+
+
 def soft_delete(db, sender) -> None:
     """Retire a sender without breaking messages that reference it.
 

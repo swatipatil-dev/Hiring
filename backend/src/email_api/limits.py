@@ -13,6 +13,7 @@ runaway sending, not an exact quota.
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from typing import List, Optional
 
@@ -68,3 +69,37 @@ def release(claimed: Optional[List[str]]) -> None:
 
 def seconds_to_next_window() -> int:
     return ratelimit.seconds_to_next_window()
+
+
+# ── submission quotas for the external API (spec §13, §16) ─────────────────
+
+API_KEY_HOURLY_QUOTA = int(os.getenv("EMAIL_API_KEY_HOURLY_QUOTA", "500"))
+TENANT_HOURLY_SUBMIT_QUOTA = int(os.getenv("EMAIL_TENANT_HOURLY_SUBMIT_QUOTA", "2000"))
+
+
+def submit_quota_retry_after(db, *, company_id: str, api_key_id: Optional[str],
+                             key_quota: Optional[int]) -> Optional[int]:
+    """Seconds to wait if an API submission would exceed a quota, else None.
+
+    Counted from ``email_messages`` over the last hour — accepted submissions,
+    which is also what a usage ledger will bill. Only API-key traffic counts;
+    the hiring application's own mail is limited at delivery instead.
+    """
+    from datetime import timedelta
+    from sqlalchemy import func
+    from src.models.models import EmailMessage
+    now = datetime.utcnow()
+    since = now - timedelta(hours=1)
+    checks = [(EmailMessage.company_id == company_id, EmailMessage.actor_type == "api_key",
+               TENANT_HOURLY_SUBMIT_QUOTA)]
+    if api_key_id:
+        checks.insert(0, (EmailMessage.company_id == company_id,
+                          EmailMessage.api_key_id == api_key_id,
+                          key_quota or API_KEY_HOURLY_QUOTA))
+    for scope_a, scope_b, quota in checks:
+        q = db.query(func.count(EmailMessage.id), func.min(EmailMessage.created_at)) \
+              .filter(scope_a, scope_b, EmailMessage.created_at >= since)
+        count, oldest = q.one()
+        if (count or 0) >= quota:
+            return max(1, int(((oldest or now) + timedelta(hours=1) - now).total_seconds()))
+    return None
