@@ -165,9 +165,15 @@ def db(db_engine) -> Session:
     orig_open_session = email_log_mod._open_session
     email_log_mod._open_session = lambda: Session(
         bind=connection, join_transaction_mode="create_savepoint")
+    # Same reason, for the email API's outbox publisher, dispatcher and worker.
+    import src.email_api.db as email_api_db
+    orig_email_api_open = email_api_db.open_session
+    email_api_db.open_session = lambda: Session(
+        bind=connection, join_transaction_mode="create_savepoint")
 
     yield session
 
+    email_api_db.open_session = orig_email_api_open
     email_log_mod._open_session = orig_open_session
     session.close()
     transaction.rollback()

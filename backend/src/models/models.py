@@ -1623,3 +1623,24 @@ from .judge_models import (  # noqa: E402,F401
     InterviewCodeSubmission,
     JudgeRuntimeState,
 )
+
+
+# ═══════════════════════════════════════════════════════
+# EMAIL API MODELS (email_connections, email_senders, email_routes,
+# email_messages, email_recipients, email_attempts, email_outbox,
+# email_suppressions, api_keys)
+#
+# Same arrangement as the judge models above: a separate module that shares
+# this Base, imported last so create_all() and alembic both see it.
+# ═══════════════════════════════════════════════════════
+from .email_api_models import (  # noqa: E402,F401
+    EmailConnection,
+    EmailSender,
+    EmailRoute,
+    EmailMessage,
+    EmailRecipient,
+    EmailAttempt,
+    EmailOutbox,
+    EmailSuppression,
+    TenantApiKey,
+)
