@@ -107,6 +107,14 @@ async def lifespan(app: FastAPI):
     except Exception as _e:
         logger.error(f"Bootstrap error: {_e}")
 
+    # The platform's own mailboxes (SMTP_*, INNOMAX_*) become explicit email
+    # connections; the send path never reads them from the environment.
+    try:
+        from src.email_api.bootstrap import seed_at_startup
+        seed_at_startup()
+    except Exception as _e:
+        logger.error(f"Email bootstrap error: {_e}")
+
     # NLP model availability check
     try:
         from src.services.enhanced_ats_service import (
