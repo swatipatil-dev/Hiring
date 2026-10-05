@@ -37,7 +37,8 @@ def main(argv=None) -> int:
     finally:
         db.close()
     for a in actions or ["nothing to do"]:
-        print(("would " if args.dry_run else "") + a)
+        is_action = a.startswith(("create ", "update ", "route "))
+        print(("would " if args.dry_run and is_action else "") + a)
     return 0
 
 
