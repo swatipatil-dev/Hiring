@@ -95,9 +95,11 @@ class Snapshot:
 class Adapter(Protocol):
     capabilities: Capabilities
 
-    def validate_connection(self, conn, secret: str) -> ValidationResult: ...
+    def validate_connection(self, conn, secret: str) -> ValidationResult:
+        ...
 
-    def send(self, conn, snapshot: Snapshot, secret: str) -> SubmissionResult: ...
+    def send(self, conn, snapshot: Snapshot, secret: str) -> SubmissionResult:
+        ...
 
 
 class UnsupportedConnection(Exception):
