@@ -333,9 +333,9 @@ the new sender rules and ignores the password it carried.
 - A step switched off in Pipeline Notifications really sends nothing.
 - Test emails go only to the mailbox's own address or a user of the company.
 
-After the sudoers file is installed everywhere, add `hireflow-email-dispatcher` to
-`SERVICES` in `.github/workflows/deploy.yml` so automated deploys restart it too.
-Until then restart it by hand after each deploy.
+`hireflow-email-dispatcher` is in `SERVICES` in `.github/workflows/deploy.yml`, so
+automated deploys restart it — which needs the updated sudoers file (step 2) on the
+server first, or the restart step is refused.
 
 ## Rollback
 
