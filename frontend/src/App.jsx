@@ -184,6 +184,7 @@ export default function App() {
       <Route path="/:companySlug" element={<CompanyLogin />} />
       <Route path="/:companySlug/jobs" element={<JobBoard />} />
       <Route path="/:companySlug/portal" element={<CompanyPortal />} />
+      <Route path="/:companySlug/forgot-password" element={<ForgotPassword />} />
 
       {/* Default redirect */}
       <Route path="*" element={

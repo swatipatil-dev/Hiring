@@ -83,6 +83,11 @@ describe('the platform front door survives a stored company slug', () => {
     renderAt('/acme-corp/jobs')
     expect(screen.getByText('JOB_BOARD')).toBeInTheDocument()
   })
+
+  it('serves the company password reset at /<slug>/forgot-password', () => {
+    renderAt('/acme-corp/forgot-password')
+    expect(screen.getByText('FORGOT')).toBeInTheDocument()
+  })
 })
 
 describe('a company slug cannot shadow a platform route', () => {

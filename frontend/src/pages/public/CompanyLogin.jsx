@@ -338,6 +338,12 @@ export default function CompanyLogin() {
                   <button type="button" onClick={() => setShowPw(p => !p)}
                     style={eyeBtn}>{showPw ? <EyeOff size={16}/> : <Eye size={16}/>}</button>
                 </div>
+                <div style={{ textAlign: 'right', marginTop: 6, fontSize: '0.8rem' }}>
+                  <Anchor color={accent}
+                    onClick={() => navigate(slug ? `/${encodeURIComponent(slug)}/forgot-password` : '/forgot-password')}>
+                    Forgot password?
+                  </Anchor>
+                </div>
               </Field>
 
               <button type="submit" disabled={loginBusy} style={submitBtn(accent, loginBusy)}>

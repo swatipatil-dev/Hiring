@@ -1,5 +1,5 @@
 import { useState, useRef } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { Mail, ShieldCheck, Lock, Eye, EyeOff, RotateCcw, ArrowLeft } from 'lucide-react'
 import api from '../api/client'
 
@@ -7,6 +7,14 @@ const STEPS = { EMAIL: 1, OTP: 2, PASSWORD: 3, DONE: 4 }
 
 export default function ForgotPassword() {
   const navigate = useNavigate()
+  // Reached from a company login page as /<slug>/forgot-password (or ?c=<slug>). The slug
+  // scopes the reset to that company's account, since one email can have an account at
+  // several companies, and sends the user back to that company's login when done.
+  const params = useParams()
+  const [searchParams] = useSearchParams()
+  const slug = params.companySlug || searchParams.get('c') || ''
+  const scope = slug ? { company_slug: slug } : {}
+  const loginPath = slug ? `/${encodeURIComponent(slug)}` : '/login'
   const [step, setStep]           = useState(STEPS.EMAIL)
   const [email, setEmail]         = useState('')
   const [otp, setOtp]             = useState(['', '', '', '', '', ''])
@@ -37,7 +45,7 @@ export default function ForgotPassword() {
     setError('')
     setLoading(true)
     try {
-      await api.post('/auth/forgot-password', { email })
+      await api.post('/auth/forgot-password', { email, ...scope })
       setStep(STEPS.OTP)
     } catch (err) {
       setError(extractErrorDetail(err, 'Something went wrong'))
@@ -73,7 +81,7 @@ export default function ForgotPassword() {
   const handleResend = async () => {
     setResendMsg(''); setError('')
     try {
-      await api.post('/auth/forgot-password', { email })
+      await api.post('/auth/forgot-password', { email, ...scope })
       setResendMsg('New OTP sent.')
       setOtp(['', '', '', '', '', ''])
       otpRefs.current[0]?.focus()
@@ -102,7 +110,7 @@ export default function ForgotPassword() {
     if (newPw.length < 8)    { setError('Password must be at least 8 characters'); return }
     setLoading(true)
     try {
-      await api.post('/auth/reset-password', { email, otp: otp.join(''), new_password: newPw })
+      await api.post('/auth/reset-password', { email, otp: otp.join(''), new_password: newPw, ...scope })
       setStep(STEPS.DONE)
     } catch (err) {
       const detail = extractErrorDetail(err, 'Reset failed')
@@ -123,7 +131,7 @@ export default function ForgotPassword() {
       <div className="fp-card">
 
         {/* Back to login */}
-        <Link to="/login" className="fp-back">
+        <Link to={loginPath} className="fp-back">
           <ArrowLeft size={15} /> Back to login
         </Link>
 
@@ -262,7 +270,7 @@ export default function ForgotPassword() {
             </div>
             <h2 className="fp-title" style={{ color: '#16a34a' }}>Password reset!</h2>
             <p className="fp-sub">Your password has been updated successfully.</p>
-            <button className="fp-btn" style={{ background: '#16a34a' }} onClick={() => navigate('/login')}>
+            <button className="fp-btn" style={{ background: '#16a34a' }} onClick={() => navigate(loginPath)}>
               Go to Login
             </button>
           </div>

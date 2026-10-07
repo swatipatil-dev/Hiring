@@ -195,6 +195,11 @@ export default function CompanyPortal() {
                 value={password} onChange={e => setPassword(e.target.value)}
                 onFocus={el => el.target.style.borderColor = accent}
                 onBlur={el => el.target.style.borderColor = '#e5e7eb'} />
+              <div style={{ textAlign: 'right', marginTop: -6 }}>
+                <button type="button"
+                  onClick={() => navigate(slug ? `/${encodeURIComponent(slug)}/forgot-password` : '/forgot-password')}
+                  style={{ ...S.switchLink, color: accent }}>Forgot password?</button>
+              </div>
 
               <button type="submit" disabled={submitting}
                 style={{ ...S.submit, background: accent, opacity: submitting ? 0.7 : 1 }}>
